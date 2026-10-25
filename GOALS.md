@@ -59,9 +59,9 @@ Never edit the headline (line 1).
   that Home Manager manages.
 
 ## M4: Docs and release
-- [ ] README with attribution to claude-swap (MIT notice kept), install, usage,
+- [x] README with attribution to claude-swap (MIT notice kept), install, usage,
   a security notes section, and a ToS note: using multiple accounts to avoid
   usage limits may be against provider terms; users are responsible.
-- [ ] LICENSE (MIT) plus a NOTICE crediting claude-swap.
+- [x] LICENSE (MIT) plus a NOTICE crediting claude-swap.
 
 ## Questions

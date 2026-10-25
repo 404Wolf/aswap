@@ -1,0 +1,11 @@
+aswap
+Copyright (c) 2026 Wolf Mermelstein
+
+Portions of this project are derived from or informed by claude-swap:
+https://github.com/realiti4/claude-swap
+Copyright (c) 2026 Onur Cetinkol
+Licensed under the MIT License, reproduced in LICENSE.
+
+The Linux account-profile, Claude OAuth usage, switching and session concepts
+were ported from claude-swap. The Rust implementation adds Codex CLI profiles,
+app-server quota collection, Waybar output and Nix/Home Manager packaging.
