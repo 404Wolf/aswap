@@ -8,6 +8,7 @@ use crate::{
 use std::{
     path::Path,
     process::{Child, Stdio},
+    sync::Arc,
     time::Duration,
 };
 
@@ -114,7 +115,10 @@ pub fn run(
             account = best.clone();
         }
     }
-    let mut lease = store.lease(&account)?;
+    let mut lease = Arc::new(store.lease(&account)?);
+    let history_owner = account.label.clone();
+    // Retain the history owner's lease even after switching credentials.
+    let history_lease = auto.then(|| Arc::clone(&lease));
     {
         let _lock = store.lock()?;
         store.account(&store.load()?, provider, Some(&account.label))?;
@@ -122,7 +126,7 @@ pub fn run(
     let profile = store.profile(provider, &account.label)?;
     let runtime;
     let session = if auto {
-        let dir = store.root.join("sessions");
+        let dir = store.sessions(provider, &account.label)?;
         store::private_dir(&dir)?;
         runtime = tempfile::Builder::new()
             .prefix("run-")
@@ -205,6 +209,9 @@ pub fn run(
             return Ok(status.code().unwrap_or(1));
         }
         sync_auth(store, &account, &session)?;
+        if status.success() && target.is_none() {
+            return Ok(0);
+        }
         let did_limit = limited;
         if did_limit {
             usage::mark_limited(store, &account)?;
@@ -229,7 +236,15 @@ pub fn run(
         };
         drop(lease);
         account = next;
-        lease = store.lease(&account)?;
+        lease = if account.label == history_owner {
+            Arc::clone(history_lease.as_ref().expect("auto session history lease"))
+        } else {
+            Arc::new(store.lease(&account)?)
+        };
+        {
+            let _lock = store.lock()?;
+            store.account(&store.load()?, provider, Some(&account.label))?;
+        }
         seed(store, &account, &session)?;
         {
             let _lock = store.lock()?;
@@ -237,10 +252,17 @@ pub fn run(
             state.auto.entry(provider).or_default().last_switch = now();
             store.save(&state)?;
         }
-        launch_args = match provider {
-            Provider::Claude => vec!["--continue".into()],
-            Provider::Codex => vec!["resume".into(), "--last".into()],
+        let prompt = {
+            let _lock = store.lock()?;
+            store
+                .load()?
+                .auto
+                .get(&provider)
+                .cloned()
+                .unwrap_or_default()
+                .resume_prompt
         };
+        launch_args = resume_args(provider, prompt.as_deref());
         switches += 1;
     }
 }
@@ -303,4 +325,17 @@ pub fn tick(store: &Store, provider: Provider, activate_live: bool) -> Result<Op
     state.auto.entry(provider).or_default().last_switch = now();
     store.save(&state)?;
     Ok(Some(account.label.clone()))
+}
+
+/// Literal argv: no shell expansion and no replay of the user's previous command.
+pub fn resume_args(provider: Provider, prompt: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = match provider {
+        Provider::Claude => vec!["--continue".into()],
+        Provider::Codex => vec!["resume".into(), "--last".into()],
+    };
+    if let Some(prompt) = prompt {
+        args.push("--".into());
+        args.push(prompt.into());
+    }
+    args
 }

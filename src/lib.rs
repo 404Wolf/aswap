@@ -33,3 +33,5 @@ pub mod terminal;
 
 pub mod display;
 pub mod identity;
+
+pub mod rename;

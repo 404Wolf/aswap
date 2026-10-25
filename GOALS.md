@@ -71,4 +71,9 @@ Never edit the headline (line 1).
 - [x] Refresh status through cache/backoff; distinguish cached, stale, unknown and unavailable observations.
 - [x] Add synthetic identity, CLI and rendering snapshot coverage.
 
+## M6: Profile rename and automatic continuation
+- [x] Rename labels under the store lock with recoverable directory/metadata moves, active selection, cache and history retention; preserve provider-wide auto policy.
+- [x] Refuse running profiles, collisions and invalid labels; identify duplicates on remove; support JSON and synthetic rename/recovery tests.
+- [x] Send a configurable follow-up only after forced auto switches, with CLI/off and nullable Home Manager settings; test literal argv, off and clean exits.
+
 ## Questions

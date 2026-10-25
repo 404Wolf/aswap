@@ -69,7 +69,9 @@
                 programs.aswap = {
                   enable = true;
                   autoswitch.claude.enable = true;
+                  autoswitch.claude.resumePrompt = ''synthetic "quotes" $HOME %n'';
                   autoswitch.codex.enable = true;
+                  autoswitch.codex.resumePrompt = null;
                   waybar.enable = true;
                 };
               }
@@ -101,6 +103,9 @@
           home-manager = assert builtins.elem package hm.config.home.packages;
             assert hm.config.systemd.user.services.aswap-claude.Service.UMask == "0077";
             assert hm.config.systemd.user.services.aswap-codex.Service.RestartSec == 60;
+            assert pkgs.lib.hasInfix " resume-prompt -- " (builtins.elemAt hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre 1);
+            assert pkgs.lib.hasInfix "$$HOME %%n" (builtins.elemAt hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre 1);
+            assert pkgs.lib.hasInfix "off" (builtins.elemAt hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre 1);
             assert hm.config.programs.waybar.settings.mainBar."custom/aswap".return-type == "json";
             pkgs.runCommand "aswap-home-manager" {} "touch $out";
         });

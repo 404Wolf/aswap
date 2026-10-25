@@ -95,3 +95,28 @@ pub fn read(provider: Provider, profile: &Path) -> Result<Identity> {
 pub fn same(a: &Identity, b: &Identity) -> bool {
     a.fingerprint.is_some() && a.fingerprint == b.fingerprint
 }
+
+/// Caller holds the store lock; only labels leave this helper.
+pub fn duplicates(
+    store: &crate::store::Store,
+    account: &crate::store::Account,
+    accounts: &[crate::store::Account],
+) -> Vec<String> {
+    let own = store
+        .profile(account.provider, &account.label)
+        .ok()
+        .and_then(|p| read(account.provider, &p).ok())
+        .unwrap_or_default();
+    accounts
+        .iter()
+        .filter(|other| other.provider == account.provider && other.label != account.label)
+        .filter_map(|other| {
+            let id = store
+                .profile(other.provider, &other.label)
+                .ok()
+                .and_then(|p| read(other.provider, &p).ok())
+                .unwrap_or_default();
+            same(&own, &id).then(|| other.label.clone())
+        })
+        .collect()
+}

@@ -192,3 +192,69 @@ fn duplicate_warning_and_local_only_identity_output() {
     assert!(text.contains("SESSION (5h) unknown"));
     assert!(text.contains("WEEKLY unknown"));
 }
+
+#[test]
+fn rename_cli_and_resume_prompt_configuration() {
+    let t = Sandbox::new();
+    t.seed();
+    t.ok(&["add", "claude", "old", "--json"]);
+    let v = t.ok(&["rename", "claude", "old", "new", "--json"]);
+    assert_eq!(v["renamed"]["label"], "new");
+    assert_eq!(v["old_label"], "old");
+    let list = t.ok(&["list", "--json"]);
+    assert_eq!(list["accounts"][0]["label"], "new");
+    assert_eq!(list["accounts"][0]["active"], true);
+    t.ok(&["add", "claude", "collision", "--json"]);
+    assert!(
+        !t.invoke(&["rename", "claude", "new", "collision", "--json"])
+            .status
+            .success()
+    );
+    assert!(
+        !t.invoke(&["rename", "claude", "new", "../escape", "--json"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        t.ok(&[
+            "auto",
+            "claude",
+            "resume-prompt",
+            "synthetic follow-up",
+            "--json"
+        ])["auto"]["resume_prompt"],
+        "synthetic follow-up"
+    );
+    assert_eq!(
+        t.ok(&["auto", "claude", "resume-prompt", "off", "--json"])["auto"]["resume_prompt"],
+        Value::Null
+    );
+    assert!(
+        !t.invoke(&["auto", "claude", "resume-prompt"])
+            .status
+            .success()
+    );
+    assert!(
+        !t.invoke(&["auto", "claude", "resume-prompt", ""])
+            .status
+            .success()
+    );
+}
+#[test]
+fn remove_names_the_duplicate_and_json_contains_only_labels() {
+    let t = Sandbox::new();
+    t.seed();
+    fs::write(t.root().join("claude/.claude.json"), serde_json::to_vec(&json!({"oauthAccount":{"accountUuid":"synthetic-account", "emailAddress":"alice@example.com"}})).unwrap()).unwrap();
+    for label in ["first", "copy", "another"] {
+        t.ok(&["add", "claude", label, "--json"]);
+    }
+    let removed = t.ok(&["remove", "claude", "copy", "--json"]);
+    assert_eq!(removed["duplicates"], json!(["first", "another"]));
+    assert!(!removed.to_string().contains("alice@example.com"));
+    let out = t.invoke(&["remove", "claude", "another"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains("Removed claude:another (duplicate login of first)")
+    );
+}

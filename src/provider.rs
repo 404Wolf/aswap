@@ -338,13 +338,14 @@ pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
     }
     Ok(())
 }
-pub fn remove(store: &Store, provider: Provider, name: &str) -> Result<()> {
+pub fn remove(store: &Store, provider: Provider, name: &str) -> Result<Vec<String>> {
     let _lock = store.lock()?;
     let mut state = store.load()?;
     let account = store.account(&state, provider, Some(name))?;
     let _lease = store.lease(&account)?;
     let profile = store.profile(provider, name)?;
     store::no_links(&profile)?;
+    let duplicates = crate::identity::duplicates(store, &account, &state.accounts);
     // First unlink metadata; a failed deletion leaves an unselectable private orphan.
     state
         .accounts
@@ -356,5 +357,5 @@ pub fn remove(store: &Store, provider: Provider, name: &str) -> Result<()> {
     if profile.exists() {
         std::fs::remove_dir_all(profile).safe("cannot remove private profile")?;
     }
-    Ok(())
+    Ok(duplicates)
 }

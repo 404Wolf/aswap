@@ -46,6 +46,12 @@ enum Action {
     },
     /// Remove a stored profile (refuses a running account).
     Remove { provider: Provider, label: String },
+    /// Rename a stored label, its usage cache and retained sessions.
+    Rename {
+        provider: Provider,
+        old: String,
+        new: String,
+    },
     /// Read usage through the shared cache, respecting backoff.
     Usage {
         provider: Provider,
@@ -57,8 +63,8 @@ enum Action {
         provider: Provider,
         #[arg(value_enum)]
         action: AutoAction,
-        #[arg(help = "Percentage, required with threshold")]
-        value: Option<f64>,
+        #[arg(help = "Percentage for threshold; text or off for resume-prompt")]
+        value: Option<String>,
         #[arg(
             long,
             help = "Also activate the live default credential file when switching"
@@ -90,6 +96,7 @@ enum Action {
 }
 #[derive(Clone, Copy, ValueEnum)]
 enum AutoAction {
+    ResumePrompt,
     On,
     Off,
     Threshold,
@@ -136,25 +143,11 @@ fn snapshot(store: &Store, filter: Option<Provider>, refresh: bool) -> Result<Va
 }
 fn duplicate_labels(store: &Store, account: &store::Account) -> Result<Vec<String>> {
     let _lock = store.lock()?;
-    let id = aswap::identity::read(
-        account.provider,
-        &store.profile(account.provider, &account.label)?,
-    )
-    .unwrap_or_default();
-    let mut duplicates = Vec::new();
-    for other in store.load()?.accounts {
-        if other.provider == account.provider && other.label != account.label {
-            let other_id = aswap::identity::read(
-                other.provider,
-                &store.profile(other.provider, &other.label)?,
-            )
-            .unwrap_or_default();
-            if aswap::identity::same(&id, &other_id) {
-                duplicates.push(other.label);
-            }
-        }
-    }
-    Ok(duplicates)
+    Ok(aswap::identity::duplicates(
+        store,
+        account,
+        &store.load()?.accounts,
+    ))
 }
 fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> {
     let accounts = value["accounts"].as_array().unwrap();
@@ -310,11 +303,24 @@ fn execute(cli: Cli) -> Result<i32> {
             )?;
         }
         Action::Remove { provider, label } => {
-            provider::remove(&store, provider, &label)?;
+            let duplicates = provider::remove(&store, provider, &label)?;
+            let detail = if duplicates.is_empty() {
+                String::new()
+            } else {
+                format!(" (duplicate login of {})", duplicates.join(", "))
+            };
             output(
-                &json!({"removed":true}),
+                &json!({"removed":true,"provider":provider,"label":label,"duplicates":duplicates}),
                 cli.json,
-                format!("Removed {provider}:{label}"),
+                format!("Removed {provider}:{label}{detail}"),
+            )?;
+        }
+        Action::Rename { provider, old, new } => {
+            let account = aswap::rename::rename(&store, provider, &old, &new)?;
+            output(
+                &json!({"renamed":account,"old_label":old}),
+                cli.json,
+                format!("Renamed {provider}:{old} to {new}"),
             )?;
         }
         Action::Usage { provider, account } => {
@@ -347,11 +353,17 @@ fn execute(cli: Cli) -> Result<i32> {
             value,
             activate_live,
         } => {
-            if matches!(action, AutoAction::Threshold) != value.is_some() {
-                return Err(Error("only threshold takes a percentage argument"));
+            if matches!(action, AutoAction::Threshold | AutoAction::ResumePrompt) != value.is_some()
+            {
+                return Err(Error(
+                    "threshold requires a percentage; resume-prompt requires text or off; other actions take no value",
+                ));
             }
             match action {
-                AutoAction::On | AutoAction::Off | AutoAction::Threshold => {
+                AutoAction::On
+                | AutoAction::Off
+                | AutoAction::Threshold
+                | AutoAction::ResumePrompt => {
                     let _lock = store.lock()?;
                     let mut state = store.load()?;
                     let settings = state.auto.entry(provider).or_default();
@@ -359,9 +371,22 @@ fn execute(cli: Cli) -> Result<i32> {
                         AutoAction::On => settings.enabled = true,
                         AutoAction::Off => settings.enabled = false,
                         AutoAction::Threshold => {
-                            let v = value.unwrap();
+                            let v = value
+                                .as_deref()
+                                .unwrap()
+                                .parse::<f64>()
+                                .safe("invalid threshold percentage")?;
                             store::threshold(v)?;
                             settings.threshold = v;
+                        }
+                        AutoAction::ResumePrompt => {
+                            let prompt = value.unwrap();
+                            if prompt.is_empty() || prompt.len() > 16384 || prompt.contains('\0') {
+                                return Err(Error(
+                                    "resume prompt must be 1–16384 bytes without NUL",
+                                ));
+                            }
+                            settings.resume_prompt = (prompt != "off").then_some(prompt);
                         }
                         _ => unreachable!(),
                     }

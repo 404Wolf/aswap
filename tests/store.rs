@@ -179,3 +179,15 @@ fn isolated_lifecycle_child() {
     assert!(!store.profile(Provider::Claude, "one").unwrap().exists());
     assert!(!store.load().unwrap().active.contains_key(&Provider::Claude));
 }
+
+#[test]
+fn legacy_auto_settings_get_default_prompt_and_off_survives_reload() {
+    let mut policy: store::Auto =
+        serde_json::from_value(serde_json::json!({"enabled":true,"threshold":90,"last_switch":0}))
+            .unwrap();
+    assert_eq!(policy.resume_prompt.as_deref(), Some(store::RESUME_PROMPT));
+    policy.resume_prompt = None;
+    let restored: store::Auto =
+        serde_json::from_value(serde_json::to_value(policy).unwrap()).unwrap();
+    assert!(restored.resume_prompt.is_none());
+}

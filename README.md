@@ -47,6 +47,7 @@ aswap run claude --account work
 aswap run codex --account personal -- --help
 aswap run claude --account work -- --resume
 aswap run codex --account personal -- resume --last
+aswap rename claude work office
 aswap remove codex personal
 ```
 
@@ -124,12 +125,15 @@ A switch stops the old child (SIGTERM, five-second grace, then SIGKILL), changes
 the runtime credentials and invokes `claude --continue` or `codex resume --last`
 in the same private history directory. It never copies conversation history
 between accounts. Resume depends on the provider having persisted the session;
-an interrupted operation may need your attention or a new prompt. Limit-text
+the configurable follow-up prompt continues interrupted work after a forced
+switch, while `resume-prompt off` leaves the next prompt to you. Limit-text
 detection is heuristic; quota polling is the primary signal. Restarts are capped
 at eight per invocation. Provider arguments are refused with `--auto`, so
 scripts and explicit command arguments cannot be replayed automatically.
 
-Auto histories remain under `$XDG_DATA_HOME/aswap/sessions/run-*` after exit.
+Auto histories remain under
+`$XDG_DATA_HOME/aswap/sessions/<provider>/<initial-label>/run-*` after exit.
+Older anonymous `sessions/run-*` histories remain usable at their original paths.
 To resume one later, point the official CLI's config-home environment variable
 at that session directory. It contains private credentials and transcripts;
 treat it as sensitive. The source account profile receives refreshed auth on
@@ -168,6 +172,30 @@ or elapsed reset makes remaining quota unknown. Cache hits never bypass a
 backoff. `list` is offline; `status`, `usage`, `waybar` and active monitors
 fetch only when due. The HTTP/RPC clients have bounded timeouts and response
 sizes; provider error bodies are redacted.
+
+`aswap rename <provider> <old> <new>` preserves active selection, provider-wide
+auto policy, cached quota and retained histories. It validates labels and refuses
+a running profile or an existing destination. Renames run under the store lock
+with recovery after an interrupted operation. Profile-owned histories move with
+the label; anonymous legacy histories have no label to rename and remain intact.
+`remove` identifies duplicate logins by their other managed labels. Both commands
+support `--json`; no email or credential data is included in their output.
+
+After a forced `run --auto` switch, the default follow-up is:
+"You were interrupted by a usage-limit account switch. Continue exactly where you
+left off." A successful session exit sends no follow-up. Configure or disable it:
+
+```sh
+aswap auto claude resume-prompt 'Continue the interrupted task.'
+aswap auto codex resume-prompt off
+```
+
+Both installed CLIs support an initial resume prompt: `claude --continue --
+"<prompt>"` and `codex resume --last -- "<prompt>"`. Prompts are literal arguments;
+previous user commands are not replayed. `off` keeps native resume without sending
+a follow-up. In Home Manager, set
+`programs.aswap.autoswitch.<provider>.resumePrompt` to text or `null` (off); the
+monitor service applies it alongside the threshold when enabled.
 
 ## Waybar
 

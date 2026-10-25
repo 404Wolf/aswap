@@ -17,13 +17,21 @@ pub struct Account {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Auto {
+    #[serde(default = "default_resume_prompt")]
+    pub resume_prompt: Option<String>,
     pub enabled: bool,
     pub threshold: f64,
     pub last_switch: u64,
 }
+pub const RESUME_PROMPT: &str =
+    "You were interrupted by a usage-limit account switch. Continue exactly where you left off.";
+pub fn default_resume_prompt() -> Option<String> {
+    Some(RESUME_PROMPT.into())
+}
 impl Default for Auto {
     fn default() -> Self {
         Self {
+            resume_prompt: default_resume_prompt(),
             enabled: false,
             threshold: 90.0,
             last_switch: 0,
@@ -183,7 +191,9 @@ impl Store {
         f.set_permissions(fs::Permissions::from_mode(0o600))
             .safe("cannot secure lock")?;
         f.lock_exclusive().safe("cannot lock account store")?;
-        Ok(Guard(f))
+        let guard = Guard(f);
+        crate::rename::recover(self)?;
+        Ok(guard)
     }
     pub fn load(&self) -> Result<State> {
         let p = self.root.join("state.json");
@@ -211,6 +221,14 @@ impl Store {
         Ok(self
             .root
             .join("profiles")
+            .join(provider.as_str())
+            .join(name))
+    }
+    pub fn sessions(&self, provider: Provider, name: &str) -> Result<PathBuf> {
+        label(name)?;
+        Ok(self
+            .root
+            .join("sessions")
             .join(provider.as_str())
             .join(name))
     }

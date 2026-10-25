@@ -3,9 +3,17 @@
 let
   cfg = config.programs.aswap;
   inherit (lib) mkEnableOption mkOption types mkIf;
+  # Same quoting rule as nixpkgs' systemd Exec argument helper: JSON quotes,
+  # then escape systemd specifiers and environment expansion (no shell involved).
+  escapeExecArg = arg: lib.replaceStrings [ "%" "$" ] [ "%%" "$$" ] (builtins.toJSON arg);
   providerOptions = { ... }: {
     options = {
       enable = mkEnableOption "the aswap account-selection monitor";
+      resumePrompt = mkOption {
+        type = types.nullOr types.str;
+        default = "You were interrupted by a usage-limit account switch. Continue exactly where you left off.";
+        description = "Follow-up prompt after a forced run --auto account switch; null disables it.";
+      };
       threshold = mkOption {
         type = types.addCheck types.number (n: n >= 1 && n <= 100);
         default = 90;
@@ -23,6 +31,7 @@ let
       UMask = "0077";
       ExecStartPre = [
         "${cfg.package}/bin/aswap auto ${provider} threshold ${toString settings.threshold}"
+        "${cfg.package}/bin/aswap auto ${provider} resume-prompt -- ${escapeExecArg (if settings.resumePrompt == null then "off" else settings.resumePrompt)}"
         "${cfg.package}/bin/aswap auto ${provider} on"
       ];
       ExecStart = "${cfg.package}/bin/aswap auto ${provider} watch";

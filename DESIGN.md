@@ -96,9 +96,9 @@ session directory, copies back provider-rotated credentials to the correct
 account, and changes only the runtime account when quota reaches the line or
 terminal output reports a provider limit. Restart uses `claude --continue` or
 `codex resume --last`, retaining that run's history. It sends SIGTERM first,
-allows five seconds to exit and falls back to SIGKILL. Native resume may
-require the user to submit their next prompt; pending commands are not
-replayed. Provider arguments are refused in this mode and restarts are capped
+allows five seconds to exit and falls back to SIGKILL. After a forced switch,
+a configurable follow-up prompt resumes work automatically; a clean exit never
+sends it. Pending user commands are not replayed. Provider arguments are refused in this mode and restarts are capped
 at eight. Auto session histories remain private under the data store's
 sessions directory. Plain `run -- --resume` and `run -- resume --last` use the
 account's persistent profile history. Isolated profiles do not import the
@@ -136,3 +136,31 @@ is unknown, not a duplicate; identity extraction failures do not expose content.
 Status preserves old observations during backoff but labels them unavailable;
 expired windows are shown as last observed rather than current quota. Terminal
 rendering strips control characters from local hints and wraps to terminal width.
+
+## Label rename and forced-switch follow-up
+
+Rename validates both labels and holds the store lock plus the old/new profile
+leases. It moves the profile (including usage-cache.json and native histories)
+and sessions/<provider>/<label>, then relabels the account and active selection.
+Auto policy is provider-wide and survives unchanged, including cooldown and the
+resume prompt. No separate label-keyed usage cache or policy exists. A private
+rename-transaction.json journal makes interrupted moves recoverable: the next
+store lock finishes the directory moves and atomic metadata replacement before
+returning to a reader. Preflight refuses existing destination metadata/directories,
+symlinks and running profiles. Lock files are retained to avoid inode-lock races.
+
+New auto histories live below sessions/<provider>/<initial-label>/run-*; the
+history owner's lease remains held throughout account switches. Anonymous legacy
+sessions/run-* histories contain no label reference or ownership manifest and
+remain intact at their original paths; rename does not guess their ownership.
+
+Auto settings persist resume_prompt as nullable text. Missing fields in old stores
+receive the default follow-up; null disables it. On a forced limit/threshold
+switch, the supervisor launches Claude with --continue -- <prompt> or Codex with
+resume --last -- <prompt>. Each prompt is one literal argv element, never shell
+text. The installed CLIs' help confirms positional prompt support; Codex's
+[session-command parser](https://github.com/openai/codex/blob/main/codex-rs/cli/src/main.rs)
+also explicitly supports --last PROMPT. With the setting off, only native resume
+arguments are sent. Success without a forced-switch target exits immediately,
+even if terminal output happened to include a limit-like string. Arbitrary errors
+still do not trigger resume or prompt replay.
