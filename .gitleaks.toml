@@ -1,4 +1,4 @@
-title = "agentswap public repository safety"
+title = "aswap public repository safety"
 [extend]
 useDefault = true
 [[rules]]

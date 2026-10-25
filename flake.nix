@@ -1,5 +1,5 @@
 {
-  description = "agentswap development and packaging";
+  description = "aswap development and packaging";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   outputs = { self, nixpkgs }: let
     systems = [ "x86_64-linux" "aarch64-linux" ];
@@ -10,7 +10,7 @@
         packages = with pkgs; [ cargo rustc rustfmt clippy gitleaks pkg-config ];
         shellHook = ''
           git config --local core.hooksPath .githooks
-          echo "agentswap: secret-scanning commit/push hooks installed"
+          echo "aswap: secret-scanning commit/push hooks installed"
         '';
       };
     });

@@ -1,0 +1,15 @@
+#!/bin/sh
+# Keep application tests and developer commands away from real provider homes.
+set -eu
+sandbox=$(mktemp -d)
+trap 'rm -rf "$sandbox"' EXIT HUP INT TERM
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+export HOME="$sandbox/home"
+export XDG_DATA_HOME="$sandbox/data"
+export XDG_CONFIG_HOME="$sandbox/config"
+export XDG_CACHE_HOME="$sandbox/cache"
+export CLAUDE_CONFIG_DIR="$sandbox/claude"
+export CODEX_HOME="$sandbox/codex"
+mkdir -p "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$CLAUDE_CONFIG_DIR" "$CODEX_HOME"
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN OPENAI_API_KEY CODEX_API_KEY CODEX_AUTH_JSON CLAUDE_SECURESTORAGE_CONFIG_DIR
+"$@"

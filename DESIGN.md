@@ -1,4 +1,4 @@
-# agentswap design
+# aswap design
 
 ## M0: reference findings
 
@@ -10,7 +10,7 @@ No user credentials or reference runtime stores were inspected.
 
 The reference provides add/list/switch/remove, usage, best/next-available
 selection, auto monitoring, aliases and account policies, mappings, isolated
-parallel sessions, JSON output, TUI and macOS menu bar. agentswap targets the
+parallel sessions, JSON output, TUI and macOS menu bar. aswap targets the
 Linux command-line subset specified in GOALS.md, with a Waybar stream instead
 of the reference's platform-specific UI.
 
@@ -41,7 +41,7 @@ Auto defaults: threshold 90%, cooldown 300s, hysteresis 10 points, unhealthy
 failover after 3 ticks. It compares all relevant windows and selects the
 eligible account with most headroom, with additional reset-aware strategies
 and per-account/weekly overrides. pace.py compares weekly consumption with
-elapsed window fraction (15 points ahead is significant). agentswap will
+elapsed window fraction (15 points ahead is significant). aswap will
 use conservative shared caching and max-window utilization with hysteresis.
 
 `cswap run` uses a persistent isolated CLAUDE_CONFIG_DIR per account, seeded
@@ -53,12 +53,12 @@ never invent a session ID or replay a prompt automatically on arbitrary errors.
 
 macOS uses Keychain services (hashed config-dir service names for profiles)
 with plaintext fallback. Windows uses file storage and copy-based sharing.
-agentswap initially supports Unix/Linux files only; it must not claim macOS
+aswap initially supports Unix/Linux files only; it must not claim macOS
 Keychain support. No keychain inspection is needed for development.
 
 ## Implementation boundaries
 
-Store data only below XDG_DATA_HOME/agentswap, with validated labels instead
+Store data only below XDG_DATA_HOME/aswap, with validated labels instead
 of email-based paths, private directories and files, a process-wide store
 lock and per-profile run locks. Metadata and secret bytes are separate;
 metadata/usage output never serializes credentials. Error text must not
@@ -66,7 +66,7 @@ include provider response bodies, credentials, arbitrary filesystem paths or
 child stderr. Tests create synthetic credentials at runtime in temp dirs.
 Development commands never inspect real Claude/Codex homes.
 
-Switch selects the default profile for agentswap launchers; Claude additionally
+Switch selects the default profile for aswap launchers; Claude additionally
 supports an explicit default-file activation operation. Isolated run never
 rewrites another profile. Avoid sharing writable auth files or replacing
 Home Manager managed files. Provider processes own refresh-token rotation;
@@ -80,4 +80,4 @@ missing limits (including API-key accounts) remain unknown. Multiple named
 rate-limit buckets may exist. See official protocol documentation:
 https://learn.chatgpt.com/docs/app-server and configuration documentation:
 https://developers.openai.com/codex/config-basic .
-No direct OpenAI API key is needed: agentswap delegates auth to Codex.
+No direct OpenAI API key is needed: aswap delegates auth to Codex.

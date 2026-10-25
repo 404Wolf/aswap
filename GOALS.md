@@ -1,5 +1,7 @@
 # agentswap: one tool to juggle Claude Code and Codex accounts
 
+Project naming note: the crate, binary, CLI, data directory and module namespace are `aswap`; the checkout path and headline stay unchanged.
+
 A Rust port of claude-swap (github.com/realiti4/claude-swap, MIT, © 2026 Onur
 Cetinkol; reference checkout: /tmp/claude-1000/-home-wolf-Config-home-manager/8b14e281-91e3-493a-b0fb-70012e093b84/scratchpad/claude-swap),
 extended to OpenAI Codex CLI. Tick items (`- [x]`) as they land, with tests.
@@ -28,7 +30,7 @@ Never edit the headline (line 1).
   Note anything platform-specific (macOS keychain vs. Linux files).
 
 ## M1: Core (Rust)
-- [ ] A provider-agnostic account store with an `Account { provider, label, ... }`
+- [x] A provider-agnostic account store with an `Account { provider, label, ... }`
   model, atomic writes, file locking, and 0600 perms.
 - [ ] Claude provider at feature parity with claude-swap on Linux: add the
   current login, list, switch, remove, usage (5h/weekly) with caching and
