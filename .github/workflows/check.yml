@@ -10,4 +10,11 @@ jobs:
         with:
           fetch-depth: 0
       - uses: cachix/install-nix-action@v31
+      - run: nix develop --command scripts/test-scanning
       - run: nix develop --command scripts/scan-release
+  rust-and-nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - run: nix flake check --print-build-logs

@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Scan the shipping tree, including untracked non-ignored files, privately.
+
+Generated ignored artifacts are not shipping files. Tracked paths remain in
+scope even when ignored. Full Git history is scanned separately.
+"""
+import os
+import pathlib
+import shutil
+import subprocess
+import tempfile
+
+root = pathlib.Path(subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip())
+os.chdir(root)
+subprocess.run([str(root / "scripts/check-paths")], check=True)
+paths = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]).split(b"\0")
+with tempfile.TemporaryDirectory(prefix="aswap-scan-") as sandbox:
+    for raw in paths:
+        if not raw:
+            continue
+        relative = pathlib.Path(os.fsdecode(raw))
+        source = root / relative
+        if source.is_symlink():
+            raise SystemExit("Refusing symlinks in the shipping tree; review before publishing.")
+        if not source.is_file():
+            continue
+        destination = pathlib.Path(sandbox) / relative
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        shutil.copyfile(source, destination)
+        destination.chmod(0o600)
+    subprocess.run(["gitleaks", "dir", "--redact", "--no-banner", "--config", str(root / ".gitleaks.toml"), sandbox], check=True)

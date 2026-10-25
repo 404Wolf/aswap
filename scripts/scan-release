@@ -1,11 +1,12 @@
 #!/bin/sh
 set -eu
 command -v gitleaks >/dev/null || { echo 'gitleaks is required; enter nix develop' >&2; exit 1; }
+scripts/check-paths
 gitleaks git --redact --no-banner --log-opts=--all
 if git rev-parse --verify origin/main >/dev/null 2>&1; then
   git diff --binary origin/main..HEAD | gitleaks stdin --redact --no-banner
 else
-  gitleaks dir --redact --no-banner .
+  scripts/scan-tree
 fi
 git status --short
 git ls-files

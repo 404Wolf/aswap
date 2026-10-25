@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""Prove hooks reject generated synthetic secrets and prohibited paths.
+
+No fixture commit is created and no credential-shaped fixture enters this repo.
+"""
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import tempfile
+
+root = pathlib.Path(__file__).resolve().parent.parent
+with tempfile.TemporaryDirectory(prefix="aswap-hook-test-") as directory:
+    sandbox = pathlib.Path(directory)
+    env = dict(os.environ, HOME=directory, XDG_CONFIG_HOME=str(sandbox / "config"),
+               XDG_DATA_HOME=str(sandbox / "data"), CLAUDE_CONFIG_DIR=str(sandbox / "claude"),
+               CODEX_HOME=str(sandbox / "codex"), GIT_CONFIG_NOSYSTEM="1")
+    def run(*args):
+        return subprocess.run(args, cwd=sandbox, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert run("git", "init", "-q").returncode == 0
+    shutil.copy(root / ".gitleaks.toml", sandbox / ".gitleaks.toml")
+    (sandbox / "scripts").mkdir()
+    shutil.copy(root / "scripts/check-paths", sandbox / "scripts/check-paths")
+    assert run("git", "config", "core.hooksPath", str(root / ".githooks")).returncode == 0
+    (sandbox / "sample.txt").write_text(json.dumps({"access" + "Token": "aswap-fixture-" + "x" * 32}))
+    assert run("git", "add", "sample.txt").returncode == 0
+    rejected = run("git", "-c", "user.name=Synthetic Test", "-c", "user.email=test@example.com", "commit", "-m", "test: synthetic fixture")
+    assert rejected.returncode != 0, "pre-commit accepted synthetic secret material"
+    assert b"leaks found" in rejected.stderr, "hook did not reach the scanner"
+    assert run("git", "rev-parse", "--verify", "HEAD").returncode != 0
+    assert run("git", "rm", "--cached", "sample.txt").returncode == 0
+    (sandbox / "auth.json").write_text("{}")
+    assert run("git", "add", "auth.json").returncode == 0
+    assert run(str(sandbox / "scripts/check-paths")).returncode != 0, "credential filename was accepted"
+print("Scanning gates reject synthetic secret material and credential filenames; no fixture commits created.")

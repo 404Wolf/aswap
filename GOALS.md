@@ -52,7 +52,7 @@ Never edit the headline (line 1).
   respect the usage cache and backoff.
 
 ## M3: Nix
-- [ ] Flake: package (crane or buildRustPackage), devShell (with gitleaks and
+- [x] Flake: package (crane or buildRustPackage), devShell (with gitleaks and
   hooks installed), checks (cargo test, clippy -D warnings, fmt, gitleaks),
   and homeManagerModules.default (enable, package, autoswitch settings, waybar
   module option). The module must not write into ~/.claude or ~/.codex files

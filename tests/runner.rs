@@ -10,8 +10,7 @@ fn fake_provider_parallel_sessions_and_limit_resume() {
     let t = tempfile::tempdir().unwrap();
     let bin = t.path().join("bin");
     fs::create_dir(&bin).unwrap();
-    let fake = r##"#!/usr/bin/env python3
-import json, os, pathlib, sys, time
+    let fake = r##"import json, os, pathlib, sys, time
 p = pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'] if pathlib.Path(sys.argv[0]).name == 'claude' else os.environ['CODEX_HOME'])
 args = sys.argv[1:]
 if args[:1] == ['-c']: args = args[2:]
@@ -34,7 +33,11 @@ sys.exit(1)
 "##;
     for name in ["claude", "codex"] {
         let p = bin.join(name);
-        fs::write(&p, fake).unwrap();
+        let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|p| p.join("python3"))
+            .find(|p| p.is_file())
+            .expect("python3 is required for synthetic process tests");
+        fs::write(&p, format!("#!{}\n{fake}", python.display())).unwrap();
         fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
     }
     let path = std::env::join_paths(
