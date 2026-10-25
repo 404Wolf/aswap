@@ -45,9 +45,9 @@ Never edit the headline (line 1).
   can be used at once.
 
 ## M2: CLI and UX
-- [ ] `agentswap` with subcommands: add, list, switch, remove, usage, auto
+- [x] `agentswap` with subcommands: add, list, switch, remove, usage, auto
   (on/off/threshold), run, status. Pretty and --json output.
-- [ ] `agentswap waybar`: a streaming JSON line for a waybar custom module
+- [x] `agentswap waybar`: a streaming JSON line for a waybar custom module
   (active account per provider plus remaining quota), with no tight polling;
   respect the usage cache and backoff.
 

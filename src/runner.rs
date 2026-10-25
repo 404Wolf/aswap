@@ -113,6 +113,10 @@ pub fn run(
         }
     }
     let mut lease = store.lease(&account)?;
+    {
+        let _lock = store.lock()?;
+        store.account(&store.load()?, provider, Some(&account.label))?;
+    }
     let profile = store.profile(provider, &account.label)?;
     let runtime;
     let session = if auto {
@@ -281,12 +285,19 @@ pub fn observations(
 /// Auto changes the launcher's active account. Existing isolated runs retain
 /// their profile; explicit --activate-live swaps the default Claude login.
 pub fn tick(store: &Store, provider: Provider, activate_live: bool) -> Result<Option<String>> {
-    let (entries, settings) = observations(store, provider)?;
+    {
+        let _lock = store.lock()?;
+        if !store.load()?.auto.get(&provider).is_some_and(|s| s.enabled) {
+            return Ok(None);
+        }
+    }
+    let (entries, _) = observations(store, provider)?;
+    let _lock = store.lock()?;
+    let mut state = store.load()?;
+    let settings = state.auto.get(&provider).cloned().unwrap_or_default();
     if !settings.enabled {
         return Ok(None);
     }
-    let _lock = store.lock()?;
-    let mut state = store.load()?;
     let Some(current) = state.active.get(&provider) else {
         return Ok(None);
     };
