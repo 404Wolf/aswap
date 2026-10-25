@@ -1,0 +1,11 @@
+/target
+/result*
+.direnv/
+# Never commit credentials, account stores or local state.
+*.json.bak
+.credentials*
+auth.json
+accounts/
+*.token
+*.key
+.env*
