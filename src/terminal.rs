@@ -119,6 +119,11 @@ impl Terminal {
         self.resize();
         command.spawn().safe("cannot launch provider in terminal")
     }
+    pub fn discard_piped_input(&mut self) {
+        if !io::stdin().is_terminal() {
+            self.input_open = false;
+        }
+    }
     fn resize(&self) {
         let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
         // SAFETY: ioctl initializes size only on success; the subsequent call

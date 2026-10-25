@@ -6,53 +6,12 @@ use crate::{
     usage,
 };
 use std::{
-    path::Path,
+    io::{IsTerminal, Write},
     process::{Child, Stdio},
     sync::Arc,
     time::Duration,
 };
 
-/// Copy only credentials and account identity; never global user settings.
-fn seed(store: &Store, account: &Account, dest: &Path) -> Result<()> {
-    let source = store.profile(account.provider, &account.label)?;
-    let auth = store::read_private(&source.join(account.provider.auth_file()))?;
-    crate::provider::validate_auth(account.provider, &auth)?;
-    store::atomic(&dest.join(account.provider.auth_file()), &auth)?;
-    if account.provider == Provider::Claude {
-        let path = dest.join(".claude.json");
-        let mut config: serde_json::Value = if path.exists() {
-            store::json_read(&path)?
-        } else {
-            serde_json::json!({"hasCompletedOnboarding":true})
-        };
-        let source_path = source.join(".claude.json");
-        let saved: serde_json::Value = if source_path.exists() {
-            store::json_read(&source_path)?
-        } else {
-            serde_json::json!({})
-        };
-        if let Some(identity) = saved.get("oauthAccount") {
-            config["oauthAccount"] = identity.clone();
-        }
-        store::json_write(&path, &config)?;
-    } else {
-        let path = source.join("config.toml");
-        if !dest.join("config.toml").exists() && path.exists() {
-            store::atomic(&dest.join("config.toml"), &store::read_private(&path)?)?;
-        }
-    }
-    Ok(())
-}
-fn sync_auth(store: &Store, account: &Account, session: &Path) -> Result<()> {
-    let bytes = store::read_private(&session.join(account.provider.auth_file()))?;
-    crate::provider::validate_auth(account.provider, &bytes)?;
-    store::atomic(
-        &store
-            .profile(account.provider, &account.label)?
-            .join(account.provider.auth_file()),
-        &bytes,
-    )
-}
 fn stop(child: &mut Child) -> Result<std::process::ExitStatus> {
     // SAFETY: the pid belongs to our unreaped child; no other process can reuse it.
     unsafe {
@@ -93,11 +52,11 @@ pub fn run(
     args: &[String],
     auto: bool,
 ) -> Result<i32> {
-    if auto && !args.is_empty() {
-        return Err(crate::Error(
-            "auto supervision accepts interactive sessions only; pass no provider arguments",
-        ));
-    }
+    let mut auto_args = if auto {
+        Some(crate::session::AutoArgs::parse(provider, args)?)
+    } else {
+        None
+    };
     let mut account = {
         let _lock = store.lock()?;
         store.account(&store.load()?, provider, name)?
@@ -123,26 +82,29 @@ pub fn run(
         let _lock = store.lock()?;
         store.account(&store.load()?, provider, Some(&account.label))?;
     }
-    let profile = store.profile(provider, &account.label)?;
-    let runtime;
-    let session = if auto {
-        let dir = store.sessions(provider, &account.label)?;
-        store::private_dir(&dir)?;
-        runtime = tempfile::Builder::new()
-            .prefix("run-")
-            .tempdir_in(dir)
-            .safe("cannot create isolated session")?;
-        seed(store, &account, runtime.path())?;
-        // Keep session history after exit so native resume can find it.
-        runtime.keep()
-    } else {
-        profile
-    };
+    let mut view = crate::shared::View::prepare(store, &account)?;
+    if auto_args.as_ref().is_some_and(|a| a.ambiguous) {
+        let help = crate::session::option_help(provider, &view.path, args);
+        auto_args = Some(crate::session::AutoArgs::parse_with_help(
+            provider, args, &help,
+        )?);
+    }
     let mut terminal = if auto { Some(Terminal::open()?) } else { None };
-    let mut launch_args = args.to_vec();
+    let mut launch_args = auto_args
+        .as_ref()
+        .map_or_else(|| args.to_vec(), |a| a.initial.clone());
+    let mut tracker = if let Some(args) = &auto_args {
+        Some(crate::session::Tracker::new(
+            provider,
+            &view.home,
+            args.id.clone(),
+        )?)
+    } else {
+        None
+    };
     let mut switches = 0;
     loop {
-        let mut cmd = provider.command(&session);
+        let mut cmd = provider.command(&view.path);
         cmd.args(&launch_args);
         let mut child = Running(
             if let Some(terminal) = &mut terminal {
@@ -163,13 +125,16 @@ pub fn run(
             if let Some(terminal) = &mut terminal {
                 limited |= terminal.pump(100)?;
             }
+            if let Some(tracker) = &mut tracker {
+                tracker.observe(child.0.id())?;
+            }
             if let Some(status) = child.0.try_wait().safe("cannot wait for provider")? {
                 break status;
             }
             if auto && now() >= next_check {
                 next_check = now() + usage::TTL;
                 // Refresh-token rotations in this private run become canonical.
-                sync_auth(store, &account, &session)?;
+                view.sync(store, &account)?;
                 let (entries, settings) = observations(store, provider)?;
                 if let Some(next) = usage::choose(
                     &account.label,
@@ -184,7 +149,7 @@ pub fn run(
                 }
             }
             if auto && limited {
-                sync_auth(store, &account, &session)?;
+                view.sync(store, &account)?;
                 let (entries, settings) = observations(store, provider)?;
                 target = usage::choose(
                     &account.label,
@@ -205,10 +170,10 @@ pub fn run(
         if let Some(terminal) = &mut terminal {
             limited |= terminal.pump(0)?;
         }
+        view.sync(store, &account)?;
         if !auto {
             return Ok(status.code().unwrap_or(1));
         }
-        sync_auth(store, &account, &session)?;
         if status.success() && target.is_none() {
             return Ok(0);
         }
@@ -234,6 +199,11 @@ pub fn run(
         let Some(next) = target else {
             return Ok(status.code().unwrap_or(1));
         };
+        let exact_id = tracker
+            .as_ref()
+            .expect("auto session tracker")
+            .id()?
+            .to_owned();
         drop(lease);
         account = next;
         lease = if account.label == history_owner {
@@ -245,7 +215,7 @@ pub fn run(
             let _lock = store.lock()?;
             store.account(&store.load()?, provider, Some(&account.label))?;
         }
-        seed(store, &account, &session)?;
+        view.select(store, &account)?;
         {
             let _lock = store.lock()?;
             let mut state = store.load()?;
@@ -262,7 +232,17 @@ pub fn run(
                 .unwrap_or_default()
                 .resume_prompt
         };
-        launch_args = resume_args(provider, prompt.as_deref());
+        if auto_args.as_ref().is_some_and(|a| a.one_shot) || !std::io::stdin().is_terminal() {
+            writeln!(std::io::stderr(), "aswap: automatic restart omitted one-shot initial input/print mode; piped stdin is not replayed").safe("cannot report automatic restart")?;
+            if let Some(terminal) = &mut terminal {
+                terminal.discard_piped_input();
+            }
+        }
+        launch_args = auto_args.as_ref().expect("auto arguments").resume(
+            provider,
+            &exact_id,
+            prompt.as_deref(),
+        )?;
         switches += 1;
     }
 }
@@ -325,17 +305,4 @@ pub fn tick(store: &Store, provider: Provider, activate_live: bool) -> Result<Op
     state.auto.entry(provider).or_default().last_switch = now();
     store.save(&state)?;
     Ok(Some(account.label.clone()))
-}
-
-/// Literal argv: no shell expansion and no replay of the user's previous command.
-pub fn resume_args(provider: Provider, prompt: Option<&str>) -> Vec<String> {
-    let mut args: Vec<String> = match provider {
-        Provider::Claude => vec!["--continue".into()],
-        Provider::Codex => vec!["resume".into(), "--last".into()],
-    };
-    if let Some(prompt) = prompt {
-        args.push("--".into());
-        args.push(prompt.into());
-    }
-    args
 }

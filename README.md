@@ -28,7 +28,7 @@ Codex usage also requires a version supporting the app-server
 File-based authentication is required; macOS Keychain, OS keyrings, the
 reference TUI/menu bar, and Windows are outside this release's scope.
 
-## Accounts and isolated sessions
+## Accounts and shared sessions
 
 Log in using the official CLI, then capture that file-based login. Labels use
 1–48 ASCII letters, digits, hyphens or underscores; use a label such as `work`,
@@ -51,20 +51,29 @@ aswap rename claude work office
 aswap remove codex personal
 ```
 
-`switch` selects the account for future `aswap run` invocations. `run` sets
-`CLAUDE_CONFIG_DIR` or `CODEX_HOME` to that account's private profile. Different
-accounts can run concurrently, including two accounts from the same provider.
-The same account profile has an exclusive lease: another launch, deletion or
-activation is refused while that profile is running. Provider exit codes are
-propagated. The first captured account becomes the default for that provider.
+`switch` selects the account for future runs. Every launch inherits the caller's
+working directory unchanged. Auth is private, while state comes from the caller's
+`CLAUDE_CONFIG_DIR` / `CODEX_HOME` (or `~/.claude` / `~/.codex`). Conversations,
+project trust, MCP configuration, settings, instructions, plugins and skills are
+available across accounts, like one provider installation. `/resume` sees the
+shared project history. Separate accounts may run concurrently.
 
-Profiles import credentials and minimal identity/onboarding metadata only.
-They do not import settings, plugins, MCP servers or past transcripts. Configure
-the isolated profile through the official CLI if needed. History stays with
-the profile, so native resume works for conversations started there.
-Inherited API-key and authentication overrides are removed from provider
-processes so they do not silently select another account. Codex is launched
-with its credential store explicitly set to `file`.
+Each launch uses a private view under the aswap store. Ordinary state entries
+are per-entry symlinks into the shared home. Home Manager-managed symlinks are
+snapshotted locally instead: aswap never replaces or writes through them, and
+provider edits to those snapshots are not published back. Claude account keys
+are overlaid onto a copy of the global config; non-account changes (including
+nested project trust/MCP state) merge back under the store lock, preserving
+concurrent changes. The default home's account identity/auth is untouched.
+Codex shares configuration and session state, with file-based auth forced private.
+
+On first launch after upgrading, isolated profile and retained auto histories
+are merged into the shared home with **new files only**. Existing files and
+session indexes are never overwritten, and migration never follows destination
+symlinks. Originals, including collisions, are retained privately under
+`$XDG_DATA_HOME/aswap/migration-backups/`. Busy profiles migrate when idle.
+Anonymous legacy auto directories migrate only when all provider profiles are
+idle. No transcript text is logged or used to infer session identity.
 
 To refresh an expired login, launch its profile and use Claude's interactive
 `/login`, or `aswap run codex --account personal -- login`. The official CLI
@@ -113,40 +122,40 @@ aswap run claude --account work --auto
 aswap run codex --account personal --auto
 ```
 
-`run --auto` explicitly supervises a new interactive session in a PTY. It can
-start with a healthier account, then switches when a known quota reaches the
-threshold or the CLI prints a recognized 429/limit error. It requires an
-eligible stored alternate. Candidates must have known, fresh quota below the
-threshold; the best remaining headroom wins. Ordinary threshold switches need
-a ten-point improvement and a 300-second cooldown; a provider limit bypasses
-those two gates. Unknown quota is never treated as free capacity.
+`run --auto` supervises the provider in a PTY and forwards its arguments normally:
 
-A switch stops the old child (SIGTERM, five-second grace, then SIGKILL), changes
-the runtime credentials and invokes `claude --continue` or `codex resume --last`
-in the same private history directory. It never copies conversation history
-between accounts. Resume depends on the provider having persisted the session;
-the configurable follow-up prompt continues interrupted work after a forced
-switch, while `resume-prompt off` leaves the next prompt to you. Limit-text
-detection is heuristic; quota polling is the primary signal. Restarts are capped
-at eight per invocation. Provider arguments are refused with `--auto`, so
-scripts and explicit command arguments cannot be replayed automatically.
+```sh
+aswap run claude --auto -- --resume <session-uuid> --dangerously-skip-permissions
+aswap run claude --auto -- --continue --model sonnet
+aswap run codex --auto -- resume <session-uuid> --model <model>
+```
 
-Auto histories remain under
-`$XDG_DATA_HOME/aswap/sessions/<provider>/<initial-label>/run-*` after exit.
-Older anonymous `sessions/run-*` histories remain usable at their original paths.
-To resume one later, point the official CLI's config-home environment variable
-at that session directory. It contains private credentials and transcripts;
-treat it as sensitive. The source account profile receives refreshed auth on
-normal exit and during observation. Abrupt termination can leave the freshest
-auth only in the retained session directory.
+On a forced switch, session selectors are replaced by `claude --resume <id>` or
+`codex resume <id>` and the configured follow-up. All other provider options are
+kept verbatim. An initial positional prompt, Claude `-p`/`--print`, and piped
+stdin are one-shot: they are omitted on relaunch with a generic note, never echoed
+or replayed. Interactive terminal input continues normally. Provider option arity
+is described by the CLI help when needed; unknown ambiguous option values cause a
+safe refusal to restart rather than risking prompt replay. Use `--` before a
+literal positional prompt to make its boundary explicit.
 
-Claude usage reads five-hour and seven-day windows from its OAuth usage
-endpoint, including supported model windows. Codex usage uses the official
-[app-server rate-limit RPC](https://learn.chatgpt.com/docs/app-server): primary
-and secondary windows of the standard `codex` bucket, with provider-reported
-durations/reset timestamps. These need not be five-hour/weekly on every plan.
-Additional Codex model buckets are not combined into the selection metric.
-No terminal status scraping or speculative OpenAI usage endpoint is used.
+Session IDs come from an explicit UUID, a preallocated Claude `--session-id`,
+Claude's own PID registry, or transcript filenames held open by that child/process
+tree. Transcript contents are not read. The tracker never picks the globally
+newest conversation: if identity cannot be established unambiguously, it refuses
+the restart. Session selection inside the provider can be detected through its
+open transcript descriptors; ambiguous provider versions fail safely.
+
+Candidates need fresh known quota below the threshold, ten points of improvement
+and a 300-second cooldown; a recognized limit bypasses the latter two gates.
+Switches stop the child with SIGTERM, wait five seconds, then use SIGKILL if
+needed. The exact same shared session resumes on the new account. Clean exits do
+not restart or send a follow-up. Restarts are capped at eight. Runtime auth/config
+views stay private under `$XDG_DATA_HOME/aswap/runtimes/`; history stays shared.
+
+Claude usage comes from the OAuth usage endpoint; Codex uses the official
+[app-server rate-limit RPC](https://learn.chatgpt.com/docs/app-server), with
+provider-reported durations and reset timestamps.
 
 `status` shows every managed profile, marks the active one and displays SESSION
 (5h), WEEKLY and any exposed Claude model weekly windows separately. Each window
@@ -190,8 +199,8 @@ aswap auto claude resume-prompt 'Continue the interrupted task.'
 aswap auto codex resume-prompt off
 ```
 
-Both installed CLIs support an initial resume prompt: `claude --continue --
-"<prompt>"` and `codex resume --last -- "<prompt>"`. Prompts are literal arguments;
+Both CLIs support a prompt with an exact resume ID: `claude --resume <id> --
+"<prompt>"` and `codex resume <id> -- "<prompt>"`. Prompts are literal arguments;
 previous user commands are not replayed. `off` keeps native resume without sending
 a follow-up. In Home Manager, set
 `programs.aswap.autoswitch.<provider>.resumePrompt` to text or `null` (off); the

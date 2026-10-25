@@ -91,18 +91,12 @@ rewriting a Home Manager managed login. `auto ... watch --activate-live` is
 the equivalent default-login monitor. Unrelated default processes are never
 killed by the monitor.
 
-`run --auto` is a separate interactive supervisor. It keeps a stable private
-session directory, copies back provider-rotated credentials to the correct
-account, and changes only the runtime account when quota reaches the line or
-terminal output reports a provider limit. Restart uses `claude --continue` or
-`codex resume --last`, retaining that run's history. It sends SIGTERM first,
-allows five seconds to exit and falls back to SIGKILL. After a forced switch,
-a configurable follow-up prompt resumes work automatically; a clean exit never
-sends it. Pending user commands are not replayed. Provider arguments are refused in this mode and restarts are capped
-at eight. Auto session histories remain private under the data store's
-sessions directory. Plain `run -- --resume` and `run -- resume --last` use the
-account's persistent profile history. Isolated profiles do not import the
-user's settings, plugins, project transcripts or MCP servers automatically.
+`run` uses a private authentication view for both plain and supervised launches.
+State is shared with the caller's provider home. `run --auto` forwards provider
+arguments on the first launch, then preserves options while replacing selectors
+with the exact tracked session ID and omitting one-shot prompt/print/stdin input.
+Clean exits do not restart; forced switches send the configured follow-up unless
+disabled. Restarts are capped at eight. No code changes the caller's cwd.
 
 Token refresh is delegated to the official CLI. Expired inactive Claude
 credentials can report unknown usage until that profile is logged in or
@@ -149,18 +143,83 @@ store lock finishes the directory moves and atomic metadata replacement before
 returning to a reader. Preflight refuses existing destination metadata/directories,
 symlinks and running profiles. Lock files are retained to avoid inode-lock races.
 
-New auto histories live below sessions/<provider>/<initial-label>/run-*; the
-history owner's lease remains held throughout account switches. Anonymous legacy
-sessions/run-* histories contain no label reference or ownership manifest and
-remain intact at their original paths; rename does not guess their ownership.
+New launch views live below runtimes/<provider>/<initial-label>/run-*; the
+history owner's lease remains held across account switches to protect migration
+and rename. Canonical transcripts live in the caller's shared provider home.
+Legacy sessions/<provider>/<label>/run-* and anonymous sessions/run-* histories
+are migrated as new files when the owning/all provider profiles are idle.
 
-Auto settings persist resume_prompt as nullable text. Missing fields in old stores
-receive the default follow-up; null disables it. On a forced limit/threshold
-switch, the supervisor launches Claude with --continue -- <prompt> or Codex with
-resume --last -- <prompt>. Each prompt is one literal argv element, never shell
-text. The installed CLIs' help confirms positional prompt support; Codex's
-[session-command parser](https://github.com/openai/codex/blob/main/codex-rs/cli/src/main.rs)
-also explicitly supports --last PROMPT. With the setting off, only native resume
-arguments are sent. Success without a forced-switch target exits immediately,
-even if terminal output happened to include a limit-like string. Arbitrary errors
-still do not trigger resume or prompt replay.
+Auto settings persist resume_prompt as nullable text. Missing fields receive the
+default follow-up; null disables it. A forced switch uses --resume <tracked UUID>
+for Claude or resume <tracked UUID> for Codex. Prompts are literal argv elements,
+never shell text. One-shot input is dropped with a generic note; options retain
+their original spelling, order and values. Option arity is a parsing aid, not an
+allowlist. CLI help can describe otherwise unknown options; if arity is ambiguous,
+the initial launch still passes everything through but restart fails safely.
+
+## Shared-state layout and migration
+
+Use unprivileged per-entry symlinks, rather than user-namespace mounts: the
+providers support config-home overrides and ordinary filesystem paths, symlinks
+work without kernel/userns dependencies, and the layout is portable across the
+three Linux machines. Auth is always a regular private file in the launch view;
+canonical profile files retain only auth, account-bound config and aswap metadata.
+All other ordinary home entries, including future provider entries, are shared.
+Known history directories exist before symlinking so native directory creation
+and transcript writers work. Settings/CLAUDE.md created during a launch publish
+on exit; providers that replace a settings symlink are reconciled only if the
+shared source has not changed concurrently. Managed root symlinks (files or
+directories) are copied into a private view and never merged back. Migration and
+reconciliation skip destination symlinks at every path component. Managed global
+Claude config is read but never modified or replaced.
+
+Claude's [official settings docs](https://code.claude.com/docs/en/settings)
+identify account details, MCP config and project trust in ~/.claude.json; the
+[storage documentation](https://code.claude.com/docs/en/claude-directory) locates
+projects, instructions and history. Inspection of Anthropic's published npm
+package @anthropic-ai/claude-code 2.1.81 (source, not any user's files) confirms
+that oauthAccount, primaryApiKey and customApiKeyResponses participate in login;
+userID/anonymousId identify the installation, and subscription/extra-usage and
+feature-gate caches depend on the login. These fields stay private, including
+userID as requested; hasCompletedOnboarding is also private to avoid repeated
+login setup. Account/auth/oauth/organization/subscription-prefixed future keys
+stay private conservatively. All remaining keys, notably projects (trust,
+allowed tools, project MCP enablement), mcpServers, preferences and UI state,
+are shared. Account-key classification is an explicit compatibility boundary,
+not a claim of a documented exhaustive provider schema.
+
+At launch, account keys are removed from the shared config and overlaid from the
+selected profile. At exit and before a switch, only that profile's keys/auth are
+saved back. Non-account changes use a recursive three-way merge against the
+launch baseline under the store lock: unchanged keys do not write back, nested
+project changes compose, and concurrent leaf changes win. The real home's
+account keys never change. Native clients do not honor aswap's store lock, so a
+native write racing the final atomic config replacement remains a provider-level
+limitation; ordinary concurrent aswap runs merge without lost unrelated keys.
+
+Migration streams only new files into shared state via no-clobber atomic publish.
+Existing transcripts, indexes and symlinks are untouched. Originals and collisions
+move to private migration-backups, including a full pre-split global config.
+Profiles in use are skipped. Legacy auto directories with unknown owners are
+migrated only while all provider profile leases are held. Legacy symlinks are
+left in place rather than followed. No migration runs against real stores during
+development: all tests create synthetic homes and transcripts outside Git.
+
+## Exact session identity and cwd
+
+[Claude's CLI reference](https://code.claude.com/docs/en/cli-reference) documents
+--resume/-r, --continue/-c, --session-id and --fork-session. A new auto Claude run
+preallocates a UUID through --session-id; explicit resumes retain their UUID.
+Claude's published CLI registers sessions/<pid>.json with pid/sessionId/cwd.
+The tracker also inspects /proc descriptors in the child's own process tree,
+recognizing Claude <UUID>.jsonl and Codex rollout-...-<UUID>.jsonl filenames.
+Only metadata and that bounded PID registry are read, never transcript contents.
+If a picker/interactive switch or concurrent writer makes the identity ambiguous,
+restart is refused; --continue/--last are never used as a fallback. Tracker
+metadata observations are conservative; provider versions that move recording
+outside the child process tree may require an explicit session UUID.
+
+Commands inherit the OS working directory; no current_dir/chdir operation is
+applied. Synthetic process tests invoke aswap from a separate project directory,
+verify os.getcwd() inside both providers and through a forced switch, and assert
+that the same transcript is visible after account changes.

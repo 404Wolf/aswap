@@ -71,14 +71,14 @@ enum Action {
         )]
         activate_live: bool,
     },
-    /// Launch an isolated provider session; arguments follow --.
+    /// Launch with shared state and private account auth; arguments follow --.
     Run {
         provider: Provider,
         #[arg(long)]
         account: Option<String>,
         #[arg(
             long,
-            help = "Supervise an interactive session and resume on quota/limit switches; accepts no provider arguments"
+            help = "Supervise quota/limit switching, preserving options and resuming the exact session"
         )]
         auto: bool,
         #[arg(last = true)]

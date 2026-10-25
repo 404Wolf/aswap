@@ -35,3 +35,7 @@ pub mod display;
 pub mod identity;
 
 pub mod rename;
+
+pub mod shared;
+
+pub mod session;

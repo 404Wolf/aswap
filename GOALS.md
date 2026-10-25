@@ -76,4 +76,10 @@ Never edit the headline (line 1).
 - [x] Refuse running profiles, collisions and invalid labels; identify duplicates on remove; support JSON and synthetic rename/recovery tests.
 - [x] Send a configurable follow-up only after forced auto switches, with CLI/off and nullable Home Manager settings; test literal argv, off and clean exits.
 
+## M7: One shared provider installation
+- [x] Share provider state and histories with per-account auth, protect managed symlinks and merge non-account Claude config under a lock.
+- [x] Migrate isolated histories as new files only, retaining originals/collisions privately.
+- [x] Forward auto-mode provider arguments, retain options across switches, drop one-shot input and resume the exact tracked session UUID.
+- [x] Verify shared layout, migrations, managed files, exact resume argv and cwd with synthetic tests.
+
 ## Questions

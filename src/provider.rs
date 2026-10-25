@@ -96,7 +96,7 @@ pub fn home() -> Result<PathBuf> {
     }
     Ok(p)
 }
-fn global_config(profile: &Path, default: bool) -> Result<PathBuf> {
+pub(crate) fn global_config(profile: &Path, default: bool) -> Result<PathBuf> {
     let legacy = profile.join(".config.json");
     store::no_links(&legacy)?;
     let global = if default
@@ -166,9 +166,12 @@ pub fn add(store: &Store, provider: Provider, name: &str) -> Result<Account> {
             if path.exists() {
                 let source: Value = store::json_read(&path)?;
                 let mut config = serde_json::json!({"hasCompletedOnboarding":true});
-                if let Some(identity) = source.get("oauthAccount") {
-                    config["oauthAccount"] = identity.clone();
-                }
+                config.as_object_mut().unwrap().extend(
+                    crate::shared::account_config(&source)
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
                 store::json_write(&target.join(".claude.json"), &config)?;
             }
         } else {
