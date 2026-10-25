@@ -20,6 +20,7 @@ assert 'ANTHROPIC_API_KEY' not in os.environ
 if args == ['--test-exit']:
     time.sleep(0.3)
     sys.exit(7)
+assert os.isatty(0) and os.isatty(1) and os.isatty(2)
 if args == ['--continue'] or args == ['resume', '--last']:
     assert (p / 'synthetic-history').read_text() == 'synthetic conversation'
     auth = (p / ('.credentials.json' if pathlib.Path(sys.argv[0]).name == 'claude' else 'auth.json')).read_text()

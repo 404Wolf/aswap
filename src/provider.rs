@@ -207,10 +207,81 @@ pub fn switch(store: &Store, provider: Provider, name: &str, activate: bool) -> 
     store.save(&state)?;
     Ok(account)
 }
+/// Preserve the outgoing default login, including provider token rotations.
+/// Identity matching never guesses from the currently selected label.
+fn preserve_live(
+    store: &Store,
+    target: &Account,
+    bytes: &[u8],
+    config: Option<&Value>,
+) -> Result<bool> {
+    validate_auth(target.provider, bytes)?;
+    let current: Value =
+        serde_json::from_slice(bytes).safe("invalid live credential JSON; contents redacted")?;
+    let backups = store
+        .root
+        .join("live-backups")
+        .join(target.provider.as_str());
+    store::private_dir(&backups)?;
+    let backup = tempfile::Builder::new()
+        .prefix("before-switch-")
+        .tempdir_in(&backups)
+        .safe("cannot preserve outgoing login")?;
+    store::atomic(&backup.path().join(target.provider.auth_file()), bytes)?;
+    if let Some(config) = config {
+        store::json_write(&backup.path().join(".claude.json"), config)?;
+    }
+    let _ = backup.keep();
+    let mut target_is_live = false;
+    for candidate in store
+        .load()?
+        .accounts
+        .into_iter()
+        .filter(|a| a.provider == target.provider)
+    {
+        let profile = store.profile(candidate.provider, &candidate.label)?;
+        let saved: Value = store::json_read(&profile.join(candidate.provider.auth_file()))?;
+        let matched = if saved == current {
+            true
+        } else if target.provider == Provider::Codex {
+            let identity = current
+                .pointer("/tokens/account_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            identity.is_some()
+                && identity == saved.pointer("/tokens/account_id").and_then(Value::as_str)
+        } else {
+            let path = profile.join(".claude.json");
+            let saved_config: Value = if path.exists() {
+                store::json_read(&path)?
+            } else {
+                serde_json::json!({})
+            };
+            let identity = config.and_then(|c| c.get("oauthAccount")).filter(|v| {
+                ["accountUuid", "emailAddress"].iter().any(|key| {
+                    v.get(key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty())
+                })
+            });
+            identity.is_some() && identity == saved_config.get("oauthAccount")
+        };
+        if matched {
+            let _lease = if candidate.label == target.label {
+                None
+            } else {
+                Some(store.lease(&candidate)?)
+            };
+            store::atomic(&profile.join(candidate.provider.auth_file()), bytes)?;
+            target_is_live |= candidate.label == target.label;
+        }
+    }
+    Ok(target_is_live)
+}
 pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
     let provider = account.provider;
     let profile = store.profile(provider, &account.label)?;
-    let bytes = store::read_private(&profile.join(provider.auth_file()))?;
+    let mut bytes = store::read_private(&profile.join(provider.auth_file()))?;
     validate_auth(provider, &bytes)?;
     let dest = provider.current_home()?;
     let auth_path = dest.join(provider.auth_file());
@@ -221,6 +292,7 @@ pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
         None
     };
     // Construct the merged config before writing either file.
+    let mut old_config = None;
     let config = if provider == Provider::Claude {
         let path = global_config(&dest, true)?;
         let old: Option<Value> = if path.exists() {
@@ -228,7 +300,8 @@ pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
         } else {
             None
         };
-        let mut merged = old.clone().unwrap_or(serde_json::json!({}));
+        old_config = old.clone();
+        let mut merged = old.unwrap_or(serde_json::json!({}));
         if !merged.is_object() {
             return Err(Error("Claude config must be an object; refusing overwrite"));
         }
@@ -247,6 +320,11 @@ pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
     } else {
         None
     };
+    if let Some(old) = &old_auth
+        && preserve_live(store, account, old, old_config.as_ref())?
+    {
+        bytes = old.clone();
+    }
     store::atomic(&auth_path, &bytes)?;
     if let Some((path, value)) = config
         && let Err(e) = store::json_write(&path, &value)

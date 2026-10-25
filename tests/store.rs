@@ -122,7 +122,32 @@ fn isolated_lifecycle_child() {
     )
     .unwrap();
     aswap::provider::add(&store, Provider::Claude, "two").unwrap();
+    // Rotate the outgoing live token after capture; activation must preserve it.
+    store::atomic(
+        &claude.join(".credentials.json"),
+        br#"{"claudeAiOauth":{"accessToken":"synthetic-second-rotated"}}"#,
+    )
+    .unwrap();
     aswap::provider::switch(&store, Provider::Claude, "one", true).unwrap();
+    let outgoing = store::read_private(
+        &store
+            .profile(Provider::Claude, "two")
+            .unwrap()
+            .join(".credentials.json"),
+    )
+    .unwrap();
+    assert!(
+        String::from_utf8(outgoing)
+            .unwrap()
+            .contains("synthetic-second-rotated")
+    );
+    assert_eq!(
+        std::fs::read_dir(store.root.join("live-backups/claude"))
+            .unwrap()
+            .count(),
+        1
+    );
+
     let config: serde_json::Value = store::json_read(&claude.join(".claude.json")).unwrap();
     assert_eq!(config["projects"]["synthetic"], true);
     assert_eq!(config["oauthAccount"]["emailAddress"], "one@example.com");

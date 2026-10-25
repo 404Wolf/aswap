@@ -94,7 +94,7 @@ killed by the monitor.
 `run --auto` is a separate interactive supervisor. It keeps a stable private
 session directory, copies back provider-rotated credentials to the correct
 account, and changes only the runtime account when quota reaches the line or
-stderr reports a provider limit. Restart uses `claude --continue` or
+terminal output reports a provider limit. Restart uses `claude --continue` or
 `codex resume --last`, retaining that run's history. It sends SIGTERM first,
 allows five seconds to exit and falls back to SIGKILL. Native resume may
 require the user to submit their next prompt; pending commands are not
@@ -106,4 +106,10 @@ user's settings, plugins, project transcripts or MCP servers automatically.
 
 Token refresh is delegated to the official CLI. Expired inactive Claude
 credentials can report unknown usage until that profile is logged in or
-launched again; agentswap does not implement a second OAuth refresh client.
+launched again; aswap does not implement a second OAuth refresh client.
+
+Interactive auto sessions use a Linux PTY, forwarding terminal I/O and window
+size while preserving native provider UIs. Signal cleanup restores terminal
+mode on normal handled termination. Before default-file activation, private
+live-backups preserve the outgoing login; matching stable identity or exact
+authentication associates provider-rotated auth with its stored profile.

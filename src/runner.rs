@@ -1,3 +1,4 @@
+use crate::terminal::Terminal;
 use crate::{
     Result, Safe, now,
     provider::Provider,
@@ -5,13 +6,8 @@ use crate::{
     usage,
 };
 use std::{
-    io::{BufRead, BufReader, Write},
     path::Path,
     process::{Child, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
     time::Duration,
 };
 
@@ -59,7 +55,7 @@ fn sync_auth(store: &Store, account: &Account, session: &Path) -> Result<()> {
 fn stop(child: &mut Child) -> Result<std::process::ExitStatus> {
     // SAFETY: the pid belongs to our unreaped child; no other process can reuse it.
     unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGTERM);
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -73,9 +69,15 @@ fn stop(child: &mut Child) -> Result<std::process::ExitStatus> {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
-struct Running(Child);
+struct Running(Child, bool);
 impl Drop for Running {
     fn drop(&mut self) {
+        if self.1 && matches!(self.0.try_wait(), Ok(None)) {
+            // SAFETY: this unreaped auto child leads its own process group.
+            unsafe {
+                libc::kill(-(self.0.id() as libc::pid_t), libc::SIGTERM);
+            }
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -132,49 +134,31 @@ pub fn run(
     } else {
         profile
     };
+    let mut terminal = if auto { Some(Terminal::open()?) } else { None };
     let mut launch_args = args.to_vec();
     let mut switches = 0;
     loop {
         let mut cmd = provider.command(&session);
-        cmd.args(&launch_args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit());
-        // Interactive output is inherited normally; auto supervision only
-        // inspects stderr as a stream and never persists or reports its bytes.
-        cmd.stderr(if auto {
-            Stdio::piped()
-        } else {
-            Stdio::inherit()
-        });
-        let mut child = Running(cmd.spawn().safe("cannot launch provider executable")?);
-        let limited = Arc::new(AtomicBool::new(false));
-        let reader = child.0.stderr.take().map(|stderr| {
-            let flag = limited.clone();
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(stderr);
-                loop {
-                    let mut chunk = Vec::new();
-                    // Bound individual lines; stream output without keeping transcripts.
-                    use std::io::Read;
-                    match reader.by_ref().take(8192).read_until(b'\n', &mut chunk) {
-                        Ok(0) | Err(_) => break,
-                        _ => {}
-                    }
-                    let text = String::from_utf8_lossy(&chunk).to_ascii_lowercase();
-                    if text.contains("429")
-                        || text.contains("usage_limit_reached")
-                        || text.contains("rate limit reached")
-                        || text.contains("usage limit reached")
-                    {
-                        flag.store(true, Ordering::Relaxed);
-                    }
-                    let _ = std::io::stderr().write_all(&chunk);
-                }
-            })
-        });
+        cmd.args(&launch_args);
+        let mut child = Running(
+            if let Some(terminal) = &mut terminal {
+                terminal.spawn(&mut cmd)?
+            } else {
+                cmd.stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .safe("cannot launch provider executable")?
+            },
+            auto,
+        );
+        let mut limited = false;
         let mut target = None;
         let mut next_check = 0;
         let status = loop {
+            if let Some(terminal) = &mut terminal {
+                limited |= terminal.pump(100)?;
+            }
             if let Some(status) = child.0.try_wait().safe("cannot wait for provider")? {
                 break status;
             }
@@ -195,7 +179,7 @@ pub fn run(
                     break stop(&mut child.0)?;
                 }
             }
-            if auto && limited.load(Ordering::Relaxed) {
+            if auto && limited {
                 sync_auth(store, &account, &session)?;
                 let (entries, settings) = observations(store, provider)?;
                 target = usage::choose(
@@ -214,14 +198,14 @@ pub fn run(
             std::thread::sleep(Duration::from_millis(250));
         };
         drop(child);
-        if let Some(reader) = reader {
-            let _ = reader.join();
+        if let Some(terminal) = &mut terminal {
+            limited |= terminal.pump(0)?;
         }
         if !auto {
             return Ok(status.code().unwrap_or(1));
         }
         sync_auth(store, &account, &session)?;
-        let did_limit = limited.load(Ordering::Relaxed);
+        let did_limit = limited;
         if did_limit {
             usage::mark_limited(store, &account)?;
             let (entries, settings) = observations(store, provider)?;
