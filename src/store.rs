@@ -87,10 +87,10 @@ pub fn no_links(path: &Path) -> Result<()> {
 pub fn private_dir(path: &Path) -> Result<()> {
     no_links(path)?;
     if !path.exists() {
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                private_dir(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
+            private_dir(parent)?;
         }
         fs::DirBuilder::new()
             .mode(0o700)

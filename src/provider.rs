@@ -240,15 +240,15 @@ pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
         None
     };
     store::atomic(&auth_path, &bytes)?;
-    if let Some((path, value)) = config {
-        if let Err(e) = store::json_write(&path, &value) {
-            if let Some(old) = old_auth {
-                store::atomic(&auth_path, &old)?;
-            } else {
-                std::fs::remove_file(&auth_path).safe("cannot roll back credential activation")?;
-            }
-            return Err(e);
+    if let Some((path, value)) = config
+        && let Err(e) = store::json_write(&path, &value)
+    {
+        if let Some(old) = old_auth {
+            store::atomic(&auth_path, &old)?;
+        } else {
+            std::fs::remove_file(&auth_path).safe("cannot roll back credential activation")?;
         }
+        return Err(e);
     }
     Ok(())
 }
