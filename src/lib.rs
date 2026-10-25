@@ -30,3 +30,6 @@ pub mod usage;
 pub mod runner;
 
 pub mod terminal;
+
+pub mod display;
+pub mod identity;

@@ -113,3 +113,26 @@ size while preserving native provider UIs. Signal cleanup restores terminal
 mode on normal handled termination. Before default-file activation, private
 live-backups preserve the outgoing login; matching stable identity or exact
 authentication associates provider-rotated auth with its stored profile.
+
+## Profile quota display and identity
+
+Usage transport and cache remain isolated per provider/label: Claude reads the
+profile credential file, Codex receives that profile as CODEX_HOME, and each
+profile has its own usage-cache.json. OAuth usage utilization and Codex
+usedPercent are percentage points (0–100); values below one are not rescaled.
+The old single remaining-quota line used the maximum utilization of all windows,
+so equal weekly observations could conceal different session headroom. Status
+now refreshes through the existing TTL/backoff gate and renders separate windows;
+list stays offline and explicitly labels cached observation age. Automatic
+selection and the JSON compatibility summary retain the conservative maximum.
+Tests reproduce equal weekly limits with different session limits synthetically.
+
+Human terminal views read email and tier hints from each profile's local config
+and auth claims. Neither those hints nor account fingerprints enter JSON,
+Waybar, cache files, diagnostics or errors. Duplicate matching compares SHA-256
+hashes of stable account identity (including Claude organization when present),
+with email as a fallback. It never hashes or compares raw tokens. Missing identity
+is unknown, not a duplicate; identity extraction failures do not expose content.
+Status preserves old observations during backoff but labels them unavailable;
+expired windows are shown as last observed rather than current quota. Terminal
+rendering strips control characters from local hints and wraps to terminal width.

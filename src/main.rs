@@ -8,7 +8,7 @@ use aswap::{
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use std::{
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     time::Duration,
 };
 
@@ -32,7 +32,7 @@ struct Cli {
 enum Action {
     /// Capture the current file-based login under a private label.
     Add { provider: Provider, label: String },
-    /// List labels without reading credentials or making network requests.
+    /// List profiles, local identity hints and cached quota; no network requests.
     List { provider: Option<Provider> },
     /// Select the account used by subsequent aswap runs.
     Switch {
@@ -78,7 +78,7 @@ enum Action {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Show active labels and cached quota; makes no network requests.
+    /// Show all profiles and quota windows, refreshing through cache/backoff.
     Status { provider: Option<Provider> },
     /// Stream Waybar custom/aswap JSON lines, at a relaxed cadence.
     Waybar {
@@ -129,9 +129,91 @@ fn snapshot(store: &Store, filter: Option<Provider>, refresh: bool) -> Result<Va
                 usage::Cached::default()
             }
         };
-        rows.push(json!({"provider":a.provider,"label":a.label,"active":active.get(&a.provider)==Some(&a.label),"remaining_percent":c.used(now()).map(|u|100.0-u),"usage":c.usage,"fetched_at":c.fetched_at,"next_poll_at":c.next_poll_at,"usage_status":if c.used(now()).is_some(){"ok"}else if c.error.is_some(){"backoff"}else{"unknown"}}));
+        let duplicates = duplicate_labels(store, &a)?;
+        rows.push(json!({"provider":a.provider,"label":a.label,"active":active.get(&a.provider)==Some(&a.label),"remaining_percent":c.used(now()).map(|u|100.0-u),"usage":c.usage,"fetched_at":c.fetched_at,"next_poll_at":c.next_poll_at,"duplicates":duplicates,"usage_status":if c.used(now()).is_some(){"ok"}else if c.error.is_some(){"backoff"}else{"unknown"}}));
     }
     Ok(json!({"schema_version":1,"accounts":rows,"auto":settings}))
+}
+fn duplicate_labels(store: &Store, account: &store::Account) -> Result<Vec<String>> {
+    let _lock = store.lock()?;
+    let id = aswap::identity::read(
+        account.provider,
+        &store.profile(account.provider, &account.label)?,
+    )
+    .unwrap_or_default();
+    let mut duplicates = Vec::new();
+    for other in store.load()?.accounts {
+        if other.provider == account.provider && other.label != account.label {
+            let other_id = aswap::identity::read(
+                other.provider,
+                &store.profile(other.provider, &other.label)?,
+            )
+            .unwrap_or_default();
+            if aswap::identity::same(&id, &other_id) {
+                duplicates.push(other.label);
+            }
+        }
+    }
+    Ok(duplicates)
+}
+fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> {
+    let accounts = value["accounts"].as_array().unwrap();
+    let mut identities = Vec::new();
+    let mut caches = Vec::new();
+    let mut duplicates = Vec::new();
+    for row in accounts {
+        let provider: Provider =
+            serde_json::from_value(row["provider"].clone()).safe("invalid provider")?;
+        let _lock = store.lock()?;
+        identities.push(
+            aswap::identity::read(
+                provider,
+                &store.profile(provider, row["label"].as_str().unwrap())?,
+            )
+            .unwrap_or_default(),
+        );
+        caches.push(usage::Cached {
+            usage: serde_json::from_value(row["usage"].clone()).safe("invalid usage")?,
+            fetched_at: row["fetched_at"].as_u64().unwrap_or(0),
+            error: (row["usage_status"] == "backoff").then(|| "backoff".into()),
+            ..Default::default()
+        });
+        duplicates.push(
+            serde_json::from_value::<Vec<String>>(row["duplicates"].clone()).unwrap_or_default(),
+        );
+    }
+    let rows: Vec<_> = accounts
+        .iter()
+        .enumerate()
+        .map(|(i, r)| aswap::display::Row {
+            provider: r["provider"].as_str().unwrap(),
+            label: r["label"].as_str().unwrap(),
+            active: r["active"] == true,
+            identity: &identities[i],
+            cached: &caches[i],
+            duplicates: &duplicates[i],
+        })
+        .collect();
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
+    // SAFETY: ioctl writes size on success; only then do we read it.
+    let detected = unsafe {
+        if libc::ioctl(1, libc::TIOCGWINSZ, size.as_mut_ptr()) == 0 {
+            Some(size.assume_init().ws_col as usize)
+        } else {
+            None
+        }
+    };
+    let width = detected
+        .filter(|w| *w > 0)
+        .or_else(|| std::env::var("COLUMNS").ok()?.parse().ok())
+        .unwrap_or(80);
+    Ok(aswap::display::render(
+        &rows,
+        compact,
+        width,
+        io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+        now(),
+    ))
 }
 fn rows_text(value: &Value) -> String {
     let rows = value["accounts"].as_array().unwrap();
@@ -182,15 +264,38 @@ fn execute(cli: Cli) -> Result<i32> {
     match cli.command {
         Action::Add { provider, label } => {
             let a = provider::add(&store, provider, &label)?;
+            let duplicates = duplicate_labels(&store, &a)?;
+            let warning = if duplicates.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\nWarning: duplicate login of {}. add captures the current provider login.",
+                    duplicates.join(", ")
+                )
+            };
             output(
-                &json!({"added":a}),
+                &json!({"added":a,"duplicates":duplicates}),
                 cli.json,
-                format!("Added {provider}:{label}"),
+                format!("Added {provider}:{label}{warning}"),
             )?;
         }
-        Action::List { provider } | Action::Status { provider } => {
+        Action::List { provider } => {
             let v = snapshot(&store, provider, false)?;
-            output(&v, cli.json, rows_text(&v))?;
+            let pretty = if cli.json {
+                String::new()
+            } else {
+                terminal_text(&store, &v, true)?
+            };
+            output(&v, cli.json, pretty)?;
+        }
+        Action::Status { provider } => {
+            let v = snapshot(&store, provider, true)?;
+            let pretty = if cli.json {
+                String::new()
+            } else {
+                terminal_text(&store, &v, false)?
+            };
+            output(&v, cli.json, pretty)?;
         }
         Action::Switch {
             provider,
@@ -223,7 +328,12 @@ fn execute(cli: Cli) -> Result<i32> {
                 .as_array_mut()
                 .unwrap()
                 .retain(|r| r["label"] == a.label);
-            output(&v, cli.json, rows_text(&v))?;
+            let pretty = if cli.json {
+                String::new()
+            } else {
+                terminal_text(&store, &v, false)?
+            };
+            output(&v, cli.json, pretty)?;
         }
         Action::Run {
             provider,

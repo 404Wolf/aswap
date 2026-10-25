@@ -1,0 +1,36 @@
+* claude:personal [activ
+e]  alice@example.com ·
+max
+  ! duplicate login: per
+sonal-copy
+  quota: cached · observ
+ed 0m ago
+  SESSION (5h) 23.5% use
+d · resets in 2h14m
+  [━━━━━░░░░░░░░░░░░░░░]
+  WEEKLY 99.0% used · re
+sets in 1d23h
+  [━━━━━━━━━━━━━━━━━━━━]
+  WEEKLY OPUS 81.0% used
+ · resets in 1d23h
+  [━━━━━━━━━━━━━━━━░░░░]
+
+  codex:work  bob@exampl
+e.com · plan unknown
+  quota: cached · observ
+ed 0m ago
+  SESSION (5h) 10.0% use
+d · resets in 2h14m
+  [━━░░░░░░░░░░░░░░░░░░]
+  WEEKLY 70.0% used · re
+sets in 1d23h
+  [━━━━━━━━━━━━━━░░░░░░]
+
+  claude:offline  email
+unknown · plan unknown
+  quota: stale/unknown ·
+ never fetched
+  SESSION (5h) unknown ·
+ reset unknown
+  WEEKLY unknown · reset
+ unknown

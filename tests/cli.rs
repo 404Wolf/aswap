@@ -69,6 +69,7 @@ fn cli_lifecycle_json_and_waybar_schema() {
         t.ok(&["switch", "codex", "work", "--json"])["live_activated"],
         false
     );
+    fs::write(t.root().join("data/aswap/profiles/codex/work/usage-cache.json"), serde_json::to_vec(&json!({"usage":{"windows":[]},"fetched_at":aswap::now(),"next_poll_at":aswap::now()+3600,"failures":0,"error":null})).unwrap()).unwrap();
     assert_eq!(
         t.ok(&["status", "codex", "--json"])["accounts"][0]["remaining_percent"],
         Value::Null
@@ -163,4 +164,31 @@ fn auto_off_performs_no_usage_fetch() {
             .join("data/aswap/profiles/claude/one/usage-cache.json")
             .exists()
     );
+}
+
+#[test]
+fn duplicate_warning_and_local_only_identity_output() {
+    let t = Sandbox::new();
+    t.seed();
+    fs::write(t.root().join("claude/.claude.json"), serde_json::to_vec(&json!({"oauthAccount":{"accountUuid":"synthetic-account", "emailAddress":"alice@example.com"}})).unwrap()).unwrap();
+    t.ok(&["add", "claude", "first", "--json"]);
+    let out = t.invoke(&["add", "claude", "second"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Warning: duplicate login of first"));
+    let v = t.ok(&["list", "--json"]);
+    assert_eq!(v["accounts"][0]["duplicates"], json!(["second"]));
+    assert_eq!(v["accounts"][1]["duplicates"], json!(["first"]));
+    assert!(!v.to_string().contains("alice@example.com"));
+    assert!(!v.to_string().contains("synthetic-private"));
+    fs::write(t.root().join("claude/.claude.json"), serde_json::to_vec(&json!({"oauthAccount":{"accountUuid":"synthetic-other-account", "emailAddress":"other@example.com"}})).unwrap()).unwrap();
+    assert_eq!(
+        t.ok(&["add", "claude", "third", "--json"])["duplicates"],
+        json!([])
+    );
+    let out = t.invoke(&["list"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("alice@example.com"));
+    assert!(text.contains("other@example.com"));
+    assert!(text.contains("duplicate login: second"));
+    assert!(text.contains("SESSION (5h) unknown"));
+    assert!(text.contains("WEEKLY unknown"));
 }

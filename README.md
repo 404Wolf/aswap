@@ -144,11 +144,28 @@ durations/reset timestamps. These need not be five-hour/weekly on every plan.
 Additional Codex model buckets are not combined into the selection metric.
 No terminal status scraping or speculative OpenAI usage endpoint is used.
 
+`status` shows every managed profile, marks the active one and displays SESSION
+(5h), WEEKLY and any exposed Claude model weekly windows separately. Each window
+has percent used, a progress bar and time until reset. `list` is a compact offline
+view of the same windows. Both label cached/stale/backoff observations; missing
+quota stays unknown. The single `remaining_percent` JSON/Waybar metric remains the
+most restrictive window for autoswitch compatibility, not specifically session
+headroom. `status` refreshes all profiles through the cache/backoff policy.
+
+Email and tier hints come from each stored profile's own config/auth claims and
+appear only in human terminal output. `NO_COLOR` disables color; redirected
+output has no ANSI escapes, and narrow terminals wrap the view. Unknown identity
+or tier is explicit. `add` warns and `list` flags duplicate account identities
+using an in-memory SHA-256 fingerprint of stable account/organization IDs (email
+fallback), never a raw-token comparison. Unknown identities cannot be declared
+duplicates. A second label still captures the current login; log into the other
+account before adding it. Token rotation does not make a new account identity.
+
 All usage surfaces share a locked, persisted 180-second success cache. Failures
 back off exponentially from 600 seconds up to one hour, or longer when required
 by `Retry-After` plus a margin. An error, stale observation (over ten minutes)
 or elapsed reset makes remaining quota unknown. Cache hits never bypass a
-backoff. `status` and `list` are offline; `usage`, `waybar` and active monitors
+backoff. `list` is offline; `status`, `usage`, `waybar` and active monitors
 fetch only when due. The HTTP/RPC clients have bounded timeouts and response
 sizes; provider error bodies are redacted.
 
@@ -215,7 +232,7 @@ updates. Labels are path-safe. Symlinks and stores inside a Git checkout are
 refused. This is private plaintext storage, not encryption or an OS keychain.
 Protect the data directory and its backups accordingly.
 
-aswap's output contains labels and quota, never credential bytes. Errors omit
+aswap's terminal output contains labels, local account email/plan hints and quota, never credential bytes. Emails and identity hashes are excluded from JSON, Waybar, caches and errors. Errors omit
 private JSON, server bodies and paths. Interactive provider output passes
 through to your terminal; it is not persisted by aswap. Providers may keep their
 own logs/transcripts in the isolated profile. Do not paste those into issues.

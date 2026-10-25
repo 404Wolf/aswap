@@ -145,7 +145,9 @@ case "$limits" in *'account/rateLimits/read'*) ;; *) exit 6;; esac
 if [ -f "$HOME/fail" ]; then
   printf '%s\n' '{"id":2,"error":{"message":"synthetic-private-error"}}'
 else
-  printf '%s\n' '{"method":"noise","params":{}}' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":27,"windowDurationMins":300}}}}'
+  case "$CODEX_HOME" in */other) used=73 ;; *) used=27 ;; esac
+  printf '%s\n' '{"method":"noise","params":{}}'
+  printf '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":%s,"windowDurationMins":300}}}}\n' "$used"
 fi
 "##).unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -179,6 +181,10 @@ fn rpc_child() {
     let profile = Provider::Codex.current_home().unwrap();
     let v = usage::codex_rpc(&profile).unwrap();
     assert_eq!(usage::parse_codex(&v).unwrap().used(1), Some(27.0));
+    let other = profile.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let v = usage::codex_rpc(&other).unwrap();
+    assert_eq!(usage::parse_codex(&v).unwrap().used(1), Some(73.0));
     std::fs::write(
         std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join("fail"),
         b"synthetic",
@@ -186,4 +192,32 @@ fn rpc_child() {
     .unwrap();
     let err = usage::codex_rpc(&profile).unwrap_err();
     assert!(!format!("{err:?} {err}").contains("synthetic-private-error"));
+}
+
+#[test]
+fn percentages_are_percentage_points_and_windows_remain_separate() {
+    for p in [0.0, 0.25, 1.0, 99.0, 100.0] {
+        let u = usage::parse_claude(&serde_json::json!({"five_hour":{"utilization":p}, "seven_day":{"utilization":99},"seven_day_opus":{"utilization":12.5}})).unwrap();
+        assert_eq!(u.windows[0].used_percent, p);
+        assert_eq!(u.windows[1].used_percent, 99.0);
+        assert_eq!(u.windows[2].used_percent, 12.5);
+        let u =
+            usage::parse_codex(&serde_json::json!({"rateLimits":{"primary":{"usedPercent":p}}}))
+                .unwrap();
+        assert_eq!(u.windows[0].used_percent, p);
+    }
+    for bad in [
+        serde_json::json!(-1),
+        serde_json::json!(100.01),
+        serde_json::json!("99"),
+        serde_json::Value::Null,
+    ] {
+        assert!(
+            usage::parse_claude(&serde_json::json!({"five_hour":{"utilization":bad}})).is_err()
+        );
+        assert!(
+            usage::parse_codex(&serde_json::json!({"rateLimits":{"primary":{"usedPercent":bad}}}))
+                .is_err()
+        );
+    }
 }

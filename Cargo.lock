@@ -56,11 +56,13 @@ dependencies = [
 name = "aswap"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "clap",
  "fs2",
  "libc",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "signal-hook",

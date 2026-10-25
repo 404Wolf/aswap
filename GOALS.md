@@ -64,4 +64,11 @@ Never edit the headline (line 1).
   usage limits may be against provider terms; users are responsible.
 - [x] LICENSE (MIT) plus a NOTICE crediting claude-swap.
 
+## M5: Per-profile quota visibility
+- [x] Verify profile credential/cache isolation and percentage-point parsing with synthetic tests.
+- [x] Warn on duplicate captured identity and flag duplicates in list without exposing tokens.
+- [x] Show local email/tier, active profile and separate session/weekly/model windows with bars, reset times, NO_COLOR and narrow-terminal support.
+- [x] Refresh status through cache/backoff; distinguish cached, stale, unknown and unavailable observations.
+- [x] Add synthetic identity, CLI and rendering snapshot coverage.
+
 ## Questions

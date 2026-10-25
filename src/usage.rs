@@ -222,12 +222,21 @@ pub fn fetch(account: &Account, profile: &Path) -> std::result::Result<Usage, Fa
             .and_then(|v| parse_codex(&v))
             .map_err(|_| Failure::unavailable());
     }
-    let auth: Value = store::json_read(&profile.join(account.provider.auth_file()))
+    fetch_claude_with(profile, request_claude)
+}
+fn fetch_claude_with<F>(profile: &Path, request: F) -> std::result::Result<Usage, Failure>
+where
+    F: FnOnce(&str) -> std::result::Result<Value, Failure>,
+{
+    let auth: Value = store::json_read(&profile.join(Provider::Claude.auth_file()))
         .map_err(|_| Failure::unavailable())?;
     let token = auth
         .pointer("/claudeAiOauth/accessToken")
         .and_then(Value::as_str)
         .ok_or(Failure::unavailable())?;
+    parse_claude(&request(token)?).map_err(|_| Failure::unavailable())
+}
+fn request_claude(token: &str) -> std::result::Result<Value, Failure> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
@@ -265,7 +274,7 @@ pub fn fetch(account: &Account, profile: &Path) -> std::result::Result<Usage, Fa
         return Err(Failure::unavailable());
     }
     let v: Value = serde_json::from_slice(&body).map_err(|_| Failure::unavailable())?;
-    parse_claude(&v).map_err(|_| Failure::unavailable())
+    Ok(v)
 }
 pub fn updated(old: Cached, result: std::result::Result<Usage, Failure>, at: u64) -> Cached {
     match result {
@@ -357,4 +366,50 @@ pub fn mark_limited(store: &Store, account: &Account) -> Result<()> {
     entry.error = Some("provider-limit".into());
     entry.next_poll_at = entry.next_poll_at.max(now().saturating_add(TTL));
     store::json_write(&path, &entry)
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    #[test]
+    fn profile_credentials_and_caches_are_isolated() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("store")).unwrap();
+        let accounts: Vec<_> = ["one", "two"]
+            .map(|label| Account {
+                provider: Provider::Claude,
+                label: label.into(),
+            })
+            .into();
+        let mut state = store.load().unwrap();
+        state.accounts = accounts.clone();
+        state.active.insert(Provider::Claude, "one".into());
+        store.save(&state).unwrap();
+        for (index, account) in accounts.iter().enumerate() {
+            let profile = store.profile(account.provider, &account.label).unwrap();
+            store::json_write(&profile.join(".credentials.json"), &serde_json::json!({"claudeAiOauth":{"accessToken":format!("synthetic-token-{index}")}})).unwrap();
+            let cached = cached_with(&store, account, 1000, |path| {
+                assert_eq!(path, profile);
+                fetch_claude_with(path, |token| {
+                    assert_eq!(token, format!("synthetic-token-{index}"));
+                    Ok(serde_json::json!({"five_hour":{"utilization":10.0 + index as f64 * 30.0}, "seven_day":{"utilization":99}}))
+                })
+            }).unwrap();
+            assert_eq!(
+                cached.usage.windows[0].used_percent,
+                10.0 + index as f64 * 30.0
+            );
+            assert_eq!(cached.used(1000), Some(99.0));
+        }
+        for (index, account) in accounts.iter().enumerate() {
+            let cached = cached_with(&store, account, 1001, |_| {
+                panic!("must use this profile's cache")
+            })
+            .unwrap();
+            assert_eq!(
+                cached.usage.windows[0].used_percent,
+                10.0 + index as f64 * 30.0
+            );
+        }
+    }
 }
