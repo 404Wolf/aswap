@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+command -v gitleaks >/dev/null || { echo 'gitleaks is required; enter nix develop' >&2; exit 1; }
+gitleaks git --redact --no-banner --log-opts=--all
+if git rev-parse --verify origin/main >/dev/null 2>&1; then
+  git diff --binary origin/main..HEAD | gitleaks stdin --redact --no-banner
+else
+  gitleaks dir --redact --no-banner .
+fi
+git status --short
+git ls-files
+printf '%s\n' 'Review the status and tracked file list above before an operator-authorized push.'

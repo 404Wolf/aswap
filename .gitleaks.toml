@@ -1,0 +1,18 @@
+title = "agentswap public repository safety"
+[extend]
+useDefault = true
+[[rules]]
+id = "credential-material"
+description = "Credential fields with non-synthetic values"
+regex = '''(?i)(?:accessToken|refreshToken|access_token|refresh_token|OPENAI_API_KEY)\s*["']?\s*[:=]\s*["']([^"'\s]{12,})'''
+secretGroup = 1
+[[rules.allowlists]]
+regexTarget = "secret"
+regexes = ['''^synthetic[-_a-zA-Z0-9]*$''']
+[[rules]]
+id = "email-in-content"
+description = "Keep personal email addresses out of repository content"
+regex = '''[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'''
+[[rules.allowlists]]
+regexTarget = "match"
+regexes = ['''^[A-Za-z0-9._%+-]+@example\.(com|org|net)$''', '''^wolf@404wolf\.com$''', '''^noreply@openai\.com$''']

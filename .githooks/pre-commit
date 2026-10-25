@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+command -v gitleaks >/dev/null || { echo 'gitleaks is required; enter nix develop' >&2; exit 1; }
+gitleaks git --pre-commit --staged --redact --no-banner
