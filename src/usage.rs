@@ -343,3 +343,18 @@ pub fn choose<'a>(
         .min_by(|(_, a), (_, b)| a.used(at).unwrap().total_cmp(&b.used(at).unwrap()))
         .map(|(a, _)| a)
 }
+
+pub fn mark_limited(store: &Store, account: &Account) -> Result<()> {
+    let _lock = store.lock()?;
+    let path = store
+        .profile(account.provider, &account.label)?
+        .join("usage-cache.json");
+    let mut entry: Cached = if path.exists() {
+        store::json_read(&path)?
+    } else {
+        Cached::default()
+    };
+    entry.error = Some("provider-limit".into());
+    entry.next_poll_at = entry.next_poll_at.max(now().saturating_add(TTL));
+    store::json_write(&path, &entry)
+}

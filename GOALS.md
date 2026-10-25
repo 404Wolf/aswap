@@ -32,15 +32,15 @@ Never edit the headline (line 1).
 ## M1: Core (Rust)
 - [x] A provider-agnostic account store with an `Account { provider, label, ... }`
   model, atomic writes, file locking, and 0600 perms.
-- [ ] Claude provider at feature parity with claude-swap on Linux: add the
+- [x] Claude provider at feature parity with claude-swap on Linux: add the
   current login, list, switch, remove, usage (5h/weekly) with caching and
   backoff, and autoswitch to the account with the most headroom at a
   threshold (default 90%), resuming the session where claude-swap does.
-- [ ] Codex provider: profiles via CODEX_HOME (auth.json per account), the same
+- [x] Codex provider: profiles via CODEX_HOME (auth.json per account), the same
   commands, and usage from what Codex exposes (rate-limit headers or its
   status/usage output; document what's available). Autoswitch on usage or
   on 429/limit errors.
-- [ ] Parallel sessions: run `agentswap run claude|codex [--account X] -- args`,
+- [x] Parallel sessions: run `agentswap run claude|codex [--account X] -- args`,
   which launches with that account's isolated config dir, so two accounts
   can be used at once.
 

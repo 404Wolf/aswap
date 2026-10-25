@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     fmt,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -70,6 +71,13 @@ impl Provider {
         }
         if self == Self::Codex {
             cmd.args(["-c", "cli_auth_credentials_store=\"file\""]);
+        }
+        // SAFETY: umask is async-signal-safe; it changes only the forked child.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::umask(0o077);
+                Ok(())
+            });
         }
         cmd
     }

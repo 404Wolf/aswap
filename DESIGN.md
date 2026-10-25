@@ -81,3 +81,29 @@ rate-limit buckets may exist. See official protocol documentation:
 https://learn.chatgpt.com/docs/app-server and configuration documentation:
 https://developers.openai.com/codex/config-basic .
 No direct OpenAI API key is needed: aswap delegates auth to Codex.
+
+## Implemented session behavior
+
+`aswap switch` selects the profile for future `aswap run` invocations.
+`--activate-live` explicitly requests the reference-style default credential
+swap; symlinks and malformed global config are refused. This avoids silently
+rewriting a Home Manager managed login. `auto ... watch --activate-live` is
+the equivalent default-login monitor. Unrelated default processes are never
+killed by the monitor.
+
+`run --auto` is a separate interactive supervisor. It keeps a stable private
+session directory, copies back provider-rotated credentials to the correct
+account, and changes only the runtime account when quota reaches the line or
+stderr reports a provider limit. Restart uses `claude --continue` or
+`codex resume --last`, retaining that run's history. It sends SIGTERM first,
+allows five seconds to exit and falls back to SIGKILL. Native resume may
+require the user to submit their next prompt; pending commands are not
+replayed. Provider arguments are refused in this mode and restarts are capped
+at eight. Auto session histories remain private under the data store's
+sessions directory. Plain `run -- --resume` and `run -- resume --last` use the
+account's persistent profile history. Isolated profiles do not import the
+user's settings, plugins, project transcripts or MCP servers automatically.
+
+Token refresh is delegated to the official CLI. Expired inactive Claude
+credentials can report unknown usage until that profile is logged in or
+launched again; agentswap does not implement a second OAuth refresh client.

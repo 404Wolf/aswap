@@ -106,7 +106,7 @@ pub fn read_private(path: &Path) -> Result<Vec<u8>> {
     no_links(path)?;
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc_no_follow())
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .safe("cannot read private file")?;
     if !file
@@ -125,10 +125,6 @@ pub fn read_private(path: &Path) -> Result<Vec<u8>> {
         return Err(Error("private file exceeds size limit"));
     }
     Ok(bytes)
-}
-// Linux O_NOFOLLOW; this crate intentionally targets Linux.
-fn libc_no_follow() -> i32 {
-    0o400000
 }
 pub fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     no_links(path)?;
@@ -181,7 +177,7 @@ impl Store {
             .read(true)
             .write(true)
             .mode(0o600)
-            .custom_flags(libc_no_follow())
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .safe("cannot open store lock")?;
         f.set_permissions(fs::Permissions::from_mode(0o600))
@@ -244,7 +240,7 @@ impl Store {
             .truncate(false)
             .write(true)
             .mode(0o600)
-            .custom_flags(libc_no_follow())
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .safe("cannot open profile lock")?;
         f.try_lock_exclusive()
