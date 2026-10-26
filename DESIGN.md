@@ -354,3 +354,35 @@ boolean flags and numeric reset count enter normalized usage; account IDs,
 credit detail rows and backend banners are discarded. Older caches remain
 readable with missing optional metadata. Live diagnostics may inspect these
 field names/types and coarse numeric magnitudes only, never log the RPC payload.
+
+## SSH sync failure classes and role drift
+
+A sync transport failure carries a safe class: owner-not-configured,
+version-mismatch, identity-conflict, label-conflict, invalid-label, timeout,
+bad-response, SSH startup/wait failure, or remote-exit with its numeric status.
+Client diagnostics capture at most 4096 bytes of the remote stderr's first line
+and map exact, known application messages to fixed class names. Unknown text,
+extra suffixes, invalid UTF-8, paths, identities and later lines are discarded;
+this is an allowlist, not regex substitution of known token formats. Both legacy
+and current owner errors are recognized without logging raw remote stderr.
+Separate bounded pipe readers drain stderr/stdout to avoid deadlocks. A timeout
+or failed exchange kills surviving SSH descendants holding the private pipes.
+
+The server's present store role is authoritative; an earlier service startup
+message does not prove that the role has remained unchanged. Check that SSH and
+the service select the same binary, user and XDG_DATA_HOME. The protocol reports
+owner-not-configured before fetching/exporting anything if that store is not an
+owner. Never auto-promote it from a network request. `sync HOST` now refuses to
+demote a configured owner: an intentional transition requires `sync --off` first,
+with idle profile leases. This prevents accidental pulls from silently disabling
+the authority. A changed role is repaired explicitly on the owner, then followers
+retry; the client must not turn a failed response into successful installation.
+
+Multiple labels with the same hashed account identity are valid aliases; an
+explicit sync warns with only the duplicate count and retains every label. No
+account ID, email, fingerprint, token or label is included in this warning.
+Background pulls avoid repeating it. Duplicate provider/label entries in a packet
+are instead label-conflict, and a local label bound to a different known account
+is identity-conflict. Whole-packet preflight rejects either conflict before any
+credentials are replaced. Synthetic tests exercise real client/server pipes,
+role drift, legacy stderr, duplicate aliases, conflicts and untrusted diagnostics.

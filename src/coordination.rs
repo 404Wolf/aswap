@@ -9,7 +9,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    io::{IsTerminal, Read, Write},
+    io::{BufRead, BufReader, IsTerminal, Read, Write},
     os::unix::process::CommandExt,
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -86,7 +86,13 @@ pub fn configure(store: &Store, host: &str) -> Result<usize> {
     }
     {
         let _lock = store.lock()?;
-        let _idle = if settings(store)?.host.is_none() {
+        let current = settings(store)?;
+        if current.owner {
+            return Err(Error(
+                "sync: owner-role-conflict; use sync --off before becoming a follower",
+            ));
+        }
+        let _idle = if current.host.is_none() {
             idle_profiles(store)?
         } else {
             Vec::new()
@@ -123,8 +129,13 @@ struct Packet {
     profiles: Vec<Profile>,
 }
 fn packet(store: &Store, request: &Request) -> Result<Packet> {
-    if request.protocol != 1 || !is_owner(store)? {
-        return Err(Error("sync server requires the configured refresh owner"));
+    if request.protocol != 1 {
+        return Err(Error("sync: version-mismatch"));
+    }
+    if !is_owner(store)? || follower(store)? {
+        return Err(Error(
+            "sync: owner-not-configured; run sync --owner on the server using its service store",
+        ));
     }
     let accounts = {
         let _lock = store.lock()?;
@@ -159,28 +170,34 @@ fn packet(store: &Store, request: &Request) -> Result<Packet> {
     })
 }
 fn install(store: &Store, packet: Packet, settings: &mut Settings) -> Result<usize> {
-    if packet.protocol != 1 || packet.profiles.len() > 128 {
-        return Err(Error("invalid owner sync packet"));
+    if packet.protocol != 1 {
+        return Err(Error("sync: version-mismatch"));
+    }
+    if packet.profiles.len() > 128 {
+        return Err(Error("sync: bad-response"));
     }
     let mut state = store.load()?;
     let mut seen = std::collections::BTreeSet::new();
     // Validate the whole packet before writing any account.
     for p in &packet.profiles {
-        store::label(&p.account.label)?;
+        store::label(&p.account.label).map_err(|_| Error("sync: invalid-label"))?;
         if !seen.insert((p.account.provider, p.account.label.clone())) {
-            return Err(Error("duplicate account in owner packet"));
+            return Err(Error(
+                "sync: label-conflict; duplicate provider/label in owner packet",
+            ));
         }
         provider::validate_auth(
             p.account.provider,
             &serde_json::to_vec(&p.auth).safe("invalid owner authentication")?,
-        )?;
+        )
+        .map_err(|_| Error("sync: bad-response; invalid owner authentication"))?;
         let path = store.profile(p.account.provider, &p.account.label)?;
         if path.join(p.account.provider.auth_file()).exists() {
             let local = crate::identity::read(p.account.provider, &path).unwrap_or_default();
             let remote = crate::identity::from_values(p.account.provider, &p.auth, &p.config);
             if local.known() && remote.known() && !crate::identity::same(&local, &remote) {
                 return Err(Error(
-                    "owner profile identity mismatch; align profile labels first",
+                    "sync: identity-conflict; same label has a different account; align labels first",
                 ));
             }
         }
@@ -234,70 +251,189 @@ fn install(store: &Store, packet: Packet, settings: &mut Settings) -> Result<usi
     store::json_write(&store.root.join("coordination.json"), settings)?;
     Ok(count)
 }
+// Only exact, application-owned messages survive the first-line filter. This is
+// deliberately not token-pattern replacement: an unknown diagnostic could contain
+// an email, path, token, terminal controls or an entire credential JSON object.
+fn remote_line(bytes: &[u8]) -> &'static str {
+    let Ok(line) = std::str::from_utf8(bytes) else {
+        return "redacted-unrecognized";
+    };
+    let line = line.trim_end_matches(['\r', '\n']);
+    match line {
+        "aswap: sync server requires the configured refresh owner"
+        | "aswap: sync: owner-not-configured; run sync --owner on the server using its service store" => {
+            "owner-not-configured"
+        }
+        "aswap: sync: version-mismatch" => "version-mismatch",
+        "aswap: invalid sync request" | "aswap: sync: invalid-request" => "invalid-request",
+        "aswap: sync transport is restricted to an SSH pipe" => "transport-restricted",
+        "aswap: owner profile identity mismatch; align profile labels first"
+        | "aswap: sync: identity-conflict; same label has a different account; align labels first" => {
+            "identity-conflict"
+        }
+        "aswap: duplicate account in owner packet"
+        | "aswap: sync: label-conflict; duplicate provider/label in owner packet" => {
+            "label-conflict"
+        }
+        "aswap: cannot read private file"
+        | "aswap: invalid private JSON; contents redacted"
+        | "aswap: cannot encode private state"
+        | "aswap: cannot secure directory"
+        | "aswap: cannot create private directory"
+        | "aswap: cannot inspect private path"
+        | "aswap: private file exceeds size limit"
+        | "aswap: expected a regular private file"
+        | "aswap: sync: owner-store-error" => "owner-store-error",
+        "aswap: refusing a symlink or managed file" => "owner-managed-path",
+        "aswap: unsupported or missing credentials; use a file-based provider login first"
+        | "aswap: invalid credential JSON; contents redacted" => "owner-auth-invalid",
+        "aswap: sync: timeout" => "timeout",
+        "aswap: sync: bad-response" => "bad-response",
+        "aswap: cannot send owner packet" => "owner-write-failed",
+        "aswap: sync request too large" => "request-too-large",
+        "aswap: cannot read sync request" => "owner-read-failed",
+        _ => "redacted-unrecognized",
+    }
+}
+fn remote_error(status: std::process::ExitStatus, first: &'static str) -> Error {
+    if let Some(code) = status.code() {
+        eprintln!("aswap sync: remote-exit-{code}; remote-stderr-first-line: {first}");
+    } else {
+        eprintln!("aswap sync: remote-signaled; remote-stderr-first-line: {first}");
+    }
+    Error(match first {
+        "owner-not-configured" => {
+            "sync: owner-not-configured; check the SSH user's role/store; run sync --owner there"
+        }
+        "version-mismatch" => "sync: version-mismatch",
+        "identity-conflict" => "sync: identity-conflict",
+        "label-conflict" => "sync: label-conflict",
+        "invalid-request" => "sync: invalid-request",
+        "owner-store-error" => "sync: owner-store-error",
+        "owner-managed-path" => "sync: owner-managed-path",
+        "owner-auth-invalid" => "sync: owner-auth-invalid",
+        "transport-restricted" => "sync: transport-restricted",
+        "timeout" => "sync: timeout",
+        "bad-response" => "sync: bad-response",
+        _ => "sync: remote-exit; see classified remote stderr above",
+    })
+}
 fn exchange(host: &str, request: &Request) -> Result<Packet> {
     if !valid_host(host) {
         return Err(Error("invalid sync host alias"));
     }
-    let mut child = Command::new("ssh")
-        .args([
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=5",
-            "-o",
-            "ServerAliveInterval=10",
-            "-o",
-            "ServerAliveCountMax=2",
-            "--",
-            host,
-            "aswap sync --serve",
-        ])
+    let mut command = Command::new("ssh");
+    command.args([
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "ServerAliveInterval=10",
+        "-o",
+        "ServerAliveCountMax=2",
+        "--",
+        host,
+        "aswap sync --serve",
+    ]);
+    exchange_command(command, request, Duration::from_secs(90))
+}
+fn exchange_command(mut command: Command, request: &Request, timeout: Duration) -> Result<Packet> {
+    let mut child = command
         .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .safe("cannot contact refresh owner over SSH")?;
+        .safe("sync: ssh-start-failed")?;
     let result = (|| {
-        let mut input = child.stdin.take().ok_or(Error("missing sync input"))?;
-        serde_json::to_writer(&mut input, request).safe("cannot send sync request")?;
-        input.write_all(b"\n").safe("cannot send sync request")?;
+        let mut input = child
+            .stdin
+            .take()
+            .ok_or(Error("sync: request-write-failed"))?;
+        let sent =
+            serde_json::to_writer(&mut input, request).is_ok() && input.write_all(b"\n").is_ok();
         drop(input);
-        let output = child.stdout.take().ok_or(Error("missing sync output"))?;
+        let output = child.stdout.take().ok_or(Error("sync: bad-response"))?;
+        let stderr = child.stderr.take().ok_or(Error("sync: bad-response"))?;
+        let (err_tx, err_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut first = Vec::new();
+            let ok = reader
+                .by_ref()
+                .take(4097)
+                .read_until(b'\n', &mut first)
+                .is_ok();
+            let filtered = if !ok || first.len() > 4096 {
+                "redacted-unrecognized"
+            } else if first.is_empty() {
+                "empty"
+            } else {
+                remote_line(&first)
+            };
+            let _ = err_tx.send(filtered);
+            // Keep draining so verbose SSH/provider errors cannot deadlock the pipe.
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+        });
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
             let result = output.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes);
             let _ = tx.send((result.is_ok(), bytes));
         });
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if let Some(status) = child.try_wait().safe("refresh-owner SSH failed")? {
+            if let Some(status) = child.try_wait().safe("sync: ssh-wait-failed")? {
                 if !status.success() {
-                    return Err(Error("refresh-owner SSH failed; details redacted"));
+                    return Err(remote_error(
+                        status,
+                        err_rx
+                            .recv_timeout(Duration::from_secs(1))
+                            .unwrap_or("unavailable"),
+                    ));
+                }
+                if !sent {
+                    return Err(Error("sync: request-write-failed"));
                 }
                 let (ok, bytes) = rx
                     .recv_timeout(Duration::from_secs(1))
-                    .safe("refresh-owner response incomplete")?;
+                    .safe("sync: bad-response; incomplete SSH output")?;
                 if !ok || bytes.len() > 4 * 1024 * 1024 {
-                    return Err(Error("invalid refresh-owner response size"));
+                    return Err(Error("sync: bad-response; invalid response size"));
                 }
                 return serde_json::from_slice(&bytes)
-                    .safe("invalid refresh-owner protocol; contents redacted");
+                    .safe("sync: bad-response; invalid protocol JSON");
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        Err(Error("refresh-owner SSH timed out"))
+        Err(Error("sync: timeout"))
     })();
-    if child.try_wait().ok().flatten().is_none() {
-        // SAFETY: this still-live child owns the new process group.
+    if result.is_err() || child.try_wait().ok().flatten().is_none() {
+        // SAFETY: this child was created as the owner of a private process group.
+        // Also stop surviving descendants holding pipes after the SSH child exits.
         unsafe {
             libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
         }
     }
     let _ = child.wait();
     result
+}
+fn duplicate_count(packet: &Packet) -> usize {
+    let mut seen: Vec<(Provider, crate::identity::Identity)> = Vec::new();
+    let mut count = 0;
+    for p in &packet.profiles {
+        let identity = crate::identity::from_values(p.account.provider, &p.auth, &p.config);
+        if seen.iter().any(|(provider, prior)| {
+            *provider == p.account.provider && crate::identity::same(prior, &identity)
+        }) {
+            count += 1;
+        } else {
+            seen.push((p.account.provider, identity));
+        }
+    }
+    count
 }
 /// One peer sync every 30s; all peers consume the owner's single persisted cache.
 /// Caller must not already hold the store lock.
@@ -325,7 +461,14 @@ pub fn poll(store: &Store, force: Option<&Account>, immediate: bool) -> Result<u
             force: force.cloned(),
         },
     )?;
-    install(store, packet, &mut settings)
+    let duplicates = duplicate_count(&packet);
+    let count = install(store, packet, &mut settings)?;
+    if immediate && duplicates > 0 {
+        eprintln!(
+            "aswap sync: duplicate-login warning: {duplicates} duplicate profile(s); aliases retained"
+        );
+    }
+    Ok(count)
 }
 /// Hidden SSH-only transport; refuse credential output to a terminal or a local
 /// invocation. Normal `sync --json` returns counts/role, never this packet.
@@ -344,8 +487,14 @@ pub fn serve(store: &Store) -> Result<()> {
     if bytes.len() > 8192 {
         return Err(Error("sync request too large"));
     }
-    let request: Request = serde_json::from_slice(&bytes).safe("invalid sync request")?;
-    let packet = packet(store, &request)?;
+    let request: Request = serde_json::from_slice(&bytes).safe("sync: invalid-request")?;
+    let packet = packet(store, &request).map_err(|e| {
+        if e.0.starts_with("sync:") {
+            e
+        } else {
+            Error("sync: owner-store-error")
+        }
+    })?;
     let mut output = std::io::stdout().lock();
     serde_json::to_writer(&mut output, &packet).safe("cannot send owner packet")?;
     output.flush().safe("cannot send owner packet")
@@ -454,5 +603,142 @@ mod tests {
         assert!(valid_host("synthetic-owner"));
         let (_t, store) = seed();
         assert!(serve(&store).is_err());
+    }
+    #[test]
+    fn duplicate_identities_are_aliases_but_duplicate_labels_and_identity_changes_are_conflicts() {
+        let (_t, store) = seed();
+        let source = store.profile(Provider::Claude, "one").unwrap();
+        let target = store.profile(Provider::Claude, "alias").unwrap();
+        for file in [".credentials.json", ".claude.json", "usage-cache.json"] {
+            let value: Value = store::json_read(&source.join(file)).unwrap();
+            store::json_write(&target.join(file), &value).unwrap();
+        }
+        let mut state = store.load().unwrap();
+        state.accounts.push(Account {
+            provider: Provider::Claude,
+            label: "alias".into(),
+        });
+        store.save(&state).unwrap();
+        let request = Request {
+            protocol: 1,
+            force: None,
+        };
+        let p = packet(&store, &request).unwrap();
+        assert_eq!(duplicate_count(&p), 1);
+        let peer_dir = tempfile::tempdir().unwrap();
+        let peer = Store::open(peer_dir.path().join("peer")).unwrap();
+        let mut config = Settings::default();
+        assert_eq!(install(&peer, p, &mut config).unwrap(), 2);
+        assert_eq!(peer.load().unwrap().accounts.len(), 2);
+        let mut p = packet(&store, &request).unwrap();
+        p.profiles[1].account.label = p.profiles[0].account.label.clone();
+        assert!(
+            install(&peer, p, &mut config)
+                .unwrap_err()
+                .0
+                .contains("label-conflict")
+        );
+        let mut p = packet(&store, &request).unwrap();
+        p.profiles[1].config = json!({"oauthAccount":{"accountUuid":"synthetic-other"}});
+        assert!(
+            install(&peer, p, &mut config)
+                .unwrap_err()
+                .0
+                .contains("identity-conflict")
+        );
+        // Preflight failures do not replace either alias's credentials.
+        let current = crate::identity::read(
+            Provider::Claude,
+            &peer.profile(Provider::Claude, "alias").unwrap(),
+        )
+        .unwrap();
+        let original = crate::identity::read(Provider::Claude, &source).unwrap();
+        assert!(crate::identity::same(&current, &original));
+    }
+    #[test]
+    fn owner_role_and_protocol_are_distinct_and_owner_cannot_be_silently_demoted() {
+        let (_t, store) = seed();
+        let err = packet(
+            &store,
+            &Request {
+                protocol: 2,
+                force: None,
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.0, "sync: version-mismatch");
+        assert!(
+            configure(&store, "synthetic-peer")
+                .unwrap_err()
+                .0
+                .contains("owner-role-conflict")
+        );
+        assert!(is_owner(&store).unwrap());
+        off(&store).unwrap();
+        let err = packet(
+            &store,
+            &Request {
+                protocol: 1,
+                force: None,
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(err.0.contains("owner-not-configured"));
+    }
+    #[test]
+    fn first_line_filter_never_forwards_unknown_text_or_suffixes() {
+        assert_eq!(
+            remote_line(b"aswap: sync server requires the configured refresh owner\n"),
+            "owner-not-configured"
+        );
+        assert_eq!(
+            remote_line(b"aswap: sync: version-mismatch\r\n"),
+            "version-mismatch"
+        );
+        for bad in [
+            "synthetic-private-token alice@example.com",
+            "aswap: sync server requires the configured refresh owner alice@example.com",
+            "aswap: sync: version-mismatch\x1b[31m",
+            "{\"access_token\":\"synthetic-private-token\"}",
+            "aswap: sync: version-mismatch\nsynthetic-second-line",
+        ] {
+            assert_eq!(remote_line(bad.as_bytes()), "redacted-unrecognized");
+        }
+        assert_eq!(remote_line(&[255, 254]), "redacted-unrecognized");
+    }
+    #[test]
+    fn exchange_timeout_bad_response_and_stderr_drain_are_bounded() {
+        let request = Request {
+            protocol: 1,
+            force: None,
+        };
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        let start = Instant::now();
+        let error = exchange_command(command, &request, Duration::from_millis(50))
+            .err()
+            .unwrap();
+        assert_eq!(error.0, "sync: timeout");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf 'not-json'; printf 'synthetic-private-stderr' >&2",
+        ]);
+        let error = exchange_command(command, &request, Duration::from_secs(2))
+            .err()
+            .unwrap();
+        assert!(error.0.contains("bad-response"));
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf 'aswap: sync: version-mismatch\\n' >&2; head -c 100000 /dev/zero >&2; exit 1",
+        ]);
+        let error = exchange_command(command, &request, Duration::from_secs(2))
+            .err()
+            .unwrap();
+        assert_eq!(error.0, "sync: version-mismatch");
     }
 }

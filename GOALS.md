@@ -95,3 +95,8 @@ Never edit the headline (line 1).
 - [x] Name Codex windows by duration, preserve their own absolute reset epochs and omit invented session windows.
 - [x] Expose RPC credit balance and available reset count; explicitly mark automatic reload unknown when absent.
 - [x] Add synthetic weekly-only parsing and terminal snapshots, including conflicting compatibility-window resets.
+
+## M10: Diagnosable owner rollout
+- [x] Classify SSH/protocol/store failures and safely filter the remote stderr first line, including legacy owners.
+- [x] Prevent implicit owner demotion; keep duplicate identities as warned aliases and reject actual label/identity conflicts.
+- [x] Test real synthetic transport round trips, role drift, redaction, bounded pipes, timeouts and conflict preflight.

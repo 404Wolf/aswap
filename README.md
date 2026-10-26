@@ -397,3 +397,14 @@ plans with no session window. Reset countdowns include days. When the app-server
 exposes them, status/list and usage JSON include credit balance and available
 usage limit resets. Automatic reload is shown as unknown because the current
 Codex RPC does not expose that setting; credit balance does not imply it is on.
+
+If follower setup fails, sync now prints a safe error class, the remote exit code
+and a classified first stderr line. Unknown remote text remains fully redacted.
+`owner-not-configured` means the store selected by the SSH command is not currently
+an owner, even if a service announced ownership earlier. On the intended owner,
+run `aswap sync --owner` using the same user/store as its monitor, then retry the
+follower. Profile runs must be idle when changing roles. Verify XDG_DATA_HOME if
+SSH and the service disagree. Sync never promotes a remote host automatically.
+A configured owner refuses `sync HOST`; use `sync --off` first for an intentional
+role change. Duplicate logins under distinct labels produce a count-only warning
+and are retained; a label mapped to a different identity still requires alignment.
