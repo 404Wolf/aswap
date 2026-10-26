@@ -347,7 +347,10 @@ the selected weekly bucket.
 The official [RateLimitWindow schema](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/typescript/v2/RateLimitWindow.ts)
 provides duration and reset fields. The [credits schema](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/typescript/v2/CreditsSnapshot.ts)
 exposes decimal balance and unlimited status, but no automatic reload setting;
-show reload as unknown rather than inferring it from balance or hasCredits.
+retain reload as null in JSON rather than inferring it from balance or hasCredits.
+Terminal credit balances round to integers with thousands separators; JSON keeps
+the original decimal precision. Hide unknown reload settings and zero/unknown
+available reset counts in terminal output.
 The [reset credits summary](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/typescript/v2/RateLimitResetCreditsSummary.ts)
 provides availableCount separately from balance. Only bounded decimal balance,
 boolean flags and numeric reset count enter normalized usage; account IDs,

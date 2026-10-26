@@ -349,7 +349,7 @@ fn codex_weekly_only_rpc_uses_its_own_epoch_and_optional_credit_metadata() {
         "rateLimitsByLimitId":{"codex":{
             "primary":{"usedPercent":23,"windowDurationMins":10080,"resetsAt":reset},
             "secondary":null,
-            "credits":{"balance":"12345","hasCredits":true,"unlimited":false}
+            "credits":{"balance":"12345.6789","hasCredits":true,"unlimited":false}
         }},
         "rateLimitResetCredits":{"availableCount":3,"credits":[]}
     });
@@ -361,7 +361,7 @@ fn codex_weekly_only_rpc_uses_its_own_epoch_and_optional_credit_metadata() {
     assert_eq!(u.used(at), Some(23.0));
     assert_eq!(
         u.credits.as_ref().unwrap().balance.as_deref(),
-        Some("12345")
+        Some("12345.6789")
     );
     assert_eq!(u.credits.as_ref().unwrap().automatic_reload, None);
     assert_eq!(u.available_usage_resets, Some(3));
@@ -390,7 +390,8 @@ fn codex_weekly_only_rpc_uses_its_own_epoch_and_optional_credit_metadata() {
         );
         assert!(output.contains("WEEKLY 23.0% used · resets in 6d4h"));
         assert!(!output.contains("SESSION") && !output.contains("PRIMARY"));
-        assert!(output.contains("credits: 12345 · automatic reload: unknown (not exposed)"));
+        assert!(output.contains("credits: 12,346"));
+        assert!(!output.contains("automatic reload"));
         assert!(output.contains("available usage limit resets: 3"));
         let name = if compact {
             "codex-weekly-list"
@@ -403,6 +404,35 @@ fn codex_weekly_only_rpc_uses_its_own_epoch_and_optional_credit_metadata() {
             std::fs::write(&path, &output).unwrap();
         }
         assert_eq!(output, std::fs::read_to_string(path).unwrap());
+    }
+    assert_eq!(
+        serde_json::to_value(&cached.usage).unwrap()["credits"]["balance"],
+        "12345.6789"
+    );
+    let mut quiet = cached.clone();
+    quiet.usage.available_usage_resets = Some(0);
+    for reload in [None, Some(false), Some(true)] {
+        quiet.usage.credits.as_mut().unwrap().automatic_reload = reload;
+        let output = aswap::display::render(
+            &[aswap::display::Row {
+                provider: "codex",
+                label: "synthetic",
+                active: true,
+                identity: &identity,
+                duplicates: &[],
+                cached: &quiet,
+            }],
+            false,
+            100,
+            false,
+            at,
+        );
+        assert!(!output.contains("available usage limit resets"));
+        match reload {
+            None => assert!(!output.contains("automatic reload")),
+            Some(true) => assert!(output.contains("automatic reload: on")),
+            Some(false) => assert!(output.contains("automatic reload: off")),
+        }
     }
     let mut v = v;
     v["rateLimitsByLimitId"]["codex"]["credits"]["balance"] =

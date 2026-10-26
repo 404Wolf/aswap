@@ -11,6 +11,23 @@ pub struct Row<'a> {
 fn clean(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
+fn credit_balance(balance: Option<&str>) -> String {
+    let Some(value) = balance
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|n| n.is_finite() && *n >= 0.0)
+    else {
+        return "unknown".into();
+    };
+    let rounded = format!("{:.0}", value.round());
+    let mut grouped = String::new();
+    for (i, c) in rounded.chars().enumerate() {
+        if i > 0 && (rounded.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    grouped
+}
 fn reset(at: Option<u64>, now: u64) -> String {
     match at {
         None => "reset unknown".into(),
@@ -155,21 +172,18 @@ pub fn render(rows: &[Row<'_>], compact: bool, width: usize, color: bool, now: u
         }
         if let Some(credits) = &c.usage.credits {
             let balance = if credits.unlimited == Some(true) {
-                "unlimited"
+                "unlimited".into()
             } else {
-                credits.balance.as_deref().unwrap_or("unknown")
+                credit_balance(credits.balance.as_deref())
             };
             let reload = match credits.automatic_reload {
-                Some(true) => "on",
-                Some(false) => "off",
-                None => "unknown (not exposed)",
+                Some(true) => " · automatic reload: on",
+                Some(false) => " · automatic reload: off",
+                None => "",
             };
-            lines.extend(wrap(
-                &format!("  credits: {} · automatic reload: {reload}", clean(balance)),
-                width,
-            ));
+            lines.extend(wrap(&format!("  credits: {balance}{reload}"), width));
         }
-        if let Some(count) = c.usage.available_usage_resets {
+        if let Some(count) = c.usage.available_usage_resets.filter(|count| *count > 0) {
             lines.extend(wrap(
                 &format!("  available usage limit resets: {count}"),
                 width,

@@ -395,8 +395,10 @@ change without notice.
 Codex quota windows are named by their reported duration, including weekly-only
 plans with no session window. Reset countdowns include days. When the app-server
 exposes them, status/list and usage JSON include credit balance and available
-usage limit resets. Automatic reload is shown as unknown because the current
-Codex RPC does not expose that setting; credit balance does not imply it is on.
+usage limit resets. Terminal credit balances round to integers with thousands
+separators; JSON retains full precision. Unknown automatic reload settings and
+zero/unknown reset counts are hidden. The current Codex RPC does not expose
+reload settings; credit balance does not imply reload is on.
 
 If follower setup fails, sync now prints a safe error class, the remote exit code
 and a classified first stderr line. Unknown remote text remains fully redacted.

@@ -93,8 +93,10 @@ Never edit the headline (line 1).
 
 ## M9: Codex weekly-only plans
 - [x] Name Codex windows by duration, preserve their own absolute reset epochs and omit invented session windows.
-- [x] Expose RPC credit balance and available reset count; explicitly mark automatic reload unknown when absent.
+- [x] Expose RPC credit balance and available reset count; retain unknown automatic reload in JSON when absent.
 - [x] Add synthetic weekly-only parsing and terminal snapshots, including conflicting compatibility-window resets.
+
+- [x] Polish terminal credits with rounded, grouped integers and hide unknown reload/zero reset details; preserve JSON precision and update snapshots.
 
 ## M10: Diagnosable owner rollout
 - [x] Classify SSH/protocol/store failures and safely filter the remote stderr first line, including legacy owners.
