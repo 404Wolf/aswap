@@ -336,7 +336,7 @@ impl View {
             .filter(|a| a.provider == account.provider)
         {
             if candidate.label != account.label {
-                match store.lease(&candidate) {
+                match store.lease_label(&candidate) {
                     Ok(lease) => leases.push(lease),
                     Err(_) => {
                         all_idle = false;
@@ -457,6 +457,15 @@ impl View {
         let profile = store.profile(account.provider, &account.label)?;
         let auth = store::read_private(&profile.join(account.provider.auth_file()))?;
         provider::validate_auth(account.provider, &auth)?;
+        let auth = if crate::coordination::follower(store)? {
+            serde_json::to_vec(&crate::refresh::launch_auth(
+                account.provider,
+                &serde_json::from_slice(&auth).safe("invalid profile auth")?,
+            ))
+            .safe("cannot encode launch auth")?
+        } else {
+            auth
+        };
         store::atomic(&self.path.join(account.provider.auth_file()), &auth)?;
         if account.provider == Provider::Claude {
             let mut config = if self.path.join(".claude.json").exists() {
@@ -492,10 +501,38 @@ impl View {
         let profile = store.profile(account.provider, &account.label)?;
         let auth = store::read_private(&self.path.join(account.provider.auth_file()))?;
         provider::validate_auth(account.provider, &auth)?;
-        store::atomic(&profile.join(account.provider.auth_file()), &auth)?;
+        if crate::coordination::follower(store)? {
+            let canonical: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
+            store::json_write(
+                &self.path.join(account.provider.auth_file()),
+                &crate::refresh::launch_auth(account.provider, &canonical),
+            )?;
+        } else {
+            let previous: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
+            let current: Value = serde_json::from_slice(&auth).safe("invalid launch auth")?;
+            let before_identity =
+                crate::identity::read(account.provider, &profile).unwrap_or_default();
+            store::atomic(&profile.join(account.provider.auth_file()), &auth)?;
+            if previous != current {
+                crate::usage::credentials_changed(store, account)?;
+
+                let runtime_config = if account.provider == Provider::Claude {
+                    store::json_read(&self.path.join(".claude.json"))?
+                } else {
+                    json!({})
+                };
+                let after =
+                    crate::identity::from_values(account.provider, &current, &runtime_config);
+                if crate::identity::same(&before_identity, &after) {
+                    crate::refresh::propagate(store, account, &current)?;
+                }
+            }
+        }
         if self.provider == Provider::Claude {
             let config: Value = store::json_read(&self.path.join(".claude.json"))?;
-            store::json_write(&profile.join(".claude.json"), &account_config(&config))?;
+            if !crate::coordination::follower(store)? {
+                store::json_write(&profile.join(".claude.json"), &account_config(&config))?;
+            }
             let after = non_account(&config);
             let mut current = read_config(&self.config_path)?;
             let before = current.clone();

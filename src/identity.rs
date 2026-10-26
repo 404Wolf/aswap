@@ -10,6 +10,16 @@ pub struct Identity {
     pub plan: Option<String>,
     fingerprint: Option<Vec<u8>>,
 }
+impl Identity {
+    pub fn known(&self) -> bool {
+        self.fingerprint.is_some()
+    }
+    pub(crate) fn lock_key(&self) -> Option<String> {
+        self.fingerprint
+            .as_ref()
+            .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect())
+    }
+}
 fn text(v: &Value, paths: &[&str]) -> Option<String> {
     paths.iter().find_map(|p| {
         v.pointer(p)

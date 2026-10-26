@@ -62,6 +62,7 @@ fn rendering_snapshots() {
         ("narrow", false, 24, false, false),
         ("color", false, 80, true, false),
         ("stale", false, 80, false, true),
+        ("stale-color", false, 80, true, true),
     ] {
         let rendered = fixture(compact, width, color, stale);
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -111,4 +112,37 @@ fn very_narrow_terminals_and_control_characters() {
     );
     assert!(!rendered.contains('\x1b'));
     assert!(!rendered.contains("\nforged"));
+}
+
+#[test]
+fn unavailable_quota_explains_reason_and_retains_dimmed_last_known_bar() {
+    let id = identity::Identity::default();
+    let cache = Cached {
+        usage: parse_claude(&json!({"five_hour":{"utilization":80}})).unwrap(),
+        error: Some("http-429".into()),
+        http_status: Some(429),
+        retry_after: Some(120),
+        next_poll_at: 1120,
+        fetched_at: 1000,
+        ..Default::default()
+    };
+    let rendered = display::render(
+        &[Row {
+            provider: "claude",
+            label: "synthetic",
+            active: true,
+            identity: &id,
+            duplicates: &[],
+            cached: &cache,
+        }],
+        false,
+        80,
+        true,
+        1000,
+    );
+    assert!(rendered.contains("HTTP 429 rate-limited"));
+    assert!(rendered.contains("Retry-After 120s"));
+    assert!(rendered.contains("80.0% used (stale)"));
+    assert!(rendered.contains("\x1b[2m"));
+    assert!(!rendered.contains("????"));
 }

@@ -75,11 +75,13 @@ symlinks. Originals, including collisions, are retained privately under
 Anonymous legacy auto directories migrate only when all provider profiles are
 idle. No transcript text is logged or used to infer session identity.
 
-To refresh an expired login, launch its profile and use Claude's interactive
-`/login`, or `aswap run codex --account personal -- login`. The official CLI
-owns OAuth refresh; aswap does not perform its own refresh-token exchange.
-An inactive expired Claude login may report unknown usage until it is launched
-or logged in again. API-key Codex profiles can run but may not expose quota.
+Automatic OAuth refresh is **opt-in on one owner**: `aswap sync --owner`.
+Without ownership configured, usage still works while access tokens remain valid;
+status JSON reports `credential_mode: "refresh-disabled"`. For three machines,
+configure the owner/followers below before restarting monitors and resuming sessions. Re-login on the
+owner if the provider has already invalidated a refresh token. API-key accounts
+can run but may not expose quota.
+
 
 ### Explicit default-login activation
 
@@ -96,8 +98,8 @@ under `live-backups/`, and recognizable rotated credentials are synchronized
 back to their matching stored profile. An existing unrelated provider process
 is not restarted; its credential reload behavior is provider-specific.
 
-Normal isolated `run` and selection-only `switch` avoid default-login writes.
-Prefer isolated sessions for parallel accounts.
+Auth-isolated `run` and selection-only `switch` avoid default-login writes.
+Parallel launches share provider state while keeping account authentication private.
 
 ## Quota and autoswitch
 
@@ -175,8 +177,8 @@ duplicates. A second label still captures the current login; log into the other
 account before adding it. Token rotation does not make a new account identity.
 
 All usage surfaces share a locked, persisted 180-second success cache. Failures
-back off exponentially from 600 seconds up to one hour, or longer when required
-by `Retry-After` plus a margin. An error, stale observation (over ten minutes)
+back off from 60 seconds exponentially to at most 15 minutes; a longer
+`Retry-After` is honored. An error, stale observation (over ten minutes)
 or elapsed reset makes remaining quota unknown. Cache hits never bypass a
 backoff. `list` is offline; `status`, `usage`, `waybar` and active monitors
 fetch only when due. The HTTP/RPC clients have bounded timeouts and response
@@ -205,6 +207,85 @@ previous user commands are not replayed. `off` keeps native resume without sendi
 a follow-up. In Home Manager, set
 `programs.aswap.autoswitch.<provider>.resumePrompt` to text or `null` (off); the
 monitor service applies it alongside the threshold when enabled.
+
+Usage failures include a safe reason and HTTP status where available: 401
+expired/invalid token, 403 forbidden, 429 rate limited (with `Retry-After`), network
+failure, or a Codex app-server start/protocol/timeout error. JSON exposes
+`usage_error`, `http_status`, `retry_after_seconds`, `last_attempt` and
+`next_poll_at`. Response bodies and child stderr are never included. A stale bar
+retains the last-known utilization with a `(stale)` tag (dimmed with color).
+Passed reset times trigger a fetch immediately, once per reset before ordinary
+failure backoff applies again.
+
+```sh
+aswap usage --refresh                 # all profiles; explicit backoff override
+aswap usage claude --account work --refresh --json
+```
+
+`--refresh` bypasses quota TTL/backoff, including Retry-After, for that explicit
+request. It does not force an unnecessary OAuth rotation. On a follower, the
+request goes to the owner instead of polling the provider locally.
+
+## Three-machine ownership and sync
+
+Use one always-available SSH-accessible machine as the refresh/usage owner. The
+other two are access-only followers; all three can still launch account profiles.
+Stop the monitors and finish/stop existing aswap sessions while assigning roles;
+then re-login to each account on the
+chosen owner if existing copied refresh tokens are already invalid. Keep labels
+consistent across machines; conflicting known account identities are refused.
+
+```sh
+# On the server (or chosen owner):
+aswap sync --owner
+# On the laptop and desktop; synthetic-owner is an SSH Host alias:
+aswap sync synthetic-owner
+# To pull again explicitly:
+aswap sync
+# To disable background refresh/sync without deleting profiles:
+aswap sync --off
+```
+
+Configure SSH key authentication and known host keys normally. `aswap` must be on
+the owner's noninteractive SSH PATH and use the same XDG data-store environment
+as its local services. Sync uses a bounded noninteractive SSH pipe; ordinary
+terminal/JSON output reports counts only. It transfers access-only auth,
+account-bound metadata and quota caches, never transcripts, settings, or refresh
+tokens. The hidden transport command is for SSH pipes, not human use.
+
+Only the owner polls provider quota and refreshes inactive credentials. Every
+monitor/client shares its persisted per-profile cache; followers pull at most
+once per 30 seconds and do not issue their own usage/refresh requests. Running
+views collect owner CLI rotations or receive follower access-token updates at
+30-second cadence. Duplicate identities share a lease and receive the same local
+rotation. This prevents refreshing an idle alias while another alias is running.
+The owner holds the profile/identity lease for background refresh and atomically
+saves rotated tokens; a running owner CLI remains responsible for its own refresh.
+
+Use `aswap run` on followers; independently running the native CLI against old
+refresh-capable copies is outside this ownership protocol. Perform login and
+profile administration on the owner, then sync while affected profiles are idle.
+Unmatched local profiles retain their files but become ineligible for auto quota
+selection. On owner/network failure, last-known quotas become unavailable/stale;
+followers never promote themselves or guess which machine has a valid refresh
+token. Existing sessions keep their current access token until it expires; a
+provider version that cannot reload an updated token may require an explicit
+resume after reconnection. Keep all machines' clocks synchronized normally.
+
+Home Manager can apply roles when monitor services start:
+
+```nix
+# Owner:
+programs.aswap.refreshOwner = true;
+# Followers, instead:
+programs.aswap.syncHost = "synthetic-owner";
+```
+
+`refreshOwner = null` (default) preserves CLI configuration. Explicit `false`
+with no `syncHost` disables automatic refresh; owner and follower options are
+mutually exclusive. Enable the desired `autoswitch.<provider>.enable` services on
+all machines after roles are assigned. No remote login or account-store operation
+is run during development; tests use synthetic HTTP outcomes and an SSH stub.
 
 ## Waybar
 

@@ -187,6 +187,48 @@ fn shared_child() {
             assert_eq!(fs::read(target).unwrap(), before);
             assert!(home.join(".claude.json").is_symlink());
         }
+        // A live follower accepts owner updates without ever restoring its stale
+        // runtime refresh token into the canonical profile.
+        store::json_write(
+            &store.root.join("coordination.json"),
+            &aswap::coordination::Settings {
+                owner: false,
+                host: Some("synthetic-owner".into()),
+                last_sync: aswap::now(),
+            },
+        )
+        .unwrap();
+        let fresh = if provider == Provider::Claude {
+            json!({"claudeAiOauth":{"accessToken":"synthetic-owner-latest","expiresAt":9999999999999u64}})
+        } else {
+            json!({"tokens":{"access_token":"synthetic-owner-latest","refresh_token":""}})
+        };
+        store::json_write(&profile.join(provider.auth_file()), &fresh).unwrap();
+        view.sync(&store, &a).unwrap();
+        let canonical: serde_json::Value =
+            store::json_read(&profile.join(provider.auth_file())).unwrap();
+        assert_eq!(canonical, fresh);
+        let running: serde_json::Value =
+            store::json_read(&view.path.join(provider.auth_file())).unwrap();
+        if provider == Provider::Claude {
+            assert_eq!(
+                running["claudeAiOauth"]["accessToken"],
+                "synthetic-owner-latest"
+            );
+            assert_eq!(
+                running["claudeAiOauth"]["refreshToken"],
+                "aswap-owner-managed"
+            );
+        } else {
+            assert_eq!(running["tokens"]["access_token"], "synthetic-owner-latest");
+            assert_eq!(running["auth_mode"], "chatgptAuthTokens");
+        }
+        drop(_lease);
+        aswap::coordination::off(&store).unwrap();
+        assert_eq!(
+            store::json_read::<serde_json::Value>(&home.join(provider.auth_file())).unwrap(),
+            auth
+        );
     }
 }
 #[test]

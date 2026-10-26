@@ -65,6 +65,11 @@ impl Provider {
             "CODEX_AUTH_JSON",
             "CODEX_REMOTE_TOKEN",
             "CODEX_REMOTE_URL",
+            "CODEX_ACCESS_TOKEN",
+            "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+            "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
+            "CLAUDE_CODE_CUSTOM_OAUTH_URL",
+            "CLAUDE_CODE_OAUTH_CLIENT_ID",
             "ANTHROPIC_BASE_URL",
         ] {
             cmd.env_remove(key);

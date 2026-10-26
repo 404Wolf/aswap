@@ -69,8 +69,8 @@ Development commands never inspect real Claude/Codex homes.
 Switch selects the default profile for aswap launchers; Claude additionally
 supports an explicit default-file activation operation. Isolated run never
 rewrites another profile. Avoid sharing writable auth files or replacing
-Home Manager managed files. Provider processes own refresh-token rotation;
-read the current profile for usage, never restore stale backup credentials.
+Home Manager managed files. Running provider processes own refresh-token rotation;
+only the explicit owner refreshes inactive profiles. Never restore stale backup credentials.
 
 Codex uses CODEX_HOME profiles with auth.json. Quota should be read through
 Codex's app-server account/rateLimits/read RPC, with initialize/initialized
@@ -98,9 +98,10 @@ with the exact tracked session ID and omitting one-shot prompt/print/stdin input
 Clean exits do not restart; forced switches send the configured follow-up unless
 disabled. Restarts are capped at eight. No code changes the caller's cwd.
 
-Token refresh is delegated to the official CLI. Expired inactive Claude
-credentials can report unknown usage until that profile is logged in or
-launched again; aswap does not implement a second OAuth refresh client.
+OAuth refresh now follows the provider-native flows below on an explicit owner.
+Running provider CLIs retain refresh ownership through profile/identity leases;
+inactive profiles can be refreshed before usage polling. Followers have no
+refresh-capable credentials and consume the owner's access tokens and quota.
 
 Interactive auto sessions use a Linux PTY, forwarding terminal I/O and window
 size while preserving native provider UIs. Signal cleanup restores terminal
@@ -223,3 +224,109 @@ Commands inherit the OS working directory; no current_dir/chdir operation is
 applied. Synthetic process tests invoke aswap from a separate project directory,
 verify os.getcwd() inside both providers and through a forced switch, and assert
 that the same transcript is visible after account changes.
+
+## Usage errors, resets and refresh
+
+Caches persist safe failure kind, HTTP status, Retry-After seconds, last attempt
+and next poll. Diagnostic serialization uses a fixed class allowlist; arbitrary
+cache strings, RPC errors, HTTP bodies and child stderr are never printed. Codex
+RPC structured status fields or explicit HTTP status markers become numeric status
+classes; otherwise start failure, timeout, unsupported method or RPC-unavailable
+are explicit, with no invented HTTP status. A normal failure waits 60, 120, 240,
+480 then at most 900 seconds. A longer Retry-After (seconds or HTTP date) wins.
+Legacy unexplained multi-hour backoff is capped from its last recorded attempt.
+
+A window with reset <= now whose reset has not yet been followed by a network
+attempt bypasses TTL/backoff once. The attempt timestamp is recorded even on
+failure, preventing a permanent passed reset from causing a poll storm.
+`usage --refresh` explicitly bypasses that gate; missing provider means all
+profiles. Stale data remains last-known utilization, dimmed and tagged stale,
+never a question-mark bar or assumed empty quota. A provider token rotation
+invalidates authentication backoff, while a quota endpoint Retry-After survives.
+
+The refresh-owner role must be explicit; defaults never let three newly upgraded
+monitors all begin rotating copied refresh tokens. Claude's published official
+npm client @anthropic-ai/claude-code 2.1.81 defines JSON POST
+https://platform.claude.com/v1/oauth/token with grant_type=refresh_token, public
+client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e, the saved refresh token and saved
+scope list (official default scopes when absent). It computes expiresAt in epoch
+milliseconds from expires_in and retains the old refresh token only if omitted
+from the response. aswap preserves unrelated credential fields and saved tier
+hints. No custom endpoint/client-id environment override is accepted for refresh.
+The endpoint is a provider interface, not a promised stable public API.
+
+OpenAI's [native auth manager](https://github.com/openai/codex/blob/main/codex-rs/login/src/auth/manager.rs)
+and [OAuth client](https://github.com/openai/codex/blob/main/codex-rs/login/src/oauth/client.rs)
+use JSON POST https://auth.openai.com/oauth/token with public client ID
+app_EMoamEEZ73f0CkXaXp7hrann. Rotated access/refresh/id tokens update the private
+auth record and last_refresh, preserving omitted rotation fields and account ID.
+JWT exp is an expiry hint, not proof of token validity. Failed/rejected or
+malformed responses do not overwrite credentials; invalid_grant requires re-login
+on the owner. There is no expiry-timestamp contest between machines.
+
+Refresh happens under the store lock plus the nonblocking account lease, with a
+fresh credential read after locking. Duplicate known identities share a hashed
+identity lease as well as label leases, so a running alias excludes background
+refresh. Successful rotations propagate to idle duplicate auth records while
+preserving other extensions. Running views sync their CLI's fresh credentials
+back at 30s cadence and exit. Usage-only Codex app-servers use a private temporary
+access-only auth snapshot, so they cannot rotate behind a running CLI. No real
+credential or transcript files were inspected or used in development tests.
+
+## Multi-machine design: one authority, access-only followers
+
+The simplest robust implementation is an explicit single refresh/usage owner,
+not bidirectional newest-file or newest-expiry wins. That heuristic cannot prove
+that a rotating refresh token is still valid. `sync --owner` enables local
+background refresh; `sync SSH_ALIAS` configures a follower and pulls the owner's
+profiles and persisted usage cache. The owner is reached through SSH batch mode,
+no PTY, normal known-host checks, a fixed remote command and bounded private
+stdin/stdout protocol. No credential is placed in argv, stderr or normal CLI JSON.
+The hidden server refuses terminals and non-SSH invocations. Auth transfer is
+necessarily credential-bearing inside the encrypted SSH pipe; it is never human
+output, a log, or a public-repository artifact.
+
+The owner exports no OAuth refresh token, including nested credential extensions.
+Peers cannot invalidate its refresh chain. Local canonical auth is access-only;
+launch views adapt to native token reload behavior: Claude gets a public
+non-credential refresh sentinel plus a delayed local refresh deadline. Its
+published 401 recovery first requires a nonempty refresh field, re-reads the auth
+file, and retries when the access token has changed. The sentinel enables that
+reload path but can never authorize a real rotation; proactive sentinel refresh
+is suppressed. Codex launch views use the external chatgptAuthTokens mode and an
+empty refresh token. Peers install the owner's fresh access token into live views
+at 30s cadence. If the owner is unreachable, a stale sentinel may yield an auth
+error rather than any rotation; no peer silently becomes an owner. Provider token
+reload behavior is version-sensitive and synthetic process tests cannot prove
+arbitrary future provider versions; explicit resume is the recovery path.
+
+Every owner request shares its existing store-locked per-profile TTL/backoff, so
+three monitors do not triple quota API traffic. Peers serialize SSH pulls and
+schedule them using receipt time on their own clock, not remote wall-clock order.
+Clock skew is never evidence that one credential is valid. Quota resets and JWT
+expiry still require normally synchronized system clocks. Unmatched local
+profiles keep their private files, get an owner-profile-missing quota state and
+cannot become eligible through stale cached headroom. Known label/identity
+collisions are refused. Sync excludes histories, shared settings and local auto
+policy. Profile administration/login is owner-side and coordinated while affected
+profiles are idle; local account data is never deleted by sync.
+
+Recommended deployment: stop all monitors and existing runs for ownership bootstrap;
+choose the always-on server as owner;
+re-login there if prior independent rotations invalidated its tokens; assign
+owner/follower roles; pull from laptop and desktop; then start their monitors.
+Use aswap launch views on peers rather than independent native refresh-capable
+copies. The SSH command must find the same aswap binary/store environment as the
+owner service. OAuth rotation by software outside this protocol, provider
+revocation, a crash after remote rotation but before local persistence, and a
+network partition cannot be solved by timestamp merging: report the safe failure
+and reauthenticate on the owner. Never push an unverified copied refresh token
+back from a follower. Entering or leaving follower mode requires idle profile
+leases, preventing a running process from retaining an old refresh-capable view.
+
+Home Manager refreshOwner is nullable (null preserves CLI role, true owner,
+false with no syncHost disables background refresh); syncHost is an SSH alias.
+Service setup applies role before threshold/prompt/on. Tests cover cache reset
+fetching, HTTP/error redaction, backoff/Retry-After, forced refresh, native OAuth
+request/rotation semantics, lease exclusion and aliases, managed-file preservation,
+owner cache reuse, access-only packets, SSH failures and clock skew.

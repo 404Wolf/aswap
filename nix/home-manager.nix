@@ -29,7 +29,10 @@ let
     Service = {
       Type = "simple";
       UMask = "0077";
-      ExecStartPre = [
+      ExecStartPre = (lib.optional (cfg.refreshOwner == true) "${cfg.package}/bin/aswap sync --owner")
+        ++ (lib.optional (cfg.refreshOwner == false && cfg.syncHost == null) "${cfg.package}/bin/aswap sync --off")
+        ++ (lib.optional (cfg.syncHost != null) "${cfg.package}/bin/aswap sync -- ${escapeExecArg cfg.syncHost}")
+        ++ [
         "${cfg.package}/bin/aswap auto ${provider} threshold ${toString settings.threshold}"
         "${cfg.package}/bin/aswap auto ${provider} resume-prompt -- ${escapeExecArg (if settings.resumePrompt == null then "off" else settings.resumePrompt)}"
         "${cfg.package}/bin/aswap auto ${provider} on"
@@ -52,9 +55,20 @@ in {
       claude = mkOption { type = types.submodule providerOptions; default = {}; };
       codex = mkOption { type = types.submodule providerOptions; default = {}; };
     };
+    refreshOwner = mkOption {
+      type = types.nullOr types.bool;
+      default = null;
+      description = "True enables this refresh owner; false disables refresh without syncHost; null preserves CLI configuration.";
+    };
+    syncHost = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "SSH host alias for the refresh/usage owner; followers receive access-only auth.";
+    };
     waybar.enable = mkEnableOption "the custom/aswap Waybar module in mainBar";
   };
   config = mkIf cfg.enable {
+    assertions = [{ assertion = !(cfg.refreshOwner == true && cfg.syncHost != null); message = "aswap refreshOwner and syncHost are mutually exclusive"; }];
     home.packages = [ cfg.package ];
     systemd.user.services = lib.mapAttrs' (provider: settings:
       lib.nameValuePair "aswap-${provider}" (serviceFor provider settings)

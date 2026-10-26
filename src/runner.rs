@@ -57,6 +57,7 @@ pub fn run(
     } else {
         None
     };
+    crate::coordination::poll(store, None, false)?;
     let mut account = {
         let _lock = store.lock()?;
         store.account(&store.load()?, provider, name)?
@@ -103,6 +104,7 @@ pub fn run(
         None
     };
     let mut switches = 0;
+    let mut next_sync = 0;
     loop {
         let mut cmd = provider.command(&view.path);
         cmd.args(&launch_args);
@@ -124,6 +126,12 @@ pub fn run(
         let status = loop {
             if let Some(terminal) = &mut terminal {
                 limited |= terminal.pump(100)?;
+            }
+            if now() >= next_sync {
+                next_sync = now().saturating_add(30);
+                if crate::coordination::poll(store, None, false).is_ok() {
+                    let _ = view.sync(store, &account);
+                }
             }
             if let Some(tracker) = &mut tracker {
                 tracker.observe(child.0.id())?;

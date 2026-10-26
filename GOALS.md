@@ -82,4 +82,11 @@ Never edit the headline (line 1).
 - [x] Forward auto-mode provider arguments, retain options across switches, drop one-shot input and resume the exact tracked session UUID.
 - [x] Verify shared layout, migrations, managed files, exact resume argv and cwd with synthetic tests.
 
+## M8: Usage freshness and one refresh owner
+- [x] Expose redacted HTTP/RPC/network reasons, cap ordinary backoff at 15m, honor Retry-After and add usage --refresh.
+- [x] Fetch after window resets and render stale last-known bars dimmed.
+- [x] Refresh inactive OAuth profiles using native provider flows under label/identity leases; persist rotations atomically and protect running aliases.
+- [x] Add explicit refresh ownership, access-only SSH sync/cache followers, Home Manager roles and the recommended three-machine setup.
+- [x] Cover errors, resets, rotation, alias locking, owner/follower transport and rendering with synthetic tests.
+
 ## Questions

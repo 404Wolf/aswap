@@ -92,6 +92,25 @@ pub fn render(rows: &[Row<'_>], compact: bool, width: usize, color: bool, now: u
             format!("observed {}m ago", now.saturating_sub(c.fetched_at) / 60)
         };
         lines.extend(wrap(&format!("  quota: {state} · {age}"), width));
+        if let Some(reason) = c.diagnostic() {
+            let status = reason["http_status"]
+                .as_u64()
+                .map(|n| format!("HTTP {n} "))
+                .unwrap_or_default();
+            let retry = c
+                .retry_after
+                .map(|s| format!(" · Retry-After {s}s"))
+                .unwrap_or_default();
+            lines.extend(wrap(
+                &format!(
+                    "  {status}{}{} · retry in {}s",
+                    reason["class"].as_str().unwrap(),
+                    retry,
+                    c.next_poll_at.saturating_sub(now)
+                ),
+                width,
+            ));
+        }
         for w in &c.usage.windows {
             let name = window_name(&w.name, w.duration_minutes);
             let valid = c.error.is_none()
@@ -100,22 +119,15 @@ pub fn render(rows: &[Row<'_>], compact: bool, width: usize, color: bool, now: u
             let percent = if valid {
                 format!("{:.1}% used", w.used_percent)
             } else {
-                format!("{:.1}% last observed ({state})", w.used_percent)
+                format!("{:.1}% used (stale)", w.used_percent)
             };
             let detail = format!("  {name} {percent} · {}", reset(w.resets_at, now));
             lines.extend(wrap(&detail, width));
             if !compact && width >= 5 {
                 let size = width.saturating_sub(4).clamp(1, 24);
-                let filled = if valid {
-                    (w.used_percent.clamp(0.0, 100.0) / 100.0 * size as f64).round() as usize
-                } else {
-                    0
-                };
-                let bar = if valid {
-                    format!("{}{}", "━".repeat(filled), "░".repeat(size - filled))
-                } else {
-                    "?".repeat(size)
-                };
+                let filled =
+                    (w.used_percent.clamp(0.0, 100.0) / 100.0 * size as f64).round() as usize;
+                let bar = format!("{}{}", "━".repeat(filled), "░".repeat(size - filled));
                 let bar = format!("[{bar}]");
                 let bar = if color && valid {
                     format!(
@@ -128,6 +140,8 @@ pub fn render(rows: &[Row<'_>], compact: bool, width: usize, color: bool, now: u
                             32
                         }
                     )
+                } else if color {
+                    format!("\x1b[2m{bar}\x1b[0m")
                 } else {
                     bar
                 };

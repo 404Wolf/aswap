@@ -39,7 +39,11 @@ impl Usage {
     }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Cached {
+    pub http_status: Option<u16>,
+    pub retry_after: Option<u64>,
+    pub last_attempt: u64,
     pub usage: Usage,
     pub fetched_at: u64,
     pub next_poll_at: u64,
@@ -47,6 +51,40 @@ pub struct Cached {
     pub error: Option<String>,
 }
 impl Cached {
+    pub fn diagnostic(&self) -> Option<serde_json::Value> {
+        let error = self.error.as_deref()?;
+        let class = match error {
+            "http-401" | "refresh-http-401" => "expired-or-invalid-token",
+            "http-403" | "refresh-http-403" => "forbidden",
+            "http-429" | "refresh-http-429" => "rate-limited",
+            "network" => "network",
+            "codex-rpc-unavailable" => "codex-rpc-unavailable",
+            "codex-rpc-start-failed" => "codex-rpc-start-failed",
+            "codex-rpc-timeout" => "codex-rpc-timeout",
+            "codex-rpc-error" => "codex-rpc-error",
+            "codex-rpc-unsupported" => "codex-rpc-unsupported",
+            "provider-limit" => "provider-limit",
+            "refresh-invalid-grant" => "refresh-invalid-grant",
+            "refresh-owner-required" => "refresh-owner-required",
+            "refresh-invalid-response" => "refresh-invalid-response",
+            "sync-unavailable" => "sync-unavailable",
+            "owner-profile-missing" => "owner-profile-missing",
+            "http-error" | "usage-http-error" | "refresh-http-error" => "http-error",
+            _ => "usage-unavailable",
+        };
+        let status = self
+            .http_status
+            .filter(|s| (100..600).contains(s))
+            .or(match error {
+                "http-401" => Some(401),
+                "http-403" => Some(403),
+                "http-429" => Some(429),
+                _ => None,
+            });
+        Some(
+            serde_json::json!({"class":class,"http_status":status,"retry_after_seconds":self.retry_after,"source":if error.starts_with("refresh-"){"oauth-refresh"}else if error.starts_with("codex-"){"codex-app-server"}else{"usage"}}),
+        )
+    }
     pub fn used(&self, at: u64) -> Option<f64> {
         if self.error.is_some() || at.saturating_sub(self.fetched_at) > 600 {
             None
@@ -114,12 +152,33 @@ pub fn parse_codex(v: &Value) -> Result<Usage> {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Failure {
+    pub status: Option<u16>,
     pub kind: &'static str,
     pub retry_after: u64,
 }
 impl Failure {
+    pub fn new(kind: &'static str) -> Self {
+        Self {
+            status: None,
+            kind,
+            retry_after: 0,
+        }
+    }
+    pub fn http(status: u16, retry_after: u64) -> Self {
+        Self {
+            status: Some(status),
+            retry_after,
+            kind: match status {
+                401 => "http-401",
+                403 => "http-403",
+                429 => "http-429",
+                _ => "http-error",
+            },
+        }
+    }
     fn unavailable() -> Self {
         Self {
+            status: None,
             kind: "usage-unavailable",
             retry_after: 0,
         }
@@ -134,6 +193,12 @@ impl Drop for Process {
 }
 /// Bounded stdio JSON-RPC client. Child stderr and RPC errors are never exposed.
 pub fn codex_rpc(profile: &Path) -> Result<Value> {
+    codex_rpc_inner(
+        profile,
+        &std::cell::Cell::new(Failure::new("codex-rpc-unavailable")),
+    )
+}
+fn codex_rpc_inner(profile: &Path, diagnostic: &std::cell::Cell<Failure>) -> Result<Value> {
     let mut child = Process(
         Provider::Codex
             .command(profile)
@@ -188,6 +253,47 @@ pub fn codex_rpc(profile: &Path) -> Result<Value> {
                     .recv_timeout(remain)
                     .safe("app-server response timed out or disconnected")?;
                 if v.get("id").and_then(Value::as_u64) == Some(id) {
+                    if v.get("error").is_some() {
+                        let error = &v["error"];
+                        let status = [
+                            "/data/http_status",
+                            "/data/httpStatus",
+                            "/data/status",
+                            "/data/statusCode",
+                        ]
+                        .iter()
+                        .find_map(|p| {
+                            error
+                                .pointer(p)
+                                .and_then(Value::as_u64)
+                                .and_then(|n| u16::try_from(n).ok())
+                        });
+                        let status = status.or_else(|| {
+                            let message =
+                                error.get("message").and_then(Value::as_str).unwrap_or("");
+                            [
+                                (401, ["HTTP 401", "401 Unauthorized", "status code: 401"]),
+                                (403, ["HTTP 403", "403 Forbidden", "status code: 403"]),
+                                (
+                                    429,
+                                    ["HTTP 429", "429 Too Many Requests", "status code: 429"],
+                                ),
+                            ]
+                            .into_iter()
+                            .find_map(|(code, markers)| {
+                                markers.iter().any(|m| message.contains(m)).then_some(code)
+                            })
+                        });
+                        let retry = error
+                            .pointer("/data/retryAfter")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        diagnostic.set(if let Some(status) = status {
+                            Failure::http(status, retry)
+                        } else {
+                            Failure::new("codex-rpc-error")
+                        });
+                    }
                     return v
                         .get("result")
                         .cloned()
@@ -218,9 +324,26 @@ pub fn codex_rpc(profile: &Path) -> Result<Value> {
 }
 pub fn fetch(account: &Account, profile: &Path) -> std::result::Result<Usage, Failure> {
     if account.provider == Provider::Codex {
-        return codex_rpc(profile)
-            .and_then(|v| parse_codex(&v))
-            .map_err(|_| Failure::unavailable());
+        let diagnostic = std::cell::Cell::new(Failure::new("codex-rpc-unavailable"));
+        let result = (|| -> Result<Value> {
+            // The usage-only app-server cannot rotate auth behind a running CLI.
+            let temporary = tempfile::tempdir().safe("cannot prepare usage auth")?;
+            let auth: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
+            store::json_write(
+                &temporary.path().join(account.provider.auth_file()),
+                &crate::refresh::access_only(account.provider, &auth),
+            )?;
+            codex_rpc_inner(temporary.path(), &diagnostic)
+        })();
+        return result.and_then(|v| parse_codex(&v)).map_err(|e| {
+            let mut failure = diagnostic.get();
+            if e.0 == "cannot start Codex app-server" {
+                failure.kind = "codex-rpc-start-failed";
+            } else if e.0 == "app-server response timed out or disconnected" {
+                failure.kind = "codex-rpc-timeout";
+            }
+            failure
+        });
     }
     fetch_claude_with(profile, request_claude)
 }
@@ -248,21 +371,16 @@ fn request_claude(token: &str) -> std::result::Result<Value, Failure> {
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("User-Agent", "aswap/0.1")
         .send()
-        .map_err(|_| Failure::unavailable())?;
+        .map_err(|_| Failure::new("network"))?;
     if !response.status().is_success() {
-        return Err(Failure {
-            kind: if response.status().as_u16() == 429 {
-                "http-429"
-            } else {
-                "usage-http-error"
-            },
-            retry_after: response
+        let retry_after = parse_retry_after(
+            response
                 .headers()
                 .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-        });
+                .and_then(|v| v.to_str().ok()),
+            now(),
+        );
+        return Err(Failure::http(response.status().as_u16(), retry_after));
     }
     let mut body = Vec::new();
     use std::io::Read;
@@ -276,6 +394,17 @@ fn request_claude(token: &str) -> std::result::Result<Value, Failure> {
     let v: Value = serde_json::from_slice(&body).map_err(|_| Failure::unavailable())?;
     Ok(v)
 }
+pub fn parse_retry_after(header: Option<&str>, at: u64) -> u64 {
+    header
+        .and_then(|s| {
+            s.parse::<u64>().ok().or_else(|| {
+                chrono::DateTime::parse_from_rfc2822(s)
+                    .ok()
+                    .map(|d| (d.timestamp().max(0) as u64).saturating_sub(at))
+            })
+        })
+        .unwrap_or(0)
+}
 pub fn updated(old: Cached, result: std::result::Result<Usage, Failure>, at: u64) -> Cached {
     match result {
         Ok(usage) => Cached {
@@ -284,23 +413,41 @@ pub fn updated(old: Cached, result: std::result::Result<Usage, Failure>, at: u64
             next_poll_at: at.saturating_add(TTL),
             failures: 0,
             error: None,
+            last_attempt: at,
+            http_status: None,
+            retry_after: None,
         },
         Err(e) => {
             let failures = old.failures.saturating_add(1);
-            let backoff = 300u64
-                .saturating_mul(1u64 << failures.min(5))
-                .min(3600)
-                .max(e.retry_after.saturating_add(60));
+            let backoff = 60u64
+                .saturating_mul(1u64 << failures.saturating_sub(1).min(4))
+                .min(900)
+                .max(e.retry_after);
             Cached {
                 next_poll_at: at.saturating_add(backoff),
                 failures,
                 error: Some(e.kind.to_owned()),
+                last_attempt: at,
+                http_status: e.status,
+                retry_after: (e.retry_after > 0).then_some(e.retry_after),
                 ..old
             }
         }
     }
 }
 pub fn cached_with<F>(store: &Store, account: &Account, at: u64, fetcher: F) -> Result<Cached>
+where
+    F: FnOnce(&Path) -> std::result::Result<Usage, Failure>,
+{
+    cached_mode_with(store, account, at, false, fetcher)
+}
+pub fn cached_mode_with<F>(
+    store: &Store,
+    account: &Account,
+    at: u64,
+    force: bool,
+    fetcher: F,
+) -> Result<Cached>
 where
     F: FnOnce(&Path) -> std::result::Result<Usage, Failure>,
 {
@@ -311,12 +458,21 @@ where
     store.account(&state, account.provider, Some(&account.label))?;
     let profile = store.profile(account.provider, &account.label)?;
     let path = profile.join("usage-cache.json");
-    let old: Cached = if path.exists() {
+    let mut old: Cached = if path.exists() {
         store::json_read(&path)?
     } else {
         Cached::default()
     };
-    if at < old.next_poll_at {
+    if old.error.is_some() && old.retry_after.is_none() {
+        old.next_poll_at = old
+            .next_poll_at
+            .min(old.last_attempt.max(old.fetched_at).saturating_add(900));
+    }
+    let reset_due = old.usage.windows.iter().any(|w| {
+        w.resets_at
+            .is_some_and(|r| r <= at && old.last_attempt.max(old.fetched_at) < r)
+    });
+    if !force && !reset_due && at < old.next_poll_at {
         return Ok(old);
     }
     let entry = updated(old, fetcher(&profile), at);
@@ -324,7 +480,41 @@ where
     Ok(entry)
 }
 pub fn cached(store: &Store, account: &Account) -> Result<Cached> {
-    cached_with(store, account, now(), |p| fetch(account, p))
+    cached_force(store, account, false)
+}
+pub fn cached_force(store: &Store, account: &Account, force: bool) -> Result<Cached> {
+    if crate::coordination::follower(store)? {
+        let result = crate::coordination::poll(store, force.then_some(account), false);
+        let _lock = store.lock()?;
+        let path = store
+            .profile(account.provider, &account.label)?
+            .join("usage-cache.json");
+        let mut cached: Cached = if path.exists() {
+            store::json_read(&path)?
+        } else {
+            Cached::default()
+        };
+        if result.is_err() {
+            cached.error = Some("sync-unavailable".into());
+            cached.http_status = None;
+        }
+        return Ok(cached);
+    }
+
+    cached_mode_with(store, account, now(), force, |p| {
+        crate::refresh::refresh(store, account, now(), false)?;
+        let first = fetch(account, p);
+        if first
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.status == Some(401) || e.kind == "codex-rpc-unavailable")
+            && crate::refresh::refresh(store, account, now(), true)?
+        {
+            fetch(account, p)
+        } else {
+            first
+        }
+    })
 }
 /// Most headroom, only fresh known quotas, ten-point hysteresis and cooldown.
 pub fn choose<'a>(
@@ -364,8 +554,32 @@ pub fn mark_limited(store: &Store, account: &Account) -> Result<()> {
         Cached::default()
     };
     entry.error = Some("provider-limit".into());
+    if entry.http_status != Some(429) {
+        entry.http_status = None;
+        entry.retry_after = None;
+    }
     entry.next_poll_at = entry.next_poll_at.max(now().saturating_add(TTL));
     store::json_write(&path, &entry)
+}
+
+/// Caller holds the store lock. A newly rotated access token invalidates only
+/// authentication backoff; a provider's Retry-After remains authoritative.
+pub fn credentials_changed(store: &Store, account: &Account) -> Result<()> {
+    let path = store
+        .profile(account.provider, &account.label)?
+        .join("usage-cache.json");
+    if path.exists() {
+        let mut cache: Cached = store::json_read(&path)?;
+        if cache.http_status == Some(401)
+            || cache.error.as_deref().is_some_and(|s| {
+                matches!(s, "http-401" | "refresh-invalid-grant" | "refresh-http-401")
+            })
+        {
+            cache.next_poll_at = now();
+            store::json_write(&path, &cache)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

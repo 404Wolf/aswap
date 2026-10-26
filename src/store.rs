@@ -48,6 +48,10 @@ pub struct Store {
     pub root: PathBuf,
 }
 pub struct Guard(File);
+pub struct Lease {
+    _label: Guard,
+    _identity: Option<Guard>,
+}
 impl Drop for Guard {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.0);
@@ -248,7 +252,28 @@ impl Store {
             .cloned()
             .ok_or(Error("account not found"))
     }
-    pub fn lease(&self, account: &Account) -> Result<Guard> {
+    pub fn lease(&self, account: &Account) -> Result<Lease> {
+        label(&account.label)?;
+        let label = self.lease_label(account)?;
+        let identity = crate::identity::read(
+            account.provider,
+            &self.profile(account.provider, &account.label)?,
+        )
+        .unwrap_or_default();
+        let identity = if let Some(key) = identity.lock_key() {
+            Some(self.lease_label(&Account {
+                provider: account.provider,
+                label: format!("identity-{key}"),
+            })?)
+        } else {
+            None
+        };
+        Ok(Lease {
+            _label: label,
+            _identity: identity,
+        })
+    }
+    pub(crate) fn lease_label(&self, account: &Account) -> Result<Guard> {
         let path = self
             .root
             .join(format!("{}-{}.run.lock", account.provider, account.label));
