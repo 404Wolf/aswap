@@ -113,6 +113,7 @@ fn runner_child() {
                         resets_at: None,
                         duration_minutes: Some(300),
                     }],
+                    ..Default::default()
                 },
                 fetched_at: aswap::now(),
                 next_poll_at: aswap::now() + 3600,

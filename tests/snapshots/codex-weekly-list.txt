@@ -1,0 +1,5 @@
+* codex:synthetic [active]  email unknown · plan unknown
+  quota: cached · observed 0m ago
+  WEEKLY 23.0% used · resets in 6d4h
+  credits: 12345 · automatic reload: unknown (not exposed)
+  available usage limit resets: 3

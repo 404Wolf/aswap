@@ -32,6 +32,8 @@ fn window_name(name: &str, duration: Option<u64>) -> String {
         ("seven_day_opus", _) => "WEEKLY OPUS".into(),
         ("seven_day_sonnet", _) => "WEEKLY SONNET".into(),
         (_, Some(10080)) => "WEEKLY".into(),
+        ("primary" | "secondary", None) => "QUOTA (duration unknown)".into(),
+        (_, Some(n)) => format!("WINDOW ({n}m)"),
         _ => clean(name).to_uppercase(),
     }
 }
@@ -111,6 +113,9 @@ pub fn render(rows: &[Row<'_>], compact: bool, width: usize, color: bool, now: u
                 width,
             ));
         }
+        if row.provider == "codex" && c.usage.windows.is_empty() {
+            lines.extend(wrap("  QUOTA unknown · reset unknown", width));
+        }
         for w in &c.usage.windows {
             let name = window_name(&w.name, w.duration_minutes);
             let valid = c.error.is_none()
@@ -148,7 +153,33 @@ pub fn render(rows: &[Row<'_>], compact: bool, width: usize, color: bool, now: u
                 lines.push(format!("  {bar}"));
             }
         }
+        if let Some(credits) = &c.usage.credits {
+            let balance = if credits.unlimited == Some(true) {
+                "unlimited"
+            } else {
+                credits.balance.as_deref().unwrap_or("unknown")
+            };
+            let reload = match credits.automatic_reload {
+                Some(true) => "on",
+                Some(false) => "off",
+                None => "unknown (not exposed)",
+            };
+            lines.extend(wrap(
+                &format!("  credits: {} · automatic reload: {reload}", clean(balance)),
+                width,
+            ));
+        }
+        if let Some(count) = c.usage.available_usage_resets {
+            lines.extend(wrap(
+                &format!("  available usage limit resets: {count}"),
+                width,
+            ));
+        }
+        // A missing Codex window is not an undisclosed 5-hour allowance.
         for (name, duration) in [("SESSION (5h)", 300), ("WEEKLY", 10080)] {
+            if row.provider == "codex" {
+                continue;
+            }
             if !c
                 .usage
                 .windows

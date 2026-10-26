@@ -18,6 +18,7 @@ fn observation(p: f64, at: u64) -> Cached {
                 resets_at: None,
                 duration_minutes: Some(300),
             }],
+            ..Default::default()
         },
         fetched_at: at,
         next_poll_at: at + 180,
@@ -335,4 +336,99 @@ fn legacy_unexplained_hour_long_backoff_is_not_preserved() {
     )
     .unwrap();
     assert_eq!(c.used(2000), Some(8.0));
+}
+
+#[test]
+fn codex_weekly_only_rpc_uses_its_own_epoch_and_optional_credit_metadata() {
+    // Synthetic epoch deliberately starts near midnight; weekly reset stays six days ahead.
+    let at = 1_800_000_000;
+    let reset = at + 6 * 86400 + 4 * 3600;
+    let v = serde_json::json!({
+        "accountId":"synthetic-not-exported",
+        "rateLimits":{"primary":{"usedPercent":99,"windowDurationMins":300,"resetsAt":at+3600}},
+        "rateLimitsByLimitId":{"codex":{
+            "primary":{"usedPercent":23,"windowDurationMins":10080,"resetsAt":reset},
+            "secondary":null,
+            "credits":{"balance":"12345","hasCredits":true,"unlimited":false}
+        }},
+        "rateLimitResetCredits":{"availableCount":3,"credits":[]}
+    });
+    let u = usage::parse_codex(&v).unwrap();
+    assert_eq!(u.windows.len(), 1);
+    assert_eq!(u.windows[0].name, "weekly");
+    assert_eq!(u.windows[0].duration_minutes, Some(10080));
+    assert_eq!(u.windows[0].resets_at, Some(reset));
+    assert_eq!(u.used(at), Some(23.0));
+    assert_eq!(
+        u.credits.as_ref().unwrap().balance.as_deref(),
+        Some("12345")
+    );
+    assert_eq!(u.credits.as_ref().unwrap().automatic_reload, None);
+    assert_eq!(u.available_usage_resets, Some(3));
+    let json = serde_json::to_string(&u).unwrap();
+    assert!(!json.contains("primary") && !json.contains("accountId"));
+    let identity = aswap::identity::Identity::default();
+    let cached = Cached {
+        usage: u,
+        fetched_at: at,
+        ..Default::default()
+    };
+    for compact in [true, false] {
+        let output = aswap::display::render(
+            &[aswap::display::Row {
+                provider: "codex",
+                label: "synthetic",
+                active: true,
+                identity: &identity,
+                duplicates: &[],
+                cached: &cached,
+            }],
+            compact,
+            100,
+            false,
+            at,
+        );
+        assert!(output.contains("WEEKLY 23.0% used · resets in 6d4h"));
+        assert!(!output.contains("SESSION") && !output.contains("PRIMARY"));
+        assert!(output.contains("credits: 12345 · automatic reload: unknown (not exposed)"));
+        assert!(output.contains("available usage limit resets: 3"));
+        let name = if compact {
+            "codex-weekly-list"
+        } else {
+            "codex-weekly-status"
+        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("tests/snapshots/{name}.txt"));
+        if std::env::var_os("ASWAP_UPDATE_SNAPSHOTS").is_some() {
+            std::fs::write(&path, &output).unwrap();
+        }
+        assert_eq!(output, std::fs::read_to_string(path).unwrap());
+    }
+    let mut v = v;
+    v["rateLimitsByLimitId"]["codex"]["credits"]["balance"] =
+        serde_json::json!("arbitrary-private-text");
+    assert_eq!(
+        usage::parse_codex(&v).unwrap().credits.unwrap().balance,
+        None
+    );
+    let unknown =
+        usage::parse_codex(&serde_json::json!({"rateLimits":{"primary":{"usedPercent":1}}}))
+            .unwrap();
+    assert_eq!(unknown.windows[0].name, "quota");
+    assert!(unknown.credits.is_none() && unknown.available_usage_resets.is_none());
+}
+
+#[test]
+fn legacy_codex_cache_slot_names_are_upgraded_before_output() {
+    let u: Usage = serde_json::from_value(serde_json::json!({"windows":[
+        {"name":"primary","used_percent":12,"resets_at":1800500000,"duration_minutes":10080},
+        {"name":"secondary","used_percent":7,"resets_at":null,"duration_minutes":null}
+    ]}))
+    .unwrap();
+    assert_eq!(u.windows[0].name, "weekly");
+    assert_eq!(u.windows[1].name, "quota");
+    assert_eq!(u.windows[0].resets_at, Some(1800500000));
+    assert!(u.credits.is_none());
+    let serialized = serde_json::to_string(&u).unwrap();
+    assert!(!serialized.contains("primary") && !serialized.contains("secondary"));
 }

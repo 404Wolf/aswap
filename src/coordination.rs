@@ -375,6 +375,7 @@ mod tests {
                     resets_at: None,
                     duration_minutes: Some(300),
                 }],
+                ..Default::default()
             },
             fetched_at: now(),
             next_poll_at: now() + 3600,

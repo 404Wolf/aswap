@@ -23,7 +23,39 @@ pub struct Window {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Usage {
+    #[serde(deserialize_with = "deserialize_windows")]
     pub windows: Vec<Window>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<Credits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_usage_resets: Option<u64>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Credits {
+    pub balance: Option<String>,
+    pub unlimited: Option<bool>,
+    // The current RPC does not expose reload settings. Never infer from balance.
+    pub automatic_reload: Option<bool>,
+}
+fn codex_window_name(duration: Option<u64>) -> String {
+    match duration {
+        Some(300) => "session".into(),
+        Some(10080) => "weekly".into(),
+        Some(n) => format!("window_{n}m"),
+        None => "quota".into(),
+    }
+}
+fn deserialize_windows<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<Window>, D::Error> {
+    let mut windows = Vec::<Window>::deserialize(deserializer)?;
+    // Upgrade older caches before either JSON or terminal output can expose slot names.
+    for w in &mut windows {
+        if matches!(w.name.as_str(), "primary" | "secondary") {
+            w.name = codex_window_name(w.duration_minutes);
+        }
+    }
+    Ok(windows)
 }
 impl Usage {
     pub fn used(&self, at: u64) -> Option<f64> {
@@ -127,7 +159,10 @@ pub fn parse_claude(v: &Value) -> Result<Usage> {
     if windows.is_empty() {
         return Err(Error("no supported Claude usage windows"));
     }
-    Ok(Usage { windows })
+    Ok(Usage {
+        windows,
+        ..Default::default()
+    })
 }
 pub fn parse_codex(v: &Value) -> Result<Usage> {
     let mut windows = Vec::new();
@@ -140,7 +175,7 @@ pub fn parse_codex(v: &Value) -> Result<Usage> {
         for key in ["primary", "secondary"] {
             if let Some(w) = bucket.get(key).filter(|w| !w.is_null()) {
                 windows.push(Window {
-                    name: key.to_owned(),
+                    name: codex_window_name(w.get("windowDurationMins").and_then(Value::as_u64)),
                     used_percent: percent(w.get("usedPercent"))?,
                     resets_at: w.get("resetsAt").and_then(Value::as_u64),
                     duration_minutes: w.get("windowDurationMins").and_then(Value::as_u64),
@@ -148,7 +183,32 @@ pub fn parse_codex(v: &Value) -> Result<Usage> {
             }
         }
     }
-    Ok(Usage { windows })
+    let credits = bucket
+        .and_then(|b| b.get("credits"))
+        .filter(|c| c.is_object())
+        .map(|c| Credits {
+            // Only a bounded decimal balance is user-visible; never forward arbitrary RPC text.
+            balance: c
+                .get("balance")
+                .and_then(Value::as_str)
+                .filter(|s| {
+                    !s.is_empty()
+                        && s.len() <= 40
+                        && s.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                        && s.parse::<f64>().is_ok_and(|n| n.is_finite() && n >= 0.0)
+                })
+                .map(str::to_owned),
+            unlimited: c.get("unlimited").and_then(Value::as_bool),
+            automatic_reload: None,
+        });
+    let available_usage_resets = v
+        .pointer("/rateLimitResetCredits/availableCount")
+        .and_then(Value::as_u64);
+    Ok(Usage {
+        windows,
+        credits,
+        available_usage_resets,
+    })
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Failure {

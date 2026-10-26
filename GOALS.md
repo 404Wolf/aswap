@@ -90,3 +90,8 @@ Never edit the headline (line 1).
 - [x] Cover errors, resets, rotation, alias locking, owner/follower transport and rendering with synthetic tests.
 
 ## Questions
+
+## M9: Codex weekly-only plans
+- [x] Name Codex windows by duration, preserve their own absolute reset epochs and omit invented session windows.
+- [x] Expose RPC credit balance and available reset count; explicitly mark automatic reload unknown when absent.
+- [x] Add synthetic weekly-only parsing and terminal snapshots, including conflicting compatibility-window resets.

@@ -330,3 +330,27 @@ Service setup applies role before threshold/prompt/on. Tests cover cache reset
 fetching, HTTP/error redaction, backoff/Retry-After, forced refresh, native OAuth
 request/rotation semantics, lease exclusion and aliases, managed-file preservation,
 owner cache reuse, access-only packets, SSH failures and clock skew.
+
+## Codex quota durations and credit metadata
+
+Codex primary/secondary are transport slots, not names for session/weekly quotas.
+Normalize windowDurationMins=300 to session and 10080 to weekly; other durations
+remain explicit minute windows, and absent duration is simply unknown quota.
+A weekly-only response must not invent a missing session allowance. The selected
+codex bucket supplies both utilization and resetsAt from the same window;
+resetsAt is absolute Unix seconds, passed through unchanged, not a relative
+countdown or milliseconds. Terminal output uses a relative days/hours countdown
+so a weekday/time cannot obscure which week is meant. Synthetic fixtures give
+the compatibility bucket a conflicting short reset to prove it cannot leak into
+the selected weekly bucket.
+
+The official [RateLimitWindow schema](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/typescript/v2/RateLimitWindow.ts)
+provides duration and reset fields. The [credits schema](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/typescript/v2/CreditsSnapshot.ts)
+exposes decimal balance and unlimited status, but no automatic reload setting;
+show reload as unknown rather than inferring it from balance or hasCredits.
+The [reset credits summary](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/typescript/v2/RateLimitResetCreditsSummary.ts)
+provides availableCount separately from balance. Only bounded decimal balance,
+boolean flags and numeric reset count enter normalized usage; account IDs,
+credit detail rows and backend banners are discarded. Older caches remain
+readable with missing optional metadata. Live diagnostics may inspect these
+field names/types and coarse numeric magnitudes only, never log the RPC payload.

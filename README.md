@@ -391,3 +391,9 @@ Using multiple accounts to avoid usage limits may violate provider terms.
 Users are responsible for their account use and compliance with applicable
 terms. aswap is independent of Anthropic and OpenAI; provider interfaces may
 change without notice.
+
+Codex quota windows are named by their reported duration, including weekly-only
+plans with no session window. Reset countdowns include days. When the app-server
+exposes them, status/list and usage JSON include credit balance and available
+usage limit resets. Automatic reload is shown as unknown because the current
+Codex RPC does not expose that setting; credit balance does not imply it is on.
