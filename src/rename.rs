@@ -47,11 +47,11 @@ pub(crate) fn recover(store: &Store) -> Result<()> {
     if tx.old == tx.new {
         return Err(Error("invalid rename transaction"));
     }
-    let _old_lease = store.lease(&Account {
+    let _old_lease = store.lease_label(&Account {
         provider: tx.provider,
         label: tx.old.clone(),
     })?;
-    let _new_lease = store.lease(&Account {
+    let _new_lease = store.lease_label(&Account {
         provider: tx.provider,
         label: tx.new.clone(),
     })?;
@@ -99,7 +99,7 @@ pub fn rename(store: &Store, provider: Provider, old: &str, new: &str) -> Result
     let _lock = store.lock()?;
     let state = store.load()?;
     let account = store.account(&state, provider, Some(old))?;
-    let _old_lease = store.lease(&account)?;
+    let _old_lease = store.lease_label(&account)?;
     if state
         .accounts
         .iter()
@@ -107,7 +107,7 @@ pub fn rename(store: &Store, provider: Provider, old: &str, new: &str) -> Result
     {
         return Err(Error("account already exists"));
     }
-    let _new_lease = store.lease(&Account {
+    let _new_lease = store.lease_label(&Account {
         provider,
         label: new.into(),
     })?;

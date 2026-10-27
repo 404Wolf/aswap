@@ -97,6 +97,7 @@ fn shared_child() {
             store::json_write(&home.join(".claude.json"),&json!({"oauthAccount":{"accountUuid":"synthetic-live"},"userID":"synthetic-live-id","projects":{"synthetic":{"hasTrustDialogAccepted":true}},"theme":"dark"})).unwrap();
         }
         let _lease = store.lease(&a).unwrap();
+        let _second_lease = store.lease(&a).unwrap();
         let mut view = View::prepare(&store, &a).unwrap();
         assert_eq!(
             fs::read(home.join(kind).join("existing.jsonl")).unwrap(),
@@ -148,7 +149,26 @@ fn shared_child() {
             .unwrap(),
         )
         .unwrap();
+        let mut second_view = View::prepare(&store, &a).unwrap();
+        let canonical = if provider == Provider::Claude {
+            json!({"claudeAiOauth":{"accessToken":"synthetic-fresh-canonical","refreshToken":"synthetic-fresh-refresh"}})
+        } else {
+            json!({"tokens":{"access_token":"synthetic-fresh-canonical","refresh_token":"synthetic-fresh-refresh"}})
+        };
+        store::json_write(&profile.join(provider.auth_file()), &canonical).unwrap();
         view.sync(&store, &a).unwrap();
+        second_view.sync(&store, &a).unwrap();
+        assert_eq!(
+            store::json_read::<serde_json::Value>(&profile.join(provider.auth_file())).unwrap(),
+            canonical
+        );
+        for path in [&view.path, &second_view.path] {
+            let current =
+                String::from_utf8(store::read_private(&path.join(provider.auth_file())).unwrap())
+                    .unwrap();
+            assert!(current.contains("synthetic-fresh-canonical"));
+            assert!(!current.contains("synthetic-fresh-refresh"));
+        }
         assert_eq!(fs::read(&managed).unwrap(), b"synthetic managed settings");
         assert!(home.join("settings.json").is_symlink());
         assert_eq!(
@@ -158,7 +178,7 @@ fn shared_child() {
         assert!(
             String::from_utf8(fs::read(profile.join(provider.auth_file())).unwrap())
                 .unwrap()
-                .contains("synthetic-rotated")
+                .contains("synthetic-fresh-canonical")
         );
         if provider == Provider::Claude {
             let shared: serde_json::Value = store::json_read(&home.join(".claude.json")).unwrap();
@@ -224,6 +244,7 @@ fn shared_child() {
             assert_eq!(running["auth_mode"], "chatgptAuthTokens");
         }
         drop(_lease);
+        drop(_second_lease);
         aswap::coordination::off(&store).unwrap();
         assert_eq!(
             store::json_read::<serde_json::Value>(&home.join(provider.auth_file())).unwrap(),

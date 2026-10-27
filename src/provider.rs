@@ -207,7 +207,6 @@ pub fn switch(store: &Store, provider: Provider, name: &str, activate: bool) -> 
     let _lock = store.lock()?;
     let mut state = store.load()?;
     let account = store.account(&state, provider, Some(name))?;
-    let _lease = store.lease(&account)?;
     if activate {
         activate_profile(store, &account)?;
     }
@@ -275,11 +274,7 @@ fn preserve_live(
             identity.is_some() && identity == saved_config.get("oauthAccount")
         };
         if matched {
-            let _lease = if candidate.label == target.label {
-                None
-            } else {
-                Some(store.lease(&candidate)?)
-            };
+            let _refresh = store.refresh_lock(&candidate)?;
             store::atomic(&profile.join(candidate.provider.auth_file()), bytes)?;
             target_is_live |= candidate.label == target.label;
         }
@@ -350,7 +345,7 @@ pub fn remove(store: &Store, provider: Provider, name: &str) -> Result<Vec<Strin
     let _lock = store.lock()?;
     let mut state = store.load()?;
     let account = store.account(&state, provider, Some(name))?;
-    let _lease = store.lease(&account)?;
+    let _lease = store.lease_label(&account)?;
     let profile = store.profile(provider, name)?;
     store::no_links(&profile)?;
     let duplicates = crate::identity::duplicates(store, &account, &state.accounts);

@@ -313,6 +313,7 @@ pub struct View {
     provider: Provider,
     config_path: PathBuf,
     baseline: Value,
+    account_baseline: Value,
     managed: BTreeSet<OsString>,
     stamps: BTreeMap<OsString, Stamp>,
 }
@@ -335,7 +336,19 @@ impl View {
             .into_iter()
             .filter(|a| a.provider == account.provider)
         {
-            if candidate.label != account.label {
+            if candidate.label == account.label {
+                // Managed peers only write shared state, never these legacy
+                // directories. The first prepare may migrate them even if several
+                // new sessions registered before reaching this store lock.
+                all_idle &= store.live_count(&candidate)? <= 1;
+                match store.legacy_lock(&candidate) {
+                    Ok(guard) => leases.push(guard),
+                    Err(_) => {
+                        all_idle = false;
+                        continue;
+                    }
+                }
+            } else {
                 match store.lease_label(&candidate) {
                     Ok(lease) => leases.push(lease),
                     Err(_) => {
@@ -428,6 +441,7 @@ impl View {
             provider: account.provider,
             config_path,
             baseline: json!({}),
+            account_baseline: json!({}),
             managed: BTreeSet::new(),
             stamps: BTreeMap::new(),
         };
@@ -453,19 +467,15 @@ impl View {
         view.select_locked(store, account)?;
         Ok(view)
     }
-    fn select_locked(&self, store: &Store, account: &Account) -> Result<()> {
+    fn select_locked(&mut self, store: &Store, account: &Account) -> Result<()> {
         let profile = store.profile(account.provider, &account.label)?;
         let auth = store::read_private(&profile.join(account.provider.auth_file()))?;
         provider::validate_auth(account.provider, &auth)?;
-        let auth = if crate::coordination::follower(store)? {
-            serde_json::to_vec(&crate::refresh::launch_auth(
-                account.provider,
-                &serde_json::from_slice(&auth).safe("invalid profile auth")?,
-            ))
-            .safe("cannot encode launch auth")?
-        } else {
-            auth
-        };
+        let auth = serde_json::to_vec(&crate::refresh::launch_auth(
+            account.provider,
+            &serde_json::from_slice(&auth).safe("invalid profile auth")?,
+        ))
+        .safe("cannot encode launch auth")?;
         store::atomic(&self.path.join(account.provider.auth_file()), &auth)?;
         if account.provider == Provider::Claude {
             let mut config = if self.path.join(".claude.json").exists() {
@@ -488,50 +498,38 @@ impl View {
                 .unwrap()
                 .entry("hasCompletedOnboarding")
                 .or_insert(Value::Bool(true));
+            self.account_baseline = account_config(&config);
             store::json_write(&self.path.join(".claude.json"), &config)?;
         }
         Ok(())
     }
-    pub fn select(&self, store: &Store, account: &Account) -> Result<()> {
+    pub fn select(&mut self, store: &Store, account: &Account) -> Result<()> {
         let _lock = store.lock()?;
         self.select_locked(store, account)
     }
     pub fn sync(&mut self, store: &Store, account: &Account) -> Result<()> {
         let _lock = store.lock()?;
         let profile = store.profile(account.provider, &account.label)?;
-        let auth = store::read_private(&self.path.join(account.provider.auth_file()))?;
-        provider::validate_auth(account.provider, &auth)?;
-        if crate::coordination::follower(store)? {
-            let canonical: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
-            store::json_write(
-                &self.path.join(account.provider.auth_file()),
-                &crate::refresh::launch_auth(account.provider, &canonical),
-            )?;
-        } else {
-            let previous: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
-            let current: Value = serde_json::from_slice(&auth).safe("invalid launch auth")?;
-            let before_identity =
-                crate::identity::read(account.provider, &profile).unwrap_or_default();
-            store::atomic(&profile.join(account.provider.auth_file()), &auth)?;
-            if previous != current {
-                crate::usage::credentials_changed(store, account)?;
-
-                let runtime_config = if account.provider == Provider::Claude {
-                    store::json_read(&self.path.join(".claude.json"))?
-                } else {
-                    json!({})
-                };
-                let after =
-                    crate::identity::from_values(account.provider, &current, &runtime_config);
-                if crate::identity::same(&before_identity, &after) {
-                    crate::refresh::propagate(store, account, &current)?;
-                }
-            }
-        }
+        // Launch views never own refresh tokens. Re-read the authority rather than
+        // letting a stale/late native write roll canonical credentials backwards.
+        let canonical: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
+        store::json_write(
+            &self.path.join(account.provider.auth_file()),
+            &crate::refresh::launch_auth(account.provider, &canonical),
+        )?;
         if self.provider == Provider::Claude {
             let config: Value = store::json_read(&self.path.join(".claude.json"))?;
             if !crate::coordination::follower(store)? {
-                store::json_write(&profile.join(".claude.json"), &account_config(&config))?;
+                let after = account_config(&config);
+                let own = profile.join(".claude.json");
+                let mut current = if own.exists() {
+                    store::json_read(&own)?
+                } else {
+                    json!({})
+                };
+                merge_changes(&self.account_baseline, &after, &mut current);
+                store::json_write(&own, &current)?;
+                self.account_baseline = after;
             }
             let after = non_account(&config);
             let mut current = read_config(&self.config_path)?;

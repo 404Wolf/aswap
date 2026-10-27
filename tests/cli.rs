@@ -119,11 +119,6 @@ fn cli_lifecycle_json_and_waybar_schema() {
         true
     );
     assert!(!t.invoke(&["switch", "codex", "work"]).status.success());
-    assert!(
-        !t.invoke(&["run", "claude", "--auto", "--", "--print", "synthetic"])
-            .status
-            .success()
-    );
 }
 #[test]
 fn errors_hide_bad_credentials_and_managed_files() {

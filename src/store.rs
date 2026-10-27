@@ -48,10 +48,7 @@ pub struct Store {
     pub root: PathBuf,
 }
 pub struct Guard(File);
-pub struct Lease {
-    _label: Guard,
-    _identity: Option<Guard>,
-}
+pub use crate::live::Lease;
 impl Drop for Guard {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.0);
@@ -253,27 +250,47 @@ impl Store {
             .ok_or(Error("account not found"))
     }
     pub fn lease(&self, account: &Account) -> Result<Lease> {
-        label(&account.label)?;
-        let label = self.lease_label(account)?;
+        let _lock = self.lock()?;
+        self.lease_locked(account)
+    }
+    pub(crate) fn lease_locked(&self, account: &Account) -> Result<Lease> {
+        crate::live::register(self, account)
+    }
+    pub(crate) fn live_count(&self, account: &Account) -> Result<usize> {
+        crate::live::count(self, account)
+    }
+    /// Short identity critical section; caller also holds the store lock.
+    pub(crate) fn refresh_lock(&self, account: &Account) -> Result<Guard> {
         let identity = crate::identity::read(
             account.provider,
             &self.profile(account.provider, &account.label)?,
         )
         .unwrap_or_default();
-        let identity = if let Some(key) = identity.lock_key() {
-            Some(self.lease_label(&Account {
-                provider: account.provider,
-                label: format!("identity-{key}"),
-            })?)
-        } else {
-            None
-        };
-        Ok(Lease {
-            _label: label,
-            _identity: identity,
-        })
+        let key = identity.lock_key().unwrap_or_else(|| account.label.clone());
+        let path = self
+            .root
+            .join(format!("{}-{key}.refresh.lock", account.provider));
+        no_links(&path)?;
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .safe("cannot open refresh lock")?;
+        f.lock_exclusive().safe("cannot lock credential refresh")?;
+        Ok(Guard(f))
     }
     pub(crate) fn lease_label(&self, account: &Account) -> Result<Guard> {
+        if self.live_count(account)? > 0 {
+            return Err(Error(
+                "account profile is in use; retry after its sessions exit",
+            ));
+        }
+        self.legacy_lock(account)
+    }
+    pub(crate) fn legacy_lock(&self, account: &Account) -> Result<Guard> {
         let path = self
             .root
             .join(format!("{}-{}.run.lock", account.provider, account.label));
@@ -287,7 +304,7 @@ impl Store {
             .open(path)
             .safe("cannot open profile lock")?;
         f.try_lock_exclusive()
-            .safe("account profile is in use; retry after its session exits")?;
+            .safe("legacy refresh-capable session is still running")?;
         Ok(Guard(f))
     }
 }

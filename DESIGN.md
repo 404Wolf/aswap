@@ -60,7 +60,7 @@ Keychain support. No keychain inspection is needed for development.
 
 Store data only below XDG_DATA_HOME/aswap, with validated labels instead
 of email-based paths, private directories and files, a process-wide store
-lock and per-profile run locks. Metadata and secret bytes are separate;
+lock and independent per-session liveness records. Metadata and secret bytes are separate;
 metadata/usage output never serializes credentials. Error text must not
 include provider response bodies, credentials, arbitrary filesystem paths or
 child stderr. Tests create synthetic credentials at runtime in temp dirs.
@@ -69,8 +69,8 @@ Development commands never inspect real Claude/Codex homes.
 Switch selects the default profile for aswap launchers; Claude additionally
 supports an explicit default-file activation operation. Isolated run never
 rewrites another profile. Avoid sharing writable auth files or replacing
-Home Manager managed files. Running provider processes own refresh-token rotation;
-only the explicit owner refreshes inactive profiles. Never restore stale backup credentials.
+Home Manager managed files. Managed provider processes only receive access tokens;
+canonical refresh/write-back is serialized by aswap. Never restore stale backup credentials.
 
 Codex uses CODEX_HOME profiles with auth.json. Quota should be read through
 Codex's app-server account/rateLimits/read RPC, with initialize/initialized
@@ -99,9 +99,10 @@ Clean exits do not restart; forced switches send the configured follow-up unless
 disabled. Restarts are capped at eight. No code changes the caller's cwd.
 
 OAuth refresh now follows the provider-native flows below on an explicit owner.
-Running provider CLIs retain refresh ownership through profile/identity leases;
-inactive profiles can be refreshed before usage polling. Followers have no
-refresh-capable credentials and consume the owner's access tokens and quota.
+Every managed CLI receives an access-only view, on the owner as well as followers.
+Active local runs refresh canonical credentials through aswap; inactive background
+refresh requires the explicit owner role. Followers consume only the owner's
+access tokens and quota. Session count never determines account eligibility.
 
 Interactive auto sessions use a Linux PTY, forwarding terminal I/O and window
 size while preserving native provider UIs. Signal cleanup restores terminal
@@ -134,8 +135,8 @@ rendering strips control characters from local hints and wraps to terminal width
 
 ## Label rename and forced-switch follow-up
 
-Rename validates both labels and holds the store lock plus the old/new profile
-leases. It moves the profile (including usage-cache.json and native histories)
+Rename validates both labels and holds the store lock while checking old/new
+live-session records and legacy locks. It moves the profile (including usage-cache.json and native histories)
 and sessions/<provider>/<label>, then relabels the account and active selection.
 Auto policy is provider-wide and survives unchanged, including cooldown and the
 resume prompt. No separate label-keyed usage cache or policy exists. A private
@@ -145,7 +146,7 @@ returning to a reader. Preflight refuses existing destination metadata/directori
 symlinks and running profiles. Lock files are retained to avoid inode-lock races.
 
 New launch views live below runtimes/<provider>/<initial-label>/run-*; the
-history owner's lease remains held across account switches to protect migration
+history owner's per-session liveness record remains registered across account switches to protect migration
 and rename. Canonical transcripts live in the caller's shared provider home.
 Legacy sessions/<provider>/<label>/run-* and anonymous sessions/run-* histories
 are migrated as new files when the owning/all provider profiles are idle.
@@ -190,8 +191,9 @@ are shared. Account-key classification is an explicit compatibility boundary,
 not a claim of a documented exhaustive provider schema.
 
 At launch, account keys are removed from the shared config and overlaid from the
-selected profile. At exit and before a switch, only that profile's keys/auth are
-saved back. Non-account changes use a recursive three-way merge against the
+selected profile. At exit and before a switch, account-bound config edits use a three-way merge
+against that view's baseline; auth is re-read from canonical storage, never saved
+from the access-only runtime. Non-account changes use a recursive three-way merge against the
 launch baseline under the store lock: unchanged keys do not write back, nested
 project changes compose, and concurrent leaf changes win. The real home's
 account keys never change. Native clients do not honor aswap's store lock, so a
@@ -201,8 +203,10 @@ limitation; ordinary concurrent aswap runs merge without lost unrelated keys.
 Migration streams only new files into shared state via no-clobber atomic publish.
 Existing transcripts, indexes and symlinks are untouched. Originals and collisions
 move to private migration-backups, including a full pre-split global config.
-Profiles in use are skipped. Legacy auto directories with unknown owners are
-migrated only while all provider profile leases are held. Legacy symlinks are
+Profiles used by legacy clients and other busy labels are skipped. Concurrent
+managed launches of the selected account serialize its migration before launch.
+Legacy auto directories with unknown owners are
+migrated only when no other provider sessions use the profiles. Legacy symlinks are
 left in place rather than followed. No migration runs against real stores during
 development: all tests create synthetic homes and transcripts outside Git.
 
@@ -264,14 +268,14 @@ JWT exp is an expiry hint, not proof of token validity. Failed/rejected or
 malformed responses do not overwrite credentials; invalid_grant requires re-login
 on the owner. There is no expiry-timestamp contest between machines.
 
-Refresh happens under the store lock plus the nonblocking account lease, with a
-fresh credential read after locking. Duplicate known identities share a hashed
-identity lease as well as label leases, so a running alias excludes background
-refresh. Successful rotations propagate to idle duplicate auth records while
-preserving other extensions. Running views sync their CLI's fresh credentials
-back at 30s cadence and exit. Usage-only Codex app-servers use a private temporary
-access-only auth snapshot, so they cannot rotate behind a running CLI. No real
-credential or transcript files were inspected or used in development tests.
+Refresh happens under a short identity lock and the store lock, with a fresh
+credential read after locking. Successful rotations propagate to duplicate auth
+records while preserving unrelated extensions, including when those aliases are
+in use. Live views cannot restore stale tokens: all runtimes use access-only
+credentials and periodically re-read canonical auth. Refresh failures share an
+identity cooldown (exponential up to 15m, honoring longer Retry-After); explicit
+forced refresh can bypass it. Usage-only app-servers also receive access-only
+auth snapshots. No real credential or transcript files were used in tests.
 
 ## Multi-machine design: one authority, access-only followers
 
@@ -389,3 +393,40 @@ are instead label-conflict, and a local label bound to a different known account
 is identity-conflict. Whole-packet preflight rejects either conflict before any
 credentials are replaced. Synthetic tests exercise real client/server pipes,
 role drift, legacy stderr, duplicate aliases, conflicts and untrusted diagnostics.
+
+## Concurrent sessions and lifecycle
+
+There is no admission limit per account. Each plain/auto run creates a unique
+0600 JSON liveness record under live/<provider>/<label>/ under the store lock.
+It contains only the supervisor/child PID and Linux process start ticks, plus a
+boot ID. Rename/remove and ownership changes scan these records under the same
+lock, refuse live users, and collect dead parents/children, reused PIDs, zombies,
+previous-boot records and orphan temporary writes. Corrupt published records fail
+closed. A supervised child gets a Linux parent-death kill signal, closing the
+fork-to-record gap; child liveness is also recorded before supervision starts.
+Auto keeps its original history-label record and its current account record,
+updating both child PIDs after a switch. Switching or killing one session only
+targets its child/process group. Existing processes and their views are untouched.
+
+No lifetime flock serializes new runs. Flock inodes for store, identity and legacy
+locks remain on disk to prevent inode races; the kernel releases actual locks on
+exit/SIGKILL, so these files cannot become stale admission barriers. Old release
+run locks are checked only by mutations and refresh to avoid competing with a
+still-running refresh-capable legacy process during an upgrade. Restart old
+aswap sessions during deployment to migrate them to access-only views.
+
+Auto decisions re-read cached candidates under the store lock and register their
+own lease/update policy atomically. Busy candidates remain eligible; quota is the
+selection criterion, without a load tie-breaker. No network operation happens in
+this decision section. Shared config changes merge per view, including private
+account-config changes; refresh credentials only change in the canonical identity
+critical section. A local active run can refresh its own non-follower store even
+when background refresh is disabled, matching the old native CLI behavior.
+Across machines, configure one refresh owner and access-only SSH followers; no
+number of sessions on followers obtains a refresh token or becomes an owner.
+Native clients outside aswap and independent refresh-capable copies on other
+machines remain outside this coordination protocol.
+
+Session liveness guards are local to each machine's store. Owner label
+administration still requires coordinating affected sessions on other machines;
+an SSH pull does not grant the owner authority to terminate remote processes.

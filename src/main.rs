@@ -478,7 +478,7 @@ fn execute(cli: Cli) -> Result<i32> {
                 output(
                     &json!({"refresh_owner":false,"role":"refresh-disabled"}),
                     cli.json,
-                    "Automatic OAuth refresh disabled; profiles retained".into(),
+                    "Background OAuth refresh disabled; profiles retained".into(),
                 )?;
             } else if owner {
                 aswap::coordination::owner(&store)?;

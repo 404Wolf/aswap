@@ -56,7 +56,8 @@ working directory unchanged. Auth is private, while state comes from the caller'
 `CLAUDE_CONFIG_DIR` / `CODEX_HOME` (or `~/.claude` / `~/.codex`). Conversations,
 project trust, MCP configuration, settings, instructions, plugins and skills are
 available across accounts, like one provider installation. `/resume` sees the
-shared project history. Separate accounts may run concurrently.
+shared project history. Any number of plain or auto sessions can use the same or different accounts
+concurrently. Starting another session never waits for an account to become free.
 
 Each launch uses a private view under the aswap store. Ordinary state entries
 are per-entry symlinks into the shared home. Home Manager-managed symlinks are
@@ -71,12 +72,15 @@ On first launch after upgrading, isolated profile and retained auto histories
 are merged into the shared home with **new files only**. Existing files and
 session indexes are never overwritten, and migration never follows destination
 symlinks. Originals, including collisions, are retained privately under
-`$XDG_DATA_HOME/aswap/migration-backups/`. Busy profiles migrate when idle.
+`$XDG_DATA_HOME/aswap/migration-backups/`. Legacy refresh-capable runs must
+finish before their histories migrate; simultaneous new launches serialize migration.
 Anonymous legacy auto directories migrate only when all provider profiles are
 idle. No transcript text is logged or used to infer session identity.
 
-Automatic OAuth refresh is **opt-in on one owner**: `aswap sync --owner`.
-Without ownership configured, usage still works while access tokens remain valid;
+Background OAuth refresh is **opt-in on one owner**: `aswap sync --owner`.
+Each active local run can refresh its non-follower store through aswap. Every
+launch view is access-only; native sessions never rotate copied refresh tokens.
+Without background ownership configured, inactive usage works while access tokens remain valid;
 status JSON reports `credential_mode: "refresh-disabled"`. For three machines,
 configure the owner/followers below before restarting monitors and resuming sessions. Re-login on the
 owner if the provider has already invalidated a refresh token. API-key accounts
@@ -253,18 +257,26 @@ terminal/JSON output reports counts only. It transfers access-only auth,
 account-bound metadata and quota caches, never transcripts, settings, or refresh
 tokens. The hidden transport command is for SSH pipes, not human use.
 
-Only the owner polls provider quota and refreshes inactive credentials. Every
-monitor/client shares its persisted per-profile cache; followers pull at most
-once per 30 seconds and do not issue their own usage/refresh requests. Running
-views collect owner CLI rotations or receive follower access-token updates at
-30-second cadence. Duplicate identities share a lease and receive the same local
-rotation. This prevents refreshing an idle alias while another alias is running.
-The owner holds the profile/identity lease for background refresh and atomically
-saves rotated tokens; a running owner CLI remains responsible for its own refresh.
+Only the owner polls provider quota and refreshes canonical credentials for the
+three-machine setup. Every monitor/client shares its persisted per-profile cache;
+followers pull at most once per 30 seconds. All live views, including owner runs,
+receive access-token updates at 30-second cadence. An identity lock serializes
+refresh; waiters re-read the refreshed credentials, and duplicate aliases receive
+the same rotation. Failed refresh attempts share a cooldown rather than creating
+one request per live session. Stale runtime writes cannot overwrite canonical auth.
+
+Live sessions have individual PID/start-time/boot records. Rename/remove refuse
+while any session uses the label; dead/reused PIDs and killed-session records are
+collected automatically. Killing a supervisor also stops its provider child.
+Automatic switching remains local to each session and can choose an account
+already used by any number of other sessions. Restart sessions from older aswap
+releases during deployment so they also receive the new access-only views.
 
 Use `aswap run` on followers; independently running the native CLI against old
 refresh-capable copies is outside this ownership protocol. Perform login and
 profile administration on the owner, then sync while affected profiles are idle.
+Session guards are local to each machine's store; coordinate label removals and
+renames with remote users before administering the owner.
 Unmatched local profiles retain their files but become ineligible for auto quota
 selection. On owner/network failure, last-known quotas become unavailable/stale;
 followers never promote themselves or guess which machine has a valid refresh

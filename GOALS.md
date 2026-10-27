@@ -85,7 +85,7 @@ Never edit the headline (line 1).
 ## M8: Usage freshness and one refresh owner
 - [x] Expose redacted HTTP/RPC/network reasons, cap ordinary backoff at 15m, honor Retry-After and add usage --refresh.
 - [x] Fetch after window resets and render stale last-known bars dimmed.
-- [x] Refresh inactive OAuth profiles using native provider flows under label/identity leases; persist rotations atomically and protect running aliases.
+- [x] Refresh OAuth profiles using native provider flows under identity critical sections; persist rotations atomically and feed running aliases access-only credentials.
 - [x] Add explicit refresh ownership, access-only SSH sync/cache followers, Home Manager roles and the recommended three-machine setup.
 - [x] Cover errors, resets, rotation, alias locking, owner/follower transport and rendering with synthetic tests.
 
@@ -102,3 +102,10 @@ Never edit the headline (line 1).
 - [x] Classify SSH/protocol/store failures and safely filter the remote stderr first line, including legacy owners.
 - [x] Prevent implicit owner demotion; keep duplicate identities as warned aliases and reject actual label/identity conflicts.
 - [x] Test real synthetic transport round trips, role drift, redaction, bounded pipes, timeouts and conflict preflight.
+
+
+## M11: Concurrent sessions on each account
+- [x] Replace exclusive run locks with independent PID/start-time/boot leases, preserving mutation protection and stale-record cleanup.
+- [x] Give every run access-only auth and centralize serialized refresh, rotation propagation, cooldowns and stale-write protection.
+- [x] Keep busy accounts eligible for atomic auto decisions and isolate each session's switches/process lifecycle.
+- [x] Test many concurrent plain/auto runs, busy-target failover, killed supervisors, PID/boot cleanup and concurrent refresh attempts; retain credits polish.

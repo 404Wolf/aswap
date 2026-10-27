@@ -7,6 +7,7 @@ use crate::{
 };
 use std::{
     io::{IsTerminal, Write},
+    os::unix::process::CommandExt,
     process::{Child, Stdio},
     sync::Arc,
     time::Duration,
@@ -43,7 +44,7 @@ impl Drop for Running {
     }
 }
 
-/// Persistent per-account profiles permit concurrent *different* accounts.
+/// Every run has its own live lease and access-only authentication view.
 /// Auto sessions keep a stable history directory while changing credentials.
 pub fn run(
     store: &Store,
@@ -63,19 +64,28 @@ pub fn run(
         store.account(&store.load()?, provider, name)?
     };
     if auto {
-        let (entries, settings) = observations(store, provider)?;
-        if let Some(best) = usage::choose(
-            &account.label,
-            &entries,
-            settings.threshold,
-            settings.last_switch,
-            now(),
-            false,
-        ) {
-            account = best.clone();
-        }
+        let _ = observations(store, provider)?;
     }
-    let mut lease = Arc::new(store.lease(&account)?);
+    let mut lease = {
+        let _lock = store.lock()?;
+        if auto {
+            let state = store.load()?;
+            let settings = state.auto.get(&provider).cloned().unwrap_or_default();
+            if let Some(best) = usage::choose(
+                &account.label,
+                &entries_from_cache(store, provider)?,
+                settings.threshold,
+                settings.last_switch,
+                now(),
+                false,
+            ) {
+                account = best.clone();
+            }
+        }
+        store.account(&store.load()?, provider, Some(&account.label))?;
+        Arc::new(store.lease_locked(&account)?)
+    };
+    let _ = crate::refresh::for_run(store, &account);
     let history_owner = account.label.clone();
     // Retain the history owner's lease even after switching credentials.
     let history_lease = auto.then(|| Arc::clone(&lease));
@@ -108,6 +118,20 @@ pub fn run(
     loop {
         let mut cmd = provider.command(&view.path);
         cmd.args(&launch_args);
+        let supervisor = std::process::id();
+        // SAFETY: only async-signal-safe Linux syscalls run after fork. Close the
+        // spawn/record gap: a killed supervisor cannot leave an untracked provider.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() as u32 != supervisor {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
         let mut child = Running(
             if let Some(terminal) = &mut terminal {
                 terminal.spawn(&mut cmd)?
@@ -120,6 +144,12 @@ pub fn run(
             },
             auto,
         );
+        lease.child(child.0.id())?;
+        if let Some(history) = &history_lease
+            && !Arc::ptr_eq(history, &lease)
+        {
+            history.child(child.0.id())?;
+        }
         let mut limited = false;
         let mut target = None;
         let mut next_check = 0;
@@ -130,6 +160,7 @@ pub fn run(
             if now() >= next_sync {
                 next_sync = now().saturating_add(30);
                 if crate::coordination::poll(store, None, false).is_ok() {
+                    let _ = crate::refresh::for_run(store, &account);
                     let _ = view.sync(store, &account);
                 }
             }
@@ -204,7 +235,7 @@ pub fn run(
         if (!did_limit && target.is_none()) || switches >= 8 {
             return Ok(status.code().unwrap_or(1));
         }
-        let Some(next) = target else {
+        let Some(_) = target else {
             return Ok(status.code().unwrap_or(1));
         };
         let exact_id = tracker
@@ -212,24 +243,42 @@ pub fn run(
             .expect("auto session tracker")
             .id()?
             .to_owned();
-        drop(lease);
-        account = next;
-        lease = if account.label == history_owner {
-            Arc::clone(history_lease.as_ref().expect("auto session history lease"))
-        } else {
-            Arc::new(store.lease(&account)?)
-        };
-        {
-            let _lock = store.lock()?;
-            store.account(&store.load()?, provider, Some(&account.label))?;
-        }
-        view.select(store, &account)?;
-        {
+        // Revalidate, reserve a new per-session lease and commit the decision
+        // together. Other sessions using the best account do not exclude it.
+        let (next, next_lease) = {
             let _lock = store.lock()?;
             let mut state = store.load()?;
+            let next = usage::choose(
+                &account.label,
+                &entries_from_cache(store, provider)?,
+                state
+                    .auto
+                    .get(&provider)
+                    .cloned()
+                    .unwrap_or_default()
+                    .threshold,
+                0,
+                now(),
+                true,
+            )
+            .cloned()
+            .ok_or(crate::Error(
+                "no eligible account after automatic switch decision",
+            ))?;
+            let next_lease = if next.label == history_owner {
+                Arc::clone(history_lease.as_ref().expect("auto session history lease"))
+            } else {
+                Arc::new(store.lease_locked(&next)?)
+            };
             state.auto.entry(provider).or_default().last_switch = now();
             store.save(&state)?;
-        }
+            (next, next_lease)
+        };
+        drop(lease);
+        account = next;
+        lease = next_lease;
+        let _ = crate::refresh::for_run(store, &account);
+        view.select(store, &account)?;
         let prompt = {
             let _lock = store.lock()?;
             store
@@ -305,7 +354,6 @@ pub fn tick(store: &Store, provider: Provider, activate_live: bool) -> Result<Op
     ) else {
         return Ok(None);
     };
-    let _lease = store.lease(account)?;
     if activate_live {
         crate::provider::activate_profile(store, account)?;
     }
@@ -313,4 +361,22 @@ pub fn tick(store: &Store, provider: Provider, activate_live: bool) -> Result<Op
     state.auto.entry(provider).or_default().last_switch = now();
     store.save(&state)?;
     Ok(Some(account.label.clone()))
+}
+
+fn entries_from_cache(store: &Store, provider: Provider) -> Result<Vec<(Account, usage::Cached)>> {
+    store
+        .load()?
+        .accounts
+        .into_iter()
+        .filter(|a| a.provider == provider)
+        .map(|a| {
+            let path = store.profile(provider, &a.label)?.join("usage-cache.json");
+            let cache = if path.exists() {
+                store::json_read(&path)?
+            } else {
+                usage::Cached::default()
+            };
+            Ok((a, cache))
+        })
+        .collect()
 }

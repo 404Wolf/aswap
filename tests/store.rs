@@ -68,7 +68,7 @@ fn leases_prevent_parallel_mutation_of_same_profile() {
     let store = Store::open(t.path().join("store")).unwrap();
     let a = account("a");
     let _lease = store.lease(&a).unwrap();
-    assert!(store.lease(&a).is_err());
+    assert!(store.lease(&a).is_ok());
     assert!(store.lease(&account("b")).is_ok());
 }
 #[test]

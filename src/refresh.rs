@@ -165,8 +165,8 @@ fn request(provider: Provider, body: &Value) -> std::result::Result<Value, Failu
     }
     Ok(value)
 }
-/// Caller holds the store lock. A nonblocking profile lease excludes running
-/// provider processes, including private launch views with rotating credentials.
+/// Caller holds the store lock. Only the canonical owner can rotate tokens;
+/// access-only live sessions never hold or compete for the refresh lock.
 pub fn refresh_with<F>(
     store: &Store,
     account: &Account,
@@ -177,17 +177,56 @@ pub fn refresh_with<F>(
 where
     F: FnOnce(Provider, &Value) -> std::result::Result<Value, Failure>,
 {
-    if !crate::coordination::is_owner(store).map_err(|_| Failure::new("usage-unavailable"))? {
+    refresh_inner(store, account, at, force, false, request)
+}
+fn refresh_inner<F>(
+    store: &Store,
+    account: &Account,
+    at: u64,
+    force: bool,
+    active: bool,
+    request: F,
+) -> std::result::Result<bool, Failure>
+where
+    F: FnOnce(Provider, &Value) -> std::result::Result<Value, Failure>,
+{
+    if crate::coordination::follower(store).map_err(|_| Failure::new("usage-unavailable"))?
+        || (!active
+            && !crate::coordination::is_owner(store)
+                .map_err(|_| Failure::new("usage-unavailable"))?)
+    {
         return Ok(false);
     }
-    let Ok(_lease) = store.lease(account) else {
+    // Exclude refresh-capable clients from the previous aswap release during upgrade.
+    let Ok(_legacy) = store.legacy_lock(account) else {
         return Ok(false);
     };
+    let identity = crate::identity::read(
+        account.provider,
+        &store
+            .profile(account.provider, &account.label)
+            .map_err(|_| Failure::new("usage-unavailable"))?,
+    )
+    .unwrap_or_default();
+    let _legacy_identity = if let Some(key) = identity.lock_key() {
+        match store.legacy_lock(&Account {
+            provider: account.provider,
+            label: format!("identity-{key}"),
+        }) {
+            Ok(lock) => Some(lock),
+            Err(_) => return Ok(false),
+        }
+    } else {
+        None
+    };
+    let _refresh = store
+        .refresh_lock(account)
+        .map_err(|_| Failure::new("usage-unavailable"))?;
     let path = store
         .profile(account.provider, &account.label)
         .map_err(|_| Failure::new("usage-unavailable"))?
         .join(account.provider.auth_file());
-    // Re-read only after acquiring the lease; never overwrite a CLI rotation.
+    // Re-read only after acquiring the identity lock; another refresher may have won.
     let old: Value = store::json_read(&path).map_err(|_| Failure::new("usage-unavailable"))?;
     if account.provider == Provider::Codex
         && old.get("tokens").is_none_or(Value::is_null)
@@ -201,9 +240,48 @@ where
     {
         return Ok(false);
     }
-    let body = request_body(account.provider, &old)?;
-    let response = request(account.provider, &body)?;
-    let auth = apply_response(account.provider, &old, &response, at)?;
+    // A failed refresh must not become N identical requests from N live sessions.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct Backoff {
+        next: u64,
+        failures: u32,
+    }
+    let key = identity.lock_key().unwrap_or_else(|| account.label.clone());
+    let gate = store
+        .root
+        .join(format!("{}-{key}.refresh-backoff.json", account.provider));
+    let previous: Backoff = if gate.exists() {
+        store::json_read(&gate).map_err(|_| Failure::new("usage-unavailable"))?
+    } else {
+        Backoff::default()
+    };
+    if !force && at < previous.next {
+        return Ok(false);
+    }
+    let result = (|| {
+        let body = request_body(account.provider, &old)?;
+        let response = request(account.provider, &body)?;
+        apply_response(account.provider, &old, &response, at)
+    })();
+    let auth = match result {
+        Ok(auth) => auth,
+        Err(error) => {
+            let failures = previous.failures.saturating_add(1);
+            let delay = 60u64
+                .saturating_mul(1u64 << failures.saturating_sub(1).min(4))
+                .min(900)
+                .max(error.retry_after);
+            store::json_write(
+                &gate,
+                &Backoff {
+                    next: at.saturating_add(delay),
+                    failures,
+                },
+            )
+            .map_err(|_| Failure::new("usage-unavailable"))?;
+            return Err(error);
+        }
+    };
     provider::validate_auth(
         account.provider,
         &serde_json::to_vec(&auth).map_err(|_| Failure::new("refresh-invalid-response"))?,
@@ -211,7 +289,20 @@ where
     .map_err(|_| Failure::new("refresh-invalid-response"))?;
     store::json_write(&path, &auth).map_err(|_| Failure::new("usage-unavailable"))?;
     propagate(store, account, &auth).map_err(|_| Failure::new("usage-unavailable"))?;
+    crate::usage::credentials_changed(store, account)
+        .map_err(|_| Failure::new("usage-unavailable"))?;
+    if gate.exists() {
+        std::fs::remove_file(&gate).map_err(|_| Failure::new("usage-unavailable"))?;
+    }
     Ok(true)
+}
+/// An active local run may refresh even when inactive-profile monitoring is off.
+/// Followers still only pull from the designated owner.
+pub fn for_run(store: &Store, account: &Account) -> std::result::Result<bool, Failure> {
+    let _lock = store
+        .lock()
+        .map_err(|_| Failure::new("usage-unavailable"))?;
+    refresh_inner(store, account, crate::now(), false, true, request)
 }
 pub fn refresh(
     store: &Store,
@@ -269,7 +360,15 @@ pub fn launch_auth(provider: Provider, auth: &Value) -> Value {
                 o.insert("expiresAt".into(), json!(expiry.saturating_add(86400000)));
             }
         }
-    } else {
+    } else if auth
+        .pointer("/tokens/access_token")
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.is_empty())
+        && !auth
+            .get("OPENAI_API_KEY")
+            .and_then(Value::as_str)
+            .is_some_and(|key| !key.is_empty())
+    {
         auth["auth_mode"] = json!("chatgptAuthTokens");
     }
     auth

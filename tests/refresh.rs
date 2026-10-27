@@ -65,7 +65,7 @@ fn refresh_rotation_scope_expiry_and_atomic_write_under_lease() {
     );
 }
 #[test]
-fn disabled_followers_and_running_profiles_never_rotate() {
+fn disabled_monitors_do_not_rotate_but_owner_refreshes_running_profiles() {
     let (_t, store, a) = seed();
     assert!(
         !refresh::refresh_with(&store, &a, 1000, true, |_, _| panic!(
@@ -76,12 +76,9 @@ fn disabled_followers_and_running_profiles_never_rotate() {
     coordination::owner(&store).unwrap();
     let _lease = store.lease(&a).unwrap();
     let _lock = store.lock().unwrap();
-    assert!(
-        !refresh::refresh_with(&store, &a, 1000, true, |_, _| panic!(
-            "running CLI owns rotation"
-        ))
-        .unwrap()
-    );
+    assert!(refresh::refresh_with(&store, &a, 1000, true, |_, _| {
+        Ok(json!({"access_token":"synthetic-concurrent-fresh", "refresh_token":"synthetic-concurrent-refresh", "expires_in":3600}))
+    }).unwrap());
 }
 #[test]
 fn codex_flow_preserves_omitted_rotation_fields_and_owner_managed_launch_auth() {
@@ -111,6 +108,8 @@ fn codex_flow_preserves_omitted_rotation_fields_and_owner_managed_launch_auth() 
         refresh::launch_auth(Provider::Codex, &after)["auth_mode"],
         "chatgptAuthTokens"
     );
+    let api = json!({"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-api-key"});
+    assert_eq!(refresh::launch_auth(Provider::Codex, &api), api);
     let claude = json!({"claudeAiOauth":{"accessToken":"synthetic-access","refreshToken":"synthetic-real-refresh","expiresAt":1000000}});
     assert!(
         refresh::access_only(Provider::Claude, &claude)["claudeAiOauth"]
@@ -141,7 +140,7 @@ fn codex_flow_preserves_omitted_rotation_fields_and_owner_managed_launch_auth() 
 }
 
 #[test]
-fn duplicate_labels_share_the_running_lock_and_receive_one_rotation() {
+fn duplicate_labels_allow_parallel_sessions_and_receive_one_rotation() {
     let (_t, store, a) = seed();
     let profile = store.profile(a.provider, &a.label).unwrap();
     store::json_write(
@@ -166,24 +165,94 @@ fn duplicate_labels_share_the_running_lock_and_receive_one_rotation() {
     old["syntheticAliasExtension"] = json!(true);
     store::json_write(&other.join(".credentials.json"), &old).unwrap();
     coordination::owner(&store).unwrap();
-    let lease = store.lease(&alias).unwrap();
-    assert!(store.lease(&a).is_err());
-    {
-        let _lock = store.lock().unwrap();
-        assert!(
-            !refresh::refresh_with(&store, &a, 1000, true, |_, _| panic!(
-                "a running alias owns rotation"
-            ))
-            .unwrap()
-        );
-    }
-    drop(lease);
+    let _leases = [
+        store.lease(&alias).unwrap(),
+        store.lease(&a).unwrap(),
+        store.lease(&a).unwrap(),
+    ];
     let _lock = store.lock().unwrap();
-    assert!(refresh::refresh_with(&store,&a,1000,true,|_,_|Ok(json!({"access_token":"synthetic-shared-new","refresh_token":"synthetic-shared-rotated","expires_in":3600}))).unwrap());
+    assert!(refresh::refresh_with(&store,&a,1000,false,|_,_|Ok(json!({"access_token":"synthetic-shared-new","refresh_token":"synthetic-shared-rotated","expires_in":3600}))).unwrap());
+    assert!(
+        !refresh::refresh_with(&store, &alias, 1001, false, |_, _| panic!(
+            "alias must re-read rotated credentials"
+        ))
+        .unwrap()
+    );
     let alias_auth: Value = store::json_read(&other.join(".credentials.json")).unwrap();
     assert_eq!(
         alias_auth["claudeAiOauth"]["refreshToken"],
         "synthetic-shared-rotated"
     );
     assert_eq!(alias_auth["syntheticAliasExtension"], true);
+}
+
+#[test]
+fn many_concurrent_refreshers_re_read_one_rotation_while_sessions_are_live() {
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let (_t, store, a) = seed();
+    coordination::owner(&store).unwrap();
+    let leases = (0..24)
+        .map(|_| store.lease(&a).unwrap())
+        .collect::<Vec<_>>();
+    let barrier = Arc::new(Barrier::new(24));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let threads=(0..24).map(|_| {
+        let root=store.root.clone();let a=a.clone();let barrier=barrier.clone();let calls=calls.clone();let active=active.clone();
+        std::thread::spawn(move||{
+            let store=Store::open(root).unwrap();barrier.wait();
+            let _lock=store.lock().unwrap();
+            refresh::refresh_with(&store,&a,1000,false,|_,body|{
+                assert_eq!(active.fetch_add(1,Ordering::SeqCst),0);
+                assert_eq!(body["refresh_token"],"synthetic-refresh-old");
+                calls.fetch_add(1,Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                active.fetch_sub(1,Ordering::SeqCst);
+                Ok(json!({"access_token":"synthetic-concurrent-new","refresh_token":"synthetic-concurrent-rotated","expires_in":3600}))
+            }).unwrap()
+        })
+    }).collect::<Vec<_>>();
+    let rotations = threads
+        .into_iter()
+        .map(|t| usize::from(t.join().unwrap()))
+        .sum::<usize>();
+    assert_eq!(rotations, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(leases.len(), 24);
+}
+
+#[test]
+fn failed_refresh_is_cooled_down_across_live_sessions() {
+    let (_t, store, a) = seed();
+    coordination::owner(&store).unwrap();
+    let _live = (0..12)
+        .map(|_| store.lease(&a).unwrap())
+        .collect::<Vec<_>>();
+    let _lock = store.lock().unwrap();
+    let error = refresh::refresh_with(&store, &a, 1000, false, |_, _| {
+        Err(Failure {
+            kind: "http-429",
+            status: Some(429),
+            retry_after: 120,
+        })
+    })
+    .unwrap_err();
+    assert_eq!(error.status, Some(429));
+    for at in 1001..1013 {
+        assert!(
+            !refresh::refresh_with(&store, &a, at, false, |_, _| panic!(
+                "shared cooldown must prevent a stampede"
+            ))
+            .unwrap()
+        );
+    }
+    assert!(
+        refresh::refresh_with(&store, &a, 1120, false, |_, _| Ok(
+            json!({"access_token":"synthetic-after-cooldown","expires_in":3600})
+        ))
+        .unwrap()
+    );
 }
