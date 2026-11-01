@@ -119,6 +119,7 @@
             assert pkgs.lib.hasInfix " resume-prompt -- " (builtins.elemAt hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre 2);
             assert pkgs.lib.hasInfix "$$HOME %%n" (builtins.elemAt hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre 2);
             assert pkgs.lib.hasInfix "off" (builtins.elemAt hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre 2);
+            assert pkgs.lib.hasSuffix " prefer headroom" (builtins.elemAt hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre 3);
             assert hm.config.programs.waybar.settings.mainBar."custom/aswap".return-type == "json";
             pkgs.runCommand "aswap-home-manager" {} "touch $out";
         });

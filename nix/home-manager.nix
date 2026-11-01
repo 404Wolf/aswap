@@ -39,8 +39,8 @@ let
         ++ (lib.optional (cfg.syncHost != null) "${cfg.package}/bin/aswap sync -- ${escapeExecArg cfg.syncHost}")
         ++ [
         "${cfg.package}/bin/aswap auto ${provider} threshold ${toString settings.threshold}"
-        "${cfg.package}/bin/aswap auto ${provider} prefer ${settings.prefer}"
         "${cfg.package}/bin/aswap auto ${provider} resume-prompt -- ${escapeExecArg (if settings.resumePrompt == null then "off" else settings.resumePrompt)}"
+        "${cfg.package}/bin/aswap auto ${provider} prefer ${settings.prefer}"
         "${cfg.package}/bin/aswap auto ${provider} on"
       ];
       ExecStart = "${cfg.package}/bin/aswap auto ${provider} watch";

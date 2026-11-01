@@ -394,14 +394,18 @@ fn exchange_command(mut command: Command, request: &Request, timeout: Duration) 
                             .unwrap_or("unavailable"),
                     ));
                 }
-                if !sent {
-                    return Err(Error("sync: request-write-failed"));
-                }
+                // Judge the response first: a peer that exits without reading
+                // stdin races the request write (EPIPE).
                 let (ok, bytes) = rx
                     .recv_timeout(Duration::from_secs(1))
                     .safe("sync: bad-response; incomplete SSH output")?;
                 if !ok || bytes.len() > 4 * 1024 * 1024 {
                     return Err(Error("sync: bad-response; invalid response size"));
+                }
+                // A complete packet is authoritative (protocol checks follow);
+                // a failed write only explains a peer that said nothing.
+                if bytes.is_empty() && !sent {
+                    return Err(Error("sync: request-write-failed"));
                 }
                 return serde_json::from_slice(&bytes)
                     .safe("sync: bad-response; invalid protocol JSON");
