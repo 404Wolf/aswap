@@ -19,6 +19,11 @@ let
         default = 90;
         description = "Switch when any quota window reaches this percentage.";
       };
+      prefer = mkOption {
+        type = types.enum [ "headroom" "weekly-reset" ];
+        default = "headroom";
+        description = "Rank eligible accounts by most headroom, or by the soonest weekly reset (new launches also move to an account whose weekly quota resets sooner).";
+      };
     };
   };
   serviceFor = provider: settings: {
@@ -34,6 +39,7 @@ let
         ++ (lib.optional (cfg.syncHost != null) "${cfg.package}/bin/aswap sync -- ${escapeExecArg cfg.syncHost}")
         ++ [
         "${cfg.package}/bin/aswap auto ${provider} threshold ${toString settings.threshold}"
+        "${cfg.package}/bin/aswap auto ${provider} prefer ${settings.prefer}"
         "${cfg.package}/bin/aswap auto ${provider} resume-prompt -- ${escapeExecArg (if settings.resumePrompt == null then "off" else settings.resumePrompt)}"
         "${cfg.package}/bin/aswap auto ${provider} on"
       ];

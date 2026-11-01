@@ -109,6 +109,7 @@ Parallel launches share provider state while keeping account authentication priv
 
 ```sh
 aswap auto claude threshold 90
+aswap auto claude prefer weekly-reset
 aswap auto claude on
 aswap auto claude once
 aswap auto claude watch
@@ -117,7 +118,7 @@ aswap auto codex on
 aswap auto codex watch
 ```
 
-`on/off/threshold` persist policy; `watch` runs a foreground selection monitor
+`on/off/threshold/prefer` persist policy; `watch` runs a foreground selection monitor
 and `once` evaluates one tick. Selection monitors affect future launches.
 Add `--activate-live` to `once` or `watch` only when default-file activation is
 wanted. `off` stops selection changes and avoids usage requests by the monitor.
@@ -128,7 +129,10 @@ aswap run claude --account work --auto
 aswap run codex --account personal --auto
 ```
 
-`run --auto` supervises the provider in a PTY and forwards its arguments normally:
+`run --auto` supervises the provider in a PTY and forwards its arguments normally.
+The provider binary is `claude`/`codex` from `PATH`, or `ASWAP_CLAUDE_BIN`/
+`ASWAP_CODEX_BIN` when set, which lets a `claude` wrapper on `PATH` run
+`aswap run claude --auto -- "$@"` without recursing:
 
 ```sh
 aswap run claude --auto -- --resume <session-uuid> --dangerously-skip-permissions
@@ -154,6 +158,12 @@ open transcript descriptors; ambiguous provider versions fail safely.
 
 Candidates need fresh known quota below the threshold, ten points of improvement
 and a 300-second cooldown; a recognized limit bypasses the latter two gates.
+`prefer headroom` (the default) picks the candidate with the lowest usage;
+`prefer weekly-reset` picks the one whose weekly window resets soonest, so
+quota that would expire unused goes first. With `weekly-reset`, new launches and
+the selection monitor also move to an eligible account whose weekly reset is
+strictly sooner, even below the threshold; running sessions are only switched
+by the threshold or a limit.
 Switches stop the child with SIGTERM, wait five seconds, then use SIGKILL if
 needed. The exact same shared session resumes on the new account. Clean exits do
 not restart or send a follow-up. Restarts are capped at eight. Runtime auth/config
@@ -337,7 +347,7 @@ Use this checkout as a flake input, then import its module:
   programs.aswap = {
     enable = true;
     # package = inputs.aswap.packages.${pkgs.stdenv.hostPlatform.system}.default;
-    autoswitch.claude = { enable = true; threshold = 90; };
+    autoswitch.claude = { enable = true; threshold = 90; prefer = "weekly-reset"; };
     autoswitch.codex = { enable = true; threshold = 90; };
     waybar.enable = true;
   };

@@ -66,7 +66,9 @@ enum Action {
         provider: Provider,
         #[arg(value_enum)]
         action: AutoAction,
-        #[arg(help = "Percentage for threshold; text or off for resume-prompt")]
+        #[arg(
+            help = "Percentage for threshold; text or off for resume-prompt; headroom or weekly-reset for prefer"
+        )]
         value: Option<String>,
         #[arg(
             long,
@@ -113,6 +115,7 @@ enum AutoAction {
     On,
     Off,
     Threshold,
+    Prefer,
     Once,
     Watch,
 }
@@ -401,16 +404,20 @@ fn execute(cli: Cli) -> Result<i32> {
             value,
             activate_live,
         } => {
-            if matches!(action, AutoAction::Threshold | AutoAction::ResumePrompt) != value.is_some()
+            if matches!(
+                action,
+                AutoAction::Threshold | AutoAction::ResumePrompt | AutoAction::Prefer
+            ) != value.is_some()
             {
                 return Err(Error(
-                    "threshold requires a percentage; resume-prompt requires text or off; other actions take no value",
+                    "threshold requires a percentage; resume-prompt requires text or off; prefer requires headroom or weekly-reset; other actions take no value",
                 ));
             }
             match action {
                 AutoAction::On
                 | AutoAction::Off
                 | AutoAction::Threshold
+                | AutoAction::Prefer
                 | AutoAction::ResumePrompt => {
                     let _lock = store.lock()?;
                     let mut state = store.load()?;
@@ -426,6 +433,12 @@ fn execute(cli: Cli) -> Result<i32> {
                                 .safe("invalid threshold percentage")?;
                             store::threshold(v)?;
                             settings.threshold = v;
+                        }
+                        AutoAction::Prefer => {
+                            settings.prefer =
+                                store::Prefer::from_str(value.as_deref().unwrap(), false).map_err(
+                                    |_| Error("prefer must be headroom or weekly-reset"),
+                                )?;
                         }
                         AutoAction::ResumePrompt => {
                             let prompt = value.unwrap();
@@ -444,8 +457,10 @@ fn execute(cli: Cli) -> Result<i32> {
                         &v,
                         cli.json,
                         format!(
-                            "{provider} auto: {} (threshold {}%)",
-                            v["auto"]["enabled"], v["auto"]["threshold"]
+                            "{provider} auto: {} (threshold {}%, prefer {})",
+                            v["auto"]["enabled"],
+                            v["auto"]["threshold"],
+                            v["auto"]["prefer"].as_str().unwrap_or("headroom")
                         ),
                     )?;
                 }

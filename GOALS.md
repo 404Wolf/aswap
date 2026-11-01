@@ -109,3 +109,9 @@ Never edit the headline (line 1).
 - [x] Give every run access-only auth and centralize serialized refresh, rotation propagation, cooldowns and stale-write protection.
 - [x] Keep busy accounts eligible for atomic auto decisions and isolate each session's switches/process lifecycle.
 - [x] Test many concurrent plain/auto runs, busy-target failover, killed supervisors, PID/boot cleanup and concurrent refresh attempts; retain credits polish.
+
+## M12: Prefer the soonest weekly reset
+- [x] Add a persisted `prefer` policy (`headroom` default, `weekly-reset`) with `aswap auto <p> prefer` and a Home Manager option.
+- [x] Rank eligible accounts by soonest account-wide weekly reset; launches and the monitor move to a strictly sooner reset without interrupting running sessions.
+- [x] Test ranking, threshold eligibility, launch moves, unknown and passed resets with synthetic fixtures.
+- [x] Honor `ASWAP_CLAUDE_BIN`/`ASWAP_CODEX_BIN` for the real provider binary so PATH wrappers can call `aswap run --auto`.

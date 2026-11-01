@@ -22,6 +22,18 @@ pub struct Auto {
     pub enabled: bool,
     pub threshold: f64,
     pub last_switch: u64,
+    #[serde(default)]
+    pub prefer: Prefer,
+}
+/// How auto selection ranks eligible accounts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum Prefer {
+    /// The lowest used percentage.
+    #[default]
+    Headroom,
+    /// The soonest weekly reset, so quota that would expire unused goes first.
+    WeeklyReset,
 }
 pub const RESUME_PROMPT: &str =
     "You were interrupted by a usage-limit account switch. Continue exactly where you left off.";
@@ -35,6 +47,7 @@ impl Default for Auto {
             enabled: false,
             threshold: 90.0,
             last_switch: 0,
+            prefer: Prefer::Headroom,
         }
     }
 }

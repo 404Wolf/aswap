@@ -1,6 +1,6 @@
 use aswap::{
     provider::Provider,
-    store::{Account, Store},
+    store::{Account, Prefer, Store},
     usage::{self, Cached, Usage, Window},
 };
 fn account(name: &str) -> Account {
@@ -79,19 +79,83 @@ fn selection_cooldown_hysteresis_and_stale_safety() {
         (account("c"), observation(30.0, 1000)),
     ];
     assert_eq!(
-        usage::choose("a", &entries, 90.0, 0, 1000, false)
+        usage::choose("a", &entries, 90.0, Prefer::Headroom, 0, 1000, false)
             .unwrap()
             .label,
         "c"
     );
-    assert!(usage::choose("a", &entries, 90.0, 900, 1000, false).is_none());
-    assert!(usage::choose("a", &entries, 90.0, 0, 1700, false).is_none());
-    assert!(usage::choose("b", &entries, 90.0, 0, 1000, false).is_none());
+    assert!(usage::choose("a", &entries, 90.0, Prefer::Headroom, 900, 1000, false).is_none());
+    assert!(usage::choose("a", &entries, 90.0, Prefer::Headroom, 0, 1700, false).is_none());
+    assert!(usage::choose("b", &entries, 90.0, Prefer::Headroom, 0, 1000, false).is_none());
     assert_eq!(
-        usage::choose("b", &entries, 90.0, 900, 1000, true)
+        usage::choose("b", &entries, 90.0, Prefer::Headroom, 900, 1000, true)
             .unwrap()
             .label,
         "c"
+    );
+}
+
+fn weekly(p: f64, reset: Option<u64>, at: u64) -> Cached {
+    let mut c = observation(p, at);
+    c.usage.windows.push(Window {
+        name: "seven_day".into(),
+        used_percent: p,
+        resets_at: reset,
+        duration_minutes: Some(10080),
+    });
+    c
+}
+#[test]
+fn weekly_reset_preference_ranks_and_moves_launches() {
+    let entries = vec![
+        (account("a"), weekly(95.0, Some(9000), 1000)),
+        (account("b"), weekly(10.0, Some(8000), 1000)),
+        (account("c"), weekly(60.0, Some(3000), 1000)),
+        (account("d"), weekly(5.0, None, 1000)),
+        (account("e"), weekly(20.0, Some(2000), 1000)),
+    ];
+    let full = &entries[..4];
+    // Forced switch: headroom picks the emptiest; weekly-reset the soonest reset.
+    let pick = |prefer| {
+        usage::choose("a", full, 90.0, prefer, 0, 1000, false)
+            .unwrap()
+            .label
+            .clone()
+    };
+    assert_eq!(pick(Prefer::Headroom), "d");
+    assert_eq!(pick(Prefer::WeeklyReset), "c");
+    // Over the threshold stays ineligible even when it resets soonest.
+    let over = vec![
+        (account("a"), weekly(95.0, Some(9000), 1000)),
+        (account("b"), weekly(92.0, Some(2000), 1000)),
+        (account("c"), weekly(40.0, Some(5000), 1000)),
+    ];
+    assert_eq!(
+        usage::choose("a", &over, 90.0, Prefer::WeeklyReset, 0, 1000, false)
+            .unwrap()
+            .label,
+        "c"
+    );
+    // Launch preference: never under headroom; moves only to a strictly sooner reset.
+    assert!(usage::prefer_at_launch("b", &entries, 90.0, Prefer::Headroom, 1000).is_none());
+    assert_eq!(
+        usage::prefer_at_launch("b", &entries, 90.0, Prefer::WeeklyReset, 1000)
+            .unwrap()
+            .label,
+        "e"
+    );
+    assert!(usage::prefer_at_launch("e", &entries, 90.0, Prefer::WeeklyReset, 1000).is_none());
+    assert_eq!(
+        usage::prefer_at_launch("d", &entries, 90.0, Prefer::WeeklyReset, 1000)
+            .unwrap()
+            .label,
+        "e"
+    );
+    // A passed reset makes the observation stale, so it is no candidate.
+    assert_eq!(
+        usage::prefer_at_launch("b", &entries, 90.0, Prefer::WeeklyReset, 2500)
+            .map(|a| a.label.as_str()),
+        None
     );
 }
 
@@ -461,4 +525,32 @@ fn legacy_codex_cache_slot_names_are_upgraded_before_output() {
     assert!(u.credits.is_none());
     let serialized = serde_json::to_string(&u).unwrap();
     assert!(!serialized.contains("primary") && !serialized.contains("secondary"));
+}
+#[test]
+fn provider_binary_override() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "provider_binary_child", "--nocapture"])
+        .env("ASWAP_BIN_CHILD", "1")
+        .env("ASWAP_CLAUDE_BIN", "/synthetic/real-claude")
+        .env("ASWAP_CODEX_BIN", "")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+#[test]
+fn provider_binary_child() {
+    if std::env::var("ASWAP_BIN_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    let profile = std::path::Path::new("/synthetic/profile");
+    assert_eq!(
+        Provider::Claude.command(profile).get_program(),
+        "/synthetic/real-claude"
+    );
+    // Empty means unset: fall back to the PATH name.
+    assert_eq!(Provider::Codex.command(profile).get_program(), "codex");
 }

@@ -49,8 +49,19 @@ impl Provider {
         store::no_links(&p)?;
         Ok(p)
     }
+    /// `ASWAP_CLAUDE_BIN`/`ASWAP_CODEX_BIN` name the real provider binary, so a
+    /// `claude` on PATH may itself be a wrapper around `aswap run claude`.
+    pub fn bin_var(self) -> &'static str {
+        match self {
+            Self::Claude => "ASWAP_CLAUDE_BIN",
+            Self::Codex => "ASWAP_CODEX_BIN",
+        }
+    }
     pub fn command(self, profile: &Path) -> Command {
-        let mut cmd = Command::new(self.as_str());
+        let bin = std::env::var_os(self.bin_var())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.as_str().into());
+        let mut cmd = Command::new(bin);
         cmd.env(self.env_var(), profile);
         // Prevent inherited credentials/config overrides from defeating account isolation.
         for key in [

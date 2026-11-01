@@ -71,14 +71,25 @@ pub fn run(
         if auto {
             let state = store.load()?;
             let settings = state.auto.get(&provider).cloned().unwrap_or_default();
+            let entries = entries_from_cache(store, provider)?;
             if let Some(best) = usage::choose(
                 &account.label,
-                &entries_from_cache(store, provider)?,
+                &entries,
                 settings.threshold,
+                settings.prefer,
                 settings.last_switch,
                 now(),
                 false,
-            ) {
+            )
+            .or_else(|| {
+                usage::prefer_at_launch(
+                    &account.label,
+                    &entries,
+                    settings.threshold,
+                    settings.prefer,
+                    now(),
+                )
+            }) {
                 account = best.clone();
             }
         }
@@ -179,6 +190,7 @@ pub fn run(
                     &account.label,
                     &entries,
                     settings.threshold,
+                    settings.prefer,
                     settings.last_switch,
                     now(),
                     false,
@@ -194,6 +206,7 @@ pub fn run(
                     &account.label,
                     &entries,
                     settings.threshold,
+                    settings.prefer,
                     settings.last_switch,
                     now(),
                     true,
@@ -224,6 +237,7 @@ pub fn run(
                 &account.label,
                 &entries,
                 settings.threshold,
+                settings.prefer,
                 settings.last_switch,
                 now(),
                 true,
@@ -248,15 +262,12 @@ pub fn run(
         let (next, next_lease) = {
             let _lock = store.lock()?;
             let mut state = store.load()?;
+            let settings = state.auto.get(&provider).cloned().unwrap_or_default();
             let next = usage::choose(
                 &account.label,
                 &entries_from_cache(store, provider)?,
-                state
-                    .auto
-                    .get(&provider)
-                    .cloned()
-                    .unwrap_or_default()
-                    .threshold,
+                settings.threshold,
+                settings.prefer,
                 0,
                 now(),
                 true,
@@ -348,10 +359,20 @@ pub fn tick(store: &Store, provider: Provider, activate_live: bool) -> Result<Op
         current,
         &entries,
         settings.threshold,
+        settings.prefer,
         settings.last_switch,
         now(),
         false,
-    ) else {
+    )
+    .or_else(|| {
+        usage::prefer_at_launch(
+            current,
+            &entries,
+            settings.threshold,
+            settings.prefer,
+            now(),
+        )
+    }) else {
         return Ok(None);
     };
     if activate_live {

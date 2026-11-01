@@ -1,7 +1,7 @@
 use crate::{
     Error, Result, Safe, now,
     provider::Provider,
-    store::{self, Account, Store},
+    store::{self, Account, Prefer, Store},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -68,6 +68,23 @@ impl Usage {
             return None;
         }
         self.windows.iter().map(|w| w.used_percent).reduce(f64::max)
+    }
+    /// When the account-wide weekly window resets; model-specific weekly
+    /// windows only stand in when no account-wide one was observed.
+    pub fn weekly_reset(&self, at: u64) -> Option<u64> {
+        let weekly =
+            |w: &&Window| w.duration_minutes == Some(10080) && w.resets_at.is_some_and(|r| r > at);
+        self.windows
+            .iter()
+            .filter(weekly)
+            .find(|w| matches!(w.name.as_str(), "seven_day" | "weekly"))
+            .or_else(|| {
+                self.windows
+                    .iter()
+                    .filter(weekly)
+                    .min_by_key(|w| w.resets_at)
+            })
+            .and_then(|w| w.resets_at)
     }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -576,11 +593,27 @@ pub fn cached_force(store: &Store, account: &Account, force: bool) -> Result<Cac
         }
     })
 }
-/// Most headroom, only fresh known quotas, ten-point hysteresis and cooldown.
+/// Ranks two eligible accounts: soonest weekly reset first under
+/// `WeeklyReset` (unknown resets last), then most headroom.
+fn rank(prefer: Prefer, a: &Cached, b: &Cached, at: u64) -> std::cmp::Ordering {
+    let by_reset = match prefer {
+        Prefer::Headroom => std::cmp::Ordering::Equal,
+        Prefer::WeeklyReset => match (a.usage.weekly_reset(at), b.usage.weekly_reset(at)) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        },
+    };
+    by_reset.then_with(|| a.used(at).unwrap().total_cmp(&b.used(at).unwrap()))
+}
+/// Only fresh known quotas, ten-point hysteresis and cooldown; eligible
+/// accounts are ranked by `prefer`.
 pub fn choose<'a>(
     current: &str,
     entries: &'a [(Account, Cached)],
     threshold: f64,
+    prefer: Prefer,
     last_switch: u64,
     at: u64,
     limited: bool,
@@ -599,8 +632,34 @@ pub fn choose<'a>(
                     v < threshold && (limited || used.is_some_and(|u| u - v >= 10.0))
                 })
         })
-        .min_by(|(_, a), (_, b)| a.used(at).unwrap().total_cmp(&b.used(at).unwrap()))
+        .min_by(|(_, a), (_, b)| rank(prefer, a, b, at))
         .map(|(a, _)| a)
+}
+/// A switch that is not forced by quota: with `WeeklyReset`, a new launch (or
+/// the selection monitor) moves to an eligible account whose weekly window
+/// resets strictly sooner than the current one's. Running sessions are never
+/// interrupted for this; only `choose` stops a child.
+pub fn prefer_at_launch<'a>(
+    current: &str,
+    entries: &'a [(Account, Cached)],
+    threshold: f64,
+    prefer: Prefer,
+    at: u64,
+) -> Option<&'a Account> {
+    if prefer != Prefer::WeeklyReset {
+        return None;
+    }
+    let (_, mine) = entries.iter().find(|(a, _)| a.label == current)?;
+    let best = entries
+        .iter()
+        .filter(|(_, c)| c.used(at).is_some_and(|v| v < threshold))
+        .min_by(|(_, a), (_, b)| rank(prefer, a, b, at))?;
+    let sooner = match (best.1.usage.weekly_reset(at), mine.usage.weekly_reset(at)) {
+        (Some(x), Some(y)) => x < y,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    (best.0.label != current && sooner).then_some(&best.0)
 }
 
 pub fn mark_limited(store: &Store, account: &Account) -> Result<()> {
