@@ -142,7 +142,10 @@ fn unavailable_quota_explains_reason_and_retains_dimmed_last_known_bar() {
     );
     assert!(rendered.contains("HTTP 429 rate-limited"));
     assert!(rendered.contains("Retry-After 120s"));
-    assert!(rendered.contains("80.0% used (stale)"));
+    assert!(rendered.contains("retrying in 2m"));
+    // The last-known bar stays, dimmed.
+    assert!(rendered.contains("\x1b[2m███"));
+    assert!(rendered.contains("80%"));
     assert!(rendered.contains("\x1b[2m"));
     assert!(!rendered.contains("????"));
 }

@@ -173,13 +173,17 @@ Claude usage comes from the OAuth usage endpoint; Codex uses the official
 [app-server rate-limit RPC](https://learn.chatgpt.com/docs/app-server), with
 provider-reported durations and reset timestamps.
 
-`status` shows every managed profile, marks the active one and displays SESSION
-(5h), WEEKLY and any exposed Claude model weekly windows separately. Each window
-has percent used, a progress bar and time until reset. `list` is a compact offline
-view of the same windows. Both label cached/stale/backoff observations; missing
-quota stays unknown. The single `remaining_percent` JSON/Waybar metric remains the
-most restrictive window for autoswitch compatibility, not specifically session
-headroom. `status` refreshes all profiles through the cache/backoff policy.
+`status` groups profiles by provider under that provider's auto policy, marks
+the active one with `●`, and shows each window (session, weekly and any exposed
+Claude model weekly windows) with an aligned bar, percent used and time until
+reset. Observations older than ten minutes carry their age and dim; a failed
+check says what went wrong and, for an expired login, how to re-add it. Logins
+broken for over a day collapse to a one-line last-known summary. `list` is a
+compact offline view with one quota line per profile. The single
+`remaining_percent` JSON/Waybar metric remains the most restrictive window for
+autoswitch compatibility, not specifically session headroom. Aliases of one
+login share a fresh observation instead of each polling the provider.
+`status` refreshes all profiles through the cache/backoff policy.
 
 Email and tier hints come from each stored profile's own config/auth claims and
 appear only in human terminal output. `NO_COLOR` disables color; redirected

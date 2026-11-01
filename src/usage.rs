@@ -552,6 +552,27 @@ where
     if !force && !reset_due && at < old.next_poll_at {
         return Ok(old);
     }
+    // Aliases of one login share one quota: reuse a fresh sibling observation
+    // instead of fetching again, which would double the provider's rate limit.
+    if !force {
+        for alias in crate::identity::duplicates(store, account, &state.accounts) {
+            let sibling = store
+                .profile(account.provider, &alias)?
+                .join("usage-cache.json");
+            if !sibling.exists() {
+                continue;
+            }
+            let other: Cached = store::json_read(&sibling)?;
+            if other.error.is_none()
+                && other.fetched_at > old.fetched_at
+                && at < other.fetched_at.saturating_add(TTL)
+                && other.used(at).is_some()
+            {
+                store::json_write(&path, &other)?;
+                return Ok(other);
+            }
+        }
+    }
     let entry = updated(old, fetcher(&profile), at);
     store::json_write(&path, &entry)?;
     Ok(entry)

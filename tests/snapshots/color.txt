@@ -1,21 +1,11 @@
-* claude:personal [active]  alice@example.com · max
-  ! duplicate login: personal-copy
-  quota: cached · observed 0m ago
-  SESSION (5h) 23.5% used · resets in 2h14m
-  [32m[━━━━━━░░░░░░░░░░░░░░░░░░][0m
-  WEEKLY 99.0% used · resets in 1d23h
-  [31m[━━━━━━━━━━━━━━━━━━━━━━━━][0m
-  WEEKLY OPUS 81.0% used · resets in 1d23h
-  [33m[━━━━━━━━━━━━━━━━━━━░░░░░][0m
+[1mclaude[0m
+[32m●[0m [1;32mpersonal[0m  [2malice@example.com · max · same login as personal-copy[0m
+    session      [32m██████░░░░░░░░░░░░░░░░░░ [0m[32m 23%[0m  [2mresets in 2h14m[0m
+    weekly       [31m████████████████████████ [0m[31m 99%[0m  [2mresets in 1d23h[0m
+    weekly opus  [33m███████████████████░░░░░ [0m[33m 81%[0m  [2mresets in 1d23h[0m
+[2m○[0m [1moffline [0m  [2mnever fetched[0m
 
-  codex:work  bob@example.com · plan unknown
-  quota: cached · observed 0m ago
-  SESSION (5h) 10.0% used · resets in 2h14m
-  [32m[━━░░░░░░░░░░░░░░░░░░░░░░][0m
-  WEEKLY 70.0% used · resets in 1d23h
-  [33m[━━━━━━━━━━━━━━━━━░░░░░░░][0m
-
-  claude:offline  email unknown · plan unknown
-  quota: stale/unknown · never fetched
-  SESSION (5h) unknown · reset unknown
-  WEEKLY unknown · reset unknown
+[1mcodex[0m
+[2m○[0m [1mwork[0m  [2mbob@example.com[0m
+    session      [32m██░░░░░░░░░░░░░░░░░░░░░░ [0m[32m 10%[0m  [2mresets in 2h14m[0m
+    weekly       [33m█████████████████░░░░░░░ [0m[33m 70%[0m  [2mresets in 1d23h[0m

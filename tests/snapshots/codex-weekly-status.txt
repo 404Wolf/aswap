@@ -1,6 +1,4 @@
-* codex:synthetic [active]  email unknown · plan unknown
-  quota: cached · observed 0m ago
-  WEEKLY 23.0% used · resets in 6d4h
-  [━━━━━━░░░░░░░░░░░░░░░░░░]
-  credits: 12,346
-  available usage limit resets: 3
+codex
+● synthetic
+    weekly  ██████░░░░░░░░░░░░░░░░░░  23%  resets in 6d4h
+    12,346 credits · 3 limit resets available

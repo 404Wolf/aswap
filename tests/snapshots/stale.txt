@@ -1,21 +1,12 @@
-* claude:personal [active]  alice@example.com · max
-  ! duplicate login: personal-copy
-  quota: stale/unknown · observed 135m ago
-  SESSION (5h) 23.5% used (stale) · reset passed; refresh needed
-  [━━━━━━░░░░░░░░░░░░░░░░░░]
-  WEEKLY 99.0% used (stale) · resets in 1d21h
-  [━━━━━━━━━━━━━━━━━━━━━━━━]
-  WEEKLY OPUS 81.0% used (stale) · resets in 1d21h
-  [━━━━━━━━━━━━━━━━━━━░░░░░]
+claude
+● personal
+    alice@example.com · max · same login as personal-copy · updated 2h15m ago
+    session      ██████░░░░░░░░░░░░░░░░░░  23%  reset passed, refreshing
+    weekly       ████████████████████████  99%  resets in 1d21h
+    weekly opus  ███████████████████░░░░░  81%  resets in 1d21h
+○ offline   never fetched
 
-  codex:work  bob@example.com · plan unknown
-  quota: stale/unknown · observed 135m ago
-  SESSION (5h) 10.0% used (stale) · reset passed; refresh needed
-  [━━░░░░░░░░░░░░░░░░░░░░░░]
-  WEEKLY 70.0% used (stale) · resets in 1d21h
-  [━━━━━━━━━━━━━━━━━░░░░░░░]
-
-  claude:offline  email unknown · plan unknown
-  quota: stale/unknown · never fetched
-  SESSION (5h) unknown · reset unknown
-  WEEKLY unknown · reset unknown
+codex
+○ work  bob@example.com · updated 2h15m ago
+    session      ██░░░░░░░░░░░░░░░░░░░░░░  10%  reset passed, refreshing
+    weekly       █████████████████░░░░░░░  70%  resets in 1d21h

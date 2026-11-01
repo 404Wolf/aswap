@@ -115,3 +115,10 @@ Never edit the headline (line 1).
 - [x] Rank eligible accounts by soonest account-wide weekly reset; launches and the monitor move to a strictly sooner reset without interrupting running sessions.
 - [x] Test ranking, threshold eligibility, launch moves, unknown and passed resets with synthetic fixtures.
 - [x] Honor `ASWAP_CLAUDE_BIN`/`ASWAP_CODEX_BIN` for the real provider binary so PATH wrappers can call `aswap run --auto`.
+
+## M13: Readable status
+- [x] Group status/list by provider under its auto policy; aligned window bars, whole percents, human ages and "not started" sessions.
+- [x] Explain failures in plain words with the exact re-add command for expired logins; collapse long-broken logins to a last-known line.
+- [x] Word-wrap with indents at any width; list rows lead with quota and move identity below when it does not fit.
+- [x] Share a fresh alias observation instead of polling the provider once per duplicate label.
+- [x] Refresh snapshots and assertions for the new layout.

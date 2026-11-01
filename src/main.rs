@@ -232,8 +232,22 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
         .filter(|w| *w > 0)
         .or_else(|| std::env::var("COLUMNS").ok()?.parse().ok())
         .unwrap_or(80);
-    Ok(aswap::display::render(
+    let auto: std::collections::BTreeMap<Provider, store::Auto> =
+        serde_json::from_value(value["auto"].clone()).unwrap_or_default();
+    let default = store::Auto::default();
+    let policies: Vec<_> = [Provider::Claude, Provider::Codex]
+        .into_iter()
+        .map(|provider| (provider, auto.get(&provider).unwrap_or(&default)))
+        .map(|(provider, a)| aswap::display::Policy {
+            provider: provider.as_str(),
+            enabled: a.enabled,
+            threshold: a.threshold,
+            prefer: a.prefer,
+        })
+        .collect();
+    Ok(aswap::display::render_with(
         &rows,
+        &policies,
         compact,
         width,
         io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
@@ -452,17 +466,17 @@ fn execute(cli: Cli) -> Result<i32> {
                         _ => unreachable!(),
                     }
                     let v = json!({"provider":provider,"auto":settings});
+                    let pretty = format!(
+                        "{provider}  {}",
+                        aswap::display::policy_text(&aswap::display::Policy {
+                            provider: provider.as_str(),
+                            enabled: settings.enabled,
+                            threshold: settings.threshold,
+                            prefer: settings.prefer,
+                        })
+                    );
                     store.save(&state)?;
-                    output(
-                        &v,
-                        cli.json,
-                        format!(
-                            "{provider} auto: {} (threshold {}%, prefer {})",
-                            v["auto"]["enabled"],
-                            v["auto"]["threshold"],
-                            v["auto"]["prefer"].as_str().unwrap_or("headroom")
-                        ),
-                    )?;
+                    output(&v, cli.json, pretty)?;
                 }
                 AutoAction::Once | AutoAction::Watch => loop {
                     let selected = runner::tick(&store, provider, activate_live)?;

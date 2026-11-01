@@ -452,11 +452,15 @@ fn codex_weekly_only_rpc_uses_its_own_epoch_and_optional_credit_metadata() {
             false,
             at,
         );
-        assert!(output.contains("WEEKLY 23.0% used · resets in 6d4h"));
-        assert!(!output.contains("SESSION") && !output.contains("PRIMARY"));
-        assert!(output.contains("credits: 12,346"));
-        assert!(!output.contains("automatic reload"));
-        assert!(output.contains("available usage limit resets: 3"));
+        assert!(
+            output.contains("weekly")
+                && output.contains("23%")
+                && output.contains("resets in 6d4h")
+        );
+        assert!(!output.contains("session") && !output.contains("primary"));
+        assert!(output.contains("12,346 credits"));
+        assert!(!output.contains("auto-reload"));
+        assert!(output.contains("3 limit resets available"));
         let name = if compact {
             "codex-weekly-list"
         } else {
@@ -491,11 +495,11 @@ fn codex_weekly_only_rpc_uses_its_own_epoch_and_optional_credit_metadata() {
             false,
             at,
         );
-        assert!(!output.contains("available usage limit resets"));
+        assert!(!output.contains("limit reset"));
         match reload {
-            None => assert!(!output.contains("automatic reload")),
-            Some(true) => assert!(output.contains("automatic reload: on")),
-            Some(false) => assert!(output.contains("automatic reload: off")),
+            None => assert!(!output.contains("auto-reload")),
+            Some(true) => assert!(output.contains("auto-reload on")),
+            Some(false) => assert!(output.contains("auto-reload off")),
         }
     }
     let mut v = v;
@@ -553,4 +557,35 @@ fn provider_binary_child() {
     );
     // Empty means unset: fall back to the PATH name.
     assert_eq!(Provider::Codex.command(profile).get_program(), "codex");
+}
+#[test]
+fn duplicate_logins_share_one_fresh_fetch() {
+    let t = tempfile::tempdir().unwrap();
+    let store = Store::open(t.path().join("store")).unwrap();
+    let (a, b) = (account("first"), account("alias"));
+    {
+        let _guard = store.lock().unwrap();
+        let mut s = store.load().unwrap();
+        s.accounts.extend([a.clone(), b.clone()]);
+        store.save(&s).unwrap();
+        for label in ["first", "alias"] {
+            let profile = store.profile(Provider::Claude, label).unwrap();
+            std::fs::create_dir_all(&profile).unwrap();
+            std::fs::write(profile.join(Provider::Claude.auth_file()), b"{}").unwrap();
+            std::fs::write(
+                profile.join(".claude.json"),
+                br#"{"oauthAccount":{"accountUuid":"synthetic-same"}}"#,
+            )
+            .unwrap();
+        }
+    }
+    usage::cached_with(&store, &a, 1000, |_| Ok(observation(42.0, 1000).usage)).unwrap();
+    let shared = usage::cached_with(&store, &b, 1010, |_| panic!("alias fetched again")).unwrap();
+    assert_eq!(shared.used(1010), Some(42.0));
+    // Once the sibling's observation ages out, the alias fetches for itself.
+    let own = usage::cached_with(&store, &b, 1000 + usage::TTL, |_| {
+        Ok(observation(43.0, 1180).usage)
+    })
+    .unwrap();
+    assert_eq!(own.used(1180), Some(43.0));
 }

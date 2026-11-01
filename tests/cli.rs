@@ -183,9 +183,8 @@ fn duplicate_warning_and_local_only_identity_output() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("alice@example.com"));
     assert!(text.contains("other@example.com"));
-    assert!(text.contains("duplicate login: second"));
-    assert!(text.contains("SESSION (5h) unknown"));
-    assert!(text.contains("WEEKLY unknown"));
+    assert!(text.contains("same login as second"));
+    assert!(text.contains("never fetched"));
 }
 
 #[test]
