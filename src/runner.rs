@@ -58,7 +58,11 @@ pub fn run(
     } else {
         None
     };
-    crate::coordination::poll(store, None, false)?;
+    // A follower whose owner is unreachable or disagrees still launches on its
+    // last synced profiles; the in-session poll keeps retrying every 30s.
+    if let Err(err) = crate::coordination::poll(store, None, false) {
+        eprintln!("aswap: {err}; launching with the last synced profiles");
+    }
     let mut account = {
         let _lock = store.lock()?;
         store.account(&store.load()?, provider, name)?
