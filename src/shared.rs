@@ -230,6 +230,56 @@ fn merge_missing(source: &Value, dest: &mut Value) {
         }
     }
 }
+/// Claude keeps MCP server OAuth (client registrations, access and refresh
+/// tokens) beside the account login in .credentials.json. It belongs to the
+/// user, not to the account: one store-wide record feeds every launch view and
+/// survives account switches, and native logins, registrations and rotations
+/// in a view merge back into it. aswap never refreshes MCP tokens, so views
+/// keep their MCP refresh tokens exactly as a native Claude home would.
+const MCP_OAUTH: &str = "mcpOAuth";
+fn mcp_record(store: &Store) -> Result<Value> {
+    let path = store.mcp_auth(Provider::Claude);
+    if path.exists() {
+        return store::json_read(&path);
+    }
+    // First use: adopt what earlier releases left in the profiles. Those
+    // copies lost their refresh tokens; the latest expiry per server wins.
+    let expiry = |entry: &Value| entry.get("expiresAt").and_then(Value::as_u64);
+    let mut seed = serde_json::Map::new();
+    for account in store.load()?.accounts {
+        if account.provider != Provider::Claude {
+            continue;
+        }
+        let profile = store.profile(account.provider, &account.label)?;
+        let Ok(auth) = store::json_read::<Value>(&profile.join(account.provider.auth_file()))
+        else {
+            continue;
+        };
+        if let Some(servers) = auth.get(MCP_OAUTH).and_then(Value::as_object) {
+            for (server, entry) in servers {
+                if seed
+                    .get(server)
+                    .is_none_or(|old| expiry(entry) > expiry(old))
+                {
+                    seed.insert(server.clone(), entry.clone());
+                }
+            }
+        }
+    }
+    let seed = Value::Object(seed);
+    store::json_write(&path, &seed)?;
+    Ok(seed)
+}
+fn with_mcp(mut auth: Value, record: &Value) -> Value {
+    if let Some(auth) = auth.as_object_mut() {
+        if record.as_object().is_some_and(|r| !r.is_empty()) {
+            auth.insert(MCP_OAUTH.into(), record.clone());
+        } else {
+            auth.remove(MCP_OAUTH);
+        }
+    }
+    auth
+}
 #[derive(Clone, PartialEq)]
 struct Stamp(u64, u64, u64, i64, i64);
 fn stamp(path: &Path) -> Option<Stamp> {
@@ -314,6 +364,9 @@ pub struct View {
     config_path: PathBuf,
     baseline: Value,
     account_baseline: Value,
+    /// The MCP record this view last received; native edits are diffed
+    /// against it.
+    mcp_baseline: Value,
     managed: BTreeSet<OsString>,
     stamps: BTreeMap<OsString, Stamp>,
 }
@@ -442,6 +495,7 @@ impl View {
             config_path,
             baseline: json!({}),
             account_baseline: json!({}),
+            mcp_baseline: json!({}),
             managed: BTreeSet::new(),
             stamps: BTreeMap::new(),
         };
@@ -471,12 +525,17 @@ impl View {
         let profile = store.profile(account.provider, &account.label)?;
         let auth = store::read_private(&profile.join(account.provider.auth_file()))?;
         provider::validate_auth(account.provider, &auth)?;
-        let auth = serde_json::to_vec(&crate::refresh::launch_auth(
+        let mut auth = crate::refresh::launch_auth(
             account.provider,
             &serde_json::from_slice(&auth).safe("invalid profile auth")?,
-        ))
-        .safe("cannot encode launch auth")?;
-        store::atomic(&self.path.join(account.provider.auth_file()), &auth)?;
+        );
+        let auth_path = self.path.join(account.provider.auth_file());
+        if account.provider == Provider::Claude {
+            let seen = store::json_read::<Value>(&auth_path).ok();
+            auth = with_mcp(auth, &self.merge_mcp(store, seen.as_ref())?);
+        }
+        let auth = serde_json::to_vec(&auth).safe("cannot encode launch auth")?;
+        store::atomic(&auth_path, &auth)?;
         if account.provider == Provider::Claude {
             let mut config = if self.path.join(".claude.json").exists() {
                 non_account(&store::json_read(&self.path.join(".claude.json"))?)
@@ -503,6 +562,21 @@ impl View {
         }
         Ok(())
     }
+    /// Merge this view's native MCP OAuth edits into the user's record and
+    /// return the record the view should carry now. An unreadable or MCP-less
+    /// view (mid-write, or not launched yet) deletes nothing.
+    fn merge_mcp(&mut self, store: &Store, seen: Option<&Value>) -> Result<Value> {
+        let mut record = mcp_record(store)?;
+        if let Some(native) = seen.and_then(|auth| auth.get(MCP_OAUTH)) {
+            let before = record.clone();
+            merge_changes(&self.mcp_baseline, native, &mut record);
+            if record != before {
+                store::json_write(&store.mcp_auth(Provider::Claude), &record)?;
+            }
+        }
+        self.mcp_baseline = record.clone();
+        Ok(record)
+    }
     pub fn select(&mut self, store: &Store, account: &Account) -> Result<()> {
         let _lock = store.lock()?;
         self.select_locked(store, account)
@@ -513,10 +587,21 @@ impl View {
         // Launch views never own refresh tokens. Re-read the authority rather than
         // letting a stale/late native write roll canonical credentials backwards.
         let canonical: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
-        store::json_write(
-            &self.path.join(account.provider.auth_file()),
-            &crate::refresh::launch_auth(account.provider, &canonical),
-        )?;
+        let auth_path = self.path.join(account.provider.auth_file());
+        let seen = store::json_read::<Value>(&auth_path).ok();
+        let mut auth = crate::refresh::launch_auth(account.provider, &canonical);
+        if self.provider == Provider::Claude {
+            auth = with_mcp(auth, &self.merge_mcp(store, seen.as_ref())?);
+        }
+        // Rewrite only on change, and never over a native write that landed
+        // after the read above: that edit merges on the next pass instead.
+        if seen.as_ref() != Some(&auth) {
+            if store::json_read::<Value>(&auth_path).ok() == seen {
+                store::json_write(&auth_path, &auth)?;
+            } else if let Some(native) = seen.as_ref().and_then(|s| s.get(MCP_OAUTH)) {
+                self.mcp_baseline = native.clone();
+            }
+        }
         if self.provider == Provider::Claude {
             let config: Value = store::json_read(&self.path.join(".claude.json"))?;
             if !crate::coordination::follower(store)? {

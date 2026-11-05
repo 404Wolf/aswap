@@ -238,6 +238,13 @@ impl Store {
             .join(provider.as_str())
             .join(name))
     }
+    /// The user's MCP server OAuth record for a provider. It belongs to the
+    /// person, not to any account, so it survives account switches.
+    pub fn mcp_auth(&self, provider: Provider) -> PathBuf {
+        self.root
+            .join("mcp")
+            .join(format!("{}.json", provider.as_str()))
+    }
     pub fn sessions(&self, provider: Provider, name: &str) -> Result<PathBuf> {
         label(name)?;
         Ok(self

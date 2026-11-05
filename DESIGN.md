@@ -277,6 +277,20 @@ identity cooldown (exponential up to 15m, honoring longer Retry-After); explicit
 forced refresh can bypass it. Usage-only app-servers also receive access-only
 auth snapshots. No real credential or transcript files were used in tests.
 
+Claude also keeps MCP server OAuth (`mcpOAuth`: dynamic client registrations,
+access and refresh tokens) in .credentials.json. That state belongs to the user,
+not to an account, and aswap never refreshes it, so it is not account auth.
+One store-wide record (mcp/claude.json, seeded once from earlier profile copies)
+feeds every launch view and survives account switches. Each sync three-way
+merges the view's native mcpOAuth edits against what that view last received,
+so a registration written before the browser callback, a completed login, a
+rotation or a removal reaches every other view instead of being overwritten
+from the profile. Views keep MCP refresh tokens, matching many native sessions
+sharing one Claude home; concurrent rotations of one server resolve leaf-wise,
+first writer wins. A view's auth file is rewritten only when its content
+changes, and not when a native write landed after the sync read it; that edit
+merges on the next pass. The record is never exported by owner sync.
+
 ## Multi-machine design: one authority, access-only followers
 
 The simplest robust implementation is an explicit single refresh/usage owner,
