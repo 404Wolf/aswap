@@ -10,7 +10,7 @@ use std::{
     os::unix::process::CommandExt,
     process::{Child, Stdio},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 fn stop(child: &mut Child) -> Result<std::process::ExitStatus> {
@@ -169,8 +169,17 @@ pub fn run(
         let mut target = None;
         let mut next_check = 0;
         let status = loop {
+            // Keystrokes and redraws go through as they arrive; the bookkeeping
+            // below only runs between these 250ms windows.
             if let Some(terminal) = &mut terminal {
-                limited |= terminal.pump(100)?;
+                let deadline = Instant::now() + Duration::from_millis(250);
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    limited |= terminal.pump(left.as_millis().max(1) as i32)?;
+                }
             }
             if now() >= next_sync {
                 next_sync = now().saturating_add(30);
@@ -220,7 +229,9 @@ pub fn run(
                     break stop(&mut child.0)?;
                 }
             }
-            std::thread::sleep(Duration::from_millis(250));
+            if terminal.is_none() {
+                std::thread::sleep(Duration::from_millis(250));
+            }
         };
         drop(child);
         if let Some(terminal) = &mut terminal {
