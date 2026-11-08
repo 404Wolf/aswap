@@ -20,6 +20,27 @@ pub struct Settings {
     pub owner: bool,
     pub host: Option<String>,
     pub last_sync: u64,
+    /// When a follower last started an exchange, successful or not. Claimed
+    /// under the store lock before the SSH round trip, so concurrent
+    /// processes skip instead of each running their own sync.
+    pub last_attempt: u64,
+    /// Consecutive failed exchanges; widens the retry interval.
+    pub failures: u32,
+    /// The owner's `issued_at` of the installed packet: a slower, older
+    /// exchange never overwrites a newer one.
+    pub last_issued: u64,
+}
+/// A sync is due 30s after the last success and, while an attempt is in
+/// flight or after failures, only after a backoff longer than one exchange.
+fn due(settings: &Settings, at: u64) -> bool {
+    if at < settings.last_sync.saturating_add(30) {
+        return false;
+    }
+    if settings.last_attempt <= settings.last_sync {
+        return true;
+    }
+    let backoff = (120u64 << settings.failures.min(2)).min(300);
+    at >= settings.last_attempt.saturating_add(backoff)
 }
 pub fn settings(store: &Store) -> Result<Settings> {
     let path = store.root.join("coordination.json");
@@ -58,8 +79,7 @@ pub fn owner(store: &Store) -> Result<()> {
         &store.root.join("coordination.json"),
         &Settings {
             owner: true,
-            host: None,
-            last_sync: 0,
+            ..Settings::default()
         },
     )
 }
@@ -102,7 +122,7 @@ pub fn configure(store: &Store, host: &str) -> Result<usize> {
             &Settings {
                 owner: false,
                 host: Some(host.into()),
-                last_sync: 0,
+                ..Settings::default()
             },
         )?;
     }
@@ -440,39 +460,77 @@ fn duplicate_count(packet: &Packet) -> usize {
     count
 }
 /// One peer sync every 30s; all peers consume the owner's single persisted cache.
-/// Caller must not already hold the store lock.
+/// Caller must not already hold the store lock. The store lock is never held
+/// across the SSH exchange: the attempt is claimed under it, the exchange runs
+/// unlocked, and the packet is re-checked and installed under it.
 pub fn poll(store: &Store, force: Option<&Account>, immediate: bool) -> Result<usize> {
+    poll_with(store, force, immediate, exchange)
+}
+fn poll_with(
+    store: &Store,
+    force: Option<&Account>,
+    immediate: bool,
+    exchange: impl FnOnce(&str, &Request) -> Result<Packet>,
+) -> Result<usize> {
+    let bypass = immediate || force.is_some();
     let initial = settings(store)?;
-    if initial.host.is_none() {
+    if initial.host.is_none() || (!bypass && !due(&initial, now())) {
         return Ok(0);
     }
-    if !immediate && force.is_none() && now() < initial.last_sync.saturating_add(30) {
-        return Ok(0);
-    }
-    let _lock = store.lock()?;
-    let mut settings = settings(store)?;
-    if !immediate && force.is_none() && now() < settings.last_sync.saturating_add(30) {
-        return Ok(0);
-    }
-    let host = settings
-        .host
-        .as_deref()
-        .ok_or(Error("refresh-owner host missing"))?;
-    let packet = exchange(
-        host,
+    let path = store.root.join("coordination.json");
+    let host = {
+        let _lock = store.lock()?;
+        let mut settings = settings(store)?;
+        let Some(host) = settings.host.clone() else {
+            return Ok(0);
+        };
+        if !bypass && !due(&settings, now()) {
+            return Ok(0);
+        }
+        settings.last_attempt = now();
+        store::json_write(&path, &settings)?;
+        host
+    };
+    let result = exchange(
+        &host,
         &Request {
             protocol: 1,
             force: force.cloned(),
         },
-    )?;
-    let duplicates = duplicate_count(&packet);
-    let count = install(store, packet, &mut settings)?;
-    if immediate && duplicates > 0 {
-        eprintln!(
-            "aswap sync: duplicate-login warning: {duplicates} duplicate profile(s); aliases retained"
-        );
+    );
+    let _lock = store.lock()?;
+    let mut settings = settings(store)?;
+    if settings.host.as_deref() != Some(host.as_str()) {
+        return Err(Error("sync: configuration changed during sync"));
     }
-    Ok(count)
+    let failures = settings.failures;
+    let outcome = result.and_then(|packet| {
+        if packet.issued_at < settings.last_issued {
+            // A newer packet landed while this exchange was in flight.
+            return Ok((packet.profiles.len(), 0));
+        }
+        let duplicates = duplicate_count(&packet);
+        settings.failures = 0;
+        settings.last_issued = packet.issued_at;
+        install(store, packet, &mut settings).map(|count| (count, duplicates))
+    });
+    match outcome {
+        Ok((count, duplicates)) => {
+            if immediate && duplicates > 0 {
+                eprintln!(
+                    "aswap sync: duplicate-login warning: {duplicates} duplicate profile(s); aliases retained"
+                );
+            }
+            Ok(count)
+        }
+        Err(err) => {
+            let mut settings = self::settings(store)?;
+            settings.failures = failures.saturating_add(1);
+            settings.last_attempt = now();
+            store::json_write(&path, &settings)?;
+            Err(err)
+        }
+    }
 }
 /// Hidden SSH-only transport; refuse credential output to a terminal or a local
 /// invocation. Normal `sync --json` returns counts/role, never this packet.
@@ -744,5 +802,88 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.0, "sync: version-mismatch");
+    }
+    fn follower_store() -> (tempfile::TempDir, Store) {
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("follower")).unwrap();
+        store::json_write(
+            &store.root.join("coordination.json"),
+            &Settings {
+                host: Some("synthetic-owner".into()),
+                ..Settings::default()
+            },
+        )
+        .unwrap();
+        (t, store)
+    }
+    fn owner_packet(owner: &Store) -> Packet {
+        packet(
+            owner,
+            &Request {
+                protocol: 1,
+                force: None,
+            },
+        )
+        .unwrap()
+    }
+    #[test]
+    fn a_slow_exchange_never_holds_the_store_lock_or_starts_twice() {
+        let (_o, owner) = seed();
+        let (_f, store) = follower_store();
+        let reply = owner_packet(&owner);
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let slow = {
+            let store = Store::open(store.root.clone()).unwrap();
+            std::thread::spawn(move || {
+                poll_with(&store, None, false, move |host, _| {
+                    assert_eq!(host, "synthetic-owner");
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(reply)
+                })
+            })
+        };
+        started.recv().unwrap();
+        // Another launch takes the store lock at once while the exchange runs,
+        let start = Instant::now();
+        drop(store.lock().unwrap());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        // and does not start a second exchange of its own.
+        assert_eq!(
+            poll_with(&store, None, false, |_, _| panic!("second exchange")).unwrap(),
+            0
+        );
+        release.send(()).unwrap();
+        assert_eq!(slow.join().unwrap().unwrap(), 1);
+        let after = settings(&store).unwrap();
+        assert!(after.last_sync > 0 && after.failures == 0);
+        assert_eq!(store.load().unwrap().accounts.len(), 1);
+    }
+    #[test]
+    fn a_failed_exchange_records_backoff_so_peers_do_not_retry() {
+        let (_f, store) = follower_store();
+        let error = poll_with(&store, None, false, |_, _| Err(Error("sync: timeout")))
+            .err()
+            .unwrap();
+        assert_eq!(error.0, "sync: timeout");
+        let after = settings(&store).unwrap();
+        assert_eq!(after.failures, 1);
+        assert!(after.last_attempt > 0 && after.last_sync == 0);
+        assert!(!due(&after, now()));
+        assert!(!due(&after, now() + 200));
+        assert!(due(&after, now() + 241));
+        assert_eq!(
+            poll_with(&store, None, false, |_, _| panic!("retried inside backoff")).unwrap(),
+            0
+        );
+        // An explicit sync still goes through, and success clears the backoff.
+        let (_o, owner) = seed();
+        let reply = owner_packet(&owner);
+        assert_eq!(poll_with(&store, None, true, |_, _| Ok(reply)).unwrap(), 1);
+        let after = settings(&store).unwrap();
+        assert_eq!(after.failures, 0);
+        assert!(!due(&after, now()));
+        assert!(due(&after, now() + 31));
     }
 }

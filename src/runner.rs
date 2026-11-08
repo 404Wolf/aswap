@@ -58,9 +58,16 @@ pub fn run(
     } else {
         None
     };
-    // A follower whose owner is unreachable or disagrees still launches on its
-    // last synced profiles; the in-session poll keeps retrying every 30s.
-    if let Err(err) = crate::coordination::poll(store, None, false) {
+    // A follower whose owner is unreachable, slow or disagrees still launches
+    // on its last synced profiles; the in-session poll keeps retrying. Only a
+    // follower with no usable profile yet waits for the owner.
+    let synced = {
+        let _lock = store.lock()?;
+        store.account(&store.load()?, provider, name).is_ok()
+    };
+    if synced {
+        drop(background_poll(store));
+    } else if let Err(err) = crate::coordination::poll(store, None, false) {
         eprintln!("aswap: {err}; launching with the last synced profiles");
     }
     let mut account = {
@@ -130,6 +137,7 @@ pub fn run(
     };
     let mut switches = 0;
     let mut next_sync = 0;
+    let mut syncing: Option<std::thread::JoinHandle<bool>> = None;
     loop {
         let mut cmd = provider.command(&view.path);
         cmd.args(&launch_args);
@@ -181,9 +189,18 @@ pub fn run(
                     limited |= terminal.pump(left.as_millis().max(1) as i32)?;
                 }
             }
-            if now() >= next_sync {
+            // The owner exchange runs off this thread so a slow owner never
+            // freezes the terminal; apply its profiles once it lands.
+            if syncing.as_ref().is_some_and(|s| s.is_finished())
+                && syncing.take().unwrap().join().unwrap_or(false)
+            {
+                let _ = crate::refresh::for_run(store, &account);
+                let _ = view.sync(store, &account);
+            }
+            if syncing.is_none() && now() >= next_sync {
                 next_sync = now().saturating_add(30);
-                if crate::coordination::poll(store, None, false).is_ok() {
+                syncing = background_poll(store);
+                if syncing.is_none() {
                     let _ = crate::refresh::for_run(store, &account);
                     let _ = view.sync(store, &account);
                 }
@@ -328,6 +345,18 @@ pub fn run(
         )?;
         switches += 1;
     }
+}
+/// Poll the refresh owner on a helper thread; true unless the poll failed
+/// (an exchange that is not due yet still counts, as the old inline poll did).
+/// Followers only: without a configured owner there is nothing to do.
+fn background_poll(store: &Store) -> Option<std::thread::JoinHandle<bool>> {
+    if !crate::coordination::follower(store).unwrap_or(false) {
+        return None;
+    }
+    let store = Store::open(store.root.clone()).ok()?;
+    Some(std::thread::spawn(move || {
+        crate::coordination::poll(&store, None, false).is_ok()
+    }))
 }
 pub fn observations(
     store: &Store,

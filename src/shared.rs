@@ -356,6 +356,71 @@ fn migrate_root(
     }
     Ok(())
 }
+/// Entries a launch view always links to the shared home of the same name.
+fn shared_names(provider: Provider) -> &'static [&'static str] {
+    if provider == Provider::Claude {
+        &[
+            "projects",
+            "sessions",
+            "todos",
+            "shell-snapshots",
+            "statsig",
+            "plans",
+            "file-history",
+            "skills",
+            "plugins",
+            "agents",
+            "commands",
+            "tasks",
+            "debug",
+            "cache",
+        ]
+    } else {
+        &[
+            "sessions",
+            "archived_sessions",
+            "skills",
+            "plugins",
+            "rules",
+            "memories",
+            "tmp",
+            "logs",
+        ]
+    }
+}
+/// A provider started inside an aswap run inherits CODEX_HOME or
+/// CLAUDE_CONFIG_DIR pointing at that run's launch view. Treating the view
+/// as home would snapshot every shared entry (each is a symlink there),
+/// copying the whole session history into the new view. Follow the view's
+/// links back to the home it shares instead.
+fn shared_home(store: &Store, provider: Provider, mut home: PathBuf) -> Result<PathBuf> {
+    let runtimes = store.root.join("runtimes");
+    for _ in 0..8 {
+        if !home.starts_with(&runtimes) {
+            return Ok(home);
+        }
+        let names = shared_names(provider)
+            .iter()
+            .copied()
+            .chain(["history.jsonl"]);
+        let target = names.into_iter().find_map(|name| {
+            let target = fs::read_link(home.join(name)).ok()?;
+            (target.is_absolute() && target.file_name() == Some(OsStr::new(name)))
+                .then(|| target.parent().map(Path::to_path_buf))
+                .flatten()
+        });
+        // Views copied by earlier releases have no links left; their real
+        // home is the provider's default one.
+        home = match target {
+            Some(target) => target,
+            None => provider::home()?.join(match provider {
+                Provider::Claude => ".claude",
+                Provider::Codex => ".codex",
+            }),
+        };
+    }
+    Err(Error("provider home is a chain of aswap launch views"))
+}
 /// A private auth/config view; actual history lives in the caller's home.
 pub struct View {
     pub path: PathBuf,
@@ -371,12 +436,16 @@ pub struct View {
     stamps: BTreeMap<OsString, Stamp>,
 }
 impl View {
+    /// The global store lock covers migration, shared-home creation and the
+    /// credential/MCP writes in `select_locked`. Linking and snapshotting into
+    /// the new run directory, which no other process knows about, happen
+    /// outside it: a large managed entry must never stall other launches.
     pub fn prepare(store: &Store, account: &Account) -> Result<Self> {
-        let home = account.provider.current_home()?;
+        let home = shared_home(store, account.provider, account.provider.current_home()?)?;
         if home.ancestors().any(|p| p.join(".git").exists()) {
             return Err(Error("provider state must live outside a Git checkout"));
         }
-        let _lock = store.lock()?;
+        let lock = store.lock()?;
         if !dir(&home)? {
             return Err(Error("provider home must be an unmanaged directory"));
         }
@@ -442,35 +511,7 @@ impl View {
             .into_iter()
             .map(|p| p.file_name().unwrap().to_owned())
             .collect();
-        let dirs: &[&str] = if account.provider == Provider::Claude {
-            &[
-                "projects",
-                "sessions",
-                "todos",
-                "shell-snapshots",
-                "statsig",
-                "plans",
-                "file-history",
-                "skills",
-                "plugins",
-                "agents",
-                "commands",
-                "tasks",
-                "debug",
-                "cache",
-            ]
-        } else {
-            &[
-                "sessions",
-                "archived_sessions",
-                "skills",
-                "plugins",
-                "rules",
-                "memories",
-                "tmp",
-                "logs",
-            ]
-        };
+        let dirs = shared_names(account.provider);
         for name in dirs {
             names.insert((*name).into());
             if !exists(&home.join(name)) {
@@ -488,6 +529,7 @@ impl View {
                 .safe("cannot secure shared history")?;
         }
         names.insert("history.jsonl".into());
+        drop(lock);
         let mut view = Self {
             path,
             home,
@@ -515,6 +557,7 @@ impl View {
                 symlink(&src, &dst).safe("cannot link shared provider state")?;
             }
         }
+        let _lock = store.lock()?;
         if view.provider == Provider::Claude {
             view.baseline = non_account(&read_config(&view.config_path)?);
         }

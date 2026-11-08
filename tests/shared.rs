@@ -215,6 +215,7 @@ fn shared_child() {
                 owner: false,
                 host: Some("synthetic-owner".into()),
                 last_sync: aswap::now(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -263,4 +264,71 @@ fn three_way_merge_preserves_concurrent_values_and_honors_deletions() {
         current,
         json!({"projects":{"one":{"trust":"concurrent","same":1},"added":true,"other":true}})
     );
+}
+#[test]
+fn nested_launch_links_the_real_home_instead_of_copying_the_parent_view() {
+    let t = tempfile::tempdir().unwrap();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "nested_child", "--nocapture"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", t.path())
+        .env("XDG_DATA_HOME", t.path().join("data"))
+        .env("CODEX_HOME", t.path().join("codex"))
+        .env("ASWAP_NESTED_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+#[test]
+fn nested_child() {
+    if std::env::var("ASWAP_NESTED_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    let store = Store::from_env().unwrap();
+    let provider = Provider::Codex;
+    let home = provider.current_home().unwrap();
+    store::json_write(
+        &home.join(provider.auth_file()),
+        &json!({"tokens":{"access_token":"synthetic-profile-token"}}),
+    )
+    .unwrap();
+    let account = provider::add(&store, provider, "one").unwrap();
+    store::atomic(&home.join("sessions").join("old.jsonl"), b"synthetic").unwrap();
+    let outer = View::prepare(&store, &account).unwrap();
+    assert!(
+        fs::symlink_metadata(outer.path.join("sessions"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    // A provider started inside that run inherits CODEX_HOME = its view.
+    // SAFETY: this child process runs exactly one single-threaded test.
+    unsafe { std::env::set_var("CODEX_HOME", &outer.path) };
+    let inner = View::prepare(&store, &account).unwrap();
+    assert_eq!(inner.home, home);
+    let sessions = inner.path.join("sessions");
+    assert!(
+        fs::symlink_metadata(&sessions)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_link(&sessions).unwrap(), home.join("sessions"));
+    // A third level resolves the same way.
+    unsafe { std::env::set_var("CODEX_HOME", &inner.path) };
+    let third = View::prepare(&store, &account).unwrap();
+    assert_eq!(third.home, home);
+    // A view copied by an earlier release has no links left: fall back to
+    // the provider's default home rather than copying it again.
+    let copied = store.root.join("runtimes/codex/one/run-copied");
+    store::atomic(&copied.join("sessions/old.jsonl"), b"synthetic").unwrap();
+    unsafe { std::env::set_var("CODEX_HOME", &copied) };
+    let fallback = View::prepare(&store, &account).unwrap();
+    assert_eq!(fallback.home, provider::home().unwrap().join(".codex"));
 }
