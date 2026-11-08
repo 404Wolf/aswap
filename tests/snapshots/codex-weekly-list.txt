@@ -1,4 +1,6 @@
 codex
   Default: synthetic · running agents may use other accounts
+  Soonest reset first; unknown reset times last
 ● synthetic  weekly 23% used (resets in 6d4h)
     12,346 credits · 3 limit resets available · checked just now
+    Next reset: weekly in 6d4h (Thu Jan 21, 12:00 UTC)

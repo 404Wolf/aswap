@@ -2,11 +2,17 @@ claude
   Default: personal ·
   running agents may use
   other accounts
+  Soonest reset first;
+  unknown reset times
+  last
 ● personal
     alice@example.com ·
     max · same login as
     personal-copy ·
     checked just now
+    Next reset: session
+    in 2h14m (Thu Jan 1,
+    02:30 UTC)
     session 23% used
     resets in 2h14m
     weekly 99% used
@@ -15,13 +21,20 @@ claude
     resets in 1d23h
 ○ offline
     never fetched
+    Next reset: unknown
 
 codex
   No default account
   selected
+  Soonest reset first;
+  unknown reset times
+  last
 ○ work
     bob@example.com ·
     checked just now
+    Next reset: session
+    in 2h14m (Thu Jan 1,
+    02:30 UTC)
     session 10% used
     resets in 2h14m
     weekly 70% used

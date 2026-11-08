@@ -69,6 +69,13 @@ fn reset(w: &Window, now: u64) -> String {
         Some(at) => format!("resets in {}", duration(at - now)),
     }
 }
+fn next_reset(c: &Cached, now: u64) -> Option<&Window> {
+    c.usage
+        .windows
+        .iter()
+        .filter(|w| w.resets_at.is_some_and(|at| at > now))
+        .min_by_key(|w| w.resets_at)
+}
 fn window_name(name: &str, duration: Option<u64>) -> String {
     match (name, duration) {
         ("five_hour", _) | (_, Some(300)) => "session".into(),
@@ -289,7 +296,15 @@ pub fn render_with(
         if pi > 0 && !compact {
             lines.push(String::new());
         }
-        let group: Vec<_> = rows.iter().filter(|r| r.provider == *provider).collect();
+        let mut group: Vec<_> = rows.iter().filter(|r| r.provider == *provider).collect();
+        group.sort_by_key(|r| {
+            (
+                next_reset(r.cached, now)
+                    .and_then(|w| w.resets_at)
+                    .unwrap_or(u64::MAX),
+                r.label,
+            )
+        });
         let mut header = paint.lines("1", &clean(provider), width);
         if let Some(p) = policies.iter().find(|p| p.provider == *provider) {
             let text = format!("{}  {}", clean(provider), policy_text(p));
@@ -310,6 +325,11 @@ pub fn render_with(
             None => "  No default account selected".into(),
         };
         lines.extend(paint.lines("2", &selection, width));
+        lines.extend(paint.lines(
+            "2",
+            "  Soonest reset first; unknown reset times last",
+            width,
+        ));
         let label_width = group
             .iter()
             .map(|r| clean(r.label).chars().count())
@@ -424,6 +444,28 @@ fn render_row(
     if !trail.is_empty() {
         lines.extend(paint.lines("2", &format!("    {trail}"), width));
     }
+    let next = match next_reset(c, now) {
+        Some(w) => {
+            let at = w.resets_at.unwrap();
+            let date = i64::try_from(at)
+                .ok()
+                .and_then(|at| chrono::DateTime::from_timestamp(at, 0))
+                .map(|at| format!(" ({})", at.format("%a %b %-d, %H:%M UTC")))
+                .unwrap_or_default();
+            let stale = if errored || age > FRESH {
+                " · last known"
+            } else {
+                ""
+            };
+            format!(
+                "    Next reset: {} in {}{date}{stale}",
+                window_name(&w.name, w.duration_minutes),
+                duration(at - now)
+            )
+        }
+        None => "    Next reset: unknown".into(),
+    };
+    lines.extend(paint.lines("2", &next, width));
     if let Some((problem, hint)) = problem(row, now) {
         lines.extend(paint.lines("31", &format!("    ! {problem}"), width));
         if let Some(hint) = hint {

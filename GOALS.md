@@ -126,3 +126,4 @@ Never edit the headline (line 1).
 ## M14: Unambiguous quota status
 - [x] Label percentages as used, show check freshness, and mark expired or stale observations as unknown availability.
 - [x] Explain that the selected default does not identify the account of every running agent; verify narrow layouts and expired-window rendering.
+- [x] Show each account's next future quota reset with countdown and UTC timestamp; sort each provider by that reset with unknown times last, and test session-versus-weekly and expired windows.

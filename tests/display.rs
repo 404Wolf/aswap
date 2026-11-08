@@ -180,3 +180,66 @@ fn expired_window_is_last_known_even_when_recently_checked() {
     assert!(text.contains("Default: example"));
     assert!(text.contains("running agents may use other accounts"));
 }
+
+#[test]
+fn accounts_sort_by_next_future_window_with_unknown_last() {
+    let id = identity::Identity::default();
+    let later = Cached {
+        fetched_at: 1000,
+        usage: parse_claude(&json!({"seven_day": {
+            "utilization": 80, "resets_at": "1970-01-03T00:00:00Z"
+        }}))
+        .unwrap(),
+        ..Default::default()
+    };
+    let soon = Cached {
+        fetched_at: 1000,
+        usage: parse_claude(&json!({
+            "five_hour": {"utilization": 30, "resets_at": "1970-01-01T02:30:00Z"},
+            "seven_day": {"utilization": 90, "resets_at": "1970-01-04T00:00:00Z"}
+        }))
+        .unwrap(),
+        ..Default::default()
+    };
+    let expired = Cached {
+        fetched_at: 1000,
+        usage: parse_claude(&json!({"seven_day": {
+            "utilization": 100, "resets_at": "1970-01-01T00:01:00Z"
+        }}))
+        .unwrap(),
+        ..Default::default()
+    };
+    for compact in [false, true] {
+        let rows = [
+            Row {
+                provider: "claude",
+                label: "expired-account",
+                active: false,
+                identity: &id,
+                duplicates: &[],
+                cached: &expired,
+            },
+            Row {
+                provider: "claude",
+                label: "later-account",
+                active: true,
+                identity: &id,
+                duplicates: &[],
+                cached: &later,
+            },
+            Row {
+                provider: "claude",
+                label: "soon-account",
+                active: false,
+                identity: &id,
+                duplicates: &[],
+                cached: &soon,
+            },
+        ];
+        let text = display::render(&rows, compact, 120, false, 1000);
+        assert!(text.find("○ soon-account").unwrap() < text.find("● later-account").unwrap());
+        assert!(text.find("● later-account").unwrap() < text.find("○ expired-account").unwrap());
+        assert!(text.contains("Next reset: session in 2h14m (Thu Jan 1, 02:30 UTC)"));
+        assert!(text.contains("Next reset: unknown"));
+    }
+}

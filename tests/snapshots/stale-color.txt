@@ -1,16 +1,21 @@
 [1mclaude[0m
 [2m  Default: personal · running agents may use other accounts[0m
+[2m  Soonest reset first; unknown reset times last[0m
 [1;32m● personal[0m
 [2m    alice@example.com · max · same login as personal-copy · checked 2h15m ago ·[0m
 [2m    last known quota; availability unknown[0m
+[2m    Next reset: weekly in 1d21h (Sat Jan 3, 00:00 UTC) · last known[0m
     session      [2m██████░░░░░░░░░░░░░░░░░░ [0m[2m 23% used[0m  [2mreset passed, refreshing[0m
     weekly       [2m████████████████████████ [0m[2m 99% used[0m  [2mresets in 1d21h[0m
     weekly opus  [2m███████████████████░░░░░ [0m[2m 81% used[0m  [2mresets in 1d21h[0m
 [2m○[0m [1moffline [0m  [2mnever fetched[0m
+[2m    Next reset: unknown[0m
 
 [1mcodex[0m
 [2m  No default account selected[0m
+[2m  Soonest reset first; unknown reset times last[0m
 [1m○ work[0m
 [2m    bob@example.com · checked 2h15m ago · last known quota; availability unknown[0m
+[2m    Next reset: weekly in 1d21h (Sat Jan 3, 00:00 UTC) · last known[0m
     session      [2m██░░░░░░░░░░░░░░░░░░░░░░ [0m[2m 10% used[0m  [2mreset passed, refreshing[0m
     weekly       [2m█████████████████░░░░░░░ [0m[2m 70% used[0m  [2mresets in 1d21h[0m
