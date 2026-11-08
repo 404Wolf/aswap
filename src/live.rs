@@ -15,6 +15,10 @@ struct Record {
     boot: String,
     parent: Process,
     child: Option<Process>,
+    #[serde(default)]
+    history_only: bool,
+    #[serde(default)]
+    terminal: Option<String>,
 }
 fn process(pid: u32) -> Option<Process> {
     let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -62,10 +66,17 @@ impl Lease {
     /// Register the child before supervision starts. If the supervisor is killed,
     /// a surviving provider still protects the profile until that child exits.
     pub fn child(&self, pid: u32) -> Result<()> {
+        self.record_child(pid, false)
+    }
+    pub fn history_child(&self, pid: u32) -> Result<()> {
+        self.record_child(pid, true)
+    }
+    fn record_child(&self, pid: u32, history_only: bool) -> Result<()> {
         let store = Store::open(self.root.clone())?;
         let _lock = store.lock()?;
         let mut record: Record = store::json_read(&self.path)?;
         record.child = process(pid);
+        record.history_only = history_only;
         store::json_write(&self.path, &record)
     }
 }
@@ -91,6 +102,8 @@ pub(crate) fn register(store: &Store, a: &Account) -> Result<Lease> {
         boot: boot()?,
         parent: process(std::process::id()).ok_or(Error("cannot identify live session"))?,
         child: None,
+        history_only: false,
+        terminal: std::env::var("HC_TERMINAL_ID").ok(),
     };
     store::json_write(&path, &record)?;
     Ok(Lease {
@@ -130,6 +143,36 @@ pub(crate) fn count(store: &Store, a: &Account) -> Result<usize> {
         }
     }
     Ok(count)
+}
+
+/// Local live sessions, including the actual credential profile after failover.
+pub fn sessions(store: &Store) -> Result<Vec<serde_json::Value>> {
+    let _lock = store.lock()?;
+    let mut rows = Vec::new();
+    for account in store.load()?.accounts {
+        count(store, &account)?;
+        let dir = directory(store, &account)?;
+        if !dir.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(dir).safe("cannot inspect live sessions")? {
+            let path = entry.safe("cannot inspect live session")?.path();
+            let record: Record = store::json_read(&path)?;
+            if !record.history_only {
+                let terminal = record.terminal.or_else(|| {
+                    let bytes = fs::read(format!("/proc/{}/environ", record.parent.pid)).ok()?;
+                    bytes.split(|b| *b == 0).find_map(|entry| {
+                        entry
+                            .strip_prefix(b"HC_TERMINAL_ID=")
+                            .and_then(|value| std::str::from_utf8(value).ok())
+                            .map(str::to_owned)
+                    })
+                });
+                rows.push(serde_json::json!({"provider": account.provider, "account": account.label, "supervisor_pid": record.parent.pid, "child_pid": record.child.map(|p|p.pid), "terminal": terminal}));
+            }
+        }
+    }
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -173,5 +216,32 @@ mod tests {
                 .count(),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    #[test]
+    fn history_leases_are_not_reported_as_active_credentials() {
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let a = Account {
+            provider: crate::provider::Provider::Claude,
+            label: "synthetic".into(),
+        };
+        let lease = {
+            let _lock = store.lock().unwrap();
+            let mut state = store.load().unwrap();
+            state.accounts.push(a.clone());
+            store.save(&state).unwrap();
+            register(&store, &a).unwrap()
+        };
+        lease.child(std::process::id()).unwrap();
+        let rows = sessions(&store).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["account"], "synthetic");
+        lease.history_child(std::process::id()).unwrap();
+        assert!(sessions(&store).unwrap().is_empty());
     }
 }

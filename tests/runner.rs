@@ -8,6 +8,13 @@ use std::{fs, os::unix::fs::PermissionsExt, process::Command};
 const ID: &str = "11111111-2222-4333-8444-555555555555";
 #[test]
 fn provider_processes_share_state_preserve_cwd_and_resume_exact_session() {
+    runner_case("usage_limit_reached");
+}
+#[test]
+fn expired_login_switches_and_resumes_exact_session() {
+    runner_case("Login expired · Please run /login");
+}
+fn runner_case(failure: &str) {
     let t = tempfile::tempdir().unwrap();
     let bin = t.path().join("bin");
     fs::create_dir(&bin).unwrap();
@@ -41,7 +48,7 @@ if 'synthetic-second' in auth:
 assert args==base+sticky
 transcript.write_text('synthetic shared conversation')
 if provider=='claude': (p/'sessions'/(str(os.getpid())+'.json')).write_text(json.dumps({'pid':os.getpid(),'sessionId':id}))
-print('usage_limit_reached',file=sys.stderr,flush=True)
+print(os.environ['ASWAP_TEST_FAILURE'],file=sys.stderr,flush=True)
 if 'synthetic-clean' in auth: sys.exit(0)
 with transcript.open('a') as held:
     time.sleep(30)
@@ -71,6 +78,7 @@ with transcript.open('a') as held:
         .env("CLAUDE_CONFIG_DIR", t.path().join("claude"))
         .env("CODEX_HOME", t.path().join("codex"))
         .env("ASWAP_RUNNER_CHILD", "1")
+        .env("ASWAP_TEST_FAILURE", failure)
         .env("ASWAP_TEST_BINARY", env!("CARGO_BIN_EXE_aswap"))
         .env("ASWAP_EXPECT_CWD", &cwd)
         .env("OPENAI_API_KEY", "synthetic-override")

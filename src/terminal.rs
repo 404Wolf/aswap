@@ -43,6 +43,7 @@ pub struct Terminal {
     original: Option<libc::termios>,
     input_open: bool,
     tail: String,
+    pub auth_expired: bool,
 }
 impl Terminal {
     pub fn open() -> Result<Self> {
@@ -93,6 +94,7 @@ impl Terminal {
             original,
             input_open: true,
             tail: String::new(),
+            auth_expired: false,
         })
     }
     pub fn spawn(&mut self, command: &mut Command) -> Result<Child> {
@@ -116,6 +118,7 @@ impl Terminal {
             });
         }
         self.tail.clear();
+        self.auth_expired = false;
         self.resize();
         command.spawn().safe("cannot launch provider in terminal")
     }
@@ -189,6 +192,7 @@ impl Terminal {
                     self.tail
                         .push_str(&String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase());
                     limited = limit_message(&self.tail);
+                    self.auth_expired |= auth_message(&self.tail);
                     // UTF-8 safe and bounded; this is never logged or persisted.
                     self.tail = self
                         .tail
@@ -237,5 +241,43 @@ mod tests {
         assert!(!super::limit_message("processed 429 items"));
         assert!(super::limit_message("error: http 429"));
         assert!(super::limit_message("usage_limit_reached"));
+    }
+}
+
+/// Explicit provider authentication failures; ordinary mentions of 401 do not match.
+pub fn auth_message(text: &str) -> bool {
+    [
+        "login expired",
+        "token has expired",
+        "token is expired",
+        "authentication token expired",
+        "invalid authentication token",
+        "refresh_token_reused",
+        "refresh token has expired",
+        "http 401",
+        "status 401",
+        "401 unauthorized",
+    ]
+    .iter()
+    .any(|needle| text.to_ascii_lowercase().contains(needle))
+}
+#[cfg(test)]
+mod auth_tests {
+    #[test]
+    fn recognizes_login_failures_without_matching_numbers_or_quota() {
+        for text in [
+            "Login expired · Please run /login",
+            "HTTP 401",
+            "refresh_token_reused",
+        ] {
+            assert!(super::auth_message(text));
+        }
+        for text in [
+            "processed 401 files",
+            "usage_limit_reached",
+            "login successful",
+        ] {
+            assert!(!super::auth_message(text));
+        }
     }
 }

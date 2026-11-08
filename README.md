@@ -436,3 +436,40 @@ SSH and the service disagree. Sync never promotes a remote host automatically.
 A configured owner refuses `sync HOST`; use `sync --off` first for an intentional
 role change. Duplicate logins under distinct labels produce a count-only warning
 and are retained; a label mapped to a different identity still requires alignment.
+
+### Expired logins and the account in each terminal
+
+`aswap sessions` shows each locally running session's provider, actual account
+label, Herdr terminal (when available), and supervisor/child PID. Use
+`aswap sessions --json` for scripts. `aswap list` shows saved account identity
+hints; the selected default only controls future launches. New runs print their
+account at launch and after automatic switches. Older supervisors cannot mark a
+retained history lease separately, so a session started before this update may
+appear under both its original and current account after a switch.
+
+Automatic runs recognize explicit expired-login/HTTP 401 errors as well as
+quota errors, and resume the exact tracked conversation on another eligible
+account. The rejected profile is marked authentication-unavailable, preserving
+its last-known quota. Automatic restart still requires an exact conversation ID;
+if none was created, restart the CLI manually. If no healthy account is known,
+the current UI stays open so you can renew the login.
+
+Refresh tokens are normally renewed automatically. A revoked/expired refresh
+login needs the provider's interactive login again. In an owner/follower setup,
+do this on the **refresh owner**, not a follower whose next sync replaces local
+credentials. Stop runs using the affected profile before replacing it:
+
+```sh
+# On the refresh owner, from a normal shell outside any managed run:
+claude auth login                  # sign into the account shown by aswap list
+aswap remove claude work           # refuses while this profile is running
+aswap add claude work
+aswap status claude
+# On each follower:
+aswap sync
+```
+
+Replace `work` with the affected label. This removes/recreates the stored login;
+shared conversation history remains. For Codex use `codex login` and substitute
+`codex` in the profile commands. Keep the old profile until interactive login
+succeeds; never remove it first. Check the identity shown after re-adding.

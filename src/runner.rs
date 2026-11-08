@@ -139,6 +139,11 @@ pub fn run(
     let mut next_sync = 0;
     let mut syncing: Option<std::thread::JoinHandle<bool>> = None;
     loop {
+        eprintln!(
+            "aswap: using {provider}:{} (supervisor PID {})",
+            account.label,
+            std::process::id()
+        );
         let mut cmd = provider.command(&view.path);
         cmd.args(&launch_args);
         let supervisor = std::process::id();
@@ -171,9 +176,10 @@ pub fn run(
         if let Some(history) = &history_lease
             && !Arc::ptr_eq(history, &lease)
         {
-            history.child(child.0.id())?;
+            history.history_child(child.0.id())?;
         }
         let mut limited = false;
+        let mut expired = false;
         let mut target = None;
         let mut next_check = 0;
         let status = loop {
@@ -229,7 +235,15 @@ pub fn run(
                     break stop(&mut child.0)?;
                 }
             }
-            if auto && limited {
+            if !expired && terminal.as_ref().is_some_and(|t| t.auth_expired) {
+                expired = true;
+                usage::mark_auth_expired(store, &account)?;
+                eprintln!(
+                    "aswap: login expired for {provider}:{}; looking for another eligible account",
+                    account.label
+                );
+            }
+            if auto && (limited || expired) {
                 view.sync(store, &account)?;
                 let (entries, settings) = observations(store, provider)?;
                 target = usage::choose(
@@ -258,12 +272,22 @@ pub fn run(
         if !auto {
             return Ok(status.code().unwrap_or(1));
         }
-        if status.success() && target.is_none() {
+        expired |= terminal.as_ref().is_some_and(|t| t.auth_expired);
+        if status.success() && target.is_none() && !expired {
             return Ok(0);
         }
-        let did_limit = limited;
+        expired |= terminal.as_ref().is_some_and(|t| t.auth_expired);
+        let did_limit = limited || expired;
         if did_limit {
-            usage::mark_limited(store, &account)?;
+            if expired {
+                usage::mark_auth_expired(store, &account)?;
+                eprintln!(
+                    "aswap: login expired for {provider}:{}; selecting another account",
+                    account.label
+                );
+            } else {
+                usage::mark_limited(store, &account)?;
+            }
             let (entries, settings) = observations(store, provider)?;
             target = usage::choose(
                 &account.label,

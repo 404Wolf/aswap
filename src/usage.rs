@@ -683,6 +683,24 @@ pub fn prefer_at_launch<'a>(
     (best.0.label != current && sooner).then_some(&best.0)
 }
 
+/// A provider rejected this session's credentials; preserve quota as last-known.
+pub fn mark_auth_expired(store: &Store, account: &Account) -> Result<()> {
+    let _lock = store.lock()?;
+    let path = store
+        .profile(account.provider, &account.label)?
+        .join("usage-cache.json");
+    let mut entry: Cached = if path.exists() {
+        store::json_read(&path)?
+    } else {
+        Cached::default()
+    };
+    entry.error = Some("http-401".into());
+    entry.http_status = Some(401);
+    entry.last_attempt = now();
+    entry.next_poll_at = now().saturating_add(TTL);
+    store::json_write(&path, &entry)
+}
+
 pub fn mark_limited(store: &Store, account: &Account) -> Result<()> {
     let _lock = store.lock()?;
     let path = store

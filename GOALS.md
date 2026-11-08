@@ -127,3 +127,8 @@ Never edit the headline (line 1).
 - [x] Label percentages as used, show check freshness, and mark expired or stale observations as unknown availability.
 - [x] Explain that the selected default does not identify the account of every running agent; verify narrow layouts and expired-window rendering.
 - [x] Show each account's next future quota reset with countdown and UTC timestamp; sort each provider by that reset with unknown times last, and test session-versus-weekly and expired windows.
+
+## M15: Expired login failover and session identity
+- [x] Recognize explicit expired-login errors separately from quota exhaustion, exclude rejected auth and preserve exact conversation resume.
+- [x] Show actual account labels at launch/switch and expose local terminal/PID/account mappings with `aswap sessions`.
+- [x] Document owner-side interactive login renewal and verify expired-login switching with synthetic provider processes.

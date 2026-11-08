@@ -30,6 +30,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Show the actual account used by each locally running session.
+    Sessions { provider: Option<Provider> },
     /// Capture the current file-based login under a private label.
     Add { provider: Provider, label: String },
     /// List profiles, local identity hints and cached quota; no network requests.
@@ -301,6 +303,32 @@ fn waybar(value: &Value) -> Value {
 fn execute(cli: Cli) -> Result<i32> {
     let store = Store::from_env()?;
     match cli.command {
+        Action::Sessions { provider } => {
+            let rows: Vec<_> = aswap::live::sessions(&store)?
+                .into_iter()
+                .filter(|r| provider.is_none_or(|p| r["provider"] == p.as_str()))
+                .collect();
+            let pretty = if rows.is_empty() {
+                "No local running sessions".into()
+            } else {
+                rows.iter()
+                    .map(|r| {
+                        format!(
+                            "{}:{} · terminal {} · supervisor PID {} · child PID {}",
+                            r["provider"].as_str().unwrap(),
+                            r["account"].as_str().unwrap(),
+                            r["terminal"]
+                                .as_str()
+                                .unwrap_or("unknown (started before session tracking)"),
+                            r["supervisor_pid"],
+                            r["child_pid"]
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            output(&json!({"sessions": rows}), cli.json, pretty)?;
+        }
         Action::Add { provider, label } => {
             let a = provider::add(&store, provider, &label)?;
             let duplicates = duplicate_labels(&store, &a)?;
