@@ -1,4 +1,5 @@
 codex
-● synthetic
-    weekly  ██████░░░░░░░░░░░░░░░░░░  23%  resets in 6d4h
+  Default: synthetic · running agents may use other accounts
+● synthetic  checked just now
+    weekly  ██████░░░░░░░░░░░░░░░░░░  23% used  resets in 6d4h
     12,346 credits · 3 limit resets available

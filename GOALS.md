@@ -122,3 +122,7 @@ Never edit the headline (line 1).
 - [x] Word-wrap with indents at any width; list rows lead with quota and move identity below when it does not fit.
 - [x] Share a fresh alias observation instead of polling the provider once per duplicate label.
 - [x] Refresh snapshots and assertions for the new layout.
+
+## M14: Unambiguous quota status
+- [x] Label percentages as used, show check freshness, and mark expired or stale observations as unknown availability.
+- [x] Explain that the selected default does not identify the account of every running agent; verify narrow layouts and expired-window rendering.

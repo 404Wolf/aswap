@@ -1,12 +1,16 @@
 claude
+  Default: personal · running agents may use other accounts
 ● personal
-    alice@example.com · max · same login as personal-copy · updated 2h15m ago
-    session      ██████░░░░░░░░░░░░░░░░░░  23%  reset passed, refreshing
-    weekly       ████████████████████████  99%  resets in 1d21h
-    weekly opus  ███████████████████░░░░░  81%  resets in 1d21h
+    alice@example.com · max · same login as personal-copy · checked 2h15m ago ·
+    last known quota; availability unknown
+    session      ██████░░░░░░░░░░░░░░░░░░  23% used  reset passed, refreshing
+    weekly       ████████████████████████  99% used  resets in 1d21h
+    weekly opus  ███████████████████░░░░░  81% used  resets in 1d21h
 ○ offline   never fetched
 
 codex
-○ work  bob@example.com · updated 2h15m ago
-    session      ██░░░░░░░░░░░░░░░░░░░░░░  10%  reset passed, refreshing
-    weekly       █████████████████░░░░░░░  70%  resets in 1d21h
+  No default account selected
+○ work
+    bob@example.com · checked 2h15m ago · last known quota; availability unknown
+    session      ██░░░░░░░░░░░░░░░░░░░░░░  10% used  reset passed, refreshing
+    weekly       █████████████████░░░░░░░  70% used  resets in 1d21h

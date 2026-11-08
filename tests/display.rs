@@ -149,3 +149,34 @@ fn unavailable_quota_explains_reason_and_retains_dimmed_last_known_bar() {
     assert!(rendered.contains("\x1b[2m"));
     assert!(!rendered.contains("????"));
 }
+
+#[test]
+fn expired_window_is_last_known_even_when_recently_checked() {
+    let id = identity::Identity::default();
+    let cache = Cached {
+        usage: parse_claude(&json!({"seven_day": {
+            "utilization": 100, "resets_at": "1970-01-01T00:15:00Z"
+        }}))
+        .unwrap(),
+        fetched_at: 990,
+        ..Default::default()
+    };
+    let text = display::render(
+        &[Row {
+            provider: "claude",
+            label: "example",
+            active: true,
+            identity: &id,
+            duplicates: &[],
+            cached: &cache,
+        }],
+        true,
+        100,
+        false,
+        1000,
+    );
+    assert!(text.contains("weekly 100% used"));
+    assert!(text.contains("last known quota; availability unknown"));
+    assert!(text.contains("Default: example"));
+    assert!(text.contains("running agents may use other accounts"));
+}

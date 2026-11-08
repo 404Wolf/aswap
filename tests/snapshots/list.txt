@@ -1,8 +1,11 @@
 claude
+  Default: personal · running agents may use other accounts
 ● personal
-    session 23% · weekly 99% (resets in 1d23h) · weekly opus 81% (resets in
-    1d23h)
-    alice@example.com · max · same login as personal-copy
+    session 23% used · weekly 99% used (resets in 1d23h) · weekly opus 81% used
+    (resets in 1d23h)
+    alice@example.com · max · same login as personal-copy · checked just now
 ○ offline   never fetched
 codex
-○ work  session 10% · weekly 70% (resets in 1d23h) · bob@example.com
+  No default account selected
+○ work  session 10% used · weekly 70% used (resets in 1d23h)
+    bob@example.com · checked just now

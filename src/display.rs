@@ -245,7 +245,7 @@ pub fn policy_text(p: &Policy<'_>) -> String {
         Prefer::WeeklyReset => "soonest weekly reset",
     };
     format!(
-        "auto-select {} · switch at {}% · prefer {prefer}",
+        "auto-select {} · switch at {}% used · prefer {prefer}",
         if p.enabled { "on" } else { "off" },
         p.threshold
     )
@@ -304,6 +304,12 @@ pub fn render_with(
             };
         }
         lines.extend(header);
+        let selected = group.iter().find(|r| r.active).map(|r| clean(r.label));
+        let selection = match selected {
+            Some(label) => format!("  Default: {label} · running agents may use other accounts"),
+            None => "  No default account selected".into(),
+        };
+        lines.extend(paint.lines("2", &selection, width));
         let label_width = group
             .iter()
             .map(|r| clean(r.label).chars().count())
@@ -356,8 +362,11 @@ fn render_row(
     }
     if c.fetched_at == 0 {
         facts.push("never fetched".into());
-    } else if age > FRESH {
-        facts.push(format!("updated {}", ago(c.fetched_at, now)));
+    } else {
+        facts.push(format!("checked {}", ago(c.fetched_at, now)));
+        if errored || age > FRESH || c.usage.used(now).is_none() {
+            facts.push("last known quota; availability unknown".into());
+        }
     }
     let summary = if compact && !collapsed {
         window_summary(c, now)
@@ -440,7 +449,7 @@ fn render_row(
     }
     for w in windows {
         let name = format!("{:<name_width$}", window_name(&w.name, w.duration_minutes));
-        let pct = format!("{:>4}", percent(w.used_percent));
+        let pct = format!("{:>4} used", percent(w.used_percent));
         let when = reset(w, now);
         let limit = if w.used_percent >= 100.0 && w.resets_at.is_none_or(|r| r > now) {
             "  limit reached"
@@ -450,7 +459,7 @@ fn render_row(
         let valid = !errored && age <= FRESH && w.resets_at.is_none_or(|t| t > now);
         // indent + name + bar + percent + reset, with two-space gutters.
         // A fixed reset column keeps every bar the same length.
-        let fixed = 4 + name_width + 2 + 1 + 4 + 2 + "resets in 10d23h".len();
+        let fixed = 4 + name_width + 2 + 1 + 9 + 2 + "resets in 10d23h".len();
         let size = width.saturating_sub(fixed).min(24);
         let plain_bar = if size >= 6 {
             let filled = (w.used_percent.clamp(0.0, 100.0) / 100.0 * size as f64).round() as usize;
@@ -490,7 +499,7 @@ fn window_summary(c: &Cached, now: u64) -> String {
         .iter()
         .map(|w| {
             let mut s = format!(
-                "{} {}",
+                "{} {} used",
                 window_name(&w.name, w.duration_minutes),
                 percent(w.used_percent)
             );
