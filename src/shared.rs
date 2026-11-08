@@ -121,18 +121,80 @@ fn dir(path: &Path) -> Result<bool> {
         .safe("cannot create shared provider directory")?;
     Ok(true)
 }
+/// SQLite sidecars are transient and belong to the connection's database path.
+fn sqlite_sidecar(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            ["-wal", "-shm", "-journal"].iter().any(|suffix| {
+                name.strip_suffix(suffix).is_some_and(|base| {
+                    base.ends_with(".sqlite") || base.ends_with(".sqlite3") || base.ends_with(".db")
+                })
+            })
+        })
+}
+fn sqlite_file(path: &Path) -> bool {
+    let mut header = [0; 16];
+    File::open(path)
+        .and_then(|mut f| f.read_exact(&mut header))
+        .is_ok()
+        && &header == b"SQLite format 3\0"
+}
+/// Copy committed pages through SQLite so live WAL writes cannot tear snapshots.
+fn sqlite_snapshot(source: &Path, dest: &Path) -> Result<()> {
+    let source =
+        rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .safe("cannot open SQLite snapshot source")?;
+    source
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .safe("cannot set SQLite timeout")?;
+    let mut target =
+        rusqlite::Connection::open(dest).safe("cannot open SQLite snapshot destination")?;
+    let backup = rusqlite::backup::Backup::new(&source, &mut target)
+        .safe("cannot prepare SQLite snapshot")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if matches!(
+            backup.step(128).safe("cannot snapshot SQLite database")?,
+            rusqlite::backup::StepResult::Done
+        ) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Error("SQLite snapshot timed out; original retained"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    drop(backup);
+    let check: String = target
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .safe("cannot validate SQLite snapshot")?;
+    if check != "ok" {
+        return Err(Error(
+            "SQLite snapshot source is corrupt; original retained",
+        ));
+    }
+    Ok(())
+}
 /// Stream into a private temporary file, then publish without replacing anything.
 fn new_file(source: &Path, dest: &Path) -> Result<()> {
     let parent = dest.parent().ok_or(Error("missing shared directory"))?;
     if exists(dest) || !dir(parent)? {
         return Ok(());
     }
-    let mut input = File::open(source).safe("cannot read migration source")?;
+    if sqlite_sidecar(source) {
+        return Ok(());
+    }
     let mut temp = tempfile::NamedTempFile::new_in(parent).safe("cannot prepare shared file")?;
     temp.as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))
         .safe("cannot secure shared file")?;
-    std::io::copy(&mut input, &mut temp).safe("cannot copy shared file")?;
+    if sqlite_file(source) {
+        sqlite_snapshot(source, temp.path())?;
+    } else {
+        let mut input = File::open(source).safe("cannot read migration source")?;
+        std::io::copy(&mut input, &mut temp).safe("cannot copy shared file")?;
+    }
     temp.as_file().sync_all().safe("cannot sync shared file")?;
     match temp.persist_noclobber(dest) {
         Ok(_) => Ok(()),
@@ -719,5 +781,59 @@ impl View {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sqlite_tests {
+    use super::*;
+    #[test]
+    fn live_wal_snapshots_include_committed_rows_and_omit_sidecars() {
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let db = source.join("thread_history_1.sqlite");
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE items (id INTEGER); INSERT INTO items VALUES (42);").unwrap();
+        assert!(source.join("thread_history_1.sqlite-wal").exists());
+        for managed in [false, true] {
+            let dest = t
+                .path()
+                .join(if managed { "snapshot" } else { "migration" });
+            if managed {
+                snapshot(&source, &dest, 0).unwrap();
+            } else {
+                merge_new(&source, &dest).unwrap();
+            }
+            assert!(!dest.join("thread_history_1.sqlite-wal").exists());
+            assert!(!dest.join("thread_history_1.sqlite-shm").exists());
+            let reader = rusqlite::Connection::open(dest.join("thread_history_1.sqlite")).unwrap();
+            assert_eq!(
+                reader
+                    .query_row("SELECT id FROM items", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                42
+            );
+            assert_eq!(
+                reader
+                    .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+        }
+    }
+    #[test]
+    fn failed_sqlite_snapshot_is_not_published_and_original_is_retained() {
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("broken.sqlite");
+        fs::write(
+            &source,
+            [b"SQLite format 3\0".as_slice(), &[0u8; 200]].concat(),
+        )
+        .unwrap();
+        let dest = t.path().join("new.sqlite");
+        assert!(new_file(&source, &dest).is_err());
+        assert!(!dest.exists());
+        assert!(source.exists());
     }
 }

@@ -473,3 +473,9 @@ Replace `work` with the affected label. This removes/recreates the stored login;
 shared conversation history remains. For Codex use `codex login` and substitute
 `codex` in the profile commands. Keep the old profile until interactive login
 succeeds; never remove it first. Check the identity shown after re-adding.
+
+SQLite state migrated into a shared home or snapshotted from a managed entry
+uses SQLite's online backup API, including committed WAL pages. Transient WAL,
+SHM and rollback-journal sidecars are not copied independently. Snapshots are
+validated before publication; corrupt sources are retained and rejected, and
+busy backups have a bounded deadline. Existing destinations remain untouched.

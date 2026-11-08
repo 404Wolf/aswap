@@ -19,4 +19,6 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 ring = "0.17"
 base64 = "0.22"
 
+rusqlite = { version = "0.38", features = ["bundled", "backup"] }
+
 [dev-dependencies]

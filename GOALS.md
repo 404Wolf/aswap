@@ -132,3 +132,7 @@ Never edit the headline (line 1).
 - [x] Recognize explicit expired-login errors separately from quota exhaustion, exclude rejected auth and preserve exact conversation resume.
 - [x] Show actual account labels at launch/switch and expose local terminal/PID/account mappings with `aswap sessions`.
 - [x] Document owner-side interactive login renewal and verify expired-login switching with synthetic provider processes.
+
+## M16: Consistent SQLite state migration
+- [x] Use validated, bounded SQLite online backups for live database copies; omit transient sidecars and preserve originals on failure.
+- [x] Test committed WAL content, managed snapshots, sidecar exclusion and rejection of corrupt databases before publication.
