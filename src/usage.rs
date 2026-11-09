@@ -276,9 +276,26 @@ pub fn codex_rpc(profile: &Path) -> Result<Value> {
     )
 }
 fn codex_rpc_inner(profile: &Path, diagnostic: &std::cell::Cell<Failure>) -> Result<Value> {
+    codex_request(
+        profile,
+        diagnostic,
+        &[],
+        "account/rateLimits/read",
+        serde_json::json!({}),
+    )
+}
+/// Shared bounded RPC transport. Responses and provider stderr never enter errors.
+pub(crate) fn codex_request(
+    profile: &Path,
+    diagnostic: &std::cell::Cell<Failure>,
+    overrides: &[String],
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    let mut command = Provider::Codex.command(profile);
+    command.args(overrides);
     let mut child = Process(
-        Provider::Codex
-            .command(profile)
+        command
             .args(["app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -390,7 +407,7 @@ fn codex_rpc_inner(profile: &Path, diagnostic: &std::cell::Cell<Failure>) -> Res
         )?;
         send(
             &mut input,
-            serde_json::json!({"id":2,"method":"account/rateLimits/read"}),
+            serde_json::json!({"id":2,"method":method,"params":params}),
         )?;
         receive(2)
     })();

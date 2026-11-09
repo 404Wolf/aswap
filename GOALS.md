@@ -136,3 +136,8 @@ Never edit the headline (line 1).
 ## M16: Consistent SQLite state migration
 - [x] Use validated, bounded SQLite online backups for live database copies; omit transient sidecars and preserve originals on failure.
 - [x] Test committed WAL content, managed snapshots, sidecar exclusion and rejection of corrupt databases before publication.
+
+## M17: Model-compatible Codex account selection
+- [x] Resolve the requested model from CLI/config and preserve it across exact-session resumes.
+- [x] Verify each switch target using its account-scoped paginated catalog, skipping unknown/unsupported targets and explaining when none fit.
+- [x] Handle explicit model rejection without marking quota exhausted; test incompatible/unknown catalogs, config/profiles, CLI flags and exact-session preservation.

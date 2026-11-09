@@ -44,6 +44,7 @@ pub struct Terminal {
     input_open: bool,
     tail: String,
     pub auth_expired: bool,
+    pub model_unsupported: bool,
 }
 impl Terminal {
     pub fn open() -> Result<Self> {
@@ -95,6 +96,7 @@ impl Terminal {
             input_open: true,
             tail: String::new(),
             auth_expired: false,
+            model_unsupported: false,
         })
     }
     pub fn spawn(&mut self, command: &mut Command) -> Result<Child> {
@@ -119,6 +121,7 @@ impl Terminal {
         }
         self.tail.clear();
         self.auth_expired = false;
+        self.model_unsupported = false;
         self.resize();
         command.spawn().safe("cannot launch provider in terminal")
     }
@@ -193,6 +196,7 @@ impl Terminal {
                         .push_str(&String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase());
                     limited = limit_message(&self.tail);
                     self.auth_expired |= auth_message(&self.tail);
+                    self.model_unsupported |= unsupported_model_message(&self.tail);
                     // UTF-8 safe and bounded; this is never logged or persisted.
                     self.tail = self
                         .tail
@@ -280,4 +284,12 @@ mod auth_tests {
             assert!(!super::auth_message(text));
         }
     }
+}
+
+/// The provider rejected a model, rather than exhausting this account's quota.
+pub fn unsupported_model_message(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("model is not supported when using codex with")
+        || text.contains("model_not_found")
+        || text.contains("does not have access to model")
 }

@@ -74,15 +74,23 @@ pub fn run(
         let _lock = store.lock()?;
         store.account(&store.load()?, provider, name)?
     };
+    let mut models = if auto {
+        crate::models::Gate::new(provider, args)?
+    } else {
+        crate::models::Gate::default()
+    };
     if auto {
-        let _ = observations(store, provider)?;
+        models.resolve(store, &account)?;
+        let (entries, _) = observations(store, provider)?;
+        let _ = models.filter(store, &account.label, entries);
     }
     let mut lease = {
         let _lock = store.lock()?;
         if auto {
             let state = store.load()?;
             let settings = state.auto.get(&provider).cloned().unwrap_or_default();
-            let entries = entries_from_cache(store, provider)?;
+            let entries =
+                models.filter_cached(store, &account.label, entries_from_cache(store, provider)?);
             if let Some(best) = usage::choose(
                 &account.label,
                 &entries,
@@ -126,6 +134,18 @@ pub fn run(
     let mut launch_args = auto_args
         .as_ref()
         .map_or_else(|| args.to_vec(), |a| a.initial.clone());
+    if models.pin
+        && let Some(model) = &models.required
+    {
+        // Freeze the effective model across account switches and config edits.
+        let index = launch_args
+            .iter()
+            .position(|a| a == "--")
+            .unwrap_or(launch_args.len());
+        launch_args.splice(index..index, ["--model".into(), model.clone()]);
+        let sticky = &mut auto_args.as_mut().expect("auto model arguments").sticky;
+        sticky.extend(["--model".into(), model.clone()]);
+    }
     let mut tracker = if let Some(args) = &auto_args {
         Some(crate::session::Tracker::new(
             provider,
@@ -180,6 +200,8 @@ pub fn run(
         }
         let mut limited = false;
         let mut expired = false;
+        let mut unsupported = false;
+        let mut reported_none = false;
         let mut target = None;
         let mut next_check = 0;
         let status = loop {
@@ -222,6 +244,7 @@ pub fn run(
                 // Refresh-token rotations in this private run become canonical.
                 view.sync(store, &account)?;
                 let (entries, settings) = observations(store, provider)?;
+                let entries = models.filter(store, &account.label, entries);
                 if let Some(next) = usage::choose(
                     &account.label,
                     &entries,
@@ -234,6 +257,16 @@ pub fn run(
                     target = Some(next.clone());
                     break stop(&mut child.0)?;
                 }
+                if !reported_none
+                    && entries
+                        .iter()
+                        .find(|(a, _)| a.label == account.label)
+                        .and_then(|(_, c)| c.used(now()))
+                        .is_some_and(|used| used >= settings.threshold)
+                {
+                    models.report_none();
+                    reported_none = true;
+                }
             }
             if !expired && terminal.as_ref().is_some_and(|t| t.auth_expired) {
                 expired = true;
@@ -243,9 +276,20 @@ pub fn run(
                     account.label
                 );
             }
-            if auto && (limited || expired) {
+            if !unsupported
+                && provider == Provider::Codex
+                && terminal.as_ref().is_some_and(|t| t.model_unsupported)
+            {
+                unsupported = true;
+                models.reject(&account);
+                eprintln!(
+                    "aswap: current account rejected the session model; looking for a compatible account"
+                );
+            }
+            if auto && (limited || expired || unsupported) {
                 view.sync(store, &account)?;
                 let (entries, settings) = observations(store, provider)?;
+                let entries = models.filter(store, &account.label, entries);
                 target = usage::choose(
                     &account.label,
                     &entries,
@@ -258,6 +302,10 @@ pub fn run(
                 .cloned();
                 if target.is_some() {
                     break stop(&mut child.0)?;
+                }
+                if !reported_none {
+                    models.report_none();
+                    reported_none = true;
                 }
             }
             if terminal.is_none() {
@@ -273,11 +321,16 @@ pub fn run(
             return Ok(status.code().unwrap_or(1));
         }
         expired |= terminal.as_ref().is_some_and(|t| t.auth_expired);
-        if status.success() && target.is_none() && !expired {
+        unsupported |=
+            provider == Provider::Codex && terminal.as_ref().is_some_and(|t| t.model_unsupported);
+        if unsupported {
+            models.reject(&account);
+        }
+        if status.success() && target.is_none() && !expired && !unsupported {
             return Ok(0);
         }
         expired |= terminal.as_ref().is_some_and(|t| t.auth_expired);
-        let did_limit = limited || expired;
+        let did_limit = limited || expired || unsupported;
         if did_limit {
             if expired {
                 usage::mark_auth_expired(store, &account)?;
@@ -285,10 +338,11 @@ pub fn run(
                     "aswap: login expired for {provider}:{}; selecting another account",
                     account.label
                 );
-            } else {
+            } else if !unsupported {
                 usage::mark_limited(store, &account)?;
             }
             let (entries, settings) = observations(store, provider)?;
+            let entries = models.filter(store, &account.label, entries);
             target = usage::choose(
                 &account.label,
                 &entries,
@@ -306,7 +360,8 @@ pub fn run(
             return Ok(status.code().unwrap_or(1));
         }
         let Some(_) = target else {
-            return Ok(status.code().unwrap_or(1));
+            models.report_none();
+            return Ok(status.code().filter(|code| *code != 0).unwrap_or(1));
         };
         let exact_id = tracker
             .as_ref()
@@ -321,7 +376,7 @@ pub fn run(
             let settings = state.auto.get(&provider).cloned().unwrap_or_default();
             let next = usage::choose(
                 &account.label,
-                &entries_from_cache(store, provider)?,
+                &models.filter_cached(store, &account.label, entries_from_cache(store, provider)?),
                 settings.threshold,
                 settings.prefer,
                 0,

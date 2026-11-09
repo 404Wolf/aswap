@@ -25,6 +25,14 @@ args=sys.argv[1:]
 if args[:1]==['-c']: args=args[2:]
 assert os.getcwd()==os.environ['ASWAP_EXPECT_CWD']
 assert 'ANTHROPIC_API_KEY' not in os.environ and 'OPENAI_API_KEY' not in os.environ
+if args[:1]==['app-server']:
+    for line in sys.stdin:
+        req=json.loads(line)
+        if req.get('method')=='initialize': result={}
+        elif req.get('method')=='model/list': result={'data':[{'model':'synthetic-model','id':'synthetic-model','isDefault':True}]}
+        else: continue
+        print(json.dumps({'id':req['id'],'result':result}),flush=True)
+    sys.exit(0)
 assert (p/'projects' if provider=='claude' else p/'sessions').is_symlink()
 (p/'private-child-file').write_text('synthetic')
 if args==['--test-exit']: time.sleep(.1);sys.exit(7)

@@ -479,3 +479,26 @@ uses SQLite's online backup API, including committed WAL pages. Transient WAL,
 SHM and rollback-journal sidecars are not copied independently. Snapshots are
 validated before publication; corrupt sources are retained and rejected, and
 busy backups have a bounded deadline. Existing destinations remain untouched.
+
+### Model-compatible Codex failover
+
+Automatic Codex runs keep the requested model when changing accounts. The model
+comes from `-m`/`--model` (including `--model=...`), or Codex's effective
+configuration, including `-c` overrides and a selected named profile. A model
+resolved from configuration is pinned on launch and exact-session resume.
+
+Before selecting another account, aswap queries that account's `model/list`
+catalog, including hidden models and subsequent pages, using an isolated,
+access-only login. It does not infer model access from labels or plan names.
+Catalog results are cached for five minutes within the running supervisor and
+invalidated when credentials change. Missing, failed, or incomplete catalogs
+exclude that candidate. A provider's explicit unsupported-model error excludes
+the current account for the rest of this run without marking its quota spent.
+
+When no compatible account has verified quota below the threshold, aswap prints
+`no eligible account with verified support for model ... and available quota`.
+An open provider stays open; a provider that has already exited returns failure.
+The launcher never substitutes another model. The initial explicitly selected
+account remains usable even if its catalog cannot be queried; every automatic
+switch target must pass verification. Restart the supervisor after changing
+model selection inside the provider UI so aswap uses the new required model.
