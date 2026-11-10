@@ -29,6 +29,21 @@ pub struct Settings {
     /// The owner's `issued_at` of the installed packet: a slower, older
     /// exchange never overwrites a newer one.
     pub last_issued: u64,
+    /// The push stream keeps its own schedule so a failing or hanging
+    /// stream never delays the poll fallback: no new stream before this time.
+    pub watch_next: u64,
+    /// Consecutive push streams that failed before delivering a packet.
+    pub watch_failures: u32,
+}
+/// Write `value` only when the file does not already hold it: heartbeat
+/// packets must leave profile auth stamps alone, or every running view would
+/// resync on each heartbeat.
+fn write_changed<T: Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
+    let value = serde_json::to_value(value).safe("cannot encode private state")?;
+    if path.exists() && store::json_read::<Value>(path).ok().as_ref() == Some(&value) {
+        return Ok(());
+    }
+    store::json_write(path, &value)
 }
 /// A sync is due 30s after the last success and, while an attempt is in
 /// flight or after failures, only after a backoff longer than one exchange.
@@ -197,6 +212,7 @@ fn install(store: &Store, packet: Packet, settings: &mut Settings) -> Result<usi
         return Err(Error("sync: bad-response"));
     }
     let mut state = store.load()?;
+    let original = serde_json::to_value(&state).safe("cannot encode private state")?;
     let mut seen = std::collections::BTreeSet::new();
     // Validate the whole packet before writing any account.
     for p in &packet.profiles {
@@ -226,17 +242,17 @@ fn install(store: &Store, packet: Packet, settings: &mut Settings) -> Result<usi
     for p in packet.profiles {
         let path = store.profile(p.account.provider, &p.account.label)?;
         store::private_dir(&path)?;
-        store::json_write(
+        write_changed(
             &path.join(p.account.provider.auth_file()),
             &crate::refresh::access_only(p.account.provider, &p.auth),
         )?;
         if p.account.provider == Provider::Claude {
-            store::json_write(
+            write_changed(
                 &path.join(".claude.json"),
                 &crate::shared::account_config(&p.config),
             )?;
         }
-        store::json_write(&path.join("usage-cache.json"), &p.cache)?;
+        write_changed(&path.join("usage-cache.json"), &p.cache)?;
         if !state
             .accounts
             .iter()
@@ -261,10 +277,12 @@ fn install(store: &Store, packet: Packet, settings: &mut Settings) -> Result<usi
             };
             cache.error = Some("owner-profile-missing".into());
             cache.http_status = None;
-            store::json_write(&path, &cache)?;
+            write_changed(&path, &cache)?;
         }
     }
-    store.save(&state)?;
+    if serde_json::to_value(&state).safe("cannot encode private state")? != original {
+        store.save(&state)?;
+    }
     // Peer scheduling uses the local clock, never the owner's clock as proof
     // of credential validity or freshness. SSH pulls are serialized locally.
     settings.last_sync = now();
@@ -570,6 +588,7 @@ enum Frame {
 fn stream_command(
     mut command: Command,
     request: &Request,
+    first: Duration,
     idle: Duration,
     mut on_packet: impl FnMut(Packet) -> Result<()>,
     mut stop: impl FnMut() -> bool,
@@ -663,6 +682,9 @@ fn stream_command(
                     return Err(Error("sync: stream-ended"));
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if accepted == 0 && heard.elapsed() >= first {
+                        return Err(Error(NO_STREAM));
+                    }
                     if heard.elapsed() >= idle {
                         return Err(Error("sync: timeout"));
                     }
@@ -677,21 +699,35 @@ fn stream_command(
     let _ = child.wait();
     (accepted, result)
 }
-/// One follower connection to the owner's push stream, claimed like a poll.
-/// Packets are installed under the store lock as they arrive; the lock is
-/// never held while waiting on the network. A stream that delivered packets
-/// and then dropped is not a failure; one that failed first, or delivered a
-/// packet the store refused, backs off like a failed poll.
+/// An owner that sends nothing this long after connecting cannot stream
+/// (an older release waits for stdin EOF that never comes).
+const FIRST_PACKET: Duration = Duration::from_secs(10);
+const NO_STREAM: &str = "sync: no-stream; owner sent no first packet";
+/// One follower connection to the owner's push stream. It has its own
+/// schedule (`watch_next`, `watch_failures`) and never touches the poll's
+/// `last_attempt`/`failures`, so the 30s poll fallback keeps its cadence
+/// however the stream fares. Packets are installed under the store lock as
+/// they arrive; the lock is never held while waiting on the network. A
+/// delivered packet counts as a sync (last_sync, last_issued, poll failures).
 fn watch_session(
     store: &Store,
     command: impl FnOnce(&str) -> Result<Command>,
+    first: Duration,
     idle: Duration,
 ) -> Result<Option<usize>> {
-    // Connect at once unless a poll is in flight or failures call for backoff.
-    let ready =
-        |s: &Settings, at: u64| (s.failures == 0 && s.last_attempt <= s.last_sync) || due(s, at);
-    let Some((host, failures)) = claim(store, ready)? else {
-        return Ok(None);
+    let host = {
+        let _lock = store.lock()?;
+        let mut settings = settings(store)?;
+        let Some(host) = settings.host.clone() else {
+            return Ok(None);
+        };
+        if now() < settings.watch_next {
+            return Ok(None);
+        }
+        // A flapping owner gets at most one new stream per poll interval.
+        settings.watch_next = now().saturating_add(30);
+        store::json_write(&store.root.join("coordination.json"), &settings)?;
+        host
     };
     let moved = || settings(store).map_or(true, |s| s.host.as_deref() != Some(host.as_str()));
     let mut refused = false;
@@ -702,6 +738,7 @@ fn watch_session(
                 protocol: WATCH_PROTOCOL,
                 force: None,
             },
+            first,
             idle,
             |packet| {
                 let _lock = store.lock()?;
@@ -720,12 +757,23 @@ fn watch_session(
     if moved() {
         return Ok(Some(accepted));
     }
+    let mut settings = settings(store)?;
     match result {
-        Ok(()) => Ok(Some(accepted)),
-        Err(_) if accepted > 0 && !refused => Ok(Some(accepted)),
-        Err(err) => {
-            record_failure(store, failures)?;
+        Err(err) if accepted == 0 || refused => {
+            settings.watch_failures = settings.watch_failures.saturating_add(1);
+            let delay = if err.0 == NO_STREAM {
+                600
+            } else {
+                (60u64 << settings.watch_failures.min(4)).min(600)
+            };
+            settings.watch_next = settings.watch_next.max(now().saturating_add(delay));
+            store::json_write(&store.root.join("coordination.json"), &settings)?;
             Err(err)
+        }
+        _ => {
+            settings.watch_failures = 0;
+            store::json_write(&store.root.join("coordination.json"), &settings)?;
+            Ok(Some(accepted))
         }
     }
 }
@@ -736,22 +784,15 @@ pub fn watch(store: &Store) -> Result<()> {
     let Some(_watching) = store.watch_lock()? else {
         return Ok(());
     };
-    let mut started: Option<Instant> = None;
     while follower(store)? {
-        // A flapping owner reconnects at most once per poll interval.
-        if started.is_none_or(|s| s.elapsed() >= Duration::from_secs(30)) {
-            let begun = Instant::now();
-            match watch_session(
-                store,
-                |host| ssh(host, "aswap sync --serve --watch"),
-                STREAM_IDLE,
-            ) {
-                Ok(None) => {}
-                // Stay quiet: this runs beside a provider's terminal UI, and
-                // failures are recorded for `aswap status` like a failed poll.
-                Ok(Some(_)) | Err(_) => started = Some(begun),
-            }
-        }
+        // Stay quiet: this runs beside a provider's terminal UI; the stream
+        // schedules its own retries in coordination.json.
+        let _ = watch_session(
+            store,
+            |host| ssh(host, "aswap sync --serve --watch"),
+            FIRST_PACKET,
+            STREAM_IDLE,
+        );
         std::thread::sleep(Duration::from_secs(1));
     }
     Ok(())
@@ -1259,6 +1300,7 @@ mod tests {
                 Ok(command)
             },
             Duration::from_secs(5),
+            Duration::from_secs(5),
         )
         .unwrap();
         assert_eq!(accepted, Some(2));
@@ -1280,31 +1322,99 @@ mod tests {
         assert!(store.watch_lock().unwrap().is_none());
         watch(&store).unwrap();
         drop(held);
-        // A stream that fails before any packet backs off like a poll.
-        let error = watch_session(
-            &store,
-            |_| {
-                let mut command = Command::new("sh");
-                command.args([
-                    "-c",
-                    "printf 'aswap: sync: version-mismatch\\n' >&2; exit 1",
-                ]);
-                Ok(command)
-            },
+    }
+    #[test]
+    fn a_failed_or_hanging_watch_backs_off_itself_but_never_the_poll() {
+        let (_f, store) = follower_store();
+        let poll_state = |s: &Settings| (s.last_sync, s.last_attempt, s.failures);
+        let before = settings(&store).unwrap();
+        let fail = |script: &'static str, first: Duration| {
+            watch_session(
+                &store,
+                move |_| {
+                    let mut command = Command::new("sh");
+                    command.args(["-c", script]);
+                    Ok(command)
+                },
+                first,
+                Duration::from_secs(5),
+            )
+            .unwrap_err()
+        };
+        // An owner that refuses the stream.
+        let error = fail(
+            "printf 'aswap: sync: version-mismatch\\n' >&2; exit 1",
             Duration::from_secs(5),
-        )
-        .unwrap_err();
+        );
         assert_eq!(error.0, "sync: version-mismatch");
-        assert_eq!(settings(&store).unwrap().failures, 1);
+        let after = settings(&store).unwrap();
+        assert_eq!(after.watch_failures, 1);
+        assert!(after.watch_next >= now() + 110);
+        assert!(poll_state(&after) == poll_state(&before));
+        for at in [now(), now() + 31, now() + 300] {
+            assert_eq!(due(&after, at), due(&before, at));
+        }
         assert_eq!(
             watch_session(
                 &store,
                 |_| panic!("reconnected inside backoff"),
+                Duration::from_secs(5),
                 Duration::from_secs(5)
             )
             .unwrap(),
             None
         );
+        // An older owner that waits for stdin EOF and never sends a packet:
+        // give up quickly and leave it alone for ten minutes.
+        let mut s = settings(&store).unwrap();
+        s.watch_next = 0;
+        store::json_write(&store.root.join("coordination.json"), &s).unwrap();
+        let start = Instant::now();
+        let error = fail("cat > /dev/null", Duration::from_millis(300));
+        assert_eq!(error.0, NO_STREAM);
+        assert!(start.elapsed() < Duration::from_secs(3));
+        let after = settings(&store).unwrap();
+        assert!(after.watch_next >= now() + 590);
+        assert!(poll_state(&after) == poll_state(&before));
+        for at in [now(), now() + 31, now() + 300] {
+            assert_eq!(due(&after, at), due(&before, at));
+        }
+        // The poll fallback still runs on its own schedule.
+        let (_o, owner) = seed();
+        let reply = owner_packet(&owner);
+        assert_eq!(poll_with(&store, None, false, |_, _| Ok(reply)).unwrap(), 1);
+    }
+    #[test]
+    fn an_unchanged_heartbeat_leaves_installed_files_alone() {
+        let (_o, owner) = seed();
+        let (_f, store) = follower_store();
+        let profile = store.profile(Provider::Claude, "one").unwrap();
+        let first = owner_packet(&owner);
+        let issued = first.issued_at;
+        {
+            let _lock = store.lock().unwrap();
+            accept(&store, first).unwrap();
+        }
+        let auth = crate::shared::stamp(&profile.join(".credentials.json"));
+        let config = crate::shared::stamp(&profile.join(".claude.json"));
+        let state = crate::shared::stamp(&store.root.join("state.json"));
+        assert!(auth.is_some());
+        let mut heartbeat = owner_packet(&owner);
+        heartbeat.issued_at += 20;
+        {
+            let _lock = store.lock().unwrap();
+            accept(&store, heartbeat).unwrap();
+        }
+        assert!(crate::shared::stamp(&profile.join(".credentials.json")) == auth);
+        assert!(crate::shared::stamp(&profile.join(".claude.json")) == config);
+        assert!(crate::shared::stamp(&store.root.join("state.json")) == state);
+        let after = settings(&store).unwrap();
+        assert_eq!(after.last_issued, issued + 20);
+        assert!(after.last_sync > 0);
+        // A changed token is still written.
+        store::json_write(&owner.profile(Provider::Claude, "one").unwrap().join(".credentials.json"),&json!({"claudeAiOauth":{"accessToken":"synthetic-rotated","refreshToken":"synthetic-owner-refresh","expiresAt":9999999999999u64}})).unwrap();
+        install(&store, owner_packet(&owner), &mut settings(&store).unwrap()).unwrap();
+        assert!(crate::shared::stamp(&profile.join(".credentials.json")) != auth);
     }
     #[test]
     fn a_follower_never_refreshes_even_for_its_own_running_session() {
