@@ -339,25 +339,11 @@ fn remote_error(status: std::process::ExitStatus, first: &'static str) -> Error 
     })
 }
 fn exchange(host: &str, request: &Request) -> Result<Packet> {
-    if !valid_host(host) {
-        return Err(Error("invalid sync host alias"));
-    }
-    let mut command = Command::new("ssh");
-    command.args([
-        "-T",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=5",
-        "-o",
-        "ServerAliveInterval=10",
-        "-o",
-        "ServerAliveCountMax=2",
-        "--",
-        host,
-        "aswap sync --serve",
-    ]);
-    exchange_command(command, request, Duration::from_secs(90))
+    exchange_command(
+        ssh(host, "aswap sync --serve")?,
+        request,
+        Duration::from_secs(90),
+    )
 }
 fn exchange_command(mut command: Command, request: &Request, timeout: Duration) -> Result<Packet> {
     let mut child = command
@@ -376,27 +362,7 @@ fn exchange_command(mut command: Command, request: &Request, timeout: Duration) 
             serde_json::to_writer(&mut input, request).is_ok() && input.write_all(b"\n").is_ok();
         drop(input);
         let output = child.stdout.take().ok_or(Error("sync: bad-response"))?;
-        let stderr = child.stderr.take().ok_or(Error("sync: bad-response"))?;
-        let (err_tx, err_rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let mut reader = BufReader::new(stderr);
-            let mut first = Vec::new();
-            let ok = reader
-                .by_ref()
-                .take(4097)
-                .read_until(b'\n', &mut first)
-                .is_ok();
-            let filtered = if !ok || first.len() > 4096 {
-                "redacted-unrecognized"
-            } else if first.is_empty() {
-                "empty"
-            } else {
-                remote_line(&first)
-            };
-            let _ = err_tx.send(filtered);
-            // Keep draining so verbose SSH/provider errors cannot deadlock the pipe.
-            let _ = std::io::copy(&mut reader, &mut std::io::sink());
-        });
+        let err_rx = stderr_filter(child.stderr.take().ok_or(Error("sync: bad-response"))?);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
@@ -473,23 +439,8 @@ fn poll_with(
     exchange: impl FnOnce(&str, &Request) -> Result<Packet>,
 ) -> Result<usize> {
     let bypass = immediate || force.is_some();
-    let initial = settings(store)?;
-    if initial.host.is_none() || (!bypass && !due(&initial, now())) {
+    let Some((host, failures)) = claim(store, |s, at| bypass || due(s, at))? else {
         return Ok(0);
-    }
-    let path = store.root.join("coordination.json");
-    let host = {
-        let _lock = store.lock()?;
-        let mut settings = settings(store)?;
-        let Some(host) = settings.host.clone() else {
-            return Ok(0);
-        };
-        if !bypass && !due(&settings, now()) {
-            return Ok(0);
-        }
-        settings.last_attempt = now();
-        store::json_write(&path, &settings)?;
-        host
     };
     let result = exchange(
         &host,
@@ -499,22 +450,10 @@ fn poll_with(
         },
     );
     let _lock = store.lock()?;
-    let mut settings = settings(store)?;
-    if settings.host.as_deref() != Some(host.as_str()) {
+    if settings(store)?.host.as_deref() != Some(host.as_str()) {
         return Err(Error("sync: configuration changed during sync"));
     }
-    let failures = settings.failures;
-    let outcome = result.and_then(|packet| {
-        if packet.issued_at < settings.last_issued {
-            // A newer packet landed while this exchange was in flight.
-            return Ok((packet.profiles.len(), 0));
-        }
-        let duplicates = duplicate_count(&packet);
-        settings.failures = 0;
-        settings.last_issued = packet.issued_at;
-        install(store, packet, &mut settings).map(|count| (count, duplicates))
-    });
-    match outcome {
+    match result.and_then(|packet| accept(store, packet)) {
         Ok((count, duplicates)) => {
             if immediate && duplicates > 0 {
                 eprintln!(
@@ -524,22 +463,327 @@ fn poll_with(
             Ok(count)
         }
         Err(err) => {
-            let mut settings = self::settings(store)?;
-            settings.failures = failures.saturating_add(1);
-            settings.last_attempt = now();
-            store::json_write(&path, &settings)?;
+            record_failure(store, failures)?;
             Err(err)
         }
     }
 }
+/// Claim an exchange under the store lock when `ready` says one may start:
+/// returns the owner host and the failure count before this attempt.
+fn claim(store: &Store, ready: impl Fn(&Settings, u64) -> bool) -> Result<Option<(String, u32)>> {
+    let initial = settings(store)?;
+    if initial.host.is_none() || !ready(&initial, now()) {
+        return Ok(None);
+    }
+    let _lock = store.lock()?;
+    let mut settings = settings(store)?;
+    let Some(host) = settings.host.clone() else {
+        return Ok(None);
+    };
+    if !ready(&settings, now()) {
+        return Ok(None);
+    }
+    settings.last_attempt = now();
+    store::json_write(&store.root.join("coordination.json"), &settings)?;
+    Ok(Some((host, settings.failures)))
+}
+/// Caller holds the store lock and has checked the host. Installs a packet
+/// unless a newer one already landed; returns (profiles, duplicates).
+fn accept(store: &Store, packet: Packet) -> Result<(usize, usize)> {
+    let mut settings = settings(store)?;
+    if packet.issued_at < settings.last_issued {
+        return Ok((packet.profiles.len(), 0));
+    }
+    let duplicates = duplicate_count(&packet);
+    settings.failures = 0;
+    settings.last_issued = packet.issued_at;
+    install(store, packet, &mut settings).map(|count| (count, duplicates))
+}
+/// Caller holds the store lock.
+fn record_failure(store: &Store, failures: u32) -> Result<()> {
+    let mut settings = settings(store)?;
+    settings.failures = failures.saturating_add(1);
+    settings.last_attempt = now();
+    store::json_write(&store.root.join("coordination.json"), &settings)
+}
+/// Request protocol of the push stream (`sync --serve --watch`): the owner
+/// answers with newline-separated protocol-1 packets, one at start, one after
+/// every profile auth change and a heartbeat every `HEARTBEAT`.
+const WATCH_PROTOCOL: u8 = 2;
+const HEARTBEAT: Duration = Duration::from_secs(20);
+/// A stream that stays silent for this long (three heartbeats) is dead.
+const STREAM_IDLE: Duration = Duration::from_secs(60);
+const PACKET_LIMIT: usize = 4 * 1024 * 1024;
+fn ssh(host: &str, remote: &str) -> Result<Command> {
+    if !valid_host(host) {
+        return Err(Error("invalid sync host alias"));
+    }
+    let mut command = Command::new("ssh");
+    command.args([
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "ServerAliveInterval=10",
+        "-o",
+        "ServerAliveCountMax=2",
+        "--",
+        host,
+        remote,
+    ]);
+    Ok(command)
+}
+/// Classify the first stderr line on a helper thread and drain the rest, so
+/// verbose SSH/provider errors cannot deadlock the pipe.
+fn stderr_filter(stderr: std::process::ChildStderr) -> std::sync::mpsc::Receiver<&'static str> {
+    let (err_tx, err_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut first = Vec::new();
+        let ok = reader
+            .by_ref()
+            .take(4097)
+            .read_until(b'\n', &mut first)
+            .is_ok();
+        let filtered = if !ok || first.len() > 4096 {
+            "redacted-unrecognized"
+        } else if first.is_empty() {
+            "empty"
+        } else {
+            remote_line(&first)
+        };
+        let _ = err_tx.send(filtered);
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    });
+    err_rx
+}
+enum Frame {
+    Line(Vec<u8>),
+    End,
+    Bad,
+}
+/// Read one owner stream. Each packet goes to `on_packet` as it arrives;
+/// `stop` ends the stream early. Returns how many packets were accepted and
+/// how the stream ended. The child is always killed and reaped.
+fn stream_command(
+    mut command: Command,
+    request: &Request,
+    idle: Duration,
+    mut on_packet: impl FnMut(Packet) -> Result<()>,
+    mut stop: impl FnMut() -> bool,
+) -> (usize, Result<()>) {
+    // SAFETY: prctl is async-signal-safe. The stream outlives no watcher: if
+    // this process dies, the SSH child (and its pipes) die with it.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = match command
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return (0, Err(Error("sync: ssh-start-failed"))),
+    };
+    let mut accepted = 0;
+    let result = (|| {
+        // Keep stdin open: the owner ends its stream when it reaches EOF.
+        let mut input = child
+            .stdin
+            .take()
+            .ok_or(Error("sync: request-write-failed"))?;
+        serde_json::to_writer(&mut input, request).safe("sync: request-write-failed")?;
+        input.write_all(b"\n").safe("sync: request-write-failed")?;
+        input.flush().safe("sync: request-write-failed")?;
+        let output = child.stdout.take().ok_or(Error("sync: bad-response"))?;
+        let err_rx = stderr_filter(child.stderr.take().ok_or(Error("sync: bad-response"))?);
+        // Bounded: the reader waits for each packet to be installed.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(output);
+            loop {
+                let mut line = Vec::new();
+                let frame = match reader
+                    .by_ref()
+                    .take(PACKET_LIMIT as u64 + 2)
+                    .read_until(b'\n', &mut line)
+                {
+                    Ok(0) => Frame::End,
+                    Ok(_) if line.len() > PACKET_LIMIT + 1 || line.last() != Some(&b'\n') => {
+                        Frame::Bad
+                    }
+                    Ok(_) => Frame::Line(line),
+                    Err(_) => Frame::Bad,
+                };
+                let last = !matches!(frame, Frame::Line(_));
+                if tx.send(frame).is_err() || last {
+                    return;
+                }
+            }
+        });
+        let mut heard = Instant::now();
+        loop {
+            if stop() {
+                return Ok(());
+            }
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(Frame::Line(bytes)) => {
+                    let packet: Packet = serde_json::from_slice(&bytes)
+                        .safe("sync: bad-response; invalid protocol JSON")?;
+                    on_packet(packet)?;
+                    accepted += 1;
+                    heard = Instant::now();
+                }
+                Ok(Frame::Bad) => return Err(Error("sync: bad-response; invalid stream frame")),
+                Ok(Frame::End) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    while Instant::now() < deadline {
+                        if let Some(status) = child.try_wait().safe("sync: ssh-wait-failed")? {
+                            if !status.success() {
+                                return Err(remote_error(
+                                    status,
+                                    err_rx
+                                        .recv_timeout(Duration::from_secs(1))
+                                        .unwrap_or("unavailable"),
+                                ));
+                            }
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    return Err(Error("sync: stream-ended"));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if heard.elapsed() >= idle {
+                        return Err(Error("sync: timeout"));
+                    }
+                }
+            }
+        }
+    })();
+    // SAFETY: this child was created as the owner of a private process group.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    let _ = child.wait();
+    (accepted, result)
+}
+/// One follower connection to the owner's push stream, claimed like a poll.
+/// Packets are installed under the store lock as they arrive; the lock is
+/// never held while waiting on the network. A stream that delivered packets
+/// and then dropped is not a failure; one that failed first, or delivered a
+/// packet the store refused, backs off like a failed poll.
+fn watch_session(
+    store: &Store,
+    command: impl FnOnce(&str) -> Result<Command>,
+    idle: Duration,
+) -> Result<Option<usize>> {
+    // Connect at once unless a poll is in flight or failures call for backoff.
+    let ready =
+        |s: &Settings, at: u64| (s.failures == 0 && s.last_attempt <= s.last_sync) || due(s, at);
+    let Some((host, failures)) = claim(store, ready)? else {
+        return Ok(None);
+    };
+    let moved = || settings(store).map_or(true, |s| s.host.as_deref() != Some(host.as_str()));
+    let mut refused = false;
+    let (accepted, result) = match command(&host) {
+        Ok(command) => stream_command(
+            command,
+            &Request {
+                protocol: WATCH_PROTOCOL,
+                force: None,
+            },
+            idle,
+            |packet| {
+                let _lock = store.lock()?;
+                if moved() {
+                    return Err(Error("sync: configuration changed during sync"));
+                }
+                accept(store, packet)
+                    .map(drop)
+                    .inspect_err(|_| refused = true)
+            },
+            moved,
+        ),
+        Err(err) => (0, Err(err)),
+    };
+    let _lock = store.lock()?;
+    if moved() {
+        return Ok(Some(accepted));
+    }
+    match result {
+        Ok(()) => Ok(Some(accepted)),
+        Err(_) if accepted > 0 && !refused => Ok(Some(accepted)),
+        Err(err) => {
+            record_failure(store, failures)?;
+            Err(err)
+        }
+    }
+}
+/// Keep the owner's push stream open for this follower store until it stops
+/// being a follower. Only one process per store streams; the others return
+/// at once and rely on the 30s poll, which stays the fallback.
+pub fn watch(store: &Store) -> Result<()> {
+    let Some(_watching) = store.watch_lock()? else {
+        return Ok(());
+    };
+    let mut started: Option<Instant> = None;
+    while follower(store)? {
+        // A flapping owner reconnects at most once per poll interval.
+        if started.is_none_or(|s| s.elapsed() >= Duration::from_secs(30)) {
+            let begun = Instant::now();
+            match watch_session(
+                store,
+                |host| ssh(host, "aswap sync --serve --watch"),
+                STREAM_IDLE,
+            ) {
+                Ok(None) => {}
+                // Stay quiet: this runs beside a provider's terminal UI, and
+                // failures are recorded for `aswap status` like a failed poll.
+                Ok(Some(_)) | Err(_) => started = Some(begun),
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Ok(())
+}
+/// Start the follower push stream on a helper thread. A run or the monitor
+/// calls this; whoever takes the watch lock first streams, and the others
+/// keep trying so the stream moves to a survivor when that process exits.
+pub fn spawn_watch(store: &Store) {
+    if !follower(store).unwrap_or(false) {
+        return;
+    }
+    let Ok(store) = Store::open(store.root.clone()) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        while follower(&store).unwrap_or(false) {
+            let _ = watch(&store);
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    });
+}
 /// Hidden SSH-only transport; refuse credential output to a terminal or a local
 /// invocation. Normal `sync --json` returns counts/role, never this packet.
-pub fn serve(store: &Store) -> Result<()> {
+pub fn serve(store: &Store, watch: bool) -> Result<()> {
     if std::io::stdout().is_terminal()
         || std::io::stdin().is_terminal()
         || std::env::var_os("SSH_CONNECTION").is_none()
     {
         return Err(Error("sync transport is restricted to an SSH pipe"));
+    }
+    if watch {
+        return serve_watch(store);
     }
     let mut bytes = Vec::new();
     std::io::stdin()
@@ -550,16 +794,86 @@ pub fn serve(store: &Store) -> Result<()> {
         return Err(Error("sync request too large"));
     }
     let request: Request = serde_json::from_slice(&bytes).safe("sync: invalid-request")?;
-    let packet = packet(store, &request).map_err(|e| {
-        if e.0.starts_with("sync:") {
-            e
-        } else {
-            Error("sync: owner-store-error")
-        }
-    })?;
+    let packet = packet(store, &request).map_err(owner_packet_error)?;
     let mut output = std::io::stdout().lock();
     serde_json::to_writer(&mut output, &packet).safe("cannot send owner packet")?;
     output.flush().safe("cannot send owner packet")
+}
+fn owner_packet_error(e: Error) -> Error {
+    if e.0.starts_with("sync:") {
+        e
+    } else {
+        Error("sync: owner-store-error")
+    }
+}
+/// What a follower's packet depends on: the account list and every
+/// profile's auth file. Stats only; no store lock and no file contents.
+fn auth_print(store: &Store) -> Vec<Option<crate::shared::Stamp>> {
+    let mut print = vec![crate::shared::stamp(&store.root.join("state.json"))];
+    for account in store.load().map(|s| s.accounts).unwrap_or_default() {
+        print.push(
+            store
+                .profile(account.provider, &account.label)
+                .ok()
+                .and_then(|p| crate::shared::stamp(&p.join(account.provider.auth_file()))),
+        );
+    }
+    print
+}
+/// The push stream: one packet per line at start, within a tick of any
+/// profile auth change (a refresh revokes the old access token at once), and
+/// a heartbeat every `HEARTBEAT`. Ends when the follower closes stdin or the
+/// pipe breaks.
+fn serve_watch(store: &Store) -> Result<()> {
+    let mut input = BufReader::new(std::io::stdin());
+    let mut line = Vec::new();
+    input
+        .by_ref()
+        .take(8193)
+        .read_until(b'\n', &mut line)
+        .safe("cannot read sync request")?;
+    if line.len() > 8192 {
+        return Err(Error("sync request too large"));
+    }
+    let request: Request = serde_json::from_slice(&line).safe("sync: invalid-request")?;
+    if request.protocol != WATCH_PROTOCOL || request.force.is_some() {
+        return Err(Error("sync: version-mismatch"));
+    }
+    let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let closed = closed.clone();
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut input, &mut std::io::sink());
+            closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+    let single = Request {
+        protocol: 1,
+        force: None,
+    };
+    let mut sent: Option<(Vec<Option<crate::shared::Stamp>>, Instant)> = None;
+    while !closed.load(std::sync::atomic::Ordering::SeqCst) {
+        // Stamp before building: a change during the build sends again.
+        let print = auth_print(store);
+        if sent
+            .as_ref()
+            .is_none_or(|(last, at)| *last != print || at.elapsed() >= HEARTBEAT)
+        {
+            let packet = packet(store, &single).map_err(owner_packet_error)?;
+            let mut bytes = serde_json::to_vec(&packet).safe("cannot send owner packet")?;
+            drop(packet);
+            bytes.push(b'\n');
+            let mut output = std::io::stdout().lock();
+            match output.write_all(&bytes).and_then(|_| output.flush()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                Err(_) => return Err(Error("cannot send owner packet")),
+            }
+            sent = Some((print, Instant::now()));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -664,7 +978,8 @@ mod tests {
         }
         assert!(valid_host("synthetic-owner"));
         let (_t, store) = seed();
-        assert!(serve(&store).is_err());
+        assert!(serve(&store, false).is_err());
+        assert!(serve(&store, true).is_err());
     }
     #[test]
     fn duplicate_identities_are_aliases_but_duplicate_labels_and_identity_changes_are_conflicts() {
@@ -885,5 +1200,144 @@ mod tests {
         assert_eq!(after.failures, 0);
         assert!(!due(&after, now()));
         assert!(due(&after, now() + 31));
+    }
+    #[test]
+    fn a_follower_watch_installs_a_second_packet_pushed_after_the_first() {
+        let (o, owner) = seed();
+        let (f, store) = follower_store();
+        let profile = owner.profile(Provider::Claude, "one").unwrap();
+        let rotate = |token: &str| {
+            store::json_write(&profile.join(".credentials.json"),&json!({"claudeAiOauth":{"accessToken":token,"refreshToken":"synthetic-owner-refresh","expiresAt":9999999999999u64}})).unwrap();
+        };
+        // The owner notices its own rotation from file stamps alone.
+        let before = auth_print(&owner);
+        rotate("synthetic-first-access");
+        assert!(auth_print(&owner) != before);
+        let first = o.path().join("first.json");
+        std::fs::write(
+            &first,
+            [
+                serde_json::to_vec(&owner_packet(&owner)).unwrap(),
+                b"\n".to_vec(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        rotate("synthetic-second-access");
+        let second = o.path().join("second.json");
+        std::fs::write(
+            &second,
+            [
+                serde_json::to_vec(&owner_packet(&owner)).unwrap(),
+                b"\n".to_vec(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let installed = store
+            .profile(Provider::Claude, "one")
+            .unwrap()
+            .join(".credentials.json");
+        let marker = f.path().join("request.json");
+        // A fake owner: read the request line, push the first packet, wait
+        // until the follower installed it, then push the rotation on the
+        // same open stream.
+        let script = format!(
+            "head -n 1 > '{m}'; cat '{a}'; i=0; until grep -q synthetic-first-access '{p}' 2>/dev/null; do i=$((i+1)); [ $i -gt 200 ] && exit 3; sleep 0.02; done; cat '{b}'",
+            m = marker.display(),
+            a = first.display(),
+            b = second.display(),
+            p = installed.display(),
+        );
+        let start = Instant::now();
+        let accepted = watch_session(
+            &store,
+            |host| {
+                assert_eq!(host, "synthetic-owner");
+                let mut command = Command::new("sh");
+                command.args(["-c", &script]);
+                Ok(command)
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(accepted, Some(2));
+        assert!(start.elapsed() < Duration::from_secs(3));
+        let request: Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(request["protocol"], WATCH_PROTOCOL);
+        let auth: Value = store::json_read(&installed).unwrap();
+        assert_eq!(
+            auth["claudeAiOauth"]["accessToken"],
+            "synthetic-second-access"
+        );
+        assert!(auth["claudeAiOauth"].get("refreshToken").is_none());
+        // A stream that delivered and then ended is not a failure.
+        let after = settings(&store).unwrap();
+        assert_eq!(after.failures, 0);
+        assert!(after.last_sync >= after.last_attempt);
+        // Only one process per store streams.
+        let held = store.watch_lock().unwrap().unwrap();
+        assert!(store.watch_lock().unwrap().is_none());
+        watch(&store).unwrap();
+        drop(held);
+        // A stream that fails before any packet backs off like a poll.
+        let error = watch_session(
+            &store,
+            |_| {
+                let mut command = Command::new("sh");
+                command.args([
+                    "-c",
+                    "printf 'aswap: sync: version-mismatch\\n' >&2; exit 1",
+                ]);
+                Ok(command)
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(error.0, "sync: version-mismatch");
+        assert_eq!(settings(&store).unwrap().failures, 1);
+        assert_eq!(
+            watch_session(
+                &store,
+                |_| panic!("reconnected inside backoff"),
+                Duration::from_secs(5)
+            )
+            .unwrap(),
+            None
+        );
+    }
+    #[test]
+    fn a_follower_never_refreshes_even_for_its_own_running_session() {
+        let (_o, owner) = seed();
+        let (_f, store) = follower_store();
+        install(&store, owner_packet(&owner), &mut settings(&store).unwrap()).unwrap();
+        let a = Account {
+            provider: Provider::Claude,
+            label: "one".into(),
+        };
+        // Expired, forced and as an active run: still no refresh request.
+        for active in [false, true] {
+            let _lock = store.lock().unwrap();
+            assert!(
+                !crate::refresh::refresh_inner(&store, &a, u64::MAX / 2, true, active, |_, _| {
+                    panic!("a follower must never rotate")
+                })
+                .unwrap()
+            );
+        }
+        let auth: Value = store::json_read(
+            &store
+                .profile(Provider::Claude, "one")
+                .unwrap()
+                .join(".credentials.json"),
+        )
+        .unwrap();
+        assert!(auth["claudeAiOauth"].get("refreshToken").is_none());
+        // Its launch views carry only the public owner-managed sentinel.
+        let launch = crate::refresh::launch_auth(Provider::Claude, &auth);
+        assert_eq!(
+            launch["claudeAiOauth"]["refreshToken"],
+            "aswap-owner-managed"
+        );
     }
 }

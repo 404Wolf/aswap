@@ -310,6 +310,21 @@ impl Store {
         }
         self.legacy_lock(account)
     }
+    /// The one process per follower store that keeps the owner's push stream
+    /// open. None while another process (a run or the monitor) holds it.
+    pub(crate) fn watch_lock(&self) -> Result<Option<Guard>> {
+        let path = self.root.join("sync-watch.lock");
+        no_links(&path)?;
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .safe("cannot open sync watch lock")?;
+        Ok(f.try_lock_exclusive().is_ok().then_some(Guard(f)))
+    }
     pub(crate) fn legacy_lock(&self, account: &Account) -> Result<Guard> {
         let path = self
             .root

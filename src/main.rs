@@ -102,6 +102,9 @@ enum Action {
         off: bool,
         #[arg(long, hide = true, conflicts_with = "host")]
         serve: bool,
+        /// With --serve: stream a packet now and after every auth change.
+        #[arg(long, hide = true, requires = "serve")]
+        watch: bool,
     },
     /// Stream Waybar custom/aswap JSON lines, at a relaxed cadence.
     Waybar {
@@ -506,20 +509,26 @@ fn execute(cli: Cli) -> Result<i32> {
                     store.save(&state)?;
                     output(&v, cli.json, pretty)?;
                 }
-                AutoAction::Once | AutoAction::Watch => loop {
-                    let selected = runner::tick(&store, provider, activate_live)?;
-                    output(
-                        &json!({"provider":provider,"selected":selected}),
-                        cli.json,
-                        selected
-                            .map(|s| format!("Selected {provider}:{s}"))
-                            .unwrap_or("No switch".into()),
-                    )?;
-                    if matches!(action, AutoAction::Once) {
-                        break;
+                AutoAction::Once | AutoAction::Watch => {
+                    if matches!(action, AutoAction::Watch) {
+                        // The monitor keeps the owner's push stream open.
+                        aswap::coordination::spawn_watch(&store);
                     }
-                    std::thread::sleep(Duration::from_secs(usage::TTL));
-                },
+                    loop {
+                        let selected = runner::tick(&store, provider, activate_live)?;
+                        output(
+                            &json!({"provider":provider,"selected":selected}),
+                            cli.json,
+                            selected
+                                .map(|s| format!("Selected {provider}:{s}"))
+                                .unwrap_or("No switch".into()),
+                        )?;
+                        if matches!(action, AutoAction::Once) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_secs(usage::TTL));
+                    }
+                }
             }
         }
         Action::Sync {
@@ -527,9 +536,10 @@ fn execute(cli: Cli) -> Result<i32> {
             owner,
             off,
             serve,
+            watch,
         } => {
             if serve {
-                aswap::coordination::serve(&store)?;
+                aswap::coordination::serve(&store, watch)?;
             } else if off {
                 aswap::coordination::off(&store)?;
                 output(

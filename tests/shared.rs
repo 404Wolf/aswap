@@ -332,3 +332,68 @@ fn nested_child() {
     let fallback = View::prepare(&store, &account).unwrap();
     assert_eq!(fallback.home, provider::home().unwrap().join(".codex"));
 }
+#[test]
+fn a_rotated_profile_token_reaches_a_running_view_without_the_30s_tick() {
+    let t = tempfile::tempdir().unwrap();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "auth_change_child", "--nocapture"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", t.path())
+        .env("XDG_DATA_HOME", t.path().join("data"))
+        .env("CLAUDE_CONFIG_DIR", t.path().join("claude"))
+        .env("CODEX_HOME", t.path().join("codex"))
+        .env("ASWAP_AUTH_CHANGE_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+#[test]
+fn auth_change_child() {
+    if std::env::var("ASWAP_AUTH_CHANGE_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    let store = Store::from_env().unwrap();
+    let home = Provider::Claude.current_home().unwrap();
+    let auth = |token: &str| json!({"claudeAiOauth":{"accessToken":token,"refreshToken":"synthetic-refresh","expiresAt":9999999999999u64}});
+    store::json_write(
+        &home.join(".credentials.json"),
+        &auth("synthetic-old-access"),
+    )
+    .unwrap();
+    store::json_write(
+        &home.join(".claude.json"),
+        &json!({"oauthAccount":{"accountUuid":"synthetic-profile"}}),
+    )
+    .unwrap();
+    let a = provider::add(&store, Provider::Claude, "one").unwrap();
+    let mut view = View::prepare(&store, &a).unwrap();
+    let view_auth = view.path.join(".credentials.json");
+    let launched = || -> serde_json::Value { store::json_read(&view_auth).unwrap() };
+    assert!(!view.auth_changed(&store, &a));
+    assert_eq!(
+        launched()["claudeAiOauth"]["accessToken"],
+        "synthetic-old-access"
+    );
+    // The owner rotates (or a follower installs a pushed packet): the old
+    // access token is revoked at once, so the view must not wait 30s.
+    let profile = store.profile(Provider::Claude, "one").unwrap();
+    store::json_write(
+        &profile.join(".credentials.json"),
+        &auth("synthetic-new-access"),
+    )
+    .unwrap();
+    assert!(view.auth_changed(&store, &a));
+    view.sync(&store, &a).unwrap();
+    let now = launched();
+    assert_eq!(now["claudeAiOauth"]["accessToken"], "synthetic-new-access");
+    // The view still carries only the owner-managed sentinel, never the
+    // refresh token, and the change is consumed.
+    assert_eq!(now["claudeAiOauth"]["refreshToken"], "aswap-owner-managed");
+    assert!(!view.auth_changed(&store, &a));
+}

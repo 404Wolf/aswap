@@ -312,8 +312,14 @@ published 401 recovery first requires a nonempty refresh field, re-reads the aut
 file, and retries when the access token has changed. The sentinel enables that
 reload path but can never authorize a real rotation; proactive sentinel refresh
 is suppressed. Codex launch views use the external chatgptAuthTokens mode and an
-empty refresh token. Peers install the owner's fresh access token into live views
-at 30s cadence. If the owner is unreachable, a stale sentinel may yield an auth
+empty refresh token. The owner revokes the old access token as soon as it
+rotates, so the handoff must be fast: the owner streams a packet to each
+follower's single watcher (`sync --serve --watch`, request protocol 2,
+newline-separated protocol-1 packets, same 4 MiB limit) within a tick of a profile
+auth stamp change and every 20s as a heartbeat; the watcher installs each one
+under the store lock and keeps the pull's last_attempt/backoff rules for
+reconnects; the 30s pull stays the fallback. Live views stat their profile auth
+every 250ms and copy a changed token immediately. If the owner is unreachable, a stale sentinel may yield an auth
 error rather than any rotation; no peer silently becomes an owner. Provider token
 reload behavior is version-sensitive and synthetic process tests cannot prove
 arbitrary future provider versions; explicit resume is the recovery path.
