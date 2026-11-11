@@ -72,7 +72,7 @@ pub fn run(
     }
     // Followers: keep the owner's push stream open unless another run or the
     // monitor already does, so a rotated token arrives within about a second.
-    crate::coordination::spawn_watch(store);
+    crate::coordination::spawn_sync(store);
     let mut account = {
         let _lock = store.lock()?;
         store.account(&store.load()?, provider, name)?

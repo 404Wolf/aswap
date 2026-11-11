@@ -162,7 +162,7 @@ fn snapshot(store: &Store, filter: Option<Provider>, refresh: bool) -> Result<Va
     }
     let coordination = aswap::coordination::settings(store)?;
     Ok(
-        json!({"schema_version":1,"accounts":rows,"auto":settings,"credential_mode":if coordination.owner {"refresh-owner"}else if coordination.host.is_some(){"access-only-follower"}else{"refresh-disabled"},"last_sync":coordination.last_sync}),
+        json!({"schema_version":1,"accounts":rows,"auto":settings,"credential_mode":if coordination.owner {"refresh-owner"}else if coordination.host.is_some(){"access-only-follower"}else{"refresh-disabled"},"last_sync":coordination.last_sync,"sync":aswap::coordination::status(store)?}),
     )
 }
 fn duplicate_labels(store: &Store, account: &store::Account) -> Result<Vec<String>> {
@@ -511,8 +511,10 @@ fn execute(cli: Cli) -> Result<i32> {
                 }
                 AutoAction::Once | AutoAction::Watch => {
                     if matches!(action, AutoAction::Watch) {
-                        // The monitor keeps the owner's push stream open.
-                        aswap::coordination::spawn_watch(&store);
+                        // The monitor keeps the owner's push stream open and
+                        // polls every 30s while no stream delivers, whatever
+                        // its usage tick and auto policy.
+                        aswap::coordination::spawn_sync(&store);
                     }
                     loop {
                         let selected = runner::tick(&store, provider, activate_live)?;

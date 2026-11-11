@@ -320,9 +320,22 @@ auth stamp change and every 20s as a heartbeat; the watcher installs each one
 under the store lock, rewriting only files whose contents changed so
 heartbeats leave auth stamps alone. The stream keeps its own schedule
 (watch_next/watch_failures; one connect per 30s, exponential backoff, 10
-minutes for an owner that sends no first packet within 10s, as an older
+minutes for an owner that sends no first packet within 30s, as an older
 release does) and never touches the pull's last_attempt/failures, so the 30s
-pull fallback keeps its cadence however the stream fares. Live views stat their profile auth
+pull fallback keeps its cadence however the stream fares. Every follower run
+and the monitor run a fallback poller beside the stream: it polls 30s after
+the last delivery (a stream packet or a poll), 30s and then 60s after a
+failure, and 60s after a claimed exchange that never finished. That cap holds
+whatever failure count older releases write into the shared coordination
+file, and timestamps in the future (a clock step) are ignored. A connected
+but silent stream stops counting as delivery after its heartbeat goes
+missing, so the poller takes over within 30s without waiting for the 60s idle
+timeout. A packet older than the installed one is skipped as an overlap only
+within 300s; a larger gap is the owner's clock stepping back and installs.
+Each claim, connect, delivery (installed, unchanged or stale), failure (fixed
+error code only) and stream end is appended as one JSON line, with the
+schedule fields and the pid, to the private sync.log (0600, rotated to
+sync.log.1 at 1 MiB); `status --json` shows the last ten under sync.events. Live views stat their profile auth
 every 250ms and copy a changed token immediately. If the owner is unreachable, a stale sentinel may yield an auth
 error rather than any rotation; no peer silently becomes an owner. Provider token
 reload behavior is version-sensitive and synthetic process tests cannot prove
