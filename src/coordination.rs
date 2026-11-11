@@ -1548,7 +1548,6 @@ mod tests {
         let (_f, store) = follower_store();
         let profile = store.profile(Provider::Claude, "one").unwrap();
         let first = owner_packet(&owner);
-        let issued = first.issued_at;
         {
             let _lock = store.lock().unwrap();
             accept(&store, first).unwrap();
@@ -1559,6 +1558,7 @@ mod tests {
         assert!(auth.is_some());
         let mut heartbeat = owner_packet(&owner);
         heartbeat.issued_at += 20;
+        let heartbeat_issued = heartbeat.issued_at;
         {
             let _lock = store.lock().unwrap();
             accept(&store, heartbeat).unwrap();
@@ -1567,7 +1567,7 @@ mod tests {
         assert!(crate::shared::stamp(&profile.join(".claude.json")) == config);
         assert!(crate::shared::stamp(&store.root.join("state.json")) == state);
         let after = settings(&store).unwrap();
-        assert_eq!(after.last_issued, issued + 20);
+        assert_eq!(after.last_issued, heartbeat_issued);
         assert!(after.last_sync > 0);
         // A changed token is still written.
         store::json_write(&owner.profile(Provider::Claude, "one").unwrap().join(".credentials.json"),&json!({"claudeAiOauth":{"accessToken":"synthetic-rotated","refreshToken":"synthetic-owner-refresh","expiresAt":9999999999999u64}})).unwrap();
