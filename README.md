@@ -320,6 +320,41 @@ programs.aswap.refreshOwner = true;
 programs.aswap.syncHost = "synthetic-owner";
 ```
 
+For a follower that must import only specified profiles, declare an exact
+provider/label allowlist on that machine:
+
+```nix
+programs.aswap.syncProfiles = {
+  allow = [ "claude:personal" "codex:personal" ];
+  deny = [];
+};
+```
+
+This writes credential-free `$XDG_CONFIG_HOME/aswap/sync-policy.json` (normally
+`~/.config/aswap/sync-policy.json`) even without an enabled monitor. Manual
+configuration uses the same JSON shape: `{"allow":["claude:personal"],"deny":[]}`.
+Keys are case-sensitive `claude:LABEL` or `codex:LABEL`; wildcards and identity or
+email matching are unsupported. `allow = null` permits all imports, `allow = []`
+permits none, and deny always wins. `syncProfiles = null` manages no policy file;
+an absent file allows all imports. Use an explicit allowlist for a non-work-only
+machine so new or renamed owner labels stay excluded until reviewed.
+
+Both polling and streaming sync reread this policy for every received packet,
+including stale packets; role changes never overwrite it. Excluded remote profiles
+are not installed or checked for auth/identity conflicts. Malformed, unreadable or
+oversized policy files fail closed with a fixed diagnostic that contains no file
+contents. The policy limits local imports; the owner still transmits its complete
+access-only packet over SSH, and local `add`, `switch`, and `run` remain available.
+
+**Existing excluded profiles block sync.** Nothing is hidden, pruned, or stopped.
+Before applying a restrictive policy, finish affected sessions and explicitly
+remove excluded local profiles using `aswap remove PROVIDER LABEL`. A busy excluded
+profile cannot be removed: it remains on the machine and the non-work-only
+requirement is **not yet satisfied** until its sessions finish and guarded cleanup
+succeeds. Until then all sync imports fail with `sync: excluded-local-profile`,
+leaving profile auth, caches, defaults and account metadata unchanged. Sync
+scheduling/failure counters may still update. No refresh ownership is transferred.
+
 `refreshOwner = null` (default) preserves CLI configuration. Explicit `false`
 with no `syncHost` disables automatic refresh; owner and follower options are
 mutually exclusive. Enable the desired `autoswitch.<provider>.enable` services on

@@ -84,7 +84,19 @@
               home.username = "synthetic";
               home.homeDirectory = "/home/synthetic";
               home.stateVersion = "26.05";
-              programs.aswap = { enable = true; syncHost = "synthetic-owner"; autoswitch.claude.enable = true; };
+              programs.aswap = {
+                enable = true; syncHost = "synthetic-owner"; autoswitch.claude.enable = true;
+                syncProfiles = { allow = [ "claude:personal" "codex:personal" ]; deny = [ "codex:personal" ]; };
+              };
+            } ];
+          };
+          hmPolicyOnly = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = [ self.homeManagerModules.default {
+              home.username = "synthetic";
+              home.homeDirectory = "/home/synthetic";
+              home.stateVersion = "26.05";
+              programs.aswap = { enable = true; syncProfiles.allow = []; };
             } ];
           };
         in {
@@ -111,6 +123,12 @@
             touch $out
           '';
           home-manager = assert builtins.elem package hm.config.home.packages;
+            assert !(hm.config.xdg.configFile ? "aswap/sync-policy.json");
+            assert hmPolicyOnly.config.xdg.configFile."aswap/sync-policy.json".text == builtins.toJSON { allow = []; deny = []; };
+            assert !(hmPolicyOnly.config.systemd.user.services ? aswap-claude);
+            assert builtins.fromJSON hmPeer.config.xdg.configFile."aswap/sync-policy.json".text == {
+              allow = [ "claude:personal" "codex:personal" ]; deny = [ "codex:personal" ];
+            };
             assert hm.config.systemd.user.services.aswap-claude.Service.UMask == "0077";
             assert hm.config.systemd.user.services.aswap-codex.Service.RestartSec == 60;
             assert pkgs.lib.hasInfix " sync --owner" (builtins.head hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre);

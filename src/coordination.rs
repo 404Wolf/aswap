@@ -35,6 +35,61 @@ pub struct Settings {
     /// Consecutive push streams that failed before delivering a packet.
     pub watch_failures: u32,
 }
+/// Credential-free local import policy, separate from mutable scheduling state.
+/// Exact provider:label keys avoid guessing an organization from private identity.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SyncPolicy {
+    allow: Option<Vec<String>>,
+    deny: Vec<String>,
+}
+impl SyncPolicy {
+    fn read(path: &std::path::Path) -> Result<Self> {
+        // Declarative configuration may be a Home Manager/Nix symlink. Unlike
+        // account-store data this file is never written by aswap.
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling managed symlink is a broken policy, not no policy.
+                return match std::fs::symlink_metadata(path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+                    _ => Err(Error("sync: invalid-profile-policy")),
+                };
+            }
+            Err(_) => return Err(Error("sync: invalid-profile-policy")),
+        };
+        let mut bytes = Vec::new();
+        file.take(65537)
+            .read_to_end(&mut bytes)
+            .map_err(|_| Error("sync: invalid-profile-policy"))?;
+        if bytes.len() > 65536 {
+            return Err(Error("sync: invalid-profile-policy"));
+        }
+        let policy: Self =
+            serde_json::from_slice(&bytes).map_err(|_| Error("sync: invalid-profile-policy"))?;
+        for key in policy.allow.iter().flatten().chain(&policy.deny) {
+            let (provider, label) = key
+                .split_once(':')
+                .ok_or(Error("sync: invalid-profile-policy"))?;
+            if !matches!(provider, "claude" | "codex") || store::label(label).is_err() {
+                return Err(Error("sync: invalid-profile-policy"));
+            }
+        }
+        Ok(policy)
+    }
+    fn permits(&self, account: &Account) -> bool {
+        let key = format!("{}:{}", account.provider.as_str(), account.label);
+        self.allow.as_ref().is_none_or(|allow| allow.contains(&key)) && !self.deny.contains(&key)
+    }
+    fn check_local(&self, store: &Store) -> Result<()> {
+        if store.load()?.accounts.iter().any(|a| !self.permits(a)) {
+            return Err(Error(
+                "sync: excluded-local-profile; remove excluded profiles when idle before syncing",
+            ));
+        }
+        Ok(())
+    }
+}
 /// Write `value` only when the file does not already hold it: heartbeat
 /// packets must leave profile auth stamps alone, or every running view would
 /// resync on each heartbeat.
@@ -298,7 +353,18 @@ fn packet(store: &Store, request: &Request) -> Result<Packet> {
         profiles,
     })
 }
+#[cfg(test)]
 fn install(store: &Store, packet: Packet, settings: &mut Settings) -> Result<(usize, bool)> {
+    let policy = SyncPolicy::read(&store.sync_policy_path)?;
+    policy.check_local(store)?;
+    install_permitted(store, packet, settings, &policy)
+}
+fn install_permitted(
+    store: &Store,
+    mut packet: Packet,
+    settings: &mut Settings,
+    policy: &SyncPolicy,
+) -> Result<(usize, bool)> {
     if packet.protocol != 1 {
         return Err(Error("sync: version-mismatch"));
     }
@@ -316,6 +382,10 @@ fn install(store: &Store, packet: Packet, settings: &mut Settings) -> Result<(us
                 "sync: label-conflict; duplicate provider/label in owner packet",
             ));
         }
+    }
+    packet.profiles.retain(|p| policy.permits(&p.account));
+    // Denied profiles never participate in auth/identity checks or writes.
+    for p in &packet.profiles {
         provider::validate_auth(
             p.account.provider,
             &serde_json::to_vec(&p.auth).safe("invalid owner authentication")?,
@@ -523,10 +593,18 @@ fn exchange_command(mut command: Command, request: &Request, timeout: Duration) 
     let _ = child.wait();
     result
 }
+#[cfg(test)]
 fn duplicate_count(packet: &Packet) -> usize {
+    duplicate_count_permitted(packet, &SyncPolicy::default())
+}
+fn duplicate_count_permitted(packet: &Packet, policy: &SyncPolicy) -> usize {
     let mut seen: Vec<(Provider, crate::identity::Identity)> = Vec::new();
     let mut count = 0;
-    for p in &packet.profiles {
+    for p in packet
+        .profiles
+        .iter()
+        .filter(|p| policy.permits(&p.account))
+    {
         let identity = crate::identity::from_values(p.account.provider, &p.auth, &p.config);
         if seen.iter().any(|(provider, prior)| {
             *provider == p.account.provider && crate::identity::same(prior, &identity)
@@ -618,6 +696,8 @@ const OVERLAP: u64 = 300;
 /// Caller holds the store lock and has checked the host. Installs a packet
 /// unless a newer one already landed.
 fn accept(store: &Store, packet: Packet) -> Result<Accepted> {
+    let policy = SyncPolicy::read(&store.sync_policy_path)?;
+    policy.check_local(store)?;
     let mut settings = settings(store)?;
     if packet.issued_at < settings.last_issued && settings.last_issued - packet.issued_at <= OVERLAP
     {
@@ -627,15 +707,19 @@ fn accept(store: &Store, packet: Packet) -> Result<Accepted> {
         settings.last_sync = now();
         store::json_write(&store.root.join("coordination.json"), &settings)?;
         return Ok(Accepted {
-            count: packet.profiles.len(),
+            count: packet
+                .profiles
+                .iter()
+                .filter(|p| policy.permits(&p.account))
+                .count(),
             duplicates: 0,
             event: "stale",
         });
     }
-    let duplicates = duplicate_count(&packet);
+    let duplicates = duplicate_count_permitted(&packet, &policy);
     settings.failures = 0;
     settings.last_issued = packet.issued_at;
-    let (count, changed) = install(store, packet, &mut settings)?;
+    let (count, changed) = install_permitted(store, packet, &mut settings, &policy)?;
     Ok(Accepted {
         count,
         duplicates,
@@ -1077,7 +1161,8 @@ mod tests {
     use super::*;
     fn seed() -> (tempfile::TempDir, Store) {
         let t = tempfile::tempdir().unwrap();
-        let store = Store::open(t.path().join("store")).unwrap();
+        let mut store = Store::open(t.path().join("store")).unwrap();
+        store.sync_policy_path = t.path().join("sync-policy.json");
         let a = Account {
             provider: Provider::Claude,
             label: "one".into(),
@@ -1318,7 +1403,8 @@ mod tests {
     }
     fn follower_store() -> (tempfile::TempDir, Store) {
         let t = tempfile::tempdir().unwrap();
-        let store = Store::open(t.path().join("follower")).unwrap();
+        let mut store = Store::open(t.path().join("follower")).unwrap();
+        store.sync_policy_path = t.path().join("sync-policy.json");
         store::json_write(
             &store.root.join("coordination.json"),
             &Settings {
@@ -1338,6 +1424,184 @@ mod tests {
             },
         )
         .unwrap()
+    }
+    fn policy(store: &Store, value: Value) {
+        std::fs::write(&store.sync_policy_path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    #[test]
+    fn profile_policy_defaults_exact_keys_deny_precedence_and_invalid_files() {
+        let (_f, store) = follower_store();
+        let a = Account {
+            provider: Provider::Claude,
+            label: "one".into(),
+        };
+        assert!(
+            SyncPolicy::read(&store.sync_policy_path)
+                .unwrap()
+                .permits(&a)
+        );
+        for (value, allowed) in [
+            (json!({"allow":null}), true),
+            (json!({"allow":[]}), false),
+            (json!({"allow":["codex:one"]}), false),
+            (json!({"allow":["claude:One"]}), false),
+            (json!({"allow":["claude:one"]}), true),
+            (json!({"allow":["claude:one"],"deny":["claude:one"]}), false),
+        ] {
+            policy(&store, value);
+            assert_eq!(
+                SyncPolicy::read(&store.sync_policy_path)
+                    .unwrap()
+                    .permits(&a),
+                allowed
+            );
+        }
+        for value in [
+            json!({"allow":["one"]}),
+            json!({"allow":["other:one"]}),
+            json!({"deny":["claude:../one"]}),
+            json!({"allow":false}),
+            json!({"deny":null}),
+            json!({"typo":[]}),
+        ] {
+            policy(&store, value);
+            assert_eq!(
+                SyncPolicy::read(&store.sync_policy_path).err().unwrap().0,
+                "sync: invalid-profile-policy"
+            );
+        }
+        std::fs::write(&store.sync_policy_path, b"{").unwrap();
+        assert!(SyncPolicy::read(&store.sync_policy_path).is_err());
+        std::fs::write(&store.sync_policy_path, vec![b' '; 65537]).unwrap();
+        assert!(SyncPolicy::read(&store.sync_policy_path).is_err());
+        std::fs::remove_file(&store.sync_policy_path).unwrap();
+        std::os::unix::fs::symlink(store.root.join("missing"), &store.sync_policy_path).unwrap();
+        assert!(SyncPolicy::read(&store.sync_policy_path).is_err());
+    }
+    #[test]
+    fn policy_filters_before_auth_checks_and_reload_applies_to_stale_packets() {
+        let (_o, owner) = seed();
+        let (_f, store) = follower_store();
+        policy(&store, json!({"allow":[]}));
+        let mut packet = owner_packet(&owner);
+        packet.profiles[0].auth = json!({"invalid":"synthetic"});
+        assert_eq!(accept(&store, packet).unwrap().count, 0);
+        assert!(store.load().unwrap().accounts.is_empty());
+        assert!(!store.profile(Provider::Claude, "one").unwrap().exists());
+        // Role configuration does not own/overwrite the policy file.
+        off(&store).unwrap();
+        assert!(
+            !SyncPolicy::read(&store.sync_policy_path)
+                .unwrap()
+                .permits(&owner.load().unwrap().accounts[0])
+        );
+        policy(&store, json!({"allow":["claude:one"]}));
+        assert_eq!(accept(&store, owner_packet(&owner)).unwrap().count, 1);
+        let before = std::fs::read(store.root.join("state.json")).unwrap();
+        let auth = store
+            .profile(Provider::Claude, "one")
+            .unwrap()
+            .join(".credentials.json");
+        let old_auth = std::fs::read(&auth).unwrap();
+        policy(&store, json!({"allow":[]}));
+        let mut stale = owner_packet(&owner);
+        stale.issued_at = settings(&store).unwrap().last_issued - 1;
+        assert!(
+            accept(&store, stale)
+                .err()
+                .unwrap()
+                .0
+                .starts_with("sync: excluded-local-profile")
+        );
+        assert_eq!(
+            std::fs::read(store.root.join("state.json")).unwrap(),
+            before
+        );
+        assert_eq!(std::fs::read(&auth).unwrap(), old_auth);
+    }
+    #[test]
+    fn policy_rejects_existing_idle_active_and_busy_profiles_without_partial_install() {
+        let (_o, owner) = seed();
+        for busy in [false, true] {
+            let (_f, store) = follower_store();
+            accept(&store, owner_packet(&owner)).unwrap();
+            let a = store.load().unwrap().accounts[0].clone();
+            let lease = busy.then(|| store.lease(&a).unwrap());
+            let before = std::fs::read(store.root.join("state.json")).unwrap();
+            let auth = store
+                .profile(a.provider, &a.label)
+                .unwrap()
+                .join(a.provider.auth_file());
+            let bytes = std::fs::read(&auth).unwrap();
+            policy(&store, json!({"deny":["claude:one"]}));
+            let mut reply = owner_packet(&owner);
+            reply.profiles[0].account.label = "two".into();
+            assert!(
+                accept(&store, reply)
+                    .err()
+                    .unwrap()
+                    .0
+                    .starts_with("sync: excluded-local-profile")
+            );
+            assert_eq!(
+                std::fs::read(store.root.join("state.json")).unwrap(),
+                before
+            );
+            assert_eq!(std::fs::read(&auth).unwrap(), bytes);
+            assert!(!store.profile(Provider::Claude, "two").unwrap().exists());
+            if busy {
+                assert!(provider::remove(&store, a.provider, &a.label).is_err());
+            }
+            drop(lease);
+            provider::remove(&store, a.provider, &a.label).unwrap();
+            assert_eq!(accept(&store, owner_packet(&owner)).unwrap().count, 0);
+        }
+    }
+    #[test]
+    fn poll_and_watch_both_enforce_the_declarative_policy() {
+        let (_o, owner) = seed();
+        let (f, store) = follower_store();
+        policy(&store, json!({"allow":[]}));
+        assert_eq!(
+            poll_with(&store, None, true, |_, _| Ok(owner_packet(&owner))).unwrap(),
+            0
+        );
+        let reply = f.path().join("reply.json");
+        std::fs::write(
+            &reply,
+            format!(
+                "{}\n",
+                serde_json::to_string(&owner_packet(&owner)).unwrap()
+            ),
+        )
+        .unwrap();
+        let watch = || {
+            watch_session(
+                &store,
+                |_| {
+                    let mut c = Command::new("sh");
+                    c.args([
+                        "-c",
+                        &format!("head -n 1 >/dev/null; cat '{}'", reply.display()),
+                    ]);
+                    Ok(c)
+                },
+                Duration::from_secs(3),
+                Duration::from_secs(3),
+            )
+        };
+        assert_eq!(watch().unwrap(), Some(1));
+        assert!(store.load().unwrap().accounts.is_empty());
+        // An atomic Home Manager symlink is supported and reread next packet.
+        let managed = f.path().join("managed.json");
+        std::fs::write(&managed, br#"{"allow":["claude:one"]}"#).unwrap();
+        std::fs::remove_file(&store.sync_policy_path).unwrap();
+        std::os::unix::fs::symlink(&managed, &store.sync_policy_path).unwrap();
+        let mut cfg = settings(&store).unwrap();
+        cfg.watch_next = 0;
+        store::json_write(&store.root.join("coordination.json"), &cfg).unwrap();
+        assert_eq!(watch().unwrap(), Some(1));
+        assert_eq!(store.load().unwrap().accounts.len(), 1);
     }
     #[test]
     fn a_slow_exchange_never_holds_the_store_lock_or_starts_twice() {

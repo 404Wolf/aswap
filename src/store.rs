@@ -59,6 +59,7 @@ pub struct State {
 }
 pub struct Store {
     pub root: PathBuf,
+    pub(crate) sync_policy_path: PathBuf,
 }
 pub struct Guard(File);
 pub use crate::live::Lease;
@@ -188,7 +189,14 @@ impl Store {
             return Err(Error("account stores must live outside a Git checkout"));
         }
         private_dir(&root)?;
-        Ok(Self { root })
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or(crate::provider::home()?.join(".config"));
+        Ok(Self {
+            root,
+            sync_policy_path: config.join("aswap/sync-policy.json"),
+        })
     }
     pub fn lock(&self) -> Result<Guard> {
         let path = self.root.join("store.lock");

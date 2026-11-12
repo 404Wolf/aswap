@@ -127,6 +127,25 @@ in {
       default = null;
       description = "SSH host alias for the refresh/usage owner; followers receive access-only auth.";
     };
+    syncProfiles = mkOption {
+      type = types.nullOr (types.submodule {
+        options = {
+          allow = mkOption {
+            type = types.nullOr (types.listOf types.str);
+            default = null;
+            description = "Exact provider:label imports to permit; null permits all, [] permits none.";
+          };
+          deny = mkOption {
+            type = types.listOf types.str;
+            default = [];
+            description = "Exact provider:label imports to exclude, even if allowed.";
+          };
+        };
+      });
+      default = null;
+      example = { allow = [ "claude:personal" "codex:personal" ]; deny = []; };
+      description = "Declarative sync import policy. Existing excluded local profiles block sync until manually removed while idle. Does not restrict local add/run or erase accounts.";
+    };
     shareClaudeAccess = mkOption {
       type = types.attrsOf (types.submodule shareOptions);
       default = {};
@@ -143,6 +162,9 @@ in {
   config = mkIf cfg.enable {
     assertions = [{ assertion = !(cfg.refreshOwner == true && cfg.syncHost != null); message = "aswap refreshOwner and syncHost are mutually exclusive"; }];
     home.packages = [ cfg.package ];
+    xdg.configFile."aswap/sync-policy.json" = mkIf (cfg.syncProfiles != null) {
+      text = builtins.toJSON cfg.syncProfiles;
+    };
     systemd.user.services = lib.mapAttrs' (provider: settings:
       lib.nameValuePair "aswap-${provider}" (serviceFor provider settings)
     ) (lib.filterAttrs (_: settings: settings.enable) cfg.autoswitch)
@@ -171,6 +193,6 @@ in {
         tooltip = true;
       };
     };
-    # No home.file/xdg.configFile entries: provider homes are never managed here.
+    # Provider homes and credential files are never managed here.
   };
 }
