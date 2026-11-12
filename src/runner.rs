@@ -88,6 +88,9 @@ pub fn run(
     } else if let Err(err) = crate::coordination::poll(store, None, false) {
         eprintln!("aswap: {err}; launching with the last synced profiles");
     }
+    // Followers: keep the owner's push stream open unless another run or the
+    // monitor already does, so a rotated token arrives within about a second.
+    crate::coordination::spawn_sync(store);
     let mut account = {
         let _lock = store.lock()?;
         store.account(&store.load()?, provider, name)?
@@ -254,6 +257,11 @@ pub fn run(
                     let _ = crate::refresh::for_run(store, &account);
                     let _ = view.sync(store, &account);
                 }
+            }
+            // The owner revokes the old access token as soon as it rotates, so
+            // copy a changed profile token into the view on the next tick.
+            if view.auth_changed(store, &account) {
+                let _ = view.sync(store, &account);
             }
             if let Some(tracker) = &mut tracker {
                 tracker.observe(child.0.id())?;

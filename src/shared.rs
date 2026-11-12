@@ -342,9 +342,10 @@ fn with_mcp(mut auth: Value, record: &Value) -> Value {
     }
     auth
 }
+/// A file's identity and version: atomic replacement changes the inode.
 #[derive(Clone, PartialEq)]
-struct Stamp(u64, u64, u64, i64, i64);
-fn stamp(path: &Path) -> Option<Stamp> {
+pub(crate) struct Stamp(u64, u64, u64, i64, i64);
+pub(crate) fn stamp(path: &Path) -> Option<Stamp> {
     let m = fs::symlink_metadata(path).ok()?;
     m.is_file()
         .then(|| Stamp(m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec()))
@@ -496,6 +497,9 @@ pub struct View {
     mcp_baseline: Value,
     managed: BTreeSet<OsString>,
     stamps: BTreeMap<OsString, Stamp>,
+    /// The canonical profile auth this view last copied; a different stamp
+    /// means the owner rotated or a follower installed a new token.
+    auth_stamp: Option<Stamp>,
 }
 impl View {
     /// The global store lock covers migration, shared-home creation and the
@@ -602,6 +606,7 @@ impl View {
             mcp_baseline: json!({}),
             managed: BTreeSet::new(),
             stamps: BTreeMap::new(),
+            auth_stamp: None,
         };
         for name in names {
             if private(view.provider, &name) {
@@ -628,6 +633,7 @@ impl View {
     }
     fn select_locked(&mut self, store: &Store, account: &Account) -> Result<()> {
         let profile = store.profile(account.provider, &account.label)?;
+        let observed = stamp(&profile.join(account.provider.auth_file()));
         let auth = store::read_private(&profile.join(account.provider.auth_file()))?;
         provider::validate_auth(account.provider, &auth)?;
         let mut auth = crate::refresh::launch_auth(
@@ -641,6 +647,7 @@ impl View {
         }
         let auth = serde_json::to_vec(&auth).safe("cannot encode launch auth")?;
         store::atomic(&auth_path, &auth)?;
+        self.auth_stamp = observed;
         if account.provider == Provider::Claude {
             let mut config = if self.path.join(".claude.json").exists() {
                 non_account(&store::json_read(&self.path.join(".claude.json"))?)
@@ -682,6 +689,14 @@ impl View {
         self.mcp_baseline = record.clone();
         Ok(record)
     }
+    /// Whether the account's canonical auth changed since this view last
+    /// copied it. One stat and no store lock, so a run can ask every tick and
+    /// hand a rotated token to its provider within a tick instead of 30s.
+    pub fn auth_changed(&self, store: &Store, account: &Account) -> bool {
+        store
+            .profile(account.provider, &account.label)
+            .is_ok_and(|p| stamp(&p.join(account.provider.auth_file())) != self.auth_stamp)
+    }
     pub fn select(&mut self, store: &Store, account: &Account) -> Result<()> {
         let _lock = store.lock()?;
         self.select_locked(store, account)
@@ -691,6 +706,8 @@ impl View {
         let profile = store.profile(account.provider, &account.label)?;
         // Launch views never own refresh tokens. Re-read the authority rather than
         // letting a stale/late native write roll canonical credentials backwards.
+        // Stamp before reading: a write after the read shows up as a change.
+        let observed = stamp(&profile.join(account.provider.auth_file()));
         let canonical: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
         let auth_path = self.path.join(account.provider.auth_file());
         let seen = store::json_read::<Value>(&auth_path).ok();
@@ -703,9 +720,13 @@ impl View {
         if seen.as_ref() != Some(&auth) {
             if store::json_read::<Value>(&auth_path).ok() == seen {
                 store::json_write(&auth_path, &auth)?;
+                self.auth_stamp = observed;
             } else if let Some(native) = seen.as_ref().and_then(|s| s.get(MCP_OAUTH)) {
+                // Leave the stamp: the next tick retries the canonical copy.
                 self.mcp_baseline = native.clone();
             }
+        } else {
+            self.auth_stamp = observed;
         }
         if self.provider == Provider::Claude {
             let config: Value = store::json_read(&self.path.join(".claude.json"))?;

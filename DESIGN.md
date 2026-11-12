@@ -312,8 +312,31 @@ published 401 recovery first requires a nonempty refresh field, re-reads the aut
 file, and retries when the access token has changed. The sentinel enables that
 reload path but can never authorize a real rotation; proactive sentinel refresh
 is suppressed. Codex launch views use the external chatgptAuthTokens mode and an
-empty refresh token. Peers install the owner's fresh access token into live views
-at 30s cadence. If the owner is unreachable, a stale sentinel may yield an auth
+empty refresh token. The owner revokes the old access token as soon as it
+rotates, so the handoff must be fast: the owner streams a packet to each
+follower's single watcher (`sync --serve --watch`, request protocol 2,
+newline-separated protocol-1 packets, same 4 MiB limit) within a tick of a profile
+auth stamp change and every 20s as a heartbeat; the watcher installs each one
+under the store lock, rewriting only files whose contents changed so
+heartbeats leave auth stamps alone. The stream keeps its own schedule
+(watch_next/watch_failures; one connect per 30s, exponential backoff, 10
+minutes for an owner that sends no first packet within 30s, as an older
+release does) and never touches the pull's last_attempt/failures, so the 30s
+pull fallback keeps its cadence however the stream fares. Every follower run
+and the monitor run a fallback poller beside the stream: it polls 30s after
+the last delivery (a stream packet or a poll), 30s and then 60s after a
+failure, and 60s after a claimed exchange that never finished. That cap holds
+whatever failure count older releases write into the shared coordination
+file, and timestamps in the future (a clock step) are ignored. A connected
+but silent stream stops counting as delivery after its heartbeat goes
+missing, so the poller takes over within 30s without waiting for the 60s idle
+timeout. A packet older than the installed one is skipped as an overlap only
+within 300s; a larger gap is the owner's clock stepping back and installs.
+Each claim, connect, delivery (installed, unchanged or stale), failure (fixed
+error code only) and stream end is appended as one JSON line, with the
+schedule fields and the pid, to the private sync.log (0600, rotated to
+sync.log.1 at 1 MiB); `status --json` shows the last ten under sync.events. Live views stat their profile auth
+every 250ms and copy a changed token immediately. If the owner is unreachable, a stale sentinel may yield an auth
 error rather than any rotation; no peer silently becomes an owner. Provider token
 reload behavior is version-sensitive and synthetic process tests cannot prove
 arbitrary future provider versions; explicit resume is the recovery path.

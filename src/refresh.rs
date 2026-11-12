@@ -179,7 +179,7 @@ where
 {
     refresh_inner(store, account, at, force, false, request)
 }
-fn refresh_inner<F>(
+pub(crate) fn refresh_inner<F>(
     store: &Store,
     account: &Account,
     at: u64,
