@@ -141,3 +141,11 @@ Never edit the headline (line 1).
 - [x] Resolve the requested model from CLI/config and preserve it across exact-session resumes.
 - [x] Verify each switch target using its account-scoped paginated catalog, skipping unknown/unsupported targets and explaining when none fit.
 - [x] Handle explicit model rejection without marking quota exhausted; test incompatible/unknown catalogs, config/profiles, CLI flags and exact-session preservation.
+
+## M18: Durable session recovery and strict sync imports
+- [x] Preserve known Claude session identity across shared history writes, and verify exact resume arguments before stopping a running provider.
+- [x] Keep active tools running through quota polling; recognize explicit provider failures and bound failover by excluding rejected accounts and identity aliases for the run.
+- [x] Add a per-machine declarative sync import allowlist and denylist with exact provider/label keys, deny precedence, strict validation and packet-by-packet reload for polling and streaming.
+- [x] Refuse imports when excluded local profiles already exist; preserve their credentials, metadata and running sessions for explicit guarded cleanup, and document that busy excluded profiles leave machine compliance unmet.
+- [x] Verify combined recovery and policy behavior with synthetic tests, formatting, Clippy, Home Manager checks and secret scans.
+- [ ] Deploy the combined build and verify each machine's declared policy and existing-profile cleanup through the coordinated rollout.
