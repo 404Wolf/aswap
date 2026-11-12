@@ -31,6 +31,24 @@ fn stop(child: &mut Child) -> Result<std::process::ExitStatus> {
     }
 }
 struct Running(Child, bool);
+
+fn restart_ready(
+    tracker: Option<&crate::session::Tracker>,
+    args: Option<&crate::session::AutoArgs>,
+    provider: Provider,
+    reported: &mut bool,
+) -> bool {
+    let ready = tracker
+        .and_then(|t| t.id().ok())
+        .zip(args)
+        .is_some_and(|(id, args)| args.resume(provider, id, None).is_ok());
+    if !ready && !*reported {
+        eprintln!("aswap: exact resume unavailable; keeping the current provider running");
+        *reported = true;
+    }
+    ready
+}
+
 impl Drop for Running {
     fn drop(&mut self) {
         if self.1 && matches!(self.0.try_wait(), Ok(None)) {
@@ -199,9 +217,11 @@ pub fn run(
             history.history_child(child.0.id())?;
         }
         let mut limited = false;
+        let mut limit_hint = false;
         let mut expired = false;
         let mut unsupported = false;
         let mut reported_none = false;
+        let mut reported_identity = false;
         let mut target = None;
         let mut next_check = 0;
         let status = loop {
@@ -214,7 +234,9 @@ pub fn run(
                     if left.is_zero() {
                         break;
                     }
-                    limited |= terminal.pump(left.as_millis().max(1) as i32)?;
+                    let hint = terminal.pump(left.as_millis().max(1) as i32)?;
+                    limited |= hint;
+                    limit_hint |= hint;
                 }
             }
             // The owner exchange runs off this thread so a slow owner never
@@ -253,6 +275,11 @@ pub fn run(
                     settings.last_switch,
                     now(),
                     false,
+                ) && restart_ready(
+                    tracker.as_ref(),
+                    auto_args.as_ref(),
+                    provider,
+                    &mut reported_identity,
                 ) {
                     target = Some(next.clone());
                     break stop(&mut child.0)?;
@@ -269,12 +296,22 @@ pub fn run(
                 }
             }
             if !expired && terminal.as_ref().is_some_and(|t| t.auth_expired) {
-                expired = true;
-                usage::mark_auth_expired(store, &account)?;
-                eprintln!(
-                    "aswap: login expired for {provider}:{}; looking for another eligible account",
-                    account.label
-                );
+                let (entries, _) = observations(store, provider)?;
+                // A successful quota request authenticated this account. Old
+                // login errors can also be redrawn from resumed history.
+                let authenticated = entries
+                    .iter()
+                    .find(|(a, _)| a.label == account.label)
+                    .and_then(|(_, c)| c.used(now()))
+                    .is_some();
+                if !authenticated {
+                    expired = true;
+                    usage::mark_auth_expired(store, &account)?;
+                    eprintln!(
+                        "aswap: login expired for {provider}:{}; looking for another eligible account",
+                        account.label
+                    );
+                }
             }
             if !unsupported
                 && provider == Provider::Codex
@@ -290,6 +327,21 @@ pub fn run(
                 view.sync(store, &account)?;
                 let (entries, settings) = observations(store, provider)?;
                 let entries = models.filter(store, &account.label, entries);
+                // Resuming a conversation can redraw an old limit error. Fresh
+                // quota with capacity takes precedence while the child is alive;
+                // the regular poll will still detect actual exhaustion.
+                if limited
+                    && entries
+                        .iter()
+                        .find(|(a, _)| a.label == account.label)
+                        .and_then(|(_, c)| c.used(now()))
+                        .is_some_and(|used| used < 100.0)
+                {
+                    limited = false;
+                    if !expired && !unsupported {
+                        continue;
+                    }
+                }
                 target = usage::choose(
                     &account.label,
                     &entries,
@@ -300,9 +352,17 @@ pub fn run(
                     true,
                 )
                 .cloned();
-                if target.is_some() {
+                if target.is_some()
+                    && restart_ready(
+                        tracker.as_ref(),
+                        auto_args.as_ref(),
+                        provider,
+                        &mut reported_identity,
+                    )
+                {
                     break stop(&mut child.0)?;
                 }
+                target = None;
                 if !reported_none {
                     models.report_none();
                     reported_none = true;
@@ -314,13 +374,18 @@ pub fn run(
         };
         drop(child);
         if let Some(terminal) = &mut terminal {
-            limited |= terminal.pump(0)?;
+            let hint = terminal.pump(0)?;
+            limited |= hint;
+            limit_hint |= hint;
         }
         view.sync(store, &account)?;
         if !auto {
             return Ok(status.code().unwrap_or(1));
         }
-        expired |= terminal.as_ref().is_some_and(|t| t.auth_expired);
+        // A failed provider exit corroborates the earlier terminal error even
+        // when the last quota observation still showed capacity.
+        limited |= !status.success() && limit_hint;
+        expired |= !status.success() && terminal.as_ref().is_some_and(|t| t.auth_expired);
         unsupported |=
             provider == Provider::Codex && terminal.as_ref().is_some_and(|t| t.model_unsupported);
         if unsupported {
@@ -329,7 +394,7 @@ pub fn run(
         if status.success() && target.is_none() && !expired && !unsupported {
             return Ok(0);
         }
-        expired |= terminal.as_ref().is_some_and(|t| t.auth_expired);
+        expired |= !status.success() && terminal.as_ref().is_some_and(|t| t.auth_expired);
         let did_limit = limited || expired || unsupported;
         if did_limit {
             if expired {
@@ -523,4 +588,40 @@ fn entries_from_cache(store: &Store, provider: Provider) -> Result<Vec<(Account,
             Ok((a, cache))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_identity_or_ambiguous_arguments_prevent_stopping_the_provider() {
+        let home = tempfile::tempdir().unwrap();
+        let provider = Provider::Claude;
+        let unknown = crate::session::Tracker::new(provider, home.path(), None).unwrap();
+        let id = "11111111-2222-4333-8444-555555555555";
+        let known = crate::session::Tracker::new(provider, home.path(), Some(id.into())).unwrap();
+        let mut args = crate::session::AutoArgs::parse(provider, &[]).unwrap();
+        let mut reported = false;
+        assert!(!restart_ready(
+            Some(&unknown),
+            Some(&args),
+            provider,
+            &mut reported
+        ));
+        assert!(reported);
+        assert!(restart_ready(
+            Some(&known),
+            Some(&args),
+            provider,
+            &mut reported
+        ));
+        args.ambiguous = true;
+        assert!(!restart_ready(
+            Some(&known),
+            Some(&args),
+            provider,
+            &mut reported
+        ));
+    }
 }

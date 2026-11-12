@@ -380,11 +380,9 @@ impl Tracker {
                         .and_then(Value::as_str)
                         .filter(|s| valid_id(s))
                 {
-                    if changed.iter().all(|s| s == id) {
-                        self.known = Some(id.into());
-                    } else {
-                        self.known = None;
-                    }
+                    // The PID registry identifies this process. Other sessions
+                    // writing shared history cannot invalidate that evidence.
+                    self.known = Some(id.into());
                 }
             } else if changed.iter().any(|s| self.known.as_ref() != Some(s)) {
                 self.known = None;

@@ -226,6 +226,7 @@ impl Drop for Terminal {
     }
 }
 pub fn limit_message(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
     [
         "http 429",
         "status 429",
@@ -234,6 +235,9 @@ pub fn limit_message(text: &str) -> bool {
         "rate_limit_exceeded",
         "rate limit reached",
         "usage limit reached",
+        "you've hit your 5-hour limit",
+        "you've hit your weekly limit",
+        "you've hit your limit",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -245,6 +249,11 @@ mod tests {
         assert!(!super::limit_message("processed 429 items"));
         assert!(super::limit_message("error: http 429"));
         assert!(super::limit_message("usage_limit_reached"));
+        assert!(super::limit_message(
+            "You've hit your 5-hour limit · resets 8:30pm"
+        ));
+        assert!(super::limit_message("You've hit your weekly limit"));
+        assert!(!super::limit_message("5-hour limit: 90% used"));
     }
 }
 

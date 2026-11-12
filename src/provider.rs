@@ -61,7 +61,10 @@ impl Provider {
         let bin = std::env::var_os(self.bin_var())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| self.as_str().into());
-        let mut cmd = Command::new(bin);
+        let mut cmd = Command::new(&bin);
+        // PATH may contain a provider wrapper that invokes aswap. Tell it this
+        // launch is already supervised so it executes the native CLI directly.
+        cmd.env(self.bin_var(), &bin);
         cmd.env(self.env_var(), profile);
         // Prevent inherited credentials/config overrides from defeating account isolation.
         for key in [

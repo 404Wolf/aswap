@@ -7,6 +7,15 @@ use aswap::{
 use std::{fs, os::unix::fs::PermissionsExt, process::Command};
 const ID: &str = "11111111-2222-4333-8444-555555555555";
 #[test]
+fn provider_wrappers_are_told_the_launch_is_already_supervised() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        let command = provider.command(std::path::Path::new("/synthetic-view"));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == provider.bin_var() && value == Some(command.get_program())
+        }));
+    }
+}
+#[test]
 fn provider_processes_share_state_preserve_cwd_and_resume_exact_session() {
     runner_case("usage_limit_reached");
 }
@@ -55,7 +64,15 @@ if 'synthetic-second' in auth:
     sys.exit(0)
 assert args==base+sticky
 transcript.write_text('synthetic shared conversation')
-if provider=='claude': (p/'sessions'/(str(os.getpid())+'.json')).write_text(json.dumps({'pid':os.getpid(),'sessionId':id}))
+if provider=='claude':
+    (p/'sessions'/(str(os.getpid())+'.json')).write_text(json.dumps({'pid':os.getpid(),'sessionId':id}))
+    # Another terminal can write shared history without changing our identity.
+    (transcript.parent/'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.jsonl').write_text('unrelated synthetic conversation')
+if 'synthetic-history' in auth:
+    print('usage_limit_reached',file=sys.stderr,flush=True)
+    print('Login expired · Please run /login',file=sys.stderr,flush=True)
+    time.sleep(1)
+    sys.exit(0)
 print(os.environ['ASWAP_TEST_FAILURE'],file=sys.stderr,flush=True)
 if 'synthetic-clean' in auth: sys.exit(0)
 with transcript.open('a') as held:
@@ -187,6 +204,8 @@ fn runner_child() {
                 .join("usage-cache.json");
             let mut c: Cached = store::json_read(&cache).unwrap();
             c.error = None;
+            // A terminal error is authoritative when quota is unknown.
+            c.usage.windows.clear();
             c.next_poll_at = aswap::now() + 3600;
             store::json_write(&cache, &c).unwrap();
             assert_eq!(
@@ -221,7 +240,30 @@ fn runner_child() {
             .join("usage-cache.json");
         let mut c: Cached = store::json_read(&cache).unwrap();
         c.error = None;
+        c.usage.windows.push(Window {
+            name: "five_hour".into(),
+            used_percent: 20.0,
+            resets_at: None,
+            duration_minutes: Some(300),
+        });
         store::json_write(&cache, &c).unwrap();
+        store::json_write(
+            &store
+                .profile(provider, "one")
+                .unwrap()
+                .join(provider.auth_file()),
+            &auth(provider, "synthetic-history"),
+        )
+        .unwrap();
+        assert_eq!(
+            aswap::runner::run(&store, provider, Some("one"), &initial, true).unwrap(),
+            0
+        );
+        let after: Cached = store::json_read(&cache).unwrap();
+        assert!(
+            after.error.is_none(),
+            "replayed error must not poison a healthy account"
+        );
         store::json_write(
             &store
                 .profile(provider, "one")
