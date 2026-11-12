@@ -172,7 +172,9 @@ Resume identity and arguments are checked before stopping the child;
 if they are unavailable, the current provider stays running.
 Switches stop the child with SIGTERM, wait five seconds, then use SIGKILL if
 needed. The exact same shared session resumes on the new account. Clean exits do
-not restart or send a follow-up. Restarts are capped at eight. Runtime auth/config
+not restart or send a follow-up. Rejected accounts and known identity aliases are
+excluded for the rest of that run, even if an owner replaces their usage caches.
+Restarts are capped at eight. Runtime auth/config
 views stay private under `$XDG_DATA_HOME/aswap/runtimes/`; history stays shared.
 
 Claude usage comes from the OAuth usage endpoint; Codex uses the official

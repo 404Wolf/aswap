@@ -228,13 +228,29 @@ impl Diagnostics {
         for &byte in bytes {
             match self.escape {
                 1 => {
-                    self.escape = if byte == b'[' { 2 } else { 0 };
+                    self.escape = match byte {
+                        b'[' => 2,
+                        b']' => 3,
+                        _ => 0,
+                    };
                     continue;
                 }
                 2 => {
                     if (0x40..=0x7e).contains(&byte) {
                         self.escape = 0;
                     }
+                    continue;
+                }
+                3 => {
+                    if byte == 7 {
+                        self.escape = 0;
+                    } else if byte == 0x1b {
+                        self.escape = 4;
+                    }
+                    continue;
+                }
+                4 => {
+                    self.escape = if byte == b'\\' { 0 } else { 3 };
                     continue;
                 }
                 _ => {}
@@ -284,6 +300,7 @@ fn diagnostic_line(line: &[u8]) -> (bool, bool, bool) {
         .or_else(|| line.strip_prefix("error:"));
     let standalone = matches!(line, "usage_limit_reached" | "rate_limit_exceeded")
         || (line.starts_with("the ") && unsupported_model_message(line))
+        || line.starts_with("oauth token revoked · please run /login")
         || line.starts_with("login expired · please run /login")
         || line.starts_with("you've hit your limit")
         || line.starts_with("you’re out of extra usage")
@@ -327,6 +344,7 @@ mod tests {
 pub fn auth_message(text: &str) -> bool {
     [
         "login expired",
+        "oauth token revoked",
         "token has expired",
         "token is expired",
         "authentication token expired",
@@ -419,6 +437,14 @@ mod diagnostic_tests {
                 (true, false, false),
             ),
             ("Error: model_not_found\r\n", (false, false, true)),
+            (
+                "\x1b]7501;state=blocked;kind=auth\x07  ⎿ OAuth token revoked · Please run /login\r\n",
+                (false, true, false),
+            ),
+            (
+                "\x1b]7501;state=blocked;kind=auth\x1b\\  ⎿ OAuth token revoked · Please run /login\r\n",
+                (false, true, false),
+            ),
         ] {
             let input = format!("\x1b[31m{line}\x1b[0m");
             let mut detector = Diagnostics::default();

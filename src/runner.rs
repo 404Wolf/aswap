@@ -158,6 +158,7 @@ pub fn run(
     } else {
         None
     };
+    let mut rejected = Rejected::default();
     let mut switches = 0;
     let mut next_sync = 0;
     let mut syncing: Option<std::thread::JoinHandle<bool>> = None;
@@ -270,9 +271,14 @@ pub fn run(
                 );
             }
             if auto && (limited || expired || unsupported) {
+                rejected.reject(store, &account)?;
                 view.sync(store, &account)?;
                 let (entries, settings) = observations(store, provider)?;
-                let entries = models.filter(store, &account.label, entries);
+                let entries = rejected.filter(
+                    store,
+                    &account.label,
+                    models.filter(store, &account.label, entries),
+                );
                 target = usage::choose(
                     &account.label,
                     &entries,
@@ -331,6 +337,7 @@ pub fn run(
         expired |= terminal.as_ref().is_some_and(|t| t.auth_expired);
         let did_limit = limited || expired || unsupported;
         if did_limit {
+            rejected.reject(store, &account)?;
             if expired {
                 usage::mark_auth_expired(store, &account)?;
                 eprintln!(
@@ -341,7 +348,11 @@ pub fn run(
                 usage::mark_limited(store, &account)?;
             }
             let (entries, settings) = observations(store, provider)?;
-            let entries = models.filter(store, &account.label, entries);
+            let entries = rejected.filter(
+                store,
+                &account.label,
+                models.filter(store, &account.label, entries),
+            );
             target = usage::choose(
                 &account.label,
                 &entries,
@@ -379,7 +390,15 @@ pub fn run(
             let settings = state.auto.get(&provider).cloned().unwrap_or_default();
             let next = usage::choose(
                 &account.label,
-                &models.filter_cached(store, &account.label, entries_from_cache(store, provider)?),
+                &rejected.filter(
+                    store,
+                    &account.label,
+                    models.filter_cached(
+                        store,
+                        &account.label,
+                        entries_from_cache(store, provider)?,
+                    ),
+                ),
                 settings.threshold,
                 settings.prefer,
                 0,
@@ -414,6 +433,53 @@ pub fn run(
         switches += 1;
     }
 }
+// Run-local rejection survives owner cache replacement and refresh observations.
+// Keep identity keys private/in-memory so aliases cannot bounce a session back
+// onto credentials that this provider process has already rejected.
+#[derive(Default)]
+struct Rejected {
+    labels: std::collections::BTreeSet<String>,
+    identities: std::collections::BTreeSet<String>,
+}
+impl Rejected {
+    fn reject(&mut self, store: &Store, account: &Account) -> Result<()> {
+        self.labels.insert(account.label.clone());
+        let _lock = store.lock()?;
+        self.labels.extend(crate::identity::duplicates(
+            store,
+            account,
+            &store.load()?.accounts,
+        ));
+        if let Some(key) = Self::key(store, account) {
+            self.identities.insert(key);
+        }
+        Ok(())
+    }
+    fn key(store: &Store, account: &Account) -> Option<String> {
+        crate::identity::read(
+            account.provider,
+            &store.profile(account.provider, &account.label).ok()?,
+        )
+        .ok()?
+        .lock_key()
+    }
+    fn filter(
+        &self,
+        store: &Store,
+        current: &str,
+        entries: Vec<(Account, usage::Cached)>,
+    ) -> Vec<(Account, usage::Cached)> {
+        entries
+            .into_iter()
+            .filter(|(a, _)| {
+                a.label == current
+                    || (!self.labels.contains(&a.label)
+                        && Self::key(store, a).is_none_or(|key| !self.identities.contains(&key)))
+            })
+            .collect()
+    }
+}
+
 // Build the exact argv before stopping a live provider. Unknown identity or
 // ambiguous option arity must leave the current conversation available.
 fn prepare_resume(

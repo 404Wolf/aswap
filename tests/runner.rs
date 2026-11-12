@@ -374,7 +374,18 @@ root=pathlib.Path(os.environ['HOME'])
 case=os.environ['ASWAP_SAFETY_CASE']
 if '--help' in sys.argv: sys.exit(0)
 with (root/'calls').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
-if case=='quota':
+if case.startswith('bounded'):
+    # Simulate an owner push replacing all rejected caches with fresh eligibility.
+    for cache in pathlib.Path(os.environ['ASWAP_TEST_CACHE']).parent.parent.glob('*/usage-cache.json'):
+        data=json.loads(cache.read_text());data['error']=None;data['http_status']=None
+        data['usage']['windows'][0]['used_percent']=10
+        data['next_poll_at']=int(time.time())+3600
+        cache.write_text(json.dumps(data))
+    auth=json.loads((pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])/'.credentials.json').read_text())
+    with (root/'identities').open('a') as f: f.write(auth['claudeAiOauth']['accessToken']+'\n')
+    print('⎿ OAuth token revoked · Please run /login' if case=='bounded401' else 'API Error: 429 synthetic quota failure',flush=True)
+    time.sleep(.4);sys.exit(1)
+elif case=='quota':
     cache=pathlib.Path(os.environ['ASWAP_TEST_CACHE'])
     data=json.loads(cache.read_text())
     data['usage']['windows'][0]['used_percent']=95
@@ -394,7 +405,14 @@ time.sleep(1)
         std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
     .unwrap();
-    for case in ["quota", "prose", "unknown", "ambiguous"] {
+    for case in [
+        "quota",
+        "prose",
+        "unknown",
+        "ambiguous",
+        "bounded401",
+        "boundedquota",
+    ] {
         let home = t.path().join(case);
         fs::create_dir(&home).unwrap();
         let out = Command::new(std::env::current_exe().unwrap())
@@ -413,6 +431,15 @@ time.sleep(1)
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+        if case.starts_with("bounded") {
+            let identities = fs::read_to_string(home.join("identities")).unwrap();
+            assert_eq!(
+                identities.lines().collect::<Vec<_>>(),
+                vec!["synthetic-one", "synthetic-two"],
+                "{case}: rejected identity or alias revisited"
+            );
+            continue;
+        }
         assert!(
             home.join("completed").exists(),
             "{case}: active tool was stopped"
@@ -442,12 +469,37 @@ fn runner_safety_child() {
     let provider = Provider::Claude;
     let store = Store::from_env().unwrap();
     let source = provider.current_home().unwrap();
-    for (label, pct) in [("one", 20.0), ("two", 10.0)] {
+    let bounded = case.starts_with("bounded");
+    let accounts = if bounded {
+        vec![("one", 20.0), ("alias", 10.0), ("two", 10.0)]
+    } else {
+        vec![("one", 20.0), ("two", 10.0)]
+    };
+    for (label, pct) in accounts {
+        let identity = if label == "two" {
+            "synthetic-two"
+        } else {
+            "synthetic-one"
+        };
         store::json_write(
             &source.join(provider.auth_file()),
-            &auth(provider, "synthetic-safety"),
+            &auth(
+                provider,
+                if bounded {
+                    identity
+                } else {
+                    "synthetic-safety"
+                },
+            ),
         )
         .unwrap();
+        if bounded {
+            store::json_write(
+                &source.join(".claude.json"),
+                &serde_json::json!({"oauthAccount":{"accountUuid":identity}}),
+            )
+            .unwrap();
+        }
         provider::add(&store, provider, label).unwrap();
         let cached = Cached {
             usage: Usage {
@@ -495,7 +547,9 @@ fn runner_safety_child() {
         vec!["--resume".into(), ID.into()]
     };
     let result = aswap::runner::run(&store, provider, Some("one"), &args, true);
-    if matches!(case.as_str(), "unknown" | "ambiguous") {
+    if bounded {
+        assert_ne!(result.unwrap(), 0);
+    } else if matches!(case.as_str(), "unknown" | "ambiguous") {
         assert!(result.is_err());
     } else {
         assert_eq!(result.unwrap(), 0);
