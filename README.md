@@ -153,8 +153,9 @@ Session IDs come from an explicit UUID, a preallocated Claude `--session-id`,
 Claude's own PID registry, or transcript filenames held open by that child/process
 tree. Transcript contents are not read. The tracker never picks the globally
 newest conversation: if identity cannot be established unambiguously, it refuses
-the restart. Session selection inside the provider can be detected through its
-open transcript descriptors; ambiguous provider versions fail safely.
+the restart. Claude’s PID registry can identify session selection inside the
+provider, even when subagents open other transcripts. A known Claude UUID survives
+unrelated shared history writes. A fork must establish its new identity first.
 
 Candidates need fresh known quota below the threshold, ten points of improvement
 and a 300-second cooldown; a recognized limit bypasses the latter two gates.
@@ -162,8 +163,13 @@ and a 300-second cooldown; a recognized limit bypasses the latter two gates.
 `prefer weekly-reset` picks the one whose weekly window resets soonest, so
 quota that would expire unused goes first. With `weekly-reset`, new launches and
 the selection monitor also move to an eligible account whose weekly reset is
-strictly sooner, even below the threshold; running sessions are only switched
-by the threshold or a limit.
+strictly sooner, even below the threshold; running sessions switch only after an
+explicit provider limit or authentication failure. Quota polling never interrupts
+active tools. Failure detection matches diagnostic line shapes rather than
+arbitrary conversation prose. A recalled line identical to a live diagnostic
+cannot be distinguished from it in raw terminal output.
+Resume identity and arguments are checked before stopping the child;
+if they are unavailable, the current provider stays running.
 Switches stop the child with SIGTERM, wait five seconds, then use SIGKILL if
 needed. The exact same shared session resumes on the new account. Clean exits do
 not restart or send a follow-up. Restarts are capped at eight. Runtime auth/config

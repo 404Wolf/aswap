@@ -357,3 +357,158 @@ fn future_option_help_describes_values_without_restricting_flags() {
     assert!(!resumed.contains(&"--fork-session".into()));
     assert!(resumed.contains(&"--permission-mode=acceptEdits".into()));
 }
+
+#[test]
+fn live_claude_is_not_stopped_for_quota_prose_or_unresumable_failure() {
+    let t = tempfile::tempdir().unwrap();
+    let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|p| p.join("python3"))
+        .find(|p| p.is_file())
+        .unwrap();
+    let bin = t.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let fake = bin.join("claude");
+    fs::write(&fake, format!("#!{}\n{}", python.display(), r#"
+import json, os, pathlib, sys, time
+root=pathlib.Path(os.environ['HOME'])
+case=os.environ['ASWAP_SAFETY_CASE']
+if '--help' in sys.argv: sys.exit(0)
+with (root/'calls').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
+if case=='quota':
+    cache=pathlib.Path(os.environ['ASWAP_TEST_CACHE'])
+    data=json.loads(cache.read_text())
+    data['usage']['windows'][0]['used_percent']=95
+    cache.write_text(json.dumps(data))
+elif case=='prose':
+    print('❯ <hc from="t7 worker">All synthetic logins failed: login expired (401), HTTP 401.</hc>',flush=True)
+    print('● The previous resume failed with "aswap: login expired for claude:synthetic".',flush=True)
+    print('❯ You were interrupted by a usage-limit account switch. Continue exactly where you left off.',flush=True)
+else:
+    print('Login expired · Please run /login',flush=True)
+# Simulate a still-running tool that must finish before the provider exits.
+time.sleep(1)
+(root/'completed').write_text('synthetic tool completed')
+"#)).unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    for case in ["quota", "prose", "unknown", "ambiguous"] {
+        let home = t.path().join(case);
+        fs::create_dir(&home).unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "runner_safety_child", "--nocapture"])
+            .env_clear()
+            .env("PATH", &path)
+            .env("HOME", &home)
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+            .env("ASWAP_SAFETY_CASE", case)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{case}: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            home.join("completed").exists(),
+            "{case}: active tool was stopped"
+        );
+        assert_eq!(
+            fs::read_to_string(home.join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "{case}: unexpected restart"
+        );
+        if matches!(case, "unknown" | "ambiguous") {
+            assert!(
+                String::from_utf8_lossy(&out.stderr)
+                    .contains("keeping the current provider running")
+            );
+        }
+    }
+}
+
+#[test]
+fn runner_safety_child() {
+    let Ok(case) = std::env::var("ASWAP_SAFETY_CASE") else {
+        return;
+    };
+    let provider = Provider::Claude;
+    let store = Store::from_env().unwrap();
+    let source = provider.current_home().unwrap();
+    for (label, pct) in [("one", 20.0), ("two", 10.0)] {
+        store::json_write(
+            &source.join(provider.auth_file()),
+            &auth(provider, "synthetic-safety"),
+        )
+        .unwrap();
+        provider::add(&store, provider, label).unwrap();
+        let cached = Cached {
+            usage: Usage {
+                windows: vec![Window {
+                    name: "primary".into(),
+                    used_percent: pct,
+                    resets_at: None,
+                    duration_minutes: Some(300),
+                }],
+                ..Default::default()
+            },
+            fetched_at: aswap::now(),
+            next_poll_at: aswap::now() + 3600,
+            ..Default::default()
+        };
+        store::json_write(
+            &store
+                .profile(provider, label)
+                .unwrap()
+                .join("usage-cache.json"),
+            &cached,
+        )
+        .unwrap();
+    }
+    // SAFETY: this subprocess test has no other threads reading environment.
+    unsafe {
+        std::env::set_var(
+            "ASWAP_TEST_CACHE",
+            store
+                .profile(provider, "one")
+                .unwrap()
+                .join("usage-cache.json"),
+        );
+    }
+    let args = if case == "unknown" {
+        vec!["--continue".into()]
+    } else if case == "ambiguous" {
+        vec![
+            "--resume".into(),
+            ID.into(),
+            "--future-option".into(),
+            "possibly-initial-input".into(),
+        ]
+    } else {
+        vec!["--resume".into(), ID.into()]
+    };
+    let result = aswap::runner::run(&store, provider, Some("one"), &args, true);
+    if matches!(case.as_str(), "unknown" | "ambiguous") {
+        assert!(result.is_err());
+    } else {
+        assert_eq!(result.unwrap(), 0);
+        let cache: Cached = store::json_read(
+            &store
+                .profile(provider, "one")
+                .unwrap()
+                .join("usage-cache.json"),
+        )
+        .unwrap();
+        assert!(
+            cache.error.is_none(),
+            "transcript prose must not poison login state"
+        );
+    }
+}

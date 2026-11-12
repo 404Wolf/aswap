@@ -53,6 +53,7 @@ impl AutoArgs {
         let mut sticky = Vec::new();
         let mut id = None;
         let mut selection = false;
+        let mut fork = false;
         let mut one_shot = false;
         if provider == Provider::Codex
             && args
@@ -61,6 +62,7 @@ impl AutoArgs {
         {
             selection = true;
             one_shot = args[0] == "exec";
+            fork = args[0] == "fork";
             i = 1;
             if let Some(value) = args.get(i).filter(|s| !s.starts_with('-')) {
                 if valid_id(value) {
@@ -100,6 +102,7 @@ impl AutoArgs {
                 || (provider == Provider::Codex && key == "--last")
             {
                 selection = true;
+                fork |= key == "--fork-session";
             } else if provider == Provider::Claude && matches!(key, "--print" | "-p") {
                 one_shot = true;
             } else if flag.starts_with('-') {
@@ -226,6 +229,10 @@ impl AutoArgs {
                 .unwrap_or(initial.len());
             initial.splice(at..at, ["--session-id".into(), uuid.clone()]);
             id = Some(uuid);
+        }
+        if fork {
+            // A fork creates a new conversation; its source UUID is not resumable identity.
+            id = None;
         }
         Ok(Self {
             initial,
@@ -367,32 +374,31 @@ impl Tracker {
             .filter(|(p, s)| self.files.get(*p) != Some(*s))
             .filter_map(|(p, _)| filename_id(self.provider, p))
             .collect();
-        if owned.len() == 1 {
-            self.known = owned.into_iter().next();
-        } else if owned.len() > 1 {
-            self.known = None;
-        } else if self.provider == Provider::Claude {
+        // Claude's PID registry identifies the main conversation even while
+        // subagents hold other transcripts open or unrelated terminals write.
+        let registered = if self.provider == Provider::Claude {
             let registry = self.home.join("sessions").join(format!("{pid}.json"));
-            if let Ok(v) = store::json_read::<Value>(&registry) {
-                if v.get("pid").and_then(Value::as_u64) == Some(pid as u64)
-                    && let Some(id) = v
-                        .get("sessionId")
-                        .and_then(Value::as_str)
-                        .filter(|s| valid_id(s))
-                {
-                    if changed.iter().all(|s| s == id) {
-                        self.known = Some(id.into());
-                    } else {
-                        self.known = None;
-                    }
-                }
-            } else if changed.iter().any(|s| self.known.as_ref() != Some(s)) {
-                self.known = None;
-            }
-        }
-        // With no PID/descriptor evidence we retain an explicit ID only if no
-        // other session changed. A global newest-file heuristic is unsafe.
-        else if changed.iter().any(|s| self.known.as_ref() != Some(s)) {
+            store::json_read::<Value>(&registry).ok().and_then(|v| {
+                (v.get("pid").and_then(Value::as_u64) == Some(pid as u64))
+                    .then(|| {
+                        v.get("sessionId")
+                            .and_then(Value::as_str)
+                            .filter(|s| valid_id(s))
+                            .map(str::to_owned)
+                    })
+                    .flatten()
+            })
+        } else {
+            None
+        };
+        if let Some(id) = registered {
+            self.known = Some(id);
+        } else if self.provider == Provider::Claude && self.known.is_some() {
+            // An explicit/previously proven Claude UUID is not invalidated by
+            // shared history activity. Open files may belong to subagents.
+        } else if owned.len() == 1 {
+            self.known = owned.into_iter().next();
+        } else if owned.len() > 1 || changed.iter().any(|s| self.known.as_ref() != Some(s)) {
             self.known = None;
         }
         self.files = current;
@@ -453,5 +459,67 @@ pub fn option_help(provider: Provider, view: &Path, args: &[String]) -> String {
         String::from_utf8(reader.join().unwrap_or_default()).unwrap_or_default()
     } else {
         String::new()
+    }
+}
+
+#[cfg(test)]
+mod tracker_tests {
+    use super::*;
+    const MAIN: &str = "11111111-2222-4333-8444-555555555555";
+    const OTHER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    fn transcript(home: &Path, id: &str) -> PathBuf {
+        let dir = home.join("projects").join("-synthetic");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.jsonl"));
+        fs::write(&path, "synthetic").unwrap();
+        path
+    }
+
+    #[test]
+    fn explicit_claude_identity_survives_other_terminal_and_subagent_writes() {
+        let home = tempfile::tempdir().unwrap();
+        let mut tracker = Tracker::new(Provider::Claude, home.path(), Some(MAIN.into())).unwrap();
+        let other = transcript(home.path(), OTHER);
+        tracker.observe(std::process::id()).unwrap();
+        assert_eq!(tracker.id().unwrap(), MAIN);
+        // A lone open transcript may belong to a tool/subagent, not the main session.
+        let _held = fs::File::open(other).unwrap();
+        tracker.observe(std::process::id()).unwrap();
+        assert_eq!(tracker.id().unwrap(), MAIN);
+    }
+
+    #[test]
+    fn claude_pid_registry_identifies_actual_session_change_despite_shared_writes() {
+        let home = tempfile::tempdir().unwrap();
+        let mut tracker = Tracker::new(Provider::Claude, home.path(), Some(MAIN.into())).unwrap();
+        let main = transcript(home.path(), MAIN);
+        let other = transcript(home.path(), OTHER);
+        let _held = [
+            fs::File::open(main).unwrap(),
+            fs::File::open(other).unwrap(),
+        ];
+        let pid = std::process::id();
+        let registry = home.path().join("sessions").join(format!("{pid}.json"));
+        store::json_write(&registry, &serde_json::json!({"pid":pid,"sessionId":OTHER})).unwrap();
+        tracker.observe(pid).unwrap();
+        assert_eq!(tracker.id().unwrap(), OTHER);
+    }
+
+    #[test]
+    fn fork_source_uuid_is_not_the_new_conversation_identity() {
+        for (provider, args) in [
+            (
+                Provider::Claude,
+                vec!["--resume".into(), MAIN.into(), "--fork-session".into()],
+            ),
+            (Provider::Codex, vec!["fork".into(), MAIN.into()]),
+        ] {
+            let parsed = AutoArgs::parse(provider, &args).unwrap();
+            assert!(parsed.id.is_none());
+            let home = tempfile::tempdir().unwrap();
+            let tracker = Tracker::new(provider, home.path(), parsed.id).unwrap();
+            assert!(tracker.id().is_err());
+        }
     }
 }

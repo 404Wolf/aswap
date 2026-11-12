@@ -206,7 +206,8 @@ pub fn run(
         let mut unsupported = false;
         let mut reported_none = false;
         let mut target = None;
-        let mut next_check = 0;
+        let mut prepared_resume = None;
+        let mut reported_resume = false;
         let status = loop {
             // Keystrokes and redraws go through as they arrive; the bookkeeping
             // below only runs between these 250ms windows.
@@ -247,35 +248,9 @@ pub fn run(
             if let Some(status) = child.0.try_wait().safe("cannot wait for provider")? {
                 break status;
             }
-            if auto && now() >= next_check {
-                next_check = now() + usage::TTL;
-                // Refresh-token rotations in this private run become canonical.
-                view.sync(store, &account)?;
-                let (entries, settings) = observations(store, provider)?;
-                let entries = models.filter(store, &account.label, entries);
-                if let Some(next) = usage::choose(
-                    &account.label,
-                    &entries,
-                    settings.threshold,
-                    settings.prefer,
-                    settings.last_switch,
-                    now(),
-                    false,
-                ) {
-                    target = Some(next.clone());
-                    break stop(&mut child.0)?;
-                }
-                if !reported_none
-                    && entries
-                        .iter()
-                        .find(|(a, _)| a.label == account.label)
-                        .and_then(|(_, c)| c.used(now()))
-                        .is_some_and(|used| used >= settings.threshold)
-                {
-                    models.report_none();
-                    reported_none = true;
-                }
-            }
+            // Quota observations rank future launches, but cannot establish
+            // that an interactive provider is idle. Never cancel active tools
+            // merely because cached quota crossed a threshold.
             if !expired && terminal.as_ref().is_some_and(|t| t.auth_expired) {
                 expired = true;
                 usage::mark_auth_expired(store, &account)?;
@@ -308,10 +283,26 @@ pub fn run(
                     true,
                 )
                 .cloned();
-                if target.is_some() {
-                    break stop(&mut child.0)?;
+                if target.is_some() && switches < 8 {
+                    match prepare_resume(
+                        store,
+                        provider,
+                        auto_args.as_ref().unwrap(),
+                        tracker.as_ref().unwrap(),
+                    ) {
+                        Ok(args) => {
+                            prepared_resume = Some(args);
+                            break stop(&mut child.0)?;
+                        }
+                        Err(err) => {
+                            if !reported_resume {
+                                eprintln!("aswap: {err}; keeping the current provider running");
+                                reported_resume = true;
+                            }
+                        }
+                    }
                 }
-                if !reported_none {
+                if target.is_none() && !reported_none {
                     models.report_none();
                     reported_none = true;
                 }
@@ -371,11 +362,15 @@ pub fn run(
             models.report_none();
             return Ok(status.code().filter(|code| *code != 0).unwrap_or(1));
         };
-        let exact_id = tracker
-            .as_ref()
-            .expect("auto session tracker")
-            .id()?
-            .to_owned();
+        let resume_args = match prepared_resume {
+            Some(args) => args,
+            None => prepare_resume(
+                store,
+                provider,
+                auto_args.as_ref().unwrap(),
+                tracker.as_ref().unwrap(),
+            )?,
+        };
         // Revalidate, reserve a new per-session lease and commit the decision
         // together. Other sessions using the best account do not exclude it.
         let (next, next_lease) = {
@@ -409,30 +404,37 @@ pub fn run(
         lease = next_lease;
         let _ = crate::refresh::for_run(store, &account);
         view.select(store, &account)?;
-        let prompt = {
-            let _lock = store.lock()?;
-            store
-                .load()?
-                .auto
-                .get(&provider)
-                .cloned()
-                .unwrap_or_default()
-                .resume_prompt
-        };
         if auto_args.as_ref().is_some_and(|a| a.one_shot) || !std::io::stdin().is_terminal() {
             writeln!(std::io::stderr(), "aswap: automatic restart omitted one-shot initial input/print mode; piped stdin is not replayed").safe("cannot report automatic restart")?;
             if let Some(terminal) = &mut terminal {
                 terminal.discard_piped_input();
             }
         }
-        launch_args = auto_args.as_ref().expect("auto arguments").resume(
-            provider,
-            &exact_id,
-            prompt.as_deref(),
-        )?;
+        launch_args = resume_args;
         switches += 1;
     }
 }
+// Build the exact argv before stopping a live provider. Unknown identity or
+// ambiguous option arity must leave the current conversation available.
+fn prepare_resume(
+    store: &Store,
+    provider: Provider,
+    args: &crate::session::AutoArgs,
+    tracker: &crate::session::Tracker,
+) -> Result<Vec<String>> {
+    let prompt = {
+        let _lock = store.lock()?;
+        store
+            .load()?
+            .auto
+            .get(&provider)
+            .cloned()
+            .unwrap_or_default()
+            .resume_prompt
+    };
+    args.resume(provider, tracker.id()?, prompt.as_deref())
+}
+
 /// Poll the refresh owner on a helper thread; true unless the poll failed
 /// (an exchange that is not due yet still counts, as the old inline poll did).
 /// Followers only: without a configured owner there is nothing to do.

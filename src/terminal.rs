@@ -42,7 +42,7 @@ pub struct Terminal {
     slave: File,
     original: Option<libc::termios>,
     input_open: bool,
-    tail: String,
+    diagnostics: Diagnostics,
     pub auth_expired: bool,
     pub model_unsupported: bool,
 }
@@ -94,7 +94,7 @@ impl Terminal {
             slave,
             original,
             input_open: true,
-            tail: String::new(),
+            diagnostics: Diagnostics::default(),
             auth_expired: false,
             model_unsupported: false,
         })
@@ -119,7 +119,7 @@ impl Terminal {
                 Ok(())
             });
         }
-        self.tail.clear();
+        self.diagnostics = Diagnostics::default();
         self.auth_expired = false;
         self.model_unsupported = false;
         self.resize();
@@ -192,21 +192,10 @@ impl Terminal {
                         .write_all(&buffer[..n])
                         .safe("cannot forward provider output")?;
                     stdout.flush().safe("cannot flush provider output")?;
-                    self.tail
-                        .push_str(&String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase());
-                    limited = limit_message(&self.tail);
-                    self.auth_expired |= auth_message(&self.tail);
-                    self.model_unsupported |= unsupported_model_message(&self.tail);
-                    // UTF-8 safe and bounded; this is never logged or persisted.
-                    self.tail = self
-                        .tail
-                        .chars()
-                        .rev()
-                        .take(512)
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect();
+                    let signals = self.diagnostics.feed(&buffer[..n]);
+                    limited = signals.0;
+                    self.auth_expired |= signals.1;
+                    self.model_unsupported |= signals.2;
                 }
                 Err(e) if e.raw_os_error() == Some(libc::EIO) => {}
                 Err(_) => return Err(Error("cannot read provider terminal")),
@@ -224,6 +213,92 @@ impl Drop for Terminal {
             }
         }
     }
+}
+// Match provider diagnostic lines, never arbitrary prose in a restored
+// conversation. Escape state survives PTY reads (including split CSI codes).
+#[derive(Default)]
+struct Diagnostics {
+    line: Vec<u8>,
+    escape: u8,
+    truncated: bool,
+}
+impl Diagnostics {
+    fn feed(&mut self, bytes: &[u8]) -> (bool, bool, bool) {
+        let mut signals = (false, false, false);
+        for &byte in bytes {
+            match self.escape {
+                1 => {
+                    self.escape = if byte == b'[' { 2 } else { 0 };
+                    continue;
+                }
+                2 => {
+                    if (0x40..=0x7e).contains(&byte) {
+                        self.escape = 0;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            match byte {
+                0x1b => self.escape = 1,
+                b'\n' | b'\r' => {
+                    let next = if self.truncated {
+                        (false, false, false)
+                    } else {
+                        diagnostic_line(&self.line)
+                    };
+                    signals.0 |= next.0;
+                    signals.1 |= next.1;
+                    signals.2 |= next.2;
+                    self.line.clear();
+                    self.truncated = false;
+                }
+                _ => {
+                    // Preserve UTF-8 bytes until the diagnostic is inspected.
+                    if self.line.len() < 4096 {
+                        self.line.push(byte);
+                    } else {
+                        self.truncated = true;
+                    }
+                }
+            }
+        }
+        let next = if self.truncated {
+            (false, false, false)
+        } else {
+            diagnostic_line(&self.line)
+        };
+        (
+            signals.0 || next.0,
+            signals.1 || next.1,
+            signals.2 || next.2,
+        )
+    }
+}
+fn diagnostic_line(line: &[u8]) -> (bool, bool, bool) {
+    // Decode bytes accumulated across reads, then remove Claude's result marker.
+    let decoded = String::from_utf8_lossy(line).to_ascii_lowercase();
+    let line = decoded.trim().trim_start_matches('⎿').trim();
+    let api = line
+        .strip_prefix("api error:")
+        .or_else(|| line.strip_prefix("error:"));
+    let standalone = matches!(line, "usage_limit_reached" | "rate_limit_exceeded")
+        || (line.starts_with("the ") && unsupported_model_message(line))
+        || line.starts_with("login expired · please run /login")
+        || line.starts_with("you've hit your limit")
+        || line.starts_with("you’re out of extra usage")
+        || line.starts_with("you're out of extra usage");
+    let Some(text) = api.or(standalone.then_some(line)) else {
+        return (false, false, false);
+    };
+    (
+        limit_message(text)
+            || text.trim_start().starts_with("429 ")
+            || line.starts_with("you've hit your limit")
+            || line.contains("out of extra usage"),
+        auth_message(text) || text.trim_start().starts_with("401 "),
+        unsupported_model_message(text),
+    )
 }
 pub fn limit_message(text: &str) -> bool {
     [
@@ -292,4 +367,70 @@ pub fn unsupported_model_message(text: &str) -> bool {
     text.contains("model is not supported when using codex with")
         || text.contains("model_not_found")
         || text.contains("does not have access to model")
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::Diagnostics;
+
+    #[test]
+    fn recalled_reports_and_prompts_are_not_live_failures() {
+        let mut detector = Diagnostics::default();
+        for report in [
+            "❯ <hc from=\"t7 worker\">All logins failed: login expired (401), HTTP 401.</hc>\r\n",
+            "● The resume failed with \"aswap: login expired for claude:synthetic\".\n",
+            "  - Profiles: synthetic has expired logins; HTTP 401.\n",
+            "❯ You were interrupted by a usage-limit account switch. Continue exactly where you left off.\n",
+            "● Discuss API Error: 429 usage_limit_reached and token has expired.\n",
+            "❯ aswap: login expired for claude:synthetic; selecting another account\n",
+        ] {
+            for chunk in report.as_bytes().chunks(7) {
+                assert_eq!(detector.feed(chunk), (false, false, false), "{report}");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_exact_diagnostic_replay_is_indistinguishable_from_live_output() {
+        // Terminal text carries no provenance. Keep this limitation explicit;
+        // anchored shapes reject surrounding prose, not identical replay bytes.
+        let bytes = b"API Error: 401 synthetic authentication failure\n";
+        assert_eq!(Diagnostics::default().feed(bytes), (false, true, false));
+        assert_eq!(Diagnostics::default().feed(bytes), (false, true, false));
+    }
+
+    #[test]
+    fn recognizes_ansi_chunked_provider_diagnostics() {
+        for (line, expected) in [
+            (
+                "  ⎿  API Error: 401 {\"error\":{\"type\":\"authentication_error\"}} · Please run /login\r\n",
+                (false, true, false),
+            ),
+            (
+                "API Error: 429 {\"error\":{\"type\":\"rate_limit_error\"}}\r\n",
+                (true, false, false),
+            ),
+            (
+                "Login expired · Please run /login\r\n",
+                (false, true, false),
+            ),
+            (
+                "You've hit your limit · resets tomorrow\r\n",
+                (true, false, false),
+            ),
+            ("Error: model_not_found\r\n", (false, false, true)),
+        ] {
+            let input = format!("\x1b[31m{line}\x1b[0m");
+            let mut detector = Diagnostics::default();
+            let mut actual = (false, false, false);
+            for byte in input.as_bytes() {
+                let next = detector.feed(&[*byte]);
+                actual.0 |= next.0;
+                actual.1 |= next.1;
+                actual.2 |= next.2;
+            }
+            assert_eq!(actual, expected, "{line}");
+            assert_eq!(detector.feed(b"ordinary output\n"), (false, false, false));
+        }
+    }
 }
