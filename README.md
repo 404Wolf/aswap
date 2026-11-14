@@ -6,6 +6,13 @@ for Linux. A port of the command-line account-switching core of
 Waybar and Home Manager integration. Original work © 2026 Onur Cetinkol,
 MIT licensed; see [LICENSE](LICENSE), [NOTICE](NOTICE) and [DESIGN.md](DESIGN.md).
 
+## Where the source lives
+
+The canonical repository is `instant-fill/aswap` on instant-fill's private
+Gitea. Push only there. `github.com/404Wolf/aswap` is a mirror of it: don't push
+to it directly, so the two mains can't diverge again as they did on
+2026-11-11.
+
 ## Install
 
 From this checkout:
