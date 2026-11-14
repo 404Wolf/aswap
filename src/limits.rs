@@ -146,7 +146,9 @@ impl Limits {
 /// How often subagent transcripts are looked for.
 const SCAN: Duration = Duration::from_secs(1);
 
-/// `.jsonl` files under `dir`, at most two levels down, modified since `since`.
+/// `.jsonl` files under `dir`, at most two levels down, modified since `since`:
+/// `subagents/agent-*.jsonl` and workflow agents'
+/// `subagents/workflows/wf_*/agent-*.jsonl`.
 fn subagent_files(dir: &std::path::Path, depth: usize, since: SystemTime, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -156,7 +158,7 @@ fn subagent_files(dir: &std::path::Path, depth: usize, since: SystemTime, out: &
             continue;
         };
         let path = entry.path();
-        if kind.is_dir() && depth < 1 {
+        if kind.is_dir() && depth < 2 {
             subagent_files(&path, depth + 1, since, out);
         } else if kind.is_file()
             && path.extension().is_some_and(|e| e == "jsonl")
@@ -449,6 +451,37 @@ mod tests {
         // A subagent of this launch hits the limit.
         std::fs::write(
             dir.join("agent-b2.jsonl"),
+            entry(SystemTime::now(), "rate_limit") + "\n",
+        )
+        .unwrap();
+        assert!(limits.check(Some(&tracker), false, true));
+    }
+
+    #[test]
+    fn a_limit_a_workflow_agent_recorded_counts() {
+        let (home, _path, tracker) = setup("");
+        let mut limits = Limits::new(Some(&tracker));
+        let workflow = home
+            .path()
+            .join("projects")
+            .join("-synthetic")
+            .join(ID)
+            .join("subagents")
+            .join("workflows")
+            .join("wf_synthetic");
+        // Deeper than any agent Claude writes: not looked at.
+        let deeper = workflow.join("nested");
+        std::fs::create_dir_all(&deeper).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(
+            deeper.join("agent-d4.jsonl"),
+            entry(SystemTime::now(), "rate_limit") + "\n",
+        )
+        .unwrap();
+        assert!(!limits.check(Some(&tracker), false, true));
+        // A workflow agent of this launch hits the limit.
+        std::fs::write(
+            workflow.join("agent-c3.jsonl"),
             entry(SystemTime::now(), "rate_limit") + "\n",
         )
         .unwrap();
