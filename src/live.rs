@@ -352,6 +352,9 @@ mod hand_out_tests {
         assert_eq!(token(&dead), "synthetic-old");
         assert!(!vanished.exists());
         let handed: Value = store::json_read(&live.join(".credentials.json")).unwrap();
-        assert_eq!(handed["claudeAiOauth"]["refreshToken"], "aswap-owner-managed");
+        assert_eq!(
+            handed["claudeAiOauth"]["refreshToken"],
+            "aswap-owner-managed"
+        );
     }
 }

@@ -556,6 +556,7 @@ const QUIET_STEP: Duration = Duration::from_millis(25);
 /// which is the resume prompt being recorded.
 struct Quiet {
     since: Instant,
+    since_wall: std::time::SystemTime,
     transcript: Option<std::path::PathBuf>,
     launch: Option<crate::shared::Stamp>,
     recorded: Option<Instant>,
@@ -565,6 +566,7 @@ impl Quiet {
         let transcript = tracker.and_then(|t| t.transcript());
         Self {
             since: Instant::now(),
+            since_wall: std::time::SystemTime::now(),
             launch: transcript.as_deref().and_then(crate::shared::stamp),
             transcript,
             recorded: None,
@@ -576,10 +578,27 @@ impl Quiet {
             return;
         }
         if self.transcript.is_none() {
-            // Found only now: its stamp at discovery is the baseline, so
-            // finding it does not count as the prompt being recorded.
+            // Found only now (the tracker learns files once a tick). One
+            // unchanged since before launch is the baseline, so finding it is
+            // not a change. One written since launch is the resume prompt
+            // being recorded: date that by its mtime, since finding it lags.
             self.transcript = tracker.and_then(|t| t.transcript());
-            self.launch = self.transcript.as_deref().and_then(crate::shared::stamp);
+            let Some(path) = &self.transcript else {
+                return;
+            };
+            self.launch = crate::shared::stamp(path);
+            if let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified())
+                && modified >= self.since_wall
+            {
+                let ago = std::time::SystemTime::now()
+                    .duration_since(modified)
+                    .unwrap_or_default();
+                self.recorded = Some(
+                    Instant::now()
+                        .checked_sub(ago)
+                        .unwrap_or_else(Instant::now),
+                );
+            }
             return;
         }
         if let Some(path) = &self.transcript
