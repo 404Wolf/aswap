@@ -246,6 +246,10 @@ pub fn run(
         let mut expired = false;
         let mut unsupported = false;
         let mut reported_none = false;
+        // How this launch rejected its account: once, so a session that sits
+        // on its limited account doesn't escalate the hold every period
+        // (`Some(true)` for a limit, which a login or model error replaces).
+        let mut rejected_as: Option<bool> = None;
         let mut target = None;
         let mut prepared_resume = None;
         let mut auth_seen: Option<Instant> = None;
@@ -370,7 +374,11 @@ pub fn run(
             }
             if auto && (limited || expired || unsupported) {
                 let decided = (|| -> Result<Option<Account>> {
-                    rejected.reject(store, &account, !expired && !unsupported)?;
+                    let limit = !expired && !unsupported;
+                    if rejected_as.is_none() || (rejected_as == Some(true) && !limit) {
+                        rejected.reject(store, &account, limit)?;
+                        rejected_as = Some(limit);
+                    }
                     view.sync(store, &account)?;
                     let (entries, settings) = observations(store, provider)?;
                     let entries = rejected.filter(
@@ -489,10 +497,13 @@ pub fn run(
         // the session.
         store::set_patience(PREPARE_PATIENCE);
         if did_limit {
-            hiccups.note(
-                "rejecting the account",
-                rejected.reject(store, &account, !expired && !unsupported),
-            );
+            let limit = !expired && !unsupported;
+            if rejected_as.is_none() || (rejected_as == Some(true) && !limit) {
+                hiccups.note(
+                    "rejecting the account",
+                    rejected.reject(store, &account, limit),
+                );
+            }
             if expired {
                 hiccups.note(
                     "recording the expired login",
