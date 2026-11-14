@@ -61,13 +61,25 @@ pub struct Store {
     pub root: PathBuf,
     pub(crate) sync_policy_path: PathBuf,
 }
-pub struct Guard(File);
+/// A held file lock; `.1` marks the store lock, counted in `HELD`.
+pub struct Guard(File, bool);
 pub use crate::live::Lease;
 impl Drop for Guard {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.0);
+        if self.1 {
+            HELD.with(|held| held.set(held.get().saturating_sub(1)));
+        }
     }
 }
+thread_local! {
+    /// How many store locks this thread holds. Every supervisor takes the
+    /// store lock on its terminal thread, so while it is held nothing may
+    /// wait long: retries under it stop after `LOCKED_PATIENCE`, and callers
+    /// that can afford to wait retry the whole locked step instead.
+    static HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+const LOCKED_PATIENCE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 pub fn label(value: &str) -> Result<()> {
     if value.is_empty()
@@ -178,7 +190,12 @@ fn report_due() -> bool {
 /// Failures are reported on stderr (the monitor's journal, or the
 /// supervisor's terminal), at most once a minute.
 pub(crate) fn retry<T>(what: &str, op: impl FnMut() -> Result<T>) -> Result<T> {
-    retry_for(what, patience(), std::time::Duration::from_millis(50), op)
+    let patience = if HELD.with(|held| held.get()) > 0 {
+        patience().min(LOCKED_PATIENCE)
+    } else {
+        patience()
+    };
+    retry_for(what, patience, std::time::Duration::from_millis(50), op)
 }
 pub(crate) fn retry_for<T>(
     what: &str,
@@ -321,7 +338,8 @@ impl Store {
                     .safe("cannot secure lock")?;
             }
             f.lock_exclusive().safe("cannot lock account store")?;
-            Ok(Guard(f))
+            HELD.with(|held| held.set(held.get() + 1));
+            Ok(Guard(f, true))
         })?;
         crate::rename::recover(self)?;
         Ok(guard)
@@ -417,7 +435,7 @@ impl Store {
             .open(path)
             .safe("cannot open refresh lock")?;
         f.lock_exclusive().safe("cannot lock credential refresh")?;
-        Ok(Guard(f))
+        Ok(Guard(f, false))
     }
     pub(crate) fn lease_label(&self, account: &Account) -> Result<Guard> {
         if self.live_count(account)? > 0 {
@@ -440,7 +458,7 @@ impl Store {
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .safe("cannot open sync watch lock")?;
-        Ok(f.try_lock_exclusive().is_ok().then_some(Guard(f)))
+        Ok(f.try_lock_exclusive().is_ok().then_some(Guard(f, false)))
     }
     pub(crate) fn legacy_lock(&self, account: &Account) -> Result<Guard> {
         let path = self
@@ -457,7 +475,7 @@ impl Store {
             .safe("cannot open profile lock")?;
         f.try_lock_exclusive()
             .safe("legacy refresh-capable session is still running")?;
-        Ok(Guard(f))
+        Ok(Guard(f, false))
     }
 }
 pub fn threshold(value: f64) -> Result<()> {
@@ -537,6 +555,33 @@ mod retry_tests {
         });
         drop(store.lock().unwrap());
         clear.join().unwrap();
+    }
+
+    #[test]
+    fn a_failing_write_under_the_store_lock_does_not_hold_up_other_sessions() {
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        // A write that keeps failing (a directory where the file goes, a
+        // stand-in for ENOSPC), made while holding the store lock.
+        let stuck = store.root.join("stuck.json");
+        fs::create_dir(&stuck).unwrap();
+        let guard = store.lock().unwrap();
+        let root = store.root.clone();
+        let other = std::thread::spawn(move || {
+            let store = Store::open(root).unwrap();
+            let waiting = std::time::Instant::now();
+            drop(store.lock().unwrap());
+            waiting.elapsed()
+        });
+        let started = std::time::Instant::now();
+        assert!(atomic(&stuck, b"synthetic").is_err());
+        // Well under the 5s it would retry without the lock held.
+        assert!(started.elapsed() < Duration::from_secs(3));
+        drop(guard);
+        assert!(other.join().unwrap() < Duration::from_secs(4));
+        // Without the lock the same write is retried for the full patience
+        // (not waited out here); the count is back to zero.
+        assert_eq!(HELD.with(|held| held.get()), 0);
     }
 
     #[test]

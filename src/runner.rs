@@ -86,10 +86,11 @@ pub fn run(
     };
     if auto {
         models.resolve(store, &account)?;
-        let (entries, _) = observations(store, provider)?;
+        let (entries, _) = patiently("reading usage", || observations(store, provider))?;
         let _ = models.filter(store, &account.label, entries);
     }
-    let mut lease = {
+    let mut lease = patiently("reserving the account", || {
+        let mut account = account.clone();
         let _lock = store.lock()?;
         if auto {
             let state = store.load()?;
@@ -118,8 +119,12 @@ pub fn run(
             }
         }
         store.account(&store.load()?, provider, Some(&account.label))?;
-        Arc::new(store.lease_locked(&account)?)
-    };
+        Ok((account.clone(), Arc::new(store.lease_locked(&account)?)))
+    })
+    .map(|(chosen, lease)| {
+        account = chosen;
+        lease
+    })?;
     let _ = crate::refresh::for_run(store, &account);
     let history_owner = account.label.clone();
     // Retain the history owner's lease even after switching credentials.
@@ -128,8 +133,10 @@ pub fn run(
         let _lock = store.lock()?;
         store.account(&store.load()?, provider, Some(&account.label))?;
     }
-    let mut view = crate::shared::View::prepare(store, &account)?;
-    lease.view(&view.path)?;
+    let mut view = patiently("preparing the provider's view", || {
+        crate::shared::View::prepare(store, &account)
+    })?;
+    patiently("recording the session's view", || lease.view(&view.path))?;
     if auto_args.as_ref().is_some_and(|a| a.ambiguous) {
         let help = crate::session::option_help(provider, &view.path, args);
         auto_args = Some(crate::session::AutoArgs::parse_with_help(
@@ -544,7 +551,7 @@ pub fn run(
         // together. Other sessions using the best account do not exclude it.
         // If that fails, resume on the same account: the session goes on, and
         // a limit there is detected and acted on again.
-        let committed = (|| -> Result<(Account, Arc<crate::live::Lease>)> {
+        let commit = || -> Result<(Account, Arc<crate::live::Lease>)> {
             let _lock = store.lock()?;
             let mut state = store.load()?;
             let settings = state.auto.get(&provider).cloned().unwrap_or_default();
@@ -578,7 +585,14 @@ pub fn run(
             state.auto.entry(provider).or_default().last_switch = now();
             store.save(&state)?;
             Ok((next, next_lease))
-        })();
+        };
+        // Retried with the store lock released between attempts.
+        let committed = store::retry_for(
+            "switching accounts",
+            COMMIT_PATIENCE,
+            Duration::from_millis(200),
+            commit,
+        );
         let (next, next_lease) = match committed {
             Ok(next) => next,
             Err(err) => {
@@ -593,7 +607,9 @@ pub fn run(
         account = next;
         lease = next_lease;
         let _ = crate::refresh::for_run(store, &account);
-        view.select(store, &account)?;
+        patiently("preparing the provider's view", || {
+            view.select(store, &account)
+        })?;
         hiccups.note("recording the session's view", lease.view(&view.path));
         omit_one_shot(auto_args.as_ref().unwrap(), &mut terminal)?;
         launch_args = resume_args;
@@ -605,6 +621,16 @@ pub fn run(
 /// restart), and while one does (then its bookkeeping retries next tick).
 const PREPARE_PATIENCE: Duration = Duration::from_secs(600);
 const SUPERVISE_PATIENCE: Duration = Duration::from_secs(1);
+/// How long a switch is retried before the conversation resumes on the same
+/// account instead.
+const COMMIT_PATIENCE: Duration = Duration::from_secs(60);
+/// Retry a step that takes and releases the store lock itself, for as long
+/// as no provider runs: under the lock, store I/O gives up within seconds so
+/// other sessions are never held up, and the waiting happens here, between
+/// attempts, with the lock released.
+fn patiently<T>(what: &str, op: impl FnMut() -> Result<T>) -> Result<T> {
+    store::retry_for(what, PREPARE_PATIENCE, Duration::from_millis(200), op)
+}
 /// Store trouble met while supervising a provider: reported once per kind
 /// per launch, never fatal to the provider.
 struct Hiccups {

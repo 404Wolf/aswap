@@ -102,7 +102,10 @@ rejections lapse after a doubling hold once a fresh reading is below the
 threshold; login and model rejections last the run. No code changes the caller's cwd.
 
 Store trouble (a full disk, EIO, EAGAIN) never ends a provider. Store locks and
-private writes retry with backoff; a supervisor waits up to ten minutes while
+private writes retry with backoff, but under the store lock for at most 1.5
+seconds: every supervisor takes that lock on its terminal thread, so a long
+wait there would freeze every session's UI. Longer waits retry the whole locked
+step with the lock released in between. A supervisor waits up to ten minutes while
 no provider runs (preparing a launch or a restart) and one second per attempt
 while one does, when a failed bookkeeping step (leases, tracking, choosing an
 account, recording a limit) is reported once and retried on later ticks. If
