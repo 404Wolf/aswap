@@ -30,12 +30,18 @@ pub const UNCONFIRMED: Duration = Duration::from_secs(10);
 pub struct Limits {
     launched: Instant,
     launched_wall: SystemTime,
-    path: Option<PathBuf>,
+    /// The conversation's transcript, as the tracker last identified it.
+    main: Option<Tail>,
+    seen: bool,
+    screen_seen: bool,
+}
+
+/// What has been read of one transcript.
+struct Tail {
+    path: PathBuf,
     offset: u64,
     partial: Vec<u8>,
     skipping: bool,
-    seen: bool,
-    screen_seen: bool,
 }
 
 impl Limits {
@@ -44,18 +50,14 @@ impl Limits {
     /// so nothing recorded before this launch, such as the limit that ended
     /// the previous provider a moment ago, counts for this one.
     pub fn new(tracker: Option<&Tracker>) -> Self {
-        let path = tracker.and_then(|t| t.transcript());
-        let offset = path
-            .as_deref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map_or(0, |m| m.len());
+        let main = tracker.and_then(|t| t.transcript()).map(|path| {
+            let offset = std::fs::metadata(&path).map_or(0, |m| m.len());
+            Tail::at(path, offset, false)
+        });
         Self {
             launched: Instant::now(),
             launched_wall: SystemTime::now(),
-            path,
-            offset,
-            partial: Vec::new(),
-            skipping: false,
+            main,
             seen: false,
             screen_seen: false,
         }
@@ -70,47 +72,59 @@ impl Limits {
         if self.seen {
             return true;
         }
-        if self.path.is_none() {
-            self.path = tracker.and_then(|t| {
-                if fresh {
-                    t.transcript_now()
-                } else {
-                    t.transcript()
-                }
-            });
-            if let Some(path) = &self.path {
-                self.offset = self.start(path);
-                self.skipping = self.offset > 0;
+        // Follow the tracker: a /clear or another conversation picked inside
+        // the provider moves its writes, limits included, to a new transcript.
+        let current = tracker.and_then(|t| {
+            if fresh {
+                t.transcript_now()
+            } else {
+                t.transcript()
             }
+        });
+        if let Some(path) = current
+            && self.main.as_ref().is_none_or(|tail| tail.path != path)
+        {
+            self.main = Some(Tail::found(path, self.launched_wall));
         }
-        if self.path.is_some() {
-            self.seen = self.read();
+        if let Some(tail) = &mut self.main {
+            self.seen = tail.read(self.launched_wall);
             return self.seen;
         }
         self.screen_seen |= screen && self.launched.elapsed() >= UNCONFIRMED;
         self.screen_seen
     }
+}
 
-    /// Where to start reading a transcript first found after launch: at its
-    /// end if nothing was written since launch, otherwise its recent tail
-    /// (entries are then told apart by their timestamps).
-    fn start(&self, path: &std::path::Path) -> u64 {
-        let Ok(meta) = std::fs::metadata(path) else {
-            return 0;
-        };
-        let written = meta.modified().is_ok_and(|m| m >= self.launched_wall);
-        if written {
-            meta.len().saturating_sub(TAIL)
-        } else {
-            meta.len()
+impl Tail {
+    fn at(path: PathBuf, offset: u64, skipping: bool) -> Self {
+        Self {
+            path,
+            offset,
+            partial: Vec::new(),
+            skipping,
         }
     }
 
-    fn read(&mut self) -> bool {
-        let Some(path) = &self.path else {
-            return false;
+    /// A transcript first seen after launch: read from its end if nothing
+    /// was written since launch, otherwise from its recent tail (entries are
+    /// then told apart by their timestamps), skipping the line cut there.
+    fn found(path: PathBuf, launched: SystemTime) -> Self {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return Self::at(path, 0, false);
         };
-        let Ok(mut file) = File::open(path) else {
+        let written = meta.modified().is_ok_and(|m| m >= launched);
+        let offset = if written {
+            meta.len().saturating_sub(TAIL)
+        } else {
+            meta.len()
+        };
+        Self::at(path, offset, offset > 0)
+    }
+
+    /// Read what was appended since the last read; whether it holds a limit
+    /// entry stamped at or after `since`.
+    fn read(&mut self, since: SystemTime) -> bool {
+        let Ok(mut file) = File::open(&self.path) else {
             return false;
         };
         let Ok(len) = file.metadata().map(|m| m.len()) else {
@@ -141,19 +155,13 @@ impl Limits {
                 continue;
             }
             if !self.skipping {
-                found |= self.limit_entry(&self.partial);
+                found |= serde_json::from_slice::<Value>(&self.partial)
+                    .is_ok_and(|entry| limit_entry(&entry, since));
             }
             self.partial.clear();
             self.skipping = false;
         }
         found
-    }
-
-    fn limit_entry(&self, line: &[u8]) -> bool {
-        let Ok(entry) = serde_json::from_slice::<Value>(line) else {
-            return false;
-        };
-        limit_entry(&entry, self.launched_wall)
     }
 }
 
@@ -262,6 +270,36 @@ mod tests {
         let mut limits = Limits::new(Some(&tracker));
         assert!(!limits.check(Some(&tracker), true, false));
         assert!(!limits.check(Some(&tracker), true, true));
+    }
+
+    #[test]
+    fn a_conversation_change_during_a_launch_is_followed() {
+        // Launched on A; the provider then switches conversation (a /clear,
+        // or a pick inside it) and the tracker follows it to B.
+        let (home, _a, mut tracker) = setup("");
+        let mut limits = Limits::new(Some(&tracker));
+        assert!(!limits.check(Some(&tracker), false, false));
+        let other = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let b = home
+            .path()
+            .join("projects")
+            .join("-synthetic")
+            .join(format!("{other}.jsonl"));
+        std::fs::write(&b, "{\"type\":\"user\"}\n").unwrap();
+        tracker = Tracker::new(
+            crate::provider::Provider::Claude,
+            home.path(),
+            Some(other.into()),
+        )
+        .unwrap();
+        assert!(!limits.check(Some(&tracker), true, false));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&b)
+            .unwrap()
+            .write_all((entry(SystemTime::now(), "rate_limit") + "\n").as_bytes())
+            .unwrap();
+        assert!(limits.check(Some(&tracker), false, false));
     }
 
     #[test]
