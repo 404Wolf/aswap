@@ -369,6 +369,27 @@ fn future_option_help_describes_values_without_restricting_flags() {
 
 #[test]
 fn live_claude_is_not_stopped_for_quota_prose_or_unresumable_failure() {
+    runner_safety_cases(&[
+        "quota",
+        "prose",
+        "unknown",
+        "ambiguous",
+        "bounded401",
+        "boundedquota",
+    ]);
+}
+
+#[test]
+fn above_threshold_fallback_skips_rejected_accounts_and_aliases_after_cache_replacement() {
+    runner_safety_cases(&["boundedhigh401", "boundedhighquota"]);
+}
+
+#[test]
+fn automatic_restarts_stop_after_eight_switches() {
+    runner_safety_cases(&["boundedcap"]);
+}
+
+fn runner_safety_cases(cases: &[&str]) {
     let t = tempfile::tempdir().unwrap();
     let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
         .map(|p| p.join("python3"))
@@ -384,16 +405,33 @@ case=os.environ['ASWAP_SAFETY_CASE']
 if '--help' in sys.argv: sys.exit(0)
 with (root/'calls').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
 if case.startswith('bounded'):
+    high=case.startswith('boundedhigh')
     # Simulate an owner push replacing all rejected caches with fresh eligibility.
     for cache in pathlib.Path(os.environ['ASWAP_TEST_CACHE']).parent.parent.glob('*/usage-cache.json'):
-        data=json.loads(cache.read_text());data['error']=None;data['http_status']=None
-        data['usage']['windows'][0]['used_percent']=10
+        data=json.loads(cache.read_text())
+        rejected=data.get('error') is not None or data['usage']['windows'][0]['used_percent']>=100
+        data['error']=None;data['http_status']=None
+        pct=10
+        if high: pct={'one':95,'alias':91,'two':94}[cache.parent.name]
+        elif case=='boundedcap': pct=95
+        data['usage']['windows'][0]['used_percent']=pct
+        data['fetched_at']=int(time.time())
         data['next_poll_at']=int(time.time())+3600
-        cache.write_text(json.dumps(data))
+        replacement=cache.with_suffix('.replacement')
+        replacement.write_text(json.dumps(data))
+        replacement.replace(cache)
+        if high and cache.parent.name=='one' and rejected:
+            (root/'replaced-rejection').write_text('rejected account cache replaced with fresh above-threshold capacity')
     auth=json.loads((pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])/'.credentials.json').read_text())
     with (root/'identities').open('a') as f: f.write(auth['claudeAiOauth']['accessToken']+'\n')
-    print('⎿ OAuth token revoked · Please run /login' if case=='bounded401' else 'API Error: 429 synthetic quota failure',flush=True)
-    time.sleep(.4);sys.exit(1)
+    print('⎿ OAuth token revoked · Please run /login' if case.endswith('401') else 'API Error: 429 synthetic quota failure',flush=True)
+    if case=='boundedcap' and len((root/'calls').read_text().splitlines())==9:
+        # At the cap the last provider must finish its active work, even though
+        # another fresh, distinct account is still eligible for the fallback.
+        time.sleep(1)
+        (root/'cap-completed').write_text('ninth provider completed its work')
+    else: time.sleep(.4)
+    sys.exit(1)
 elif case=='quota':
     cache=pathlib.Path(os.environ['ASWAP_TEST_CACHE'])
     data=json.loads(cache.read_text())
@@ -414,14 +452,7 @@ time.sleep(1)
         std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
     .unwrap();
-    for case in [
-        "quota",
-        "prose",
-        "unknown",
-        "ambiguous",
-        "bounded401",
-        "boundedquota",
-    ] {
+    for &case in cases {
         let home = t.path().join(case);
         fs::create_dir(&home).unwrap();
         let out = Command::new(std::env::current_exe().unwrap())
@@ -442,11 +473,43 @@ time.sleep(1)
         );
         if case.starts_with("bounded") {
             let identities = fs::read_to_string(home.join("identities")).unwrap();
+            let calls = fs::read_to_string(home.join("calls")).unwrap();
+            if case == "boundedcap" {
+                assert_eq!(calls.lines().count(), 9, "expected exactly eight restarts");
+                assert_eq!(identities.lines().count(), 9);
+                assert_eq!(
+                    identities
+                        .lines()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len(),
+                    9,
+                    "the restart cap must be reached with distinct identities"
+                );
+                assert!(
+                    home.join("cap-completed").exists(),
+                    "ninth provider was stopped instead of completing its work"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stderr)
+                        .matches("aswap: using claude:")
+                        .count(),
+                    9,
+                    "each launch must be reported, with no tenth launch"
+                );
+                continue;
+            }
+            assert_eq!(calls.lines().count(), 2, "{case}: unexpected restart");
             assert_eq!(
                 identities.lines().collect::<Vec<_>>(),
                 vec!["synthetic-one", "synthetic-two"],
                 "{case}: rejected identity or alias revisited"
             );
+            if case.starts_with("boundedhigh") {
+                assert!(
+                    home.join("replaced-rejection").exists(),
+                    "{case}: must replace a previously rejected account's cache"
+                );
+            }
             continue;
         }
         assert!(
@@ -479,13 +542,26 @@ fn runner_safety_child() {
     let store = Store::from_env().unwrap();
     let source = provider.current_home().unwrap();
     let bounded = case.starts_with("bounded");
-    let accounts = if bounded {
+    let accounts = if case == "boundedcap" {
+        [
+            "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+        ]
+        .into_iter()
+        .map(|label| (label, 95.0))
+        .collect()
+    } else if case.starts_with("boundedhigh") {
+        // The alias has the most headroom, but shares the rejected identity.
+        // All accounts stay above the soft threshold, including after replacement.
+        vec![("one", 95.0), ("alias", 91.0), ("two", 94.0)]
+    } else if bounded {
         vec![("one", 20.0), ("alias", 10.0), ("two", 10.0)]
     } else {
         vec![("one", 20.0), ("two", 10.0)]
     };
     for (label, pct) in accounts {
-        let identity = if label == "two" {
+        let identity = if case == "boundedcap" {
+            label
+        } else if label == "two" {
             "synthetic-two"
         } else {
             "synthetic-one"
@@ -533,6 +609,11 @@ fn runner_safety_child() {
         )
         .unwrap();
     }
+    if case.starts_with("boundedhigh") || case == "boundedcap" {
+        let mut state = store.load().unwrap();
+        state.auto.entry(provider).or_default().threshold = 90.0;
+        store.save(&state).unwrap();
+    }
     // SAFETY: this subprocess test has no other threads reading environment.
     unsafe {
         std::env::set_var(
@@ -556,7 +637,9 @@ fn runner_safety_child() {
         vec!["--resume".into(), ID.into()]
     };
     let result = aswap::runner::run(&store, provider, Some("one"), &args, true);
-    if bounded {
+    if case == "boundedcap" {
+        assert_eq!(result.unwrap(), 1);
+    } else if bounded {
         assert_ne!(result.unwrap(), 0);
     } else if matches!(case.as_str(), "unknown" | "ambiguous") {
         assert!(result.is_err());
