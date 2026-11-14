@@ -35,6 +35,10 @@ pub struct Limits {
     launched_wall: SystemTime,
     /// The conversation's transcript, as the tracker last identified it.
     main: Option<Tail>,
+    /// Its subagents' transcripts written since launch: a subagent can hit a
+    /// limit (and record it only there) before the main thread calls again.
+    subagents: std::collections::BTreeMap<PathBuf, Tail>,
+    scanned: Option<Instant>,
     seen: bool,
     screen_seen: bool,
 }
@@ -72,6 +76,8 @@ impl Limits {
             launched: Instant::now(),
             launched_wall: SystemTime::now(),
             main,
+            subagents: Default::default(),
+            scanned: None,
             seen: false,
             screen_seen: false,
         }
@@ -99,13 +105,68 @@ impl Limits {
             && self.main.as_ref().is_none_or(|tail| tail.path != path)
         {
             self.main = Some(Tail::found(path, self.launched_wall));
+            self.subagents.clear();
+            self.scanned = None;
         }
         if let Some(tail) = &mut self.main {
             self.seen = tail.read(self.launched_wall);
+            let dir = tail.path.with_extension("").join("subagents");
+            self.seen |= self.subagents_limited(&dir, fresh);
             return self.seen;
         }
         self.screen_seen |= screen && self.launched.elapsed() >= UNCONFIRMED;
         self.screen_seen
+    }
+}
+
+impl Limits {
+    /// Whether a subagent transcript under `dir` (`<id>/subagents/`, up to
+    /// two levels deep) written since launch gained a limit entry. Looked at
+    /// once a second, or now when `fresh`.
+    fn subagents_limited(&mut self, dir: &std::path::Path, fresh: bool) -> bool {
+        if !fresh && self.scanned.is_some_and(|at| at.elapsed() < SCAN) {
+            return false;
+        }
+        self.scanned = Some(Instant::now());
+        let since = self.launched_wall;
+        let mut files = Vec::new();
+        subagent_files(dir, 0, since, &mut files);
+        let mut found = false;
+        for path in files {
+            let tail = self
+                .subagents
+                .entry(path.clone())
+                .or_insert_with(|| Tail::found(path, since));
+            found |= tail.read(since);
+        }
+        found
+    }
+}
+
+/// How often subagent transcripts are looked for.
+const SCAN: Duration = Duration::from_secs(1);
+
+/// `.jsonl` files under `dir`, at most two levels down, modified since `since`.
+fn subagent_files(dir: &std::path::Path, depth: usize, since: SystemTime, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if kind.is_dir() && depth < 1 {
+            subagent_files(&path, depth + 1, since, out);
+        } else if kind.is_file()
+            && path.extension().is_some_and(|e| e == "jsonl")
+            && entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|m| m >= since)
+        {
+            out.push(path);
+        }
     }
 }
 
@@ -360,6 +421,38 @@ mod tests {
         assert_eq!(live.len(), first.len());
         std::fs::write(&path, &live).unwrap();
         assert!(limits.check(Some(&tracker), false, false));
+    }
+
+    #[test]
+    fn a_limit_only_a_subagent_recorded_counts() {
+        let (home, _path, tracker) = setup("");
+        let mut limits = Limits::new(Some(&tracker));
+        // A subagent's old limit and its live non-limit error don't count.
+        let dir = home
+            .path()
+            .join("projects")
+            .join("-synthetic")
+            .join(ID)
+            .join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!limits.check(Some(&tracker), false, true));
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(
+            dir.join("agent-a1.jsonl"),
+            entry(hours_ago(4), "rate_limit")
+                + "\n"
+                + &entry(SystemTime::now(), "server_error")
+                + "\n",
+        )
+        .unwrap();
+        assert!(!limits.check(Some(&tracker), false, true));
+        // A subagent of this launch hits the limit.
+        std::fs::write(
+            dir.join("agent-b2.jsonl"),
+            entry(SystemTime::now(), "rate_limit") + "\n",
+        )
+        .unwrap();
+        assert!(limits.check(Some(&tracker), false, true));
     }
 
     #[test]

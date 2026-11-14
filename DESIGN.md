@@ -395,7 +395,11 @@ Claude appends an API error entry (`isApiErrorMessage: true`, `error:
 dialog on screen, and never writes it again when it redraws the conversation on
 resume or resize. Before a launch, the run notes the known transcript's length
 and reads only lines appended after it (a transcript first found later is read
-from its last MiB, keeping entries timestamped after launch). Only those three
+from its last MiB, keeping entries timestamped after launch). The tracker's
+current transcript is followed when the conversation changes (a /clear), and
+the conversation's subagent transcripts written since launch
+(`<id>/subagents/`) are read too, since a subagent may record a limit before
+the main thread does. Only those three
 fields are looked at; nothing read is kept or logged. While no transcript is
 known, a limit notice on screen counts if shown 10 seconds or more after
 launch, when a redraw is over. The 2026-11-14 incident: a resumed conversation
