@@ -123,7 +123,101 @@ pub fn private_dir(path: &Path) -> Result<()> {
     if !path.is_dir() {
         return Err(Error("private directory is not a directory"));
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).safe("cannot secure directory")
+    secure(path, 0o700, "cannot secure directory")
+}
+/// Set `mode` only when it differs: a chmod is a metadata write, which a full
+/// filesystem (ZFS, btrfs) can refuse with ENOSPC even though nothing needs
+/// changing. On 2026-11-14 that ended every new supervisor and the monitor.
+fn secure(path: &Path, mode: u32, message: &'static str) -> Result<()> {
+    let current = fs::metadata(path).safe(message)?.permissions().mode() & 0o7777;
+    if current == mode {
+        return Ok(());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).safe(message)
+}
+/// How long store I/O (locks, private writes) keeps retrying a failure such as
+/// ENOSPC, EIO or EAGAIN, in milliseconds. A supervisor raises it while it
+/// prepares a launch (nothing runs yet, so waiting beats exiting) and lowers
+/// it while a provider runs (its bookkeeping retries on the next tick).
+static PATIENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(5_000);
+pub fn set_patience(patience: std::time::Duration) {
+    PATIENCE.store(
+        patience.as_millis().try_into().unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+fn patience() -> std::time::Duration {
+    std::time::Duration::from_millis(PATIENCE.load(std::sync::atomic::Ordering::Relaxed))
+}
+/// Whether an error is an I/O failure that may pass (a full disk, EIO,
+/// EAGAIN, a busy lock): this crate words every one "cannot ...", while
+/// refusals (a symlink, corrupt JSON, a missing account) are worded otherwise
+/// and never pass by waiting.
+pub fn transient(err: &Error) -> bool {
+    err.0.starts_with("cannot ")
+}
+/// When store trouble was last reported (seconds since the epoch): a
+/// supervisor's terminal shows the provider's UI, so an outage is reported
+/// at most once a minute however many operations it fails.
+static REPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn report_due() -> bool {
+    let at = crate::now();
+    let last = REPORTED.load(std::sync::atomic::Ordering::Relaxed);
+    at.saturating_sub(last) >= 60
+        && REPORTED
+            .compare_exchange(
+                last,
+                at,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+}
+/// Run `op` until it succeeds, fails with a non-transient error, or
+/// `patience` is spent, backing off from 50ms up to 5s between attempts.
+/// Failures are reported on stderr (the monitor's journal, or the
+/// supervisor's terminal), at most once a minute.
+pub(crate) fn retry<T>(what: &str, op: impl FnMut() -> Result<T>) -> Result<T> {
+    retry_for(what, patience(), std::time::Duration::from_millis(50), op)
+}
+pub(crate) fn retry_for<T>(
+    what: &str,
+    patience: std::time::Duration,
+    first: std::time::Duration,
+    mut op: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let start = std::time::Instant::now();
+    let mut delay = first;
+    let mut reported = false;
+    loop {
+        match op() {
+            Ok(value) => {
+                if reported {
+                    eprintln!("aswap: {what} succeeded after retrying");
+                }
+                return Ok(value);
+            }
+            Err(err) if !transient(&err) => return Err(err),
+            Err(err) => {
+                let left = patience.saturating_sub(start.elapsed());
+                if left.is_zero() {
+                    if reported {
+                        eprintln!("aswap: {what} still failing ({err}); giving up");
+                    }
+                    return Err(err);
+                }
+                if !reported && report_due() {
+                    eprintln!(
+                        "aswap: {what} failed ({err}); retrying for up to {}s",
+                        left.as_secs().max(1)
+                    );
+                    reported = true;
+                }
+                std::thread::sleep(delay.min(left));
+                delay = (delay * 2).min(std::time::Duration::from_secs(5));
+            }
+        }
+    }
 }
 pub fn read_private(path: &Path) -> Result<Vec<u8>> {
     no_links(path)?;
@@ -152,6 +246,9 @@ pub fn read_private(path: &Path) -> Result<Vec<u8>> {
 pub fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     no_links(path)?;
     let parent = path.parent().ok_or(Error("missing private parent"))?;
+    retry("writing private state", || write_once(path, parent, bytes))
+}
+fn write_once(path: &Path, parent: &Path, bytes: &[u8]) -> Result<()> {
     private_dir(parent)?;
     let mut temp =
         tempfile::NamedTempFile::new_in(parent).safe("cannot create private temporary file")?;
@@ -201,19 +298,31 @@ impl Store {
     pub fn lock(&self) -> Result<Guard> {
         let path = self.root.join("store.lock");
         no_links(&path)?;
-        let f = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .safe("cannot open store lock")?;
-        f.set_permissions(fs::Permissions::from_mode(0o600))
-            .safe("cannot secure lock")?;
-        f.lock_exclusive().safe("cannot lock account store")?;
-        let guard = Guard(f);
+        let guard = retry("locking the account store", || {
+            let f = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+                .safe("cannot open store lock")?;
+            // As for directories, only change a mode that differs; through
+            // the descriptor, never the path.
+            let mode = f
+                .metadata()
+                .safe("cannot secure lock")?
+                .permissions()
+                .mode()
+                & 0o7777;
+            if mode != 0o600 {
+                f.set_permissions(fs::Permissions::from_mode(0o600))
+                    .safe("cannot secure lock")?;
+            }
+            f.lock_exclusive().safe("cannot lock account store")?;
+            Ok(Guard(f))
+        })?;
         crate::rename::recover(self)?;
         Ok(guard)
     }
@@ -356,4 +465,89 @@ pub fn threshold(value: f64) -> Result<()> {
         return Err(Error("threshold must be between 1 and 100"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::{os::unix::fs::MetadataExt, time::Duration};
+
+    #[test]
+    fn a_lock_that_fails_a_few_times_is_retried_until_it_works() {
+        let mut failures = 3;
+        let mut calls = 0;
+        let got = retry_for(
+            "locking",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            || {
+                calls += 1;
+                if failures > 0 {
+                    failures -= 1;
+                    Err(Error("cannot lock account store"))
+                } else {
+                    Ok(7)
+                }
+            },
+        );
+        assert_eq!(got.unwrap(), 7);
+        assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn retrying_is_bounded_and_refusals_are_not_retried() {
+        let started = std::time::Instant::now();
+        let mut calls = 0;
+        let got: Result<()> = retry_for(
+            "writing",
+            Duration::from_millis(60),
+            Duration::from_millis(5),
+            || {
+                calls += 1;
+                Err(Error("cannot write private file"))
+            },
+        );
+        assert_eq!(got.unwrap_err().0, "cannot write private file");
+        assert!(calls > 1 && started.elapsed() < Duration::from_secs(2));
+        let mut calls = 0;
+        let got: Result<()> = retry_for(
+            "reading",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            || {
+                calls += 1;
+                Err(Error("refusing a symlink or managed file"))
+            },
+        );
+        assert!(got.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_store_whose_lock_is_briefly_unusable_still_locks() {
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        // Something occupies the lock's path (a stand-in for ENOSPC/EIO on
+        // open): the lock waits for it to clear instead of failing.
+        let lock = store.root.join("store.lock");
+        fs::create_dir(&lock).unwrap();
+        let clear = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            fs::remove_dir(&lock).unwrap();
+        });
+        drop(store.lock().unwrap());
+        clear.join().unwrap();
+    }
+
+    #[test]
+    fn an_unchanged_mode_is_not_rewritten() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("private");
+        private_dir(&dir).unwrap();
+        // A directory already 0700 needs no metadata write, which a full
+        // filesystem may refuse (a chmod updates ctime even when unchanged).
+        let before = fs::metadata(&dir).unwrap().ctime_nsec();
+        private_dir(&dir).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().ctime_nsec(), before);
+    }
 }
