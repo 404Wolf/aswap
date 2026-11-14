@@ -31,6 +31,8 @@ pub mod runner;
 
 pub mod terminal;
 
+pub mod limits;
+
 pub mod display;
 pub mod identity;
 

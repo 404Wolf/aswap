@@ -186,6 +186,7 @@ pub fn run(
         // until the transcript shows which ones are live.
         let resumed = switches > 0;
         let mut quiet = Quiet::new(tracker.as_ref());
+        let mut limits = crate::limits::Limits::new(tracker.as_ref());
         let mut cmd = provider.command(&view.path);
         cmd.args(&launch_args);
         let supervisor = std::process::id();
@@ -233,6 +234,9 @@ pub fn run(
         let mut rotated = false;
         let mut reported_resume = false;
         let status = loop {
+            // Whether the screen showed a limit this tick; for Claude, its
+            // transcript decides whether that is live (see `limit_seen`).
+            let mut screen_limit = false;
             // Keystrokes and redraws go through as they arrive; the bookkeeping
             // below only runs between these 250ms windows.
             if let Some(terminal) = &mut terminal {
@@ -249,7 +253,7 @@ pub fn run(
                     } else {
                         left
                     };
-                    limited |= terminal.pump(step.as_millis().max(1) as i32)?;
+                    screen_limit |= terminal.pump(step.as_millis().max(1) as i32)?;
                     if terminal.quiet_auth {
                         quiet.check(tracker.as_ref(), false);
                     }
@@ -279,6 +283,7 @@ pub fn run(
             if let Some(tracker) = &mut tracker {
                 tracker.observe(child.0.id())?;
             }
+            limited |= limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, false);
             if let Some(terminal) = &mut terminal {
                 quiet.apply(terminal, tracker.as_ref(), false);
             }
@@ -391,7 +396,8 @@ pub fn run(
         };
         drop(child);
         if let Some(terminal) = &mut terminal {
-            limited |= terminal.pump(0)?;
+            let screen_limit = terminal.pump(0)?;
+            limited |= limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, true);
             // The provider is gone and the tracker will not walk again: look
             // for a transcript it created in its last moments afresh.
             quiet.apply(terminal, tracker.as_ref(), true);
@@ -539,6 +545,24 @@ pub fn run(
         omit_one_shot(auto_args.as_ref().unwrap(), &mut terminal)?;
         launch_args = resume_args;
         switches += 1;
+    }
+}
+/// Whether the provider hit a usage limit. Claude records each limit in its
+/// transcript as it happens, so a limit counts only once that entry appears
+/// (a redrawn conversation shows old limit notices again but never records
+/// them again, and a limit dialog the screen parser can't read still records
+/// one). Codex, and a Claude whose transcript is unknown, go by the screen.
+fn limit_seen(
+    provider: Provider,
+    limits: &mut crate::limits::Limits,
+    tracker: Option<&crate::session::Tracker>,
+    screen: bool,
+    fresh: bool,
+) -> bool {
+    if provider == Provider::Claude && tracker.is_some() {
+        limits.check(tracker, screen, fresh)
+    } else {
+        screen
     }
 }
 /// Same-account restarts after a login error that followed a token rotation.

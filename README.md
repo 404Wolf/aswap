@@ -168,7 +168,7 @@ literal positional prompt to make its boundary explicit.
 
 Session IDs come from an explicit UUID, a preallocated Claude `--session-id`,
 Claude's own PID registry, or transcript filenames held open by that child/process
-tree. Transcript contents are not read. The tracker never picks the globally
+tree. Transcript contents are not read for identity. The tracker never picks the globally
 newest conversation: if identity cannot be established unambiguously, it refuses
 the restart. Claude’s PID registry can identify session selection inside the
 provider, even when subagents open other transcripts. A known Claude UUID survives
@@ -186,7 +186,10 @@ strictly sooner, even below the threshold; running sessions switch only after an
 explicit provider limit or authentication failure. Quota polling never interrupts
 active tools. Failure detection matches diagnostic line shapes rather than
 arbitrary conversation prose. A recalled line identical to a live diagnostic
-cannot be distinguished from it in raw terminal output.
+cannot be distinguished from it in raw terminal output, so a Claude usage limit
+counts only once the conversation's transcript records a new `rate_limit` API
+error entry (only that entry's flags are parsed); a redrawn notice never does,
+and a limit dialog the parser can't read still switches.
 Resume identity and arguments are checked before stopping the child;
 if they are unavailable, the current provider stays running.
 Switches stop the child with SIGTERM, wait five seconds, then use SIGKILL if

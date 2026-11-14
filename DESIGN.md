@@ -218,7 +218,8 @@ preallocates a UUID through --session-id; explicit resumes retain their UUID.
 Claude's published CLI registers sessions/<pid>.json with pid/sessionId/cwd.
 The tracker also inspects /proc descriptors in the child's own process tree,
 recognizing Claude <UUID>.jsonl and Codex rollout-...-<UUID>.jsonl filenames.
-Only metadata and that bounded PID registry are read, never transcript contents.
+Only metadata and that bounded PID registry are read for identity, never
+transcript contents (limit detection, below, parses appended entries' flags).
 If a picker/interactive switch or concurrent writer makes the identity ambiguous,
 restart is refused; --continue/--last are never used as a fallback. Tracker
 metadata observations are conservative; provider versions that move recording
@@ -369,9 +370,21 @@ are the redraw, and after 10 seconds without a change the held ones are dropped.
 This assumes `claude --resume` appends to the same transcript and redraws
 before writing to it; not yet checked against a real Claude. Follow-ups:
 a Codex `resume` that writes a new rollout file under the same id leaves the
-tracker on the old file, so held errors wait the full 10 seconds; and limit and
-model-unsupported lines are not held, so a redrawn limit message can still mark
-the account a run has just failed over to (older than this change).
+tracker on the old file, so held errors wait the full 10 seconds; and
+model-unsupported lines are not held.
+
+A Claude usage limit counts only when the conversation's transcript records it.
+Claude appends an API error entry (`isApiErrorMessage: true`, `error:
+"rate_limit"`) the moment a request hits any limit, whatever the wording or
+dialog on screen, and never writes it again when it redraws the conversation on
+resume or resize. Before a launch, the run notes the known transcript's length
+and reads only lines appended after it (a transcript first found later is read
+from its last MiB, keeping entries timestamped after launch). Only those three
+fields are looked at; nothing read is kept or logged. While no transcript is
+known, a limit notice on screen counts if shown 10 seconds or more after
+launch, when a redraw is over. The 2026-11-14 incident: a resumed conversation
+that had ended on a weekly limit redrew the notice, and the run rejected and
+marked its healthy account and moved to one at 91%.
 
 Every owner request shares its existing store-locked per-profile TTL/backoff, so
 three monitors do not triple quota API traffic. Peers serialize SSH pulls and

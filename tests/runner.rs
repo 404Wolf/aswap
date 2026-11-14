@@ -56,7 +56,7 @@ transcript.parent.mkdir(parents=True,exist_ok=True)
 if 'synthetic-second' in auth:
     expected=base+sticky
     assert args==expected or args==expected+['--','You were interrupted by a usage-limit account switch. Continue exactly where you left off.']
-    assert transcript.read_text()=='synthetic shared conversation'
+    assert transcript.read_text().startswith('synthetic shared conversation')
     (p/'resume-args').write_text(json.dumps(args))
     for label in ['one','two']:
         result=subprocess.run([os.environ['ASWAP_TEST_BINARY'],'rename',provider,label,'must-not-rename','--json'],capture_output=True)
@@ -66,6 +66,11 @@ assert args==base+sticky
 transcript.write_text('synthetic shared conversation')
 if provider=='claude': (p/'sessions'/(str(os.getpid())+'.json')).write_text(json.dumps({'pid':os.getpid(),'sessionId':id}))
 print(os.environ['ASWAP_TEST_FAILURE'],file=sys.stderr,flush=True)
+if provider=='claude' and 'limit' in os.environ['ASWAP_TEST_FAILURE'] and 'synthetic-clean' not in auth:
+    # Claude records each usage-limit error in the transcript as it happens.
+    import datetime
+    with transcript.open('a') as t:
+        t.write('\n'+json.dumps({'type':'assistant','timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat(),'isApiErrorMessage':True,'error':'rate_limit'})+'\n')
 if 'synthetic-clean' in auth: sys.exit(0)
 with transcript.open('a') as held:
     time.sleep(30)
@@ -416,6 +421,16 @@ fn a_login_error_right_after_a_rotation_resumes_on_the_same_account() {
 }
 
 #[test]
+fn a_limit_switches_only_when_the_transcript_records_it() {
+    // limitredraw: a resumed conversation that ended on a limit redraws the
+    // notice; nothing new is recorded, so the run stays on its account.
+    // limitlive: the notice is live and recorded: switch and resume.
+    // limitdialog: recorded, but only a menu the screen parser can't read
+    // is shown: switch and resume all the same.
+    runner_safety_cases(&["limitredraw", "limitresumed", "limitlive", "limitdialog"]);
+}
+
+#[test]
 fn automatic_restarts_stop_after_eight_switches() {
     runner_safety_cases(&["boundedcap"]);
 }
@@ -430,11 +445,41 @@ fn runner_safety_cases(cases: &[&str]) {
     fs::create_dir(&bin).unwrap();
     let fake = bin.join("claude");
     fs::write(&fake, format!("#!{}\n{}", python.display(), r#"
-import json, os, pathlib, sys, time
+import datetime, json, os, pathlib, sys, time
 root=pathlib.Path(os.environ['HOME'])
 case=os.environ['ASWAP_SAFETY_CASE']
 if '--help' in sys.argv: sys.exit(0)
 with (root/'calls').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
+NOTICE="You've hit your weekly limit · resets Nov 20, 3am (America/New_York)"
+def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
+def limit_entry(view,at):
+    # What Claude 2.1.3xx appends to the transcript when a request hits a limit.
+    transcript=view/'projects'/'-synthetic'/'11111111-2222-4333-8444-555555555555.jsonl'
+    transcript.parent.mkdir(parents=True,exist_ok=True)
+    with transcript.open('a') as t:
+        t.write(json.dumps({'type':'assistant','timestamp':at,'isApiErrorMessage':True,'error':'rate_limit','message':{'role':'assistant','content':[{'type':'text','text':NOTICE}]}})+'\n')
+if case.startswith('limit'):
+    view=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])
+    token=json.loads((view/'.credentials.json').read_text())['claudeAiOauth']['accessToken']
+    with (root/'identities').open('a') as f: f.write(token+'\n')
+    if token=='synthetic-two':
+        (root/'completed').write_text('resumed provider completed its work')
+        sys.exit(0)
+    if case in ('limitredraw','limitresumed'):
+        # The conversation ended on a limit hours ago. Resuming it redraws
+        # that notice, but the account is fine and work goes on.
+        # (limitresumed: the transcript already exists at launch.)
+        if case=='limitredraw': limit_entry(view,'2026-01-01T14:42:46.895Z')
+        print('  ⎿  '+NOTICE,flush=True)
+        time.sleep(1.5)
+        (root/'completed').write_text('synthetic tool completed')
+        sys.exit(0)
+    # A live limit: recorded, then shown inline or only as a menu.
+    limit_entry(view,now())
+    if case=='limitlive': print('  ⎿  '+NOTICE,flush=True)
+    else: print('│ What do you want to do?  1. Stop and wait for limit to reset  2. Upgrade │',flush=True)
+    time.sleep(30)
+    sys.exit(1)
 if case.startswith('rotation'):
     view=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])
     token=json.loads((view/'.credentials.json').read_text())['claudeAiOauth']['accessToken']
@@ -503,6 +548,7 @@ if case.startswith('bounded'):
     auth=json.loads((pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])/'.credentials.json').read_text())
     with (root/'identities').open('a') as f: f.write(auth['claudeAiOauth']['accessToken']+'\n')
     print('⎿ OAuth token revoked · Please run /login' if case.endswith('401') else 'API Error: 429 synthetic quota failure',flush=True)
+    if not case.endswith('401'): limit_entry(pathlib.Path(os.environ['CLAUDE_CONFIG_DIR']),now())
     if case=='boundedcap' and len((root/'calls').read_text().splitlines())==9:
         # At the cap the last provider must finish its active work, even though
         # another fresh, distinct account is still eligible for the fallback.
@@ -589,6 +635,28 @@ time.sleep(1)
             assert!(home.join("completed").exists(), "{case}");
             continue;
         }
+        if case.starts_with("limit") {
+            let identities = fs::read_to_string(home.join("identities")).unwrap();
+            let calls = fs::read_to_string(home.join("calls")).unwrap();
+            let redraw = matches!(case, "limitredraw" | "limitresumed");
+            assert_eq!(
+                identities.lines().collect::<Vec<_>>(),
+                if redraw {
+                    vec!["synthetic-one"]
+                } else {
+                    vec!["synthetic-one", "synthetic-two"]
+                },
+                "{case}"
+            );
+            assert!(
+                calls
+                    .lines()
+                    .all(|call| call.contains("--resume") && call.contains(ID)),
+                "{case}: every launch must resume the exact conversation"
+            );
+            assert!(home.join("completed").exists(), "{case}");
+            continue;
+        }
         if case.starts_with("bounded") {
             let identities = fs::read_to_string(home.join("identities")).unwrap();
             let calls = fs::read_to_string(home.join("calls")).unwrap();
@@ -660,7 +728,7 @@ fn runner_safety_child() {
     let store = Store::from_env().unwrap();
     let source = provider.current_home().unwrap();
     let bounded = case.starts_with("bounded");
-    let distinct = bounded || case.starts_with("rotation");
+    let distinct = bounded || case.starts_with("rotation") || case.starts_with("limit");
     let accounts = if case == "boundedcap" {
         [
             "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
@@ -733,6 +801,16 @@ fn runner_safety_child() {
         state.auto.entry(provider).or_default().threshold = 90.0;
         store.save(&state).unwrap();
     }
+    if case == "limitresumed" {
+        // The conversation being resumed ended on a limit hours ago.
+        let dir = source.join("projects").join("-synthetic");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(format!("{ID}.jsonl")),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-01-01T14:42:46.895Z\",\"isApiErrorMessage\":true,\"error\":\"rate_limit\"}\n",
+        )
+        .unwrap();
+    }
     // SAFETY: this subprocess test has no other threads reading environment.
     unsafe {
         std::env::set_var(
@@ -762,6 +840,20 @@ fn runner_safety_child() {
         assert_ne!(result.unwrap(), 0);
     } else if matches!(case.as_str(), "unknown" | "ambiguous") {
         assert!(result.is_err());
+    } else if case.starts_with("limit") {
+        assert_eq!(result.unwrap(), 0);
+        let cache: Cached = store::json_read(
+            &store
+                .profile(provider, "one")
+                .unwrap()
+                .join("usage-cache.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            cache.error.as_deref(),
+            (!matches!(case.as_str(), "limitredraw" | "limitresumed")).then_some("provider-limit"),
+            "{case}: only a recorded limit marks the account"
+        );
     } else if FAILS_OVER.contains(&case.as_str()) {
         assert_eq!(result.unwrap(), 0);
         let cache: Cached = store::json_read(
