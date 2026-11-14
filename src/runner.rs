@@ -182,13 +182,10 @@ pub fn run(
             std::process::id()
         );
         // A restarted provider redraws the conversation it resumes, including
-        // the login error that ended the previous one. Ignore its login
-        // errors until it has recorded the resume prompt in the transcript
-        // (a live API call can only fail after that), or RESUME_QUIET at most.
+        // the login error that ended the previous one; hold its login errors
+        // until the transcript shows which ones are live.
         let resumed = switches > 0;
-        let quiet_from = Instant::now();
-        let launch_transcript = tracker.as_ref().and_then(|t| t.transcript());
-        let mut recorded: Option<Instant> = None;
+        let mut quiet = Quiet::new(tracker.as_ref());
         let mut cmd = provider.command(&view.path);
         cmd.args(&launch_args);
         let supervisor = std::process::id();
@@ -245,7 +242,17 @@ pub fn run(
                     if left.is_zero() {
                         break;
                     }
-                    limited |= terminal.pump(left.as_millis().max(1) as i32)?;
+                    // While login errors are held, look at the transcript
+                    // every QUIET_STEP to know closely when it changed.
+                    let step = if terminal.quiet_auth {
+                        left.min(QUIET_STEP)
+                    } else {
+                        left
+                    };
+                    limited |= terminal.pump(step.as_millis().max(1) as i32)?;
+                    if terminal.quiet_auth {
+                        quiet.check(tracker.as_ref());
+                    }
                 }
             }
             // The owner exchange runs off this thread so a slow owner never
@@ -272,17 +279,8 @@ pub fn run(
             if let Some(tracker) = &mut tracker {
                 tracker.observe(child.0.id())?;
             }
-            if let Some(terminal) = terminal.as_mut().filter(|t| t.quiet_auth) {
-                if recorded.is_none()
-                    && tracker.as_ref().and_then(|t| t.transcript()) != launch_transcript
-                {
-                    recorded = Some(Instant::now());
-                }
-                if quiet_from.elapsed() >= RESUME_QUIET
-                    || recorded.is_some_and(|at| at.elapsed() >= RESUME_LIVE)
-                {
-                    terminal.quiet_auth = false;
-                }
+            if let Some(terminal) = &mut terminal {
+                quiet.apply(terminal, tracker.as_ref());
             }
             if let Some(status) = child.0.try_wait().safe("cannot wait for provider")? {
                 break status;
@@ -394,6 +392,7 @@ pub fn run(
         drop(child);
         if let Some(terminal) = &mut terminal {
             limited |= terminal.pump(0)?;
+            quiet.apply(terminal, tracker.as_ref());
         }
         view.sync(store, &account)?;
         if !auto {
@@ -544,12 +543,68 @@ pub fn run(
 const AUTH_RESTARTS: u32 = 3;
 /// How long a follower waits for the owner's rotated token after a login error.
 const AUTH_SETTLE: Duration = Duration::from_secs(10);
-/// Login errors from a restarted provider count this long after it records
-/// the resume prompt, or after RESUME_QUIET if that is never seen. Its
-/// redraw comes before the prompt; a live failure takes at least an API
-/// call and a refresh attempt after it.
-const RESUME_LIVE: Duration = Duration::from_millis(500);
+/// A held login error read this long after a restarted provider records its
+/// resume prompt is live. Its redraw is written before the prompt and read
+/// at once; a live failure needs an API call and a refresh attempt after.
+const RESUME_LIVE: Duration = Duration::from_millis(50);
+/// Stop holding login errors this long after launch if the transcript never
+/// changes; what was held by then is taken for the redraw.
 const RESUME_QUIET: Duration = Duration::from_secs(10);
+const QUIET_STEP: Duration = Duration::from_millis(25);
+/// Tells a restarted provider's redrawn login errors from live ones by when
+/// they were read relative to the first change of its transcript since launch,
+/// which is the resume prompt being recorded.
+struct Quiet {
+    since: Instant,
+    transcript: Option<std::path::PathBuf>,
+    launch: Option<crate::shared::Stamp>,
+    recorded: Option<Instant>,
+}
+impl Quiet {
+    fn new(tracker: Option<&crate::session::Tracker>) -> Self {
+        let transcript = tracker.and_then(|t| t.transcript());
+        Self {
+            since: Instant::now(),
+            launch: transcript.as_deref().and_then(crate::shared::stamp),
+            transcript,
+            recorded: None,
+        }
+    }
+    /// One stat; the path comes from the tracker's last walk.
+    fn check(&mut self, tracker: Option<&crate::session::Tracker>) {
+        if self.recorded.is_some() {
+            return;
+        }
+        if self.transcript.is_none() {
+            self.transcript = tracker.and_then(|t| t.transcript());
+        }
+        if let Some(path) = &self.transcript
+            && crate::shared::stamp(path) != self.launch
+        {
+            self.recorded = Some(Instant::now());
+        }
+    }
+    /// Count held login errors that are live, and stop holding once nothing
+    /// read from now on can be part of the redraw.
+    fn apply(&mut self, terminal: &mut Terminal, tracker: Option<&crate::session::Tracker>) {
+        if !terminal.quiet_auth {
+            return;
+        }
+        self.check(tracker);
+        if let Some(recorded) = self.recorded {
+            let live = recorded + RESUME_LIVE;
+            terminal.auth_expired |= terminal.held_auth.iter().any(|at| *at > live);
+            if Instant::now() > live {
+                terminal.quiet_auth = false;
+            }
+        } else if self.since.elapsed() >= RESUME_QUIET {
+            terminal.quiet_auth = false;
+        }
+        if !terminal.quiet_auth {
+            terminal.held_auth.clear();
+        }
+    }
+}
 /// A digest of an auth file's access token: enough to tell that the token
 /// changed, without keeping the token itself in memory.
 fn access_print(provider: Provider, path: &std::path::Path) -> Option<Vec<u8>> {

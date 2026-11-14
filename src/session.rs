@@ -270,7 +270,7 @@ impl AutoArgs {
     }
 }
 #[derive(Clone, PartialEq)]
-pub(crate) struct Stamp(u64, u64, i64, i64);
+struct Stamp(u64, u64, i64, i64);
 fn files(provider: Provider, home: &Path) -> Result<BTreeMap<PathBuf, Stamp>> {
     fn walk(
         provider: Provider,
@@ -404,15 +404,14 @@ impl Tracker {
         self.files = current;
         Ok(())
     }
-    /// The current stamp of the tracked conversation's transcript, read
-    /// fresh from disk; None while the identity or the file is unknown.
-    pub(crate) fn transcript(&self) -> Option<Stamp> {
+    /// The tracked conversation's transcript, from the last `observe`
+    /// (no walk); None while the identity or the file is unknown.
+    pub(crate) fn transcript(&self) -> Option<PathBuf> {
         let id = self.known.as_deref()?;
-        files(self.provider, &self.home)
-            .ok()?
-            .into_iter()
-            .find(|(path, _)| filename_id(self.provider, path).as_deref() == Some(id))
-            .map(|(_, stamp)| stamp)
+        self.files
+            .keys()
+            .find(|path| filename_id(self.provider, path).as_deref() == Some(id))
+            .cloned()
     }
     pub fn id(&self) -> Result<&str> {
         self.known.as_deref().ok_or(Error(
