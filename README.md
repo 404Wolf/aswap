@@ -194,9 +194,13 @@ Resume identity and arguments are checked before stopping the child;
 if they are unavailable, the current provider stays running.
 Switches stop the child with SIGTERM, wait five seconds, then use SIGKILL if
 needed. The exact same shared session resumes on the new account. Clean exits do
-not restart or send a follow-up. Rejected accounts and known identity aliases are
-excluded for the rest of that run, even if an owner replaces their usage caches.
-Restarts are capped at eight. Runtime auth/config
+not restart or send a follow-up. Accounts rejected for a login or model error,
+and their known identity aliases, are excluded for the rest of that run, even if
+an owner replaces their usage caches. An account rejected for a usage limit comes
+back only after a hold (15 minutes, doubling with each new limit on it, up to 4
+hours) and a fresh reading below the auto threshold, so a reset account is used
+again while two accounts near 100% never trade a session back and forth.
+Restarts are capped at eight per hour. Runtime auth/config
 views stay private under `$XDG_DATA_HOME/aswap/runtimes/`; history stays shared.
 
 Claude usage comes from the OAuth usage endpoint; Codex uses the official
@@ -530,7 +534,7 @@ access token at once, and a provider that calls the API in the moment before
 its view has the new token fails with the same error. So when the account's
 token has changed since the provider started, the run resumes the conversation
 on the **same** account with the new token instead (at most three times per
-run, within the usual cap of eight restarts). The account is only marked
+run, within the usual cap of eight restarts an hour). The account is only marked
 expired, and the run moves to another, when a provider started with the current
 token fails too. A follower first waits up to 10 seconds for the owner's new
 token, and asks the owner for it at once. A resumed provider redraws its

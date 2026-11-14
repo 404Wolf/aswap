@@ -161,6 +161,7 @@ pub fn run(
     };
     let mut rejected = Rejected::default();
     let mut switches = 0;
+    let mut restarts = Restarts::default();
     let mut next_sync = 0;
     let mut syncing: Option<std::thread::JoinHandle<bool>> = None;
     let mut auth_restarts = 0;
@@ -303,7 +304,7 @@ pub fn run(
                 if !limited
                     && !unsupported
                     && auth_restarts < AUTH_RESTARTS
-                    && switches < 8
+                    && !restarts.capped()
                     && rotated_since(store, &account, launched.as_deref())
                 {
                     // The provider called the API in the moment between the
@@ -348,12 +349,13 @@ pub fn run(
                 );
             }
             if auto && (limited || expired || unsupported) {
-                rejected.reject(store, &account)?;
+                rejected.reject(store, &account, !expired && !unsupported)?;
                 view.sync(store, &account)?;
                 let (entries, settings) = observations(store, provider)?;
                 let entries = rejected.filter(
                     store,
                     &account.label,
+                    settings.threshold,
                     models.filter(store, &account.label, entries),
                 );
                 target = usage::choose(
@@ -366,7 +368,7 @@ pub fn run(
                     true,
                 )
                 .cloned();
-                if target.is_some() && switches < 8 {
+                if target.is_some() && !restarts.capped() {
                     match prepare_resume(
                         store,
                         provider,
@@ -413,7 +415,7 @@ pub fn run(
             && !limited
             && !unsupported
             && auth_restarts < AUTH_RESTARTS
-            && switches < 8
+            && !restarts.capped()
         {
             if !settle.is_zero() && syncing.is_none() {
                 syncing = immediate_poll(store);
@@ -440,6 +442,7 @@ pub fn run(
             omit_one_shot(auto_args.as_ref().unwrap(), &mut terminal)?;
             launch_args = resume_args;
             switches += 1;
+            restarts.record();
             auth_restarts += 1;
             continue;
         }
@@ -455,7 +458,7 @@ pub fn run(
         expired |= terminal.as_ref().is_some_and(|t| t.auth_expired);
         let did_limit = limited || expired || unsupported;
         if did_limit {
-            rejected.reject(store, &account)?;
+            rejected.reject(store, &account, !expired && !unsupported)?;
             if expired {
                 usage::mark_auth_expired(store, &account)?;
                 eprintln!(
@@ -469,6 +472,7 @@ pub fn run(
             let entries = rejected.filter(
                 store,
                 &account.label,
+                settings.threshold,
                 models.filter(store, &account.label, entries),
             );
             target = usage::choose(
@@ -484,7 +488,7 @@ pub fn run(
         }
         // Resume the same interactive history; never replay command arguments.
         // Bound restarts even if provider observations are misleading.
-        if (!did_limit && target.is_none()) || switches >= 8 {
+        if (!did_limit && target.is_none()) || restarts.capped() {
             return Ok(status.code().unwrap_or(1));
         }
         let Some(_) = target else {
@@ -511,6 +515,7 @@ pub fn run(
                 &rejected.filter(
                     store,
                     &account.label,
+                    settings.threshold,
                     models.filter_cached(
                         store,
                         &account.label,
@@ -545,6 +550,7 @@ pub fn run(
         omit_one_shot(auto_args.as_ref().unwrap(), &mut terminal)?;
         launch_args = resume_args;
         switches += 1;
+        restarts.record();
     }
 }
 /// Whether the provider hit a usage limit. Claude records each limit in its
@@ -723,22 +729,77 @@ fn omit_one_shot(args: &crate::session::AutoArgs, terminal: &mut Option<Terminal
 // Run-local rejection survives owner cache replacement and refresh observations.
 // Keep identity keys private/in-memory so aliases cannot bounce a session back
 // onto credentials that this provider process has already rejected.
+// A login or model rejection lasts for the run. A limit rejection lapses (see
+// `Lapse`), so one limit, or one misread, can't strand a long session once
+// every other account is exhausted too.
 #[derive(Default)]
 struct Rejected {
-    labels: std::collections::BTreeSet<String>,
-    identities: std::collections::BTreeSet<String>,
+    labels: std::collections::BTreeMap<String, Option<Lapse>>,
+    identities: std::collections::BTreeMap<String, Option<Lapse>>,
+}
+/// When a limit rejection lapses: after a hold that doubles with each new
+/// limit on the account (15 minutes, then 30, ... up to 4 hours), and only once
+/// a reading taken after the rejection is below the auto threshold. Two
+/// accounts near 100% therefore never trade a session back and forth: neither
+/// reads below the threshold again until its window resets.
+#[derive(Clone, Copy)]
+struct Lapse {
+    at: u64,
+    count: u32,
+}
+const LIMIT_HOLD: u64 = 15 * 60;
+const LIMIT_HOLD_MAX: u64 = 4 * 3600;
+impl Lapse {
+    fn hold(&self) -> u64 {
+        (LIMIT_HOLD << self.count.saturating_sub(1).min(8)).min(LIMIT_HOLD_MAX)
+    }
+    fn lapsed(&self, cache: &usage::Cached, threshold: f64, at: u64) -> bool {
+        at >= self.at.saturating_add(self.hold())
+            && cache.fetched_at > self.at
+            && cache.used(at).is_some_and(|used| used < threshold)
+    }
+    /// The same limit seen again while held stays one rejection; a limit
+    /// after the rejection lapsed is a new one, held twice as long.
+    fn again(previous: Option<Self>, at: u64) -> Self {
+        match previous {
+            Some(p) if at < p.at.saturating_add(p.hold()) => p,
+            Some(p) => Self {
+                at,
+                count: p.count.saturating_add(1),
+            },
+            None => Self { at, count: 1 },
+        }
+    }
 }
 impl Rejected {
-    fn reject(&mut self, store: &Store, account: &Account) -> Result<()> {
-        self.labels.insert(account.label.clone());
-        let _lock = store.lock()?;
-        self.labels.extend(crate::identity::duplicates(
-            store,
-            account,
-            &store.load()?.accounts,
-        ));
-        if let Some(key) = Self::key(store, account) {
-            self.identities.insert(key);
+    /// Reject `account` (and its aliases and identity) for the run, or, for
+    /// a `limit`, until the rejection lapses.
+    fn reject(&mut self, store: &Store, account: &Account, limit: bool) -> Result<()> {
+        let at = now();
+        let mut keys = vec![account.label.clone()];
+        let identity = {
+            let _lock = store.lock()?;
+            keys.extend(crate::identity::duplicates(
+                store,
+                account,
+                &store.load()?.accounts,
+            ));
+            Self::key(store, account)
+        };
+        let mark = |map: &mut std::collections::BTreeMap<String, Option<Lapse>>, key: String| {
+            let next = match map.get(&key) {
+                // A login or model rejection is never weakened by a limit.
+                Some(None) => None,
+                _ if !limit => None,
+                previous => Some(Lapse::again(previous.copied().flatten(), at)),
+            };
+            map.insert(key, next);
+        };
+        for key in keys {
+            mark(&mut self.labels, key);
+        }
+        if let Some(key) = identity {
+            mark(&mut self.identities, key);
         }
         Ok(())
     }
@@ -754,16 +815,46 @@ impl Rejected {
         &self,
         store: &Store,
         current: &str,
+        threshold: f64,
         entries: Vec<(Account, usage::Cached)>,
     ) -> Vec<(Account, usage::Cached)> {
+        let at = now();
+        let held = |rejection: Option<&Option<Lapse>>, cache: &usage::Cached| match rejection {
+            None => false,
+            Some(None) => true,
+            Some(Some(lapse)) => !lapse.lapsed(cache, threshold, at),
+        };
         entries
             .into_iter()
-            .filter(|(a, _)| {
+            .filter(|(a, cache)| {
                 a.label == current
-                    || (!self.labels.contains(&a.label)
-                        && Self::key(store, a).is_none_or(|key| !self.identities.contains(&key)))
+                    || (!held(self.labels.get(&a.label), cache)
+                        && Self::key(store, a)
+                            .is_none_or(|key| !held(self.identities.get(&key), cache)))
             })
             .collect()
+    }
+}
+/// Automatic restarts are bounded per hour rather than per run, so a session
+/// that lives for days can still switch when its accounts reset, while a run
+/// misled by its observations stops after eight quick restarts.
+#[derive(Default)]
+struct Restarts(std::collections::VecDeque<Instant>);
+const RESTARTS: usize = 8;
+const RESTART_WINDOW: Duration = Duration::from_secs(3600);
+impl Restarts {
+    fn capped(&mut self) -> bool {
+        while self
+            .0
+            .front()
+            .is_some_and(|at| at.elapsed() >= RESTART_WINDOW)
+        {
+            self.0.pop_front();
+        }
+        self.0.len() >= RESTARTS
+    }
+    fn record(&mut self) {
+        self.0.push_back(Instant::now());
     }
 }
 
@@ -894,4 +985,128 @@ fn entries_from_cache(store: &Store, provider: Provider) -> Result<Vec<(Account,
             Ok((a, cache))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod rejection_tests {
+    use super::*;
+
+    fn cache(used: f64, fetched_at: u64) -> usage::Cached {
+        usage::Cached {
+            usage: usage::Usage {
+                windows: vec![usage::Window {
+                    name: "seven_day".into(),
+                    used_percent: used,
+                    resets_at: None,
+                    duration_minutes: Some(10080),
+                }],
+                ..Default::default()
+            },
+            fetched_at,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_limit_rejection_lapses_after_its_hold_on_a_fresh_reading_below_threshold() {
+        let lapse = Lapse {
+            at: 10_000,
+            count: 1,
+        };
+        let later = 10_000 + LIMIT_HOLD;
+        // Held for the hold, however good the reading.
+        assert!(!lapse.lapsed(&cache(5.0, later - 10), 90.0, later - 1));
+        assert!(lapse.lapsed(&cache(5.0, later - 10), 90.0, later));
+        // Only a reading taken after the rejection, below the threshold, and
+        // without an error counts.
+        assert!(!lapse.lapsed(&cache(5.0, 9_999), 90.0, 10_500 + LIMIT_HOLD));
+        assert!(!lapse.lapsed(&cache(95.0, later), 90.0, later));
+        let mut failed = cache(5.0, later);
+        failed.error = Some("provider-limit".into());
+        assert!(!lapse.lapsed(&failed, 90.0, later));
+    }
+
+    #[test]
+    fn a_new_limit_after_a_lapse_is_held_twice_as_long() {
+        let first = Lapse::again(None, 1_000);
+        assert_eq!(
+            (first.at, first.count, first.hold()),
+            (1_000, 1, LIMIT_HOLD)
+        );
+        // Seen again every tick while held: still the same rejection.
+        let same = Lapse::again(Some(first), 1_000 + LIMIT_HOLD - 1);
+        assert_eq!((same.at, same.count), (1_000, 1));
+        let second = Lapse::again(Some(first), 1_000 + LIMIT_HOLD);
+        assert_eq!((second.count, second.hold()), (2, 2 * LIMIT_HOLD));
+        let many = Lapse { at: 0, count: 30 };
+        assert_eq!(many.hold(), LIMIT_HOLD_MAX);
+    }
+
+    #[test]
+    fn accounts_near_the_limit_never_trade_a_session_back_and_forth() {
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let account = |label: &str| Account {
+            provider: Provider::Claude,
+            label: label.into(),
+        };
+        let at = now();
+        let mut rejected = Rejected::default();
+        // "a" hit its limit two hours ago (its hold is over); now on "b".
+        rejected.labels.insert(
+            "a".into(),
+            Some(Lapse {
+                at: at - 7200,
+                count: 1,
+            }),
+        );
+        rejected.labels.insert("expired".into(), None);
+        let kept = |entries: Vec<(Account, usage::Cached)>| {
+            rejected
+                .filter(&store, "b", 90.0, entries)
+                .into_iter()
+                .map(|(a, _)| a.label)
+                .collect::<Vec<_>>()
+        };
+        // Still near 100%: "a" stays rejected, so "b" can't bounce back to it.
+        assert_eq!(
+            kept(vec![
+                (account("a"), cache(98.0, at)),
+                (account("b"), cache(99.0, at))
+            ]),
+            vec!["b"]
+        );
+        // "a" reset (or the limit was misread): it is a candidate again.
+        assert_eq!(
+            kept(vec![
+                (account("a"), cache(3.0, at)),
+                (account("b"), cache(99.0, at))
+            ]),
+            vec!["a", "b"]
+        );
+        // A login rejection never lapses.
+        assert_eq!(
+            kept(vec![
+                (account("expired"), cache(3.0, at)),
+                (account("b"), cache(99.0, at))
+            ]),
+            vec!["b"]
+        );
+    }
+
+    #[test]
+    fn restarts_are_capped_per_hour_not_per_run() {
+        let mut restarts = Restarts::default();
+        for _ in 0..RESTARTS {
+            assert!(!restarts.capped());
+            restarts.record();
+        }
+        assert!(restarts.capped());
+        // An hour later the same session may switch again (unless this
+        // machine has been up for less than an hour).
+        if let Some(old) = Instant::now().checked_sub(RESTART_WINDOW) {
+            restarts.0.iter_mut().for_each(|at| *at = old);
+            assert!(!restarts.capped());
+        }
+    }
 }

@@ -96,7 +96,10 @@ State is shared with the caller's provider home. `run --auto` forwards provider
 arguments on the first launch, then preserves options while replacing selectors
 with the exact tracked session ID and omitting one-shot prompt/print/stdin input.
 Clean exits do not restart; forced switches send the configured follow-up unless
-disabled. Restarts are capped at eight. No code changes the caller's cwd.
+disabled. Restarts are capped at eight per hour (per run, before 2026-11-14:
+a session living for days could exhaust it and then sit at a limit). Limit
+rejections lapse after a doubling hold once a fresh reading is below the
+threshold; login and model rejections last the run. No code changes the caller's cwd.
 
 OAuth refresh now follows the provider-native flows below on an explicit owner.
 Every managed CLI receives an access-only view, on the owner as well as followers.
