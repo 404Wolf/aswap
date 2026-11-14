@@ -1649,10 +1649,12 @@ mod tests {
         let after = settings(&store).unwrap();
         assert_eq!(after.failures, 1);
         assert!(after.last_attempt > 0 && after.last_sync == 0);
-        // One failure retries 30s later; never the old 120-300s.
-        assert!(!due(&after, now()));
-        assert!(!due(&after, now() + 29));
-        assert!(due(&after, now() + 31));
+        // One failure retries 30s later; never the old 120-300s. Measured
+        // from the recorded attempt, not a clock that may have ticked since.
+        let attempt = after.last_attempt;
+        assert!(!due(&after, attempt));
+        assert!(!due(&after, attempt + 29));
+        assert!(due(&after, attempt + 30));
         assert_eq!(
             poll_with(&store, None, false, |_, _| panic!("retried inside backoff")).unwrap(),
             0
