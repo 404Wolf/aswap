@@ -95,6 +95,12 @@ fn shared_child() {
         symlink(&managed_dir, home.join("skills")).unwrap();
         if provider == Provider::Claude {
             store::json_write(&home.join(".claude.json"),&json!({"oauthAccount":{"accountUuid":"synthetic-live"},"userID":"synthetic-live-id","projects":{"synthetic":{"hasTrustDialogAccepted":true}},"theme":"dark"})).unwrap();
+            let mut config: serde_json::Value =
+                store::json_read(&home.join(".claude.json")).unwrap();
+            config["fullscreenBootPending"] = json!({"123": {"startedAt": 1}});
+            config["fullscreenBootStrikes"] = json!({"count": 1});
+            config["fullscreenAutoDisabled"] = json!({"strikes": 2});
+            store::json_write(&home.join(".claude.json"), &config).unwrap();
         }
         let _lease = store.lease(&a).unwrap();
         let _second_lease = store.lease(&a).unwrap();
@@ -130,8 +136,14 @@ fn shared_child() {
                 config["projects"]["synthetic"]["hasTrustDialogAccepted"],
                 true
             );
+            assert!(config.get("fullscreenBootPending").is_none());
+            assert!(config.get("fullscreenBootStrikes").is_none());
+            assert!(config.get("fullscreenAutoDisabled").is_none());
             config["projects"]["synthetic"]["allowedTools"] = json!(["synthetic-tool"]);
             config["userID"] = json!("synthetic-profile-rotated-id");
+            config["fullscreenBootPending"] = json!({"456": {"startedAt": 2}});
+            config["fullscreenBootStrikes"] = json!({"count": 3});
+            config["fullscreenAutoDisabled"] = json!({"strikes": 3});
             store::json_write(&view.path.join(".claude.json"), &config).unwrap();
             let mut concurrent: serde_json::Value =
                 store::json_read(&home.join(".claude.json")).unwrap();
@@ -190,6 +202,19 @@ fn shared_child() {
                 shared["projects"]["synthetic"]["allowedTools"],
                 json!(["synthetic-tool"])
             );
+            assert_eq!(
+                shared["fullscreenBootPending"],
+                json!({"123": {"startedAt": 1}})
+            );
+            assert_eq!(shared["fullscreenBootStrikes"], json!({"count": 1}));
+            assert_eq!(shared["fullscreenAutoDisabled"], json!({"strikes": 2}));
+            // Restarting in the same view also discards the previous process's canary.
+            view.select(&store, &a).unwrap();
+            let restarted: serde_json::Value =
+                store::json_read(&view.path.join(".claude.json")).unwrap();
+            assert!(restarted.get("fullscreenBootPending").is_none());
+            assert!(restarted.get("fullscreenBootStrikes").is_none());
+            assert!(restarted.get("fullscreenAutoDisabled").is_none());
             let own: serde_json::Value = store::json_read(&profile.join(".claude.json")).unwrap();
             assert!(own.get("projects").is_none());
             assert_eq!(own["userID"], "synthetic-profile-rotated-id");

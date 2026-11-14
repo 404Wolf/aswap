@@ -56,13 +56,20 @@ pub fn account_config(config: &Value) -> Value {
             .collect(),
     )
 }
-fn non_account(config: &Value) -> Value {
+// Claude's fullscreen boot canary tracks process liveness. Copying it between
+// launches makes stale pids look like failed boots after an account switch.
+const PER_PROCESS_KEYS: &[&str] = &[
+    "fullscreenBootPending",
+    "fullscreenBootStrikes",
+    "fullscreenAutoDisabled",
+];
+fn shared_config(config: &Value) -> Value {
     Value::Object(
         config
             .as_object()
             .into_iter()
             .flatten()
-            .filter(|(k, _)| !account_key(k))
+            .filter(|(k, _)| !account_key(k) && !PER_PROCESS_KEYS.contains(&k.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
     )
@@ -382,7 +389,7 @@ fn migrate_root(
         let old: Value = store::json_read(&config)?;
         let mut shared = read_config(config_path)?;
         let before = shared.clone();
-        merge_missing(&non_account(&old), &mut shared);
+        merge_missing(&shared_config(&old), &mut shared);
         if before != shared && store::no_links(config_path).is_ok() {
             store::json_write(config_path, &shared)?;
         }
@@ -626,7 +633,7 @@ impl View {
         }
         let _lock = store.lock()?;
         if view.provider == Provider::Claude {
-            view.baseline = non_account(&read_config(&view.config_path)?);
+            view.baseline = shared_config(&read_config(&view.config_path)?);
         }
         view.select_locked(store, account)?;
         Ok(view)
@@ -650,7 +657,7 @@ impl View {
         self.auth_stamp = observed;
         if account.provider == Provider::Claude {
             let mut config = if self.path.join(".claude.json").exists() {
-                non_account(&store::json_read(&self.path.join(".claude.json"))?)
+                shared_config(&store::json_read(&self.path.join(".claude.json"))?)
             } else {
                 self.baseline.clone()
             };
@@ -742,19 +749,12 @@ impl View {
                 store::json_write(&own, &current)?;
                 self.account_baseline = after;
             }
-            let after = non_account(&config);
+            let after = shared_config(&config);
             let mut current = read_config(&self.config_path)?;
             let before = current.clone();
-            let mut shared = non_account(&current);
-            merge_changes(&self.baseline, &after, &mut shared);
-            current
-                .as_object_mut()
-                .unwrap()
-                .retain(|k, _| account_key(k));
-            current
-                .as_object_mut()
-                .unwrap()
-                .extend(shared.as_object().unwrap().clone());
+            // Only shared keys enter the diff; home-owned account and process
+            // state stays untouched, even when the run adds or removes it.
+            merge_changes(&self.baseline, &after, &mut current);
             if current != before && store::no_links(&self.config_path).is_ok() {
                 store::json_write(&self.config_path, &current)?;
             }
@@ -802,6 +802,55 @@ impl View {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    #[test]
+    fn snapshot_omits_only_account_and_top_level_process_keys() {
+        let config = json!({
+            "oauthAccount": {"accountUuid": "synthetic"},
+            "fullscreenBootPending": {"123": {"startedAt": 1}},
+            "fullscreenBootStrikes": {"count": 2},
+            "fullscreenAutoDisabled": {"strikes": 2},
+            "fullscreenUpsellSeenCount": 3,
+            "theme": "dark",
+            "projects": {"synthetic": {"fullscreenBootPending": true}}
+        });
+        assert_eq!(
+            shared_config(&config),
+            json!({
+                "fullscreenUpsellSeenCount": 3,
+                "theme": "dark",
+                "projects": {"synthetic": {"fullscreenBootPending": true}}
+            })
+        );
+    }
+    #[test]
+    fn process_changes_preserve_home_state_while_other_keys_merge() {
+        let base = shared_config(&json!({"theme": "dark"}));
+        let after = shared_config(&json!({
+            "theme": "light",
+            "fullscreenBootPending": {"456": {"startedAt": 2}},
+            "fullscreenBootStrikes": {"count": 3},
+            "fullscreenAutoDisabled": {"strikes": 3}
+        }));
+        for mut current in [
+            json!({"theme": "dark"}),
+            json!({
+                "theme": "dark",
+                "fullscreenBootPending": {"123": {"startedAt": 1}},
+                "fullscreenBootStrikes": {"count": 1},
+                "fullscreenAutoDisabled": {"strikes": 2}
+            }),
+        ] {
+            let mut expected = current.clone();
+            expected["theme"] = json!("light");
+            merge_changes(&base, &after, &mut current);
+            assert_eq!(current, expected);
+        }
     }
 }
 
