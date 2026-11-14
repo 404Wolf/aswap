@@ -118,7 +118,8 @@ impl Tail {
         } else {
             meta.len()
         };
-        Self::at(path, offset, offset > 0)
+        // Only a tail can start inside a line; the end of a file never does.
+        Self::at(path, offset, written && offset > 0)
     }
 
     /// Read what was appended since the last read; whether it holds a limit
@@ -296,6 +297,24 @@ mod tests {
         std::fs::OpenOptions::new()
             .append(true)
             .open(&b)
+            .unwrap()
+            .write_all((entry(SystemTime::now(), "rate_limit") + "\n").as_bytes())
+            .unwrap();
+        assert!(limits.check(Some(&tracker), false, false));
+    }
+
+    #[test]
+    fn the_first_line_appended_to_a_late_found_unchanged_transcript_counts() {
+        // Resumed with --continue: the tracker learns the transcript only
+        // after launch, and nothing was written to it since.
+        let (_home, path, tracker) = setup("{\"type\":\"user\"}\n");
+        std::thread::sleep(Duration::from_millis(20));
+        let mut limits = Limits::new(None);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!limits.check(Some(&tracker), false, false));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
             .unwrap()
             .write_all((entry(SystemTime::now(), "rate_limit") + "\n").as_bytes())
             .unwrap();
