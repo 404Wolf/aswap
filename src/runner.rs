@@ -163,7 +163,19 @@ pub fn run(
     let mut switches = 0;
     let mut next_sync = 0;
     let mut syncing: Option<std::thread::JoinHandle<bool>> = None;
+    let mut auth_restarts = 0;
+    // A follower learns of a rotation from the owner, a moment after the old
+    // token stopped working: give it this long to arrive before deciding
+    // that a login error means the account itself has expired.
+    let settle = if crate::coordination::follower(store).unwrap_or(false) {
+        AUTH_SETTLE
+    } else {
+        Duration::ZERO
+    };
     loop {
+        // What this provider starts with, to tell a token that rotated under
+        // it from one that has really expired.
+        let launched = access_print(provider, &view.path.join(provider.auth_file()));
         eprintln!(
             "aswap: using {provider}:{} (supervisor PID {})",
             account.label,
@@ -209,6 +221,8 @@ pub fn run(
         let mut reported_none = false;
         let mut target = None;
         let mut prepared_resume = None;
+        let mut auth_seen: Option<Instant> = None;
+        let mut rotated = false;
         let mut reported_resume = false;
         let status = loop {
             // Keystrokes and redraws go through as they arrive; the bookkeeping
@@ -253,13 +267,48 @@ pub fn run(
             // Quota observations rank future launches, but cannot establish
             // that an interactive provider is idle. Never cancel active tools
             // merely because cached quota crossed a threshold.
-            if !expired && terminal.as_ref().is_some_and(|t| t.auth_expired) {
-                expired = true;
-                usage::mark_auth_expired(store, &account)?;
-                eprintln!(
-                    "aswap: login expired for {provider}:{}; looking for another eligible account",
-                    account.label
-                );
+            if !expired && !rotated && terminal.as_ref().is_some_and(|t| t.auth_expired) {
+                if auth_seen.is_none() {
+                    auth_seen = Some(Instant::now());
+                    if !settle.is_zero() && syncing.is_none() {
+                        syncing = immediate_poll(store);
+                    }
+                }
+                if !limited
+                    && !unsupported
+                    && auth_restarts < AUTH_RESTARTS
+                    && switches < 8
+                    && rotated_since(store, &account, launched.as_deref())
+                {
+                    // The provider called the API in the moment between the
+                    // revocation and its view getting the new token. The
+                    // account is fine: resume the conversation on it.
+                    rotated = true;
+                    match prepare_resume(
+                        store,
+                        provider,
+                        auto_args.as_ref().unwrap(),
+                        tracker.as_ref().unwrap(),
+                    ) {
+                        Ok(args) => {
+                            prepared_resume = Some(args);
+                            break stop(&mut child.0)?;
+                        }
+                        Err(err) => {
+                            if !reported_resume {
+                                eprintln!("aswap: {err}; keeping the current provider running");
+                                reported_resume = true;
+                            }
+                        }
+                    }
+                } else if auth_seen.is_some_and(|at| at.elapsed() >= settle) {
+                    expired = true;
+                    usage::mark_auth_expired(store, &account)?;
+                    eprintln!(
+                        "aswap: login expired for {provider}:{}; looking for another eligible account",
+                        account.label
+                    );
+                }
             }
             if !unsupported
                 && provider == Provider::Codex
@@ -326,7 +375,44 @@ pub fn run(
         if !auto {
             return Ok(status.code().unwrap_or(1));
         }
-        expired |= terminal.as_ref().is_some_and(|t| t.auth_expired);
+        let auth_failed = terminal.as_ref().is_some_and(|t| t.auth_expired);
+        if auth_failed
+            && !rotated
+            && !expired
+            && !limited
+            && !unsupported
+            && auth_restarts < AUTH_RESTARTS
+            && switches < 8
+        {
+            if !settle.is_zero() && syncing.is_none() {
+                syncing = immediate_poll(store);
+            }
+            let deadline = auth_seen.unwrap_or_else(Instant::now) + settle;
+            rotated = rotation_by(store, &account, launched.as_deref(), deadline);
+        }
+        if rotated {
+            let resume_args = match prepared_resume.take() {
+                Some(args) => args,
+                None => prepare_resume(
+                    store,
+                    provider,
+                    auto_args.as_ref().unwrap(),
+                    tracker.as_ref().unwrap(),
+                )?,
+            };
+            eprintln!(
+                "aswap: {provider}:{} got a new token after this provider started; resuming on the same account",
+                account.label
+            );
+            let _ = crate::refresh::for_run(store, &account);
+            view.sync(store, &account)?;
+            omit_one_shot(auto_args.as_ref().unwrap(), &mut terminal)?;
+            launch_args = resume_args;
+            switches += 1;
+            auth_restarts += 1;
+            continue;
+        }
+        expired |= auth_failed;
         unsupported |=
             provider == Provider::Codex && terminal.as_ref().is_some_and(|t| t.model_unsupported);
         if unsupported {
@@ -425,15 +511,72 @@ pub fn run(
         let _ = crate::refresh::for_run(store, &account);
         view.select(store, &account)?;
         lease.view(&view.path)?;
-        if auto_args.as_ref().is_some_and(|a| a.one_shot) || !std::io::stdin().is_terminal() {
-            writeln!(std::io::stderr(), "aswap: automatic restart omitted one-shot initial input/print mode; piped stdin is not replayed").safe("cannot report automatic restart")?;
-            if let Some(terminal) = &mut terminal {
-                terminal.discard_piped_input();
-            }
-        }
+        omit_one_shot(auto_args.as_ref().unwrap(), &mut terminal)?;
         launch_args = resume_args;
         switches += 1;
     }
+}
+/// Same-account restarts after a login error that followed a token rotation.
+const AUTH_RESTARTS: u32 = 3;
+/// How long a follower waits for the owner's rotated token after a login error.
+const AUTH_SETTLE: Duration = Duration::from_secs(10);
+/// A digest of an auth file's access token: enough to tell that the token
+/// changed, without keeping the token itself in memory.
+fn access_print(provider: Provider, path: &std::path::Path) -> Option<Vec<u8>> {
+    let auth: serde_json::Value = store::json_read(path).ok()?;
+    let pointer = if provider == Provider::Claude {
+        "/claudeAiOauth/accessToken"
+    } else {
+        "/tokens/access_token"
+    };
+    let token = auth.pointer(pointer)?.as_str()?;
+    Some(
+        ring::digest::digest(&ring::digest::SHA256, token.as_bytes())
+            .as_ref()
+            .to_vec(),
+    )
+}
+/// Whether the account's token differs from the one the provider started with.
+/// Only then is a login error a rotation race rather than an expired account;
+/// once a provider started with the current token also fails, it is real.
+fn rotated_since(store: &Store, account: &Account, launched: Option<&[u8]>) -> bool {
+    let Some(launched) = launched else {
+        return false;
+    };
+    store
+        .profile(account.provider, &account.label)
+        .is_ok_and(|profile| {
+            access_print(
+                account.provider,
+                &profile.join(account.provider.auth_file()),
+            )
+            .is_some_and(|now| now != launched)
+        })
+}
+fn rotation_by(
+    store: &Store,
+    account: &Account,
+    launched: Option<&[u8]>,
+    deadline: Instant,
+) -> bool {
+    loop {
+        if rotated_since(store, account, launched) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+fn omit_one_shot(args: &crate::session::AutoArgs, terminal: &mut Option<Terminal>) -> Result<()> {
+    if args.one_shot || !std::io::stdin().is_terminal() {
+        writeln!(std::io::stderr(), "aswap: automatic restart omitted one-shot initial input/print mode; piped stdin is not replayed").safe("cannot report automatic restart")?;
+        if let Some(terminal) = terminal {
+            terminal.discard_piped_input();
+        }
+    }
+    Ok(())
 }
 // Run-local rejection survives owner cache replacement and refresh observations.
 // Keep identity keys private/in-memory so aliases cannot bounce a session back
@@ -513,6 +656,14 @@ fn background_poll(store: &Store) -> Option<std::thread::JoinHandle<bool>> {
     let store = Store::open(store.root.clone()).ok()?;
     Some(std::thread::spawn(move || {
         crate::coordination::poll(&store, None, false).is_ok()
+    }))
+}
+/// A follower's poll that skips the 30s schedule: after a login error the
+/// owner may hold a rotated token this follower has not received yet.
+fn immediate_poll(store: &Store) -> Option<std::thread::JoinHandle<bool>> {
+    let store = Store::open(store.root.clone()).ok()?;
+    Some(std::thread::spawn(move || {
+        crate::coordination::poll(&store, None, true).is_ok()
     }))
 }
 pub fn observations(

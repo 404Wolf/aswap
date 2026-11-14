@@ -522,6 +522,16 @@ its last-known quota. Automatic restart still requires an exact conversation ID;
 if none was created, restart the CLI manually. If no healthy account is known,
 the current UI stays open so you can renew the login.
 
+A login error is not always an expired account. A refresh revokes the old
+access token at once, and a provider that calls the API in the moment before
+its view has the new token fails with the same error. So when the account's
+token has changed since the provider started, the run resumes the conversation
+on the **same** account with the new token instead (at most three times per
+run, within the usual cap of eight restarts). The account is only marked
+expired, and the run moves to another, when a provider started with the current
+token fails too. A follower first waits up to 10 seconds for the owner's new
+token, and asks the owner for it at once.
+
 Refresh tokens are normally renewed automatically. A revoked/expired refresh
 login needs the provider's interactive login again. In an owner/follower setup,
 do this on the **refresh owner**, not a follower whose next sync replaces local
