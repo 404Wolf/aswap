@@ -51,7 +51,7 @@ fn many_plain_and_auto_sessions_share_busy_accounts_without_disturbing_each_othe
             "#!{}\n{}",
             python.display(),
             r#"
-import os,pathlib,json,sys,time
+import datetime,os,pathlib,json,sys,time
 p=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])
 auth=json.loads((p/'.credentials.json').read_text())['claudeAiOauth']
 assert auth['refreshToken']=='aswap-owner-managed'
@@ -61,6 +61,11 @@ ready=pathlib.Path(os.environ['ASWAP_TEST_READY'])
 (ready/(id+'-'+auth['accessToken'])).write_text(str(os.getpid()))
 if id.endswith('0099') and auth['accessToken']=='synthetic-one':
     print('usage_limit_reached',file=sys.stderr,flush=True)
+    # Claude records the limit in the conversation's transcript as it happens.
+    transcript=p/'projects'/'-x'/(id+'.jsonl')
+    transcript.parent.mkdir(parents=True,exist_ok=True)
+    with transcript.open('a') as t:
+        t.write(json.dumps({'type':'assistant','timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat(),'isApiErrorMessage':True,'error':'rate_limit'})+'\n')
     sys.exit(1)
 while not (ready/'release').exists():time.sleep(.025)
 "#
