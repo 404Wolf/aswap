@@ -645,8 +645,8 @@ fn rank(prefer: Prefer, a: &Cached, b: &Cached, at: u64) -> std::cmp::Ordering {
     };
     by_reset.then_with(|| a.used(at).unwrap().total_cmp(&b.used(at).unwrap()))
 }
-/// Only fresh known quotas, ten-point hysteresis and cooldown; eligible
-/// accounts are ranked by `prefer`.
+/// Prefer fresh quotas below the threshold with hysteresis and cooldown.
+/// An exhausted account may use remaining quota above the soft threshold.
 pub fn choose<'a>(
     current: &str,
     entries: &'a [(Account, Cached)],
@@ -657,21 +657,25 @@ pub fn choose<'a>(
     limited: bool,
 ) -> Option<&'a Account> {
     let used = entries.iter().find(|(a, _)| a.label == current)?.1.used(at);
-    if !limited
+    let exhausted = limited || used.is_some_and(|v| v >= 100.0);
+    if !exhausted
         && used.is_none_or(|v| v < threshold || (v < 100.0 && at.saturating_sub(last_switch) < 300))
     {
         return None;
     }
-    entries
-        .iter()
-        .filter(|(a, c)| {
-            a.label != current
-                && c.used(at).is_some_and(|v| {
-                    v < threshold && (limited || used.is_some_and(|u| u - v >= 10.0))
-                })
-        })
-        .min_by(|(_, a), (_, b)| rank(prefer, a, b, at))
-        .map(|(a, _)| a)
+    let eligible = |ceiling: f64, forced: bool| {
+        entries
+            .iter()
+            .filter(|(a, c)| {
+                a.label != current
+                    && c.used(at).is_some_and(|v| {
+                        v < ceiling && (forced || used.is_some_and(|u| u - v >= 10.0))
+                    })
+            })
+            .min_by(|(_, a), (_, b)| rank(prefer, a, b, at))
+            .map(|(a, _)| a)
+    };
+    eligible(threshold, exhausted).or_else(|| exhausted.then(|| eligible(100.0, true)).flatten())
 }
 /// A switch that is not forced by quota: with `WeeklyReset`, a new launch (or
 /// the selection monitor) moves to an eligible account whose weekly window

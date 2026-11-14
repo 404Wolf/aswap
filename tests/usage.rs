@@ -106,6 +106,52 @@ fn weekly(p: f64, reset: Option<u64>, at: u64) -> Cached {
     c
 }
 #[test]
+fn exhausted_accounts_use_remaining_quota_above_the_soft_threshold() {
+    let entries = vec![
+        (account("full"), weekly(100.0, Some(9000), 1000)),
+        (account("soon"), weekly(97.0, Some(2000), 1000)),
+        (account("room"), weekly(93.0, Some(5000), 1000)),
+        (account("also-full"), weekly(100.0, Some(1500), 1000)),
+    ];
+    for limited in [false, true] {
+        assert_eq!(
+            usage::choose(
+                "full",
+                &entries,
+                90.0,
+                Prefer::WeeklyReset,
+                999,
+                1000,
+                limited
+            )
+            .unwrap()
+            .label,
+            "soon"
+        );
+        assert_eq!(
+            usage::choose("full", &entries, 90.0, Prefer::Headroom, 999, 1000, limited)
+                .unwrap()
+                .label,
+            "room"
+        );
+    }
+    // Soft-threshold crossing alone must not churn accounts above it.
+    assert!(usage::choose("soon", &entries, 90.0, Prefer::Headroom, 0, 1000, false).is_none());
+    // Unknown, stale, failed and exhausted observations are never fallback targets.
+    let mut unavailable = entries.clone();
+    unavailable[1].1.error = Some("provider-limit".into());
+    unavailable[2].1.fetched_at = 1;
+    assert!(usage::choose("full", &unavailable, 90.0, Prefer::Headroom, 0, 1000, true).is_none());
+    let mut preferred = entries;
+    preferred.push((account("below"), weekly(80.0, Some(8000), 1000)));
+    assert_eq!(
+        usage::choose("full", &preferred, 90.0, Prefer::WeeklyReset, 0, 1000, true)
+            .unwrap()
+            .label,
+        "below"
+    );
+}
+#[test]
 fn weekly_reset_preference_ranks_and_moves_launches() {
     let entries = vec![
         (account("a"), weekly(95.0, Some(9000), 1000)),

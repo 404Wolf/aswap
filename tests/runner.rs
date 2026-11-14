@@ -7,6 +7,15 @@ use aswap::{
 use std::{fs, os::unix::fs::PermissionsExt, process::Command};
 const ID: &str = "11111111-2222-4333-8444-555555555555";
 #[test]
+fn provider_wrappers_are_told_the_launch_is_already_supervised() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        let command = provider.command(std::path::Path::new("/synthetic-view"));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == provider.bin_var() && value == Some(command.get_program())
+        }));
+    }
+}
+#[test]
 fn provider_processes_share_state_preserve_cwd_and_resume_exact_session() {
     runner_case("usage_limit_reached");
 }

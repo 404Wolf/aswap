@@ -158,7 +158,9 @@ provider, even when subagents open other transcripts. A known Claude UUID surviv
 unrelated shared history writes. A fork must establish its new identity first.
 
 Candidates need fresh known quota below the threshold, ten points of improvement
-and a 300-second cooldown; a recognized limit bypasses the latter two gates.
+and a 300-second cooldown. A recognized limit or a fresh 100% observation bypasses
+the latter two gates and, if no account is below the threshold, can use an account
+with remaining quota below 100%. Exhausted, stale and unknown accounts remain excluded.
 `prefer headroom` (the default) picks the candidate with the lowest usage;
 `prefer weekly-reset` picks the one whose weekly window resets soonest, so
 quota that would expire unused goes first. With `weekly-reset`, new launches and
