@@ -304,21 +304,30 @@ impl Diagnostics {
         )
     }
 }
+/// Box-drawing and quote characters Claude's dialogs and notices may wrap a
+/// diagnostic in; they carry no meaning for the match.
+fn normalize(line: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(line)
+        .to_lowercase()
+        .replace(['\u{2019}', '\u{2018}'], "'");
+    let frame =
+        |c: char| c.is_whitespace() || c == '\u{23bf}' || ('\u{2500}'..='\u{257f}').contains(&c);
+    decoded.trim_matches(frame).to_owned()
+}
 fn diagnostic_line(line: &[u8]) -> (bool, bool, bool) {
-    // Decode bytes accumulated across reads, then remove Claude's result marker.
-    let decoded = String::from_utf8_lossy(line).to_ascii_lowercase();
-    let line = decoded.trim().trim_start_matches('⎿').trim();
+    // Decode bytes accumulated across reads, then remove Claude's result
+    // marker and any dialog border around the notice.
+    let line = normalize(line);
+    let line = line.as_str();
     let api = line
         .strip_prefix("api error:")
         .or_else(|| line.strip_prefix("error:"));
+    let notice = hit_limit_notice(line);
     let standalone = matches!(line, "usage_limit_reached" | "rate_limit_exceeded")
         || (line.starts_with("the ") && unsupported_model_message(line))
-        || line.starts_with("oauth token revoked · please run /login")
-        || line.starts_with("login expired · please run /login")
-        || line.starts_with("you've hit your limit")
-        || line.starts_with("you've hit your 5-hour limit")
-        || line.starts_with("you've hit your weekly limit")
-        || line.starts_with("you’re out of extra usage")
+        || line.starts_with("oauth token revoked \u{b7} please run /login")
+        || line.starts_with("login expired \u{b7} please run /login")
+        || notice
         || line.starts_with("you're out of extra usage");
     let Some(text) = api.or(standalone.then_some(line)) else {
         return (false, false, false);
@@ -326,14 +335,31 @@ fn diagnostic_line(line: &[u8]) -> (bool, bool, bool) {
     (
         limit_message(text)
             || text.trim_start().starts_with("429 ")
-            || line.starts_with("you've hit your limit")
+            || notice
             || line.contains("out of extra usage"),
         auth_message(text) || text.trim_start().starts_with("401 "),
         unsupported_model_message(text),
     )
 }
+/// Claude's usage-limit notice, in every wording it has used: "You've hit
+/// your limit", "… your session limit", "… your 5-hour limit", "… your weekly
+/// limit", and model limits such as "… your Opus limit" or "… your Fable
+/// weekly limit", each optionally followed by " · resets …". Only the notice
+/// itself, at the start of the (normalized) line, never prose that quotes it.
+fn hit_limit_notice(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("you've hit your ") else {
+        return false;
+    };
+    let head = rest.split('\u{b7}').next().unwrap_or("").trim();
+    let words: Vec<_> = head.split_whitespace().collect();
+    !words.is_empty()
+        && words.len() <= 4
+        && words
+            .last()
+            .is_some_and(|w| w.trim_end_matches(|c: char| c.is_ascii_punctuation()) == "limit")
+}
 pub fn limit_message(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
+    let text = text.to_lowercase().replace(['\u{2019}', '\u{2018}'], "'");
     [
         "http 429",
         "status 429",
@@ -342,12 +368,12 @@ pub fn limit_message(text: &str) -> bool {
         "rate_limit_exceeded",
         "rate limit reached",
         "usage limit reached",
-        "you've hit your 5-hour limit",
-        "you've hit your weekly limit",
-        "you've hit your limit",
     ]
     .iter()
     .any(|needle| text.contains(needle))
+        || text
+            .match_indices("you've hit your ")
+            .any(|(at, _)| hit_limit_notice(&text[at..]))
 }
 #[cfg(test)]
 mod tests {
@@ -360,7 +386,50 @@ mod tests {
             "You've hit your 5-hour limit · resets 8:30pm"
         ));
         assert!(super::limit_message("You've hit your weekly limit"));
+        assert!(super::limit_message("You\u{2019}ve hit your session limit"));
         assert!(!super::limit_message("5-hour limit: 90% used"));
+        assert!(!super::limit_message(
+            "you've hit your stride; no limit in sight today"
+        ));
+    }
+
+    /// Every wording Claude Code has printed for a usage limit, as recorded
+    /// in real transcripts (2.1.3xx) and its changelog, plain and as drawn in
+    /// its limit dialog (a bordered box, curly apostrophe).
+    #[test]
+    fn every_claude_limit_notice_is_recognized() {
+        for notice in [
+            "You've hit your weekly limit \u{b7} resets Nov 20, 3am (America/New_York)",
+            "You've hit your session limit \u{b7} resets 4am (America/New_York)",
+            "You've hit your 5-hour limit \u{b7} resets 8:30pm (America/New_York)",
+            "You've hit your limit \u{b7} resets tomorrow",
+            "You've hit your Fable limit",
+            "You've hit your Opus weekly limit \u{b7} resets Nov 21, 9pm",
+            "You\u{2019}ve hit your weekly limit \u{b7} resets Nov 20, 3am",
+        ] {
+            for line in [
+                format!("  \u{23bf}  {notice}\r\n"),
+                format!("{notice}\n"),
+                format!("\u{2502} {notice}   \u{2502}\r\n"),
+                format!("\x1b[1m\u{2502}\x1b[0m  {notice}\x1b[2m  \u{2502}\x1b[0m\r\n"),
+            ] {
+                let mut detector = super::Diagnostics::default();
+                assert!(detector.feed(line.as_bytes()).0, "{line:?}");
+            }
+        }
+        for prose in [
+            "\u{25cf} You've hit your weekly limit, so I stopped here.\n",
+            "\u{276f} why did you've hit your weekly limit show up?\n",
+            "  - you've hit your weekly limit when the account is at 100%\n",
+            "You've hit your stride, and the session limit is far away\n",
+        ] {
+            let mut detector = super::Diagnostics::default();
+            assert_eq!(
+                detector.feed(prose.as_bytes()),
+                (false, false, false),
+                "{prose:?}"
+            );
+        }
     }
 }
 
