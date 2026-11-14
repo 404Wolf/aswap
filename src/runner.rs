@@ -251,7 +251,7 @@ pub fn run(
                     };
                     limited |= terminal.pump(step.as_millis().max(1) as i32)?;
                     if terminal.quiet_auth {
-                        quiet.check(tracker.as_ref());
+                        quiet.check(tracker.as_ref(), false);
                     }
                 }
             }
@@ -280,7 +280,7 @@ pub fn run(
                 tracker.observe(child.0.id())?;
             }
             if let Some(terminal) = &mut terminal {
-                quiet.apply(terminal, tracker.as_ref());
+                quiet.apply(terminal, tracker.as_ref(), false);
             }
             if let Some(status) = child.0.try_wait().safe("cannot wait for provider")? {
                 break status;
@@ -392,7 +392,9 @@ pub fn run(
         drop(child);
         if let Some(terminal) = &mut terminal {
             limited |= terminal.pump(0)?;
-            quiet.apply(terminal, tracker.as_ref());
+            // The provider is gone and the tracker will not walk again: look
+            // for a transcript it created in its last moments afresh.
+            quiet.apply(terminal, tracker.as_ref(), true);
         }
         view.sync(store, &account)?;
         if !auto {
@@ -572,8 +574,9 @@ impl Quiet {
             recorded: None,
         }
     }
-    /// One stat; the path comes from the tracker's last walk.
-    fn check(&mut self, tracker: Option<&crate::session::Tracker>) {
+    /// One stat; the path comes from the tracker's last walk, or a new one
+    /// when `fresh`.
+    fn check(&mut self, tracker: Option<&crate::session::Tracker>, fresh: bool) {
         if self.recorded.is_some() {
             return;
         }
@@ -582,7 +585,13 @@ impl Quiet {
             // unchanged since before launch is the baseline, so finding it is
             // not a change. One written since launch is the resume prompt
             // being recorded: date that by its mtime, since finding it lags.
-            self.transcript = tracker.and_then(|t| t.transcript());
+            self.transcript = tracker.and_then(|t| {
+                if fresh {
+                    t.transcript_now()
+                } else {
+                    t.transcript()
+                }
+            });
             let Some(path) = &self.transcript else {
                 return;
             };
@@ -593,11 +602,7 @@ impl Quiet {
                 let ago = std::time::SystemTime::now()
                     .duration_since(modified)
                     .unwrap_or_default();
-                self.recorded = Some(
-                    Instant::now()
-                        .checked_sub(ago)
-                        .unwrap_or_else(Instant::now),
-                );
+                self.recorded = Some(Instant::now().checked_sub(ago).unwrap_or_else(Instant::now));
             }
             return;
         }
@@ -609,11 +614,16 @@ impl Quiet {
     }
     /// Count held login errors that are live, and stop holding once nothing
     /// read from now on can be part of the redraw.
-    fn apply(&mut self, terminal: &mut Terminal, tracker: Option<&crate::session::Tracker>) {
+    fn apply(
+        &mut self,
+        terminal: &mut Terminal,
+        tracker: Option<&crate::session::Tracker>,
+        fresh: bool,
+    ) {
         if !terminal.quiet_auth {
             return;
         }
-        self.check(tracker);
+        self.check(tracker, fresh);
         if let Some(recorded) = self.recorded {
             let live = recorded + RESUME_LIVE;
             terminal.auth_expired |= terminal.held_auth.iter().any(|at| *at > live);

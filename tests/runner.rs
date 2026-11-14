@@ -384,6 +384,13 @@ fn above_threshold_fallback_skips_rejected_accounts_and_aliases_after_cache_repl
     runner_safety_cases(&["boundedhigh401", "boundedhighquota"]);
 }
 
+/// Rotation cases whose account really expired, so the run fails over.
+const FAILS_OVER: [&str; 4] = [
+    "rotationfail401",
+    "rotationfast401",
+    "rotationexisting401",
+    "rotationcap401",
+];
 #[test]
 fn a_login_error_right_after_a_rotation_resumes_on_the_same_account() {
     // rotation401: the token rotated under the provider, so the account is
@@ -393,8 +400,9 @@ fn a_login_error_right_after_a_rotation_resumes_on_the_same_account() {
     // rotationlate401: the conversation is identified only after the error;
     // the run keeps retrying and resumes once it is known. rotationcap401:
     // after three same-account restarts the account counts as expired.
-    // rotationfail401 and rotationfast401 (failing 150ms after the resume
-    // prompt): a provider started with the fresh token fails
+    // rotationfail401, rotationfast401 (failing 150ms after the resume
+    // prompt) and rotationexisting401 (the same, with a transcript that
+    // exists at launch): a provider started with the fresh token fails
     // too, so the account really expired and the run fails over.
     runner_safety_cases(&[
         "rotation401",
@@ -403,6 +411,7 @@ fn a_login_error_right_after_a_rotation_resumes_on_the_same_account() {
         "rotationcap401",
         "rotationfail401",
         "rotationfast401",
+        "rotationexisting401",
     ]);
 }
 
@@ -431,11 +440,14 @@ if case.startswith('rotation'):
     token=json.loads((view/'.credentials.json').read_text())['claudeAiOauth']['accessToken']
     with (root/'identities').open('a') as f: f.write(token+'\n')
     first=len((root/'calls').read_text().splitlines())==1
+    transcript=view/'projects'/'-synthetic'/('11111111-2222-4333-8444-555555555555.jsonl')
+    transcript.parent.mkdir(parents=True,exist_ok=True)
+    def record():
+        with transcript.open('a') as t: t.write('{"synthetic":"resume prompt"}\n')
+    if first and case=='rotationexisting401':
+        # The conversation already has a transcript when it is resumed.
+        record()
     if not first:
-        transcript=view/'projects'/'-synthetic'/('11111111-2222-4333-8444-555555555555.jsonl')
-        transcript.parent.mkdir(parents=True,exist_ok=True)
-        def record():
-            with transcript.open('a') as t: t.write('{"synthetic":"resume prompt"}\n')
         if case=='rotationredraw401':
             # The redraw reaches the terminal just after the prompt is recorded.
             record()
@@ -449,7 +461,7 @@ if case.startswith('rotation'):
             # ...then records the resume prompt and makes a live API call.
             record()
         # A revoked token fails fast: one quick 401 and a failed refresh.
-        time.sleep(.15 if case=='rotationfast401' else 1.5)
+        time.sleep(.15 if case in ('rotationfast401','rotationexisting401') else 1.5)
     if token=='synthetic-two' or (case in ('rotation401','rotationredraw401','rotationlate401') and not first):
         (root/'completed').write_text('resumed provider completed its work')
         sys.exit(0)
@@ -546,10 +558,7 @@ time.sleep(1)
                     "synthetic-one-rotated-again-again",
                 ]);
             }
-            if matches!(
-                case,
-                "rotationfail401" | "rotationfast401" | "rotationcap401"
-            ) {
+            if FAILS_OVER.contains(&case) {
                 expected.push("synthetic-two");
             }
             assert_eq!(identities.lines().collect::<Vec<_>>(), expected, "{case}");
@@ -569,10 +578,7 @@ time.sleep(1)
             );
             assert_eq!(
                 stderr.contains("login expired for claude:one"),
-                matches!(
-                    case,
-                    "rotationfail401" | "rotationfast401" | "rotationcap401"
-                ),
+                FAILS_OVER.contains(&case),
                 "{case}: {stderr}"
             );
             assert_eq!(
@@ -756,10 +762,7 @@ fn runner_safety_child() {
         assert_ne!(result.unwrap(), 0);
     } else if matches!(case.as_str(), "unknown" | "ambiguous") {
         assert!(result.is_err());
-    } else if matches!(
-        case.as_str(),
-        "rotationfail401" | "rotationfast401" | "rotationcap401"
-    ) {
+    } else if FAILS_OVER.contains(&case.as_str()) {
         assert_eq!(result.unwrap(), 0);
         let cache: Cached = store::json_read(
             &store

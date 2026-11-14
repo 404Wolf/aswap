@@ -407,9 +407,15 @@ impl Tracker {
     /// The tracked conversation's transcript, from the last `observe`
     /// (no walk); None while the identity or the file is unknown.
     pub(crate) fn transcript(&self) -> Option<PathBuf> {
+        self.find(self.files.keys())
+    }
+    /// The same, from a fresh walk: for when no further `observe` will come.
+    pub(crate) fn transcript_now(&self) -> Option<PathBuf> {
+        self.find(files(self.provider, &self.home).ok()?.keys())
+    }
+    fn find<'a>(&self, mut paths: impl Iterator<Item = &'a PathBuf>) -> Option<PathBuf> {
         let id = self.known.as_deref()?;
-        self.files
-            .keys()
+        paths
             .find(|path| filename_id(self.provider, path).as_deref() == Some(id))
             .cloned()
     }
