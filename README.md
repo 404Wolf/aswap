@@ -304,11 +304,12 @@ followers pull at most once per 30 seconds. A refresh revokes the old access
 token at once, so the owner also pushes: one process per follower (the monitor or
 any run) keeps an SSH stream (`sync --serve --watch`) open, and the owner sends a
 packet within a quarter second of any profile auth change plus a heartbeat every
-20 seconds; the 30-second pull remains the fallback. Every live view, including
-owner runs, notices a changed profile token on its next 250ms tick and installs
-it, so a rotation reaches running sessions in about a second. An identity lock serializes
-refresh; waiters re-read the refreshed credentials, and duplicate aliases receive
-the same rotation. Failed refresh attempts share a cooldown rather than creating
+20 seconds; the 30-second pull remains the fallback. The refresh (or the
+follower's install) then writes the new token into every running session's
+view at once, by atomic rename, so all of them have it within tens of
+milliseconds; each session also checks its profile every 250ms as a fallback.
+An identity lock serializes refresh; waiters re-read the refreshed credentials,
+and duplicate aliases receive the same rotation. Failed refresh attempts share a cooldown rather than creating
 one request per live session. Stale runtime writes cannot overwrite canonical auth.
 
 Live sessions have individual PID/start-time/boot records. Rename/remove refuse

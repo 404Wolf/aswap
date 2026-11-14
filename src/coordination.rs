@@ -407,10 +407,12 @@ fn install_permitted(
     for p in packet.profiles {
         let path = store.profile(p.account.provider, &p.account.label)?;
         store::private_dir(&path)?;
-        changed |= write_changed(
-            &path.join(p.account.provider.auth_file()),
-            &crate::refresh::access_only(p.account.provider, &p.auth),
-        )?;
+        let auth = crate::refresh::access_only(p.account.provider, &p.auth);
+        if write_changed(&path.join(p.account.provider.auth_file()), &auth)? {
+            // The owner's refresh already revoked the old token here too.
+            crate::shared::hand_out(store, &p.account, &auth);
+            changed = true;
+        }
         if p.account.provider == Provider::Claude {
             write_changed(
                 &path.join(".claude.json"),
@@ -1837,6 +1839,41 @@ mod tests {
         store::json_write(&owner.profile(Provider::Claude, "one").unwrap().join(".credentials.json"),&json!({"claudeAiOauth":{"accessToken":"synthetic-rotated","refreshToken":"synthetic-owner-refresh","expiresAt":9999999999999u64}})).unwrap();
         install(&store, owner_packet(&owner), &mut settings(&store).unwrap()).unwrap();
         assert!(crate::shared::stamp(&profile.join(".credentials.json")) != auth);
+    }
+    #[test]
+    fn a_follower_hands_an_installed_rotation_to_its_live_views() {
+        let (_o, owner) = seed();
+        let (_f, store) = follower_store();
+        install(&store, owner_packet(&owner), &mut settings(&store).unwrap()).unwrap();
+        let a = Account {
+            provider: Provider::Claude,
+            label: "one".into(),
+        };
+        // A running view of the account, as View::prepare leaves it.
+        let view = store.root.join("runtimes/claude/one/run-synthetic");
+        let profile = store.profile(Provider::Claude, "one").unwrap();
+        let installed: Value = store::json_read(&profile.join(".credentials.json")).unwrap();
+        store::json_write(
+            &view.join(".credentials.json"),
+            &crate::refresh::launch_auth(Provider::Claude, &installed),
+        )
+        .unwrap();
+        std::fs::write(view.with_extension("lock"), "one").unwrap();
+        let lease = store.lease(&a).unwrap();
+        lease.view(&view).unwrap();
+        store::json_write(&owner.profile(Provider::Claude, "one").unwrap().join(".credentials.json"),&json!({"claudeAiOauth":{"accessToken":"synthetic-rotated","refreshToken":"synthetic-owner-refresh","expiresAt":9999999999999u64}})).unwrap();
+        let mut packet = owner_packet(&owner);
+        packet.issued_at += 1;
+        {
+            let _lock = store.lock().unwrap();
+            accept(&store, packet).unwrap();
+        }
+        let handed: Value = store::json_read(&view.join(".credentials.json")).unwrap();
+        assert_eq!(handed["claudeAiOauth"]["accessToken"], "synthetic-rotated");
+        assert_eq!(
+            handed["claudeAiOauth"]["refreshToken"],
+            "aswap-owner-managed"
+        );
     }
     #[test]
     fn a_follower_never_refreshes_even_for_its_own_running_session() {

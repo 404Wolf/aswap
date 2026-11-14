@@ -422,3 +422,152 @@ fn auth_change_child() {
     assert_eq!(now["claudeAiOauth"]["refreshToken"], "aswap-owner-managed");
     assert!(!view.auth_changed(&store, &a));
 }
+#[test]
+fn a_refresh_hands_the_new_token_to_every_live_view_at_once() {
+    let t = tempfile::tempdir().unwrap();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "hand_out_child", "--nocapture"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", t.path())
+        .env("XDG_DATA_HOME", t.path().join("data"))
+        .env("CLAUDE_CONFIG_DIR", t.path().join("claude"))
+        .env("CODEX_HOME", t.path().join("codex"))
+        .env("ASWAP_HAND_OUT_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+#[test]
+fn hand_out_child() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    if std::env::var("ASWAP_HAND_OUT_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    const VIEWS: usize = 40;
+    let store = Store::from_env().unwrap();
+    let home = Provider::Claude.current_home().unwrap();
+    let auth = |token: &str| json!({"claudeAiOauth":{"accessToken":token,"refreshToken":"synthetic-refresh","expiresAt":9999999999999u64}});
+    let mut accounts = Vec::new();
+    for (label, token) in [
+        ("one", "synthetic-old-access"),
+        ("two", "synthetic-two-access"),
+    ] {
+        store::json_write(&home.join(".credentials.json"), &auth(token)).unwrap();
+        store::json_write(
+            &home.join(".claude.json"),
+            &json!({"oauthAccount":{"accountUuid":format!("synthetic-{label}")}}),
+        )
+        .unwrap();
+        accounts.push(provider::add(&store, Provider::Claude, label).unwrap());
+    }
+    let (one, two) = (&accounts[0], &accounts[1]);
+    aswap::coordination::owner(&store).unwrap();
+    // Every run registers its live lease and names its view, as `aswap run` does.
+    let mut runs = (0..VIEWS)
+        .map(|_| {
+            let lease = store.lease(one).unwrap();
+            let view = View::prepare(&store, one).unwrap();
+            lease.view(&view.path).unwrap();
+            (lease, view)
+        })
+        .collect::<Vec<_>>();
+    // A native MCP login in one view survives the hand-out untouched.
+    let native = runs[0].1.path.join(".credentials.json");
+    let mut with_mcp: serde_json::Value = store::json_read(&native).unwrap();
+    with_mcp["mcpOAuth"] = json!({"synthetic-server":{"accessToken":"synthetic-mcp"}});
+    store::json_write(&native, &with_mcp).unwrap();
+    // A run that has just switched to another account still has a lease for
+    // the old one: it must keep the new account's token.
+    let moved_lease = store.lease(one).unwrap();
+    let mut moved = View::prepare(&store, one).unwrap();
+    moved_lease.view(&moved.path).unwrap();
+    moved.select(&store, two).unwrap();
+    let paths: Vec<_> = runs
+        .iter()
+        .map(|(_, view)| view.path.join(".credentials.json"))
+        .chain([moved.path.join(".credentials.json")])
+        .collect();
+    // Providers read their files all the while: none may see a partial write.
+    let stop = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let readers = (0..4)
+        .map(|_| {
+            let (paths, stop, reads) = (paths.clone(), stop.clone(), reads.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    for path in &paths {
+                        let bytes = fs::read(path).unwrap();
+                        let value: serde_json::Value = serde_json::from_slice(&bytes)
+                            .expect("a view held a partially written auth file");
+                        let token = value["claudeAiOauth"]["accessToken"].as_str().unwrap();
+                        assert!(token.starts_with("synthetic-"));
+                        reads.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut slowest = std::time::Duration::ZERO;
+    for round in 0..20 {
+        let token = format!("synthetic-rotated-{round}");
+        let started = std::time::Instant::now();
+        {
+            let _lock = store.lock().unwrap();
+            assert!(
+                aswap::refresh::refresh_with(&store, one, 1000, true, |_, _| Ok(
+                    json!({"access_token":token,"refresh_token":"synthetic-refresh-rotated","expires_in":3600})
+                ))
+                .unwrap()
+            );
+        }
+        slowest = slowest.max(started.elapsed());
+        // The refresh itself handed the token out: no run has ticked.
+        for (_, view) in &runs {
+            let now: serde_json::Value =
+                store::json_read(&view.path.join(".credentials.json")).unwrap();
+            assert_eq!(now["claudeAiOauth"]["accessToken"], token.as_str());
+            assert_eq!(now["claudeAiOauth"]["refreshToken"], "aswap-owner-managed");
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    assert!(reads.load(Ordering::SeqCst) > 0);
+    eprintln!("slowest refresh with {VIEWS} views: {slowest:?}");
+    let first: serde_json::Value = store::json_read(&native).unwrap();
+    assert_eq!(first["mcpOAuth"], with_mcp["mcpOAuth"]);
+    let kept: serde_json::Value = store::json_read(&moved.path.join(".credentials.json")).unwrap();
+    assert_eq!(kept["claudeAiOauth"]["accessToken"], "synthetic-two-access");
+    // The first view goes last: its native MCP login then reaches the others.
+    for (_, view) in runs.iter_mut().rev() {
+        let leftovers = fs::read_dir(&view.path)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("handout")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        // The run's own sync agrees with what it was handed: nothing to rewrite.
+        let path = view.path.join(".credentials.json");
+        let before = fs::metadata(&path).unwrap();
+        view.sync(&store, one).unwrap();
+        let after = fs::metadata(&path).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(before.ino(), after.ino(), "sync rewrote a handed-out view");
+        assert!(!view.auth_changed(&store, one));
+    }
+}

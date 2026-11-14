@@ -335,9 +335,18 @@ within 300s; a larger gap is the owner's clock stepping back and installs.
 Each claim, connect, delivery (installed, unchanged or stale), failure (fixed
 error code only) and stream end is appended as one JSON line, with the
 schedule fields and the pid, to the private sync.log (0600, rotated to
-sync.log.1 at 1 MiB); `status --json` shows the last ten under sync.events. Live views stat their profile auth
-every 250ms and copy a changed token immediately. If the owner is unreachable, a stale sentinel may yield an auth
-error rather than any rotation; no peer silently becomes an owner. Provider token
+sync.log.1 at 1 MiB); `status --json` shows the last ten under sync.events.
+Whoever writes a rotated token into a profile (the owner's refresh, a duplicate
+alias, a follower installing a packet) hands it to every live run's view in the
+same pass: each liveness record names its run's view, and each view is replaced
+by temporary file and rename under the view's own lock (`run-*.lock` beside it,
+holding the label of the account the view carries), with no store lock and no
+fsync. A view that has switched to another account is skipped. Forty views take
+tens of milliseconds, where copying on each run's tick took seconds, and the
+provider never reads a partial file. Live views still stat their profile auth
+every 250ms and copy a changed token, for runs from older releases. If the
+owner is unreachable, a stale sentinel may yield an auth error rather than any
+rotation; no peer silently becomes an owner. Provider token
 reload behavior is version-sensitive and synthetic process tests cannot prove
 arbitrary future provider versions; explicit resume is the recovery path.
 
@@ -435,10 +444,10 @@ role drift, legacy stderr, duplicate aliases, conflicts and untrusted diagnostic
 
 There is no admission limit per account. Each plain/auto run creates a unique
 0600 JSON liveness record under live/<provider>/<label>/ under the store lock.
-It contains only the supervisor/child PID and Linux process start ticks, plus a
-boot ID. Rename/remove and ownership changes scan these records under the same
-lock, refuse live users, and collect dead parents/children, reused PIDs, zombies,
-previous-boot records and orphan temporary writes. Corrupt published records fail
+It contains only the supervisor/child PID and Linux process start ticks, a
+boot ID and the path of the run's launch view. Rename/remove and ownership
+changes scan these records under the same lock, refuse live users, and collect
+dead parents/children, reused PIDs, zombies, previous-boot records and orphan temporary writes. Corrupt published records fail
 closed. A supervised child gets a Linux parent-death kill signal, closing the
 fork-to-record gap; child liveness is also recorded before supervision starts.
 Auto keeps its original history-label record and its current account record,

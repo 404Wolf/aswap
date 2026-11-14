@@ -4,7 +4,10 @@ use crate::{
     store::{self, Account, Store},
 };
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 #[derive(Serialize, Deserialize)]
 struct Process {
     pid: u32,
@@ -19,6 +22,10 @@ struct Record {
     history_only: bool,
     #[serde(default)]
     terminal: Option<String>,
+    /// The run's launch view, so a refresh can hand the new token to it at
+    /// once. Older records lack it; their runs still copy on their own tick.
+    #[serde(default)]
+    view: Option<PathBuf>,
 }
 fn process(pid: u32) -> Option<Process> {
     let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -72,11 +79,20 @@ impl Lease {
         self.record_child(pid, true)
     }
     fn record_child(&self, pid: u32, history_only: bool) -> Result<()> {
+        self.update(|record| {
+            record.child = process(pid);
+            record.history_only = history_only;
+        })
+    }
+    /// Name the launch view this run's provider reads its credentials from.
+    pub fn view(&self, path: &Path) -> Result<()> {
+        self.update(|record| record.view = Some(path.to_owned()))
+    }
+    fn update(&self, change: impl FnOnce(&mut Record)) -> Result<()> {
         let store = Store::open(self.root.clone())?;
         let _lock = store.lock()?;
         let mut record: Record = store::json_read(&self.path)?;
-        record.child = process(pid);
-        record.history_only = history_only;
+        change(&mut record);
         store::json_write(&self.path, &record)
     }
 }
@@ -104,6 +120,7 @@ pub(crate) fn register(store: &Store, a: &Account) -> Result<Lease> {
         child: None,
         history_only: false,
         terminal: std::env::var("HC_TERMINAL_ID").ok(),
+        view: None,
     };
     store::json_write(&path, &record)?;
     Ok(Lease {
@@ -143,6 +160,34 @@ pub(crate) fn count(store: &Store, a: &Account) -> Result<usize> {
         }
     }
     Ok(count)
+}
+
+/// The launch views of this account's live runs. Reads only: no store lock,
+/// and stale records are left for `count` to collect. A view may have moved
+/// to another account since; the caller checks under the view's own lock.
+pub(crate) fn views(store: &Store, a: &Account) -> Vec<PathBuf> {
+    let (Ok(dir), Ok(current_boot)) = (directory(store, a), boot()) else {
+        return Vec::new();
+    };
+    if store::no_links(&dir).is_err() {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                return None;
+            }
+            let record: Record = store::json_read(&path).ok()?;
+            (record.boot == current_boot
+                && (alive(&record.parent) || record.child.as_ref().is_some_and(alive)))
+            .then_some(record.view)
+            .flatten()
+        })
+        .collect()
 }
 
 /// Local live sessions, including the actual credential profile after failover.

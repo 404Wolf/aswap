@@ -288,6 +288,9 @@ where
     )
     .map_err(|_| Failure::new("refresh-invalid-response"))?;
     store::json_write(&path, &auth).map_err(|_| Failure::new("usage-unavailable"))?;
+    // The old access token is already revoked: hand the new one to every
+    // live run now, before anything else, rather than on each run's tick.
+    crate::shared::hand_out(store, account, &auth);
     propagate(store, account, &auth).map_err(|_| Failure::new("usage-unavailable"))?;
     crate::usage::credentials_changed(store, account)
         .map_err(|_| Failure::new("usage-unavailable"))?;
@@ -401,6 +404,7 @@ pub(crate) fn propagate(store: &Store, account: &Account, auth: &Value) -> crate
             saved["last_refresh"] = value.clone();
         }
         store::json_write(&path, &saved)?;
+        crate::shared::hand_out(store, &other, &saved);
         crate::usage::credentials_changed(store, &other)?;
     }
     Ok(())

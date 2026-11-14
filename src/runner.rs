@@ -127,6 +127,7 @@ pub fn run(
         store.account(&store.load()?, provider, Some(&account.label))?;
     }
     let mut view = crate::shared::View::prepare(store, &account)?;
+    lease.view(&view.path)?;
     if auto_args.as_ref().is_some_and(|a| a.ambiguous) {
         let help = crate::session::option_help(provider, &view.path, args);
         auto_args = Some(crate::session::AutoArgs::parse_with_help(
@@ -238,8 +239,8 @@ pub fn run(
                     let _ = view.sync(store, &account);
                 }
             }
-            // The owner revokes the old access token as soon as it rotates, so
-            // copy a changed profile token into the view on the next tick.
+            // A refresh hands the new token to this view at once; this tick
+            // covers what a hand-out skips (an older owner, a missed view).
             if view.auth_changed(store, &account) {
                 let _ = view.sync(store, &account);
             }
@@ -423,6 +424,7 @@ pub fn run(
         lease = next_lease;
         let _ = crate::refresh::for_run(store, &account);
         view.select(store, &account)?;
+        lease.view(&view.path)?;
         if auto_args.as_ref().is_some_and(|a| a.one_shot) || !std::io::stdin().is_terminal() {
             writeln!(std::io::stderr(), "aswap: automatic restart omitted one-shot initial input/print mode; piped stdin is not replayed").safe("cannot report automatic restart")?;
             if let Some(terminal) = &mut terminal {
