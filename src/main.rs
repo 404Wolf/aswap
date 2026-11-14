@@ -517,7 +517,17 @@ fn execute(cli: Cli) -> Result<i32> {
                         aswap::coordination::spawn_sync(&store);
                     }
                     loop {
-                        let selected = runner::tick(&store, provider, activate_live)?;
+                        let selected = match runner::tick(&store, provider, activate_live) {
+                            Ok(selected) => selected,
+                            // The monitor outlives store trouble (a full disk, a
+                            // busy lock): report it and try again next tick.
+                            Err(err) if matches!(action, AutoAction::Watch) => {
+                                eprintln!("aswap: monitor tick failed ({err}); retrying");
+                                std::thread::sleep(Duration::from_secs(usage::TTL.min(60)));
+                                continue;
+                            }
+                            Err(err) => return Err(err),
+                        };
                         output(
                             &json!({"provider":provider,"selected":selected}),
                             cli.json,

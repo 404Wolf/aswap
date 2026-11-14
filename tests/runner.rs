@@ -431,6 +431,14 @@ fn a_limit_switches_only_when_the_transcript_records_it() {
 }
 
 #[test]
+fn an_unusable_store_never_ends_the_provider() {
+    // While the provider runs, the store's lock and state can't be opened (as
+    // when the disk is full): the supervisor keeps the provider running,
+    // then switches once the store is usable again.
+    runner_safety_cases(&["limitstorefull"]);
+}
+
+#[test]
 fn automatic_restarts_stop_after_eight_switches() {
     runner_safety_cases(&["boundedcap"]);
 }
@@ -474,6 +482,23 @@ if case.startswith('limit'):
         time.sleep(1.5)
         (root/'completed').write_text('synthetic tool completed')
         sys.exit(0)
+    if case=='limitstorefull':
+        # The disk fills up: the store's lock and state can't be opened.
+        store=pathlib.Path(os.environ['XDG_DATA_HOME'])/'aswap'
+        for name in ['store.lock','state.json']:
+            if (store/name).exists(): (store/name).rename(store/(name+'.away'))
+            (store/name).mkdir()
+        limit_entry(view,now())
+        print('  ⎿  '+NOTICE,flush=True)
+        # The supervisor can't decide anything now, but must not stop this
+        # provider over it.
+        time.sleep(2.5)
+        (root/'survived').write_text('provider kept running while the store was unusable')
+        for name in ['store.lock','state.json']:
+            (store/name).rmdir()
+            if (store/(name+'.away')).exists(): (store/(name+'.away')).rename(store/name)
+        time.sleep(30)
+        sys.exit(1)
     # A live limit: recorded, then shown inline or only as a menu.
     limit_entry(view,now())
     if case=='limitlive': print('  ⎿  '+NOTICE,flush=True)
@@ -655,6 +680,11 @@ time.sleep(1)
                 "{case}: every launch must resume the exact conversation"
             );
             assert!(home.join("completed").exists(), "{case}");
+            if case == "limitstorefull" {
+                assert!(home.join("survived").exists());
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(stderr.contains("the provider keeps running"), "{stderr}");
+            }
             continue;
         }
         if case.starts_with("bounded") {

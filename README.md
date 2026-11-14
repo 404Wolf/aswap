@@ -200,7 +200,10 @@ an owner replaces their usage caches. An account rejected for a usage limit come
 back only after a hold (15 minutes, doubling with each new limit on it, up to 4
 hours) and a fresh reading below the auto threshold, so a reset account is used
 again while two accounts near 100% never trade a session back and forth.
-Restarts are capped at eight per hour. Runtime auth/config
+Restarts are capped at eight per hour. A full disk or other store I/O failure
+never ends a running provider: the supervisor reports it once, keeps the
+provider running and retries; before a launch it waits (up to ten minutes)
+instead of exiting. Runtime auth/config
 views stay private under `$XDG_DATA_HOME/aswap/runtimes/`; history stays shared.
 
 Claude usage comes from the OAuth usage endpoint; Codex uses the official

@@ -53,6 +53,8 @@ pub fn run(
     args: &[String],
     auto: bool,
 ) -> Result<i32> {
+    // Nothing runs yet: wait out a full disk or a busy store rather than exit.
+    store::set_patience(PREPARE_PATIENCE);
     let mut auto_args = if auto {
         Some(crate::session::AutoArgs::parse(provider, args)?)
     } else {
@@ -219,11 +221,19 @@ pub fn run(
         if let Some(terminal) = &mut terminal {
             terminal.quiet_auth = resumed;
         }
-        lease.child(child.0.id())?;
+        // From here on the provider runs: store trouble costs at most a short
+        // wait per tick, and its bookkeeping is retried on later ticks; it
+        // never ends the provider.
+        store::set_patience(SUPERVISE_PATIENCE);
+        let mut hiccups = Hiccups::default();
+        hiccups.note("recording the session lease", lease.child(child.0.id()));
         if let Some(history) = &history_lease
             && !Arc::ptr_eq(history, &lease)
         {
-            history.history_child(child.0.id())?;
+            hiccups.note(
+                "recording the history lease",
+                history.history_child(child.0.id()),
+            );
         }
         let mut limited = false;
         let mut expired = false;
@@ -282,7 +292,7 @@ pub fn run(
                 let _ = view.sync(store, &account);
             }
             if let Some(tracker) = &mut tracker {
-                tracker.observe(child.0.id())?;
+                hiccups.note("tracking the conversation", tracker.observe(child.0.id()));
             }
             limited |= limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, false);
             if let Some(terminal) = &mut terminal {
@@ -331,7 +341,10 @@ pub fn run(
                     }
                 } else if auth_seen.is_some_and(|at| at.elapsed() >= settle) {
                     expired = true;
-                    usage::mark_auth_expired(store, &account)?;
+                    hiccups.note(
+                        "recording the expired login",
+                        usage::mark_auth_expired(store, &account),
+                    );
                     eprintln!(
                         "aswap: login expired for {provider}:{}; looking for another eligible account",
                         account.label
@@ -349,25 +362,32 @@ pub fn run(
                 );
             }
             if auto && (limited || expired || unsupported) {
-                rejected.reject(store, &account, !expired && !unsupported)?;
-                view.sync(store, &account)?;
-                let (entries, settings) = observations(store, provider)?;
-                let entries = rejected.filter(
-                    store,
-                    &account.label,
-                    settings.threshold,
-                    models.filter(store, &account.label, entries),
-                );
-                target = usage::choose(
-                    &account.label,
-                    &entries,
-                    settings.threshold,
-                    settings.prefer,
-                    settings.last_switch,
-                    now(),
-                    true,
-                )
-                .cloned();
+                let decided = (|| -> Result<Option<Account>> {
+                    rejected.reject(store, &account, !expired && !unsupported)?;
+                    view.sync(store, &account)?;
+                    let (entries, settings) = observations(store, provider)?;
+                    let entries = rejected.filter(
+                        store,
+                        &account.label,
+                        settings.threshold,
+                        models.filter(store, &account.label, entries),
+                    );
+                    Ok(usage::choose(
+                        &account.label,
+                        &entries,
+                        settings.threshold,
+                        settings.prefer,
+                        settings.last_switch,
+                        now(),
+                        true,
+                    )
+                    .cloned())
+                })();
+                // An unreadable store leaves the decision to the next tick.
+                let decided = hiccups.note("choosing another account", decided);
+                if let Some(choice) = &decided {
+                    target = choice.clone();
+                }
                 if target.is_some() && !restarts.capped() {
                     match prepare_resume(
                         store,
@@ -387,7 +407,7 @@ pub fn run(
                         }
                     }
                 }
-                if target.is_none() && !reported_none {
+                if decided.is_some() && target.is_none() && !reported_none {
                     models.report_none();
                     reported_none = true;
                 }
@@ -397,6 +417,7 @@ pub fn run(
             }
         };
         drop(child);
+        hiccups.running = false;
         if let Some(terminal) = &mut terminal {
             let screen_limit = terminal.pump(0)?;
             limited |= limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, true);
@@ -404,7 +425,7 @@ pub fn run(
             // for a transcript it created in its last moments afresh.
             quiet.apply(terminal, tracker.as_ref(), true);
         }
-        view.sync(store, &account)?;
+        hiccups.note("saving the provider's view", view.sync(store, &account));
         if !auto {
             return Ok(status.code().unwrap_or(1));
         }
@@ -438,7 +459,7 @@ pub fn run(
                 account.label
             );
             let _ = crate::refresh::for_run(store, &account);
-            view.sync(store, &account)?;
+            hiccups.note("handing over the new token", view.sync(store, &account));
             omit_one_shot(auto_args.as_ref().unwrap(), &mut terminal)?;
             launch_args = resume_args;
             switches += 1;
@@ -457,34 +478,49 @@ pub fn run(
         }
         expired |= terminal.as_ref().is_some_and(|t| t.auth_expired);
         let did_limit = limited || expired || unsupported;
+        // The provider is gone: wait out store trouble rather than give up
+        // the session.
+        store::set_patience(PREPARE_PATIENCE);
         if did_limit {
-            rejected.reject(store, &account, !expired && !unsupported)?;
+            hiccups.note(
+                "rejecting the account",
+                rejected.reject(store, &account, !expired && !unsupported),
+            );
             if expired {
-                usage::mark_auth_expired(store, &account)?;
+                hiccups.note(
+                    "recording the expired login",
+                    usage::mark_auth_expired(store, &account),
+                );
                 eprintln!(
                     "aswap: login expired for {provider}:{}; selecting another account",
                     account.label
                 );
             } else if !unsupported {
-                usage::mark_limited(store, &account)?;
+                hiccups.note("recording the limit", usage::mark_limited(store, &account));
             }
-            let (entries, settings) = observations(store, provider)?;
-            let entries = rejected.filter(
-                store,
-                &account.label,
-                settings.threshold,
-                models.filter(store, &account.label, entries),
-            );
-            target = usage::choose(
-                &account.label,
-                &entries,
-                settings.threshold,
-                settings.prefer,
-                settings.last_switch,
-                now(),
-                true,
-            )
-            .cloned();
+            let decided = (|| -> Result<Option<Account>> {
+                let (entries, settings) = observations(store, provider)?;
+                let entries = rejected.filter(
+                    store,
+                    &account.label,
+                    settings.threshold,
+                    models.filter(store, &account.label, entries),
+                );
+                Ok(usage::choose(
+                    &account.label,
+                    &entries,
+                    settings.threshold,
+                    settings.prefer,
+                    settings.last_switch,
+                    now(),
+                    true,
+                )
+                .cloned())
+            })();
+            // Keep the decision that stopped the provider if this one fails.
+            if let Some(choice) = hiccups.note("choosing another account", decided) {
+                target = choice.or(target);
+            }
         }
         // Resume the same interactive history; never replay command arguments.
         // Bound restarts even if provider observations are misleading.
@@ -506,7 +542,9 @@ pub fn run(
         };
         // Revalidate, reserve a new per-session lease and commit the decision
         // together. Other sessions using the best account do not exclude it.
-        let (next, next_lease) = {
+        // If that fails, resume on the same account: the session goes on, and
+        // a limit there is detected and acted on again.
+        let committed = (|| -> Result<(Account, Arc<crate::live::Lease>)> {
             let _lock = store.lock()?;
             let mut state = store.load()?;
             let settings = state.auto.get(&provider).cloned().unwrap_or_default();
@@ -539,18 +577,65 @@ pub fn run(
             };
             state.auto.entry(provider).or_default().last_switch = now();
             store.save(&state)?;
-            (next, next_lease)
+            Ok((next, next_lease))
+        })();
+        let (next, next_lease) = match committed {
+            Ok(next) => next,
+            Err(err) => {
+                eprintln!(
+                    "aswap: cannot switch accounts ({err}); resuming on {provider}:{}",
+                    account.label
+                );
+                (account.clone(), Arc::clone(&lease))
+            }
         };
         drop(lease);
         account = next;
         lease = next_lease;
         let _ = crate::refresh::for_run(store, &account);
         view.select(store, &account)?;
-        lease.view(&view.path)?;
+        hiccups.note("recording the session's view", lease.view(&view.path));
         omit_one_shot(auto_args.as_ref().unwrap(), &mut terminal)?;
         launch_args = resume_args;
         switches += 1;
         restarts.record();
+    }
+}
+/// How long store I/O retries while no provider runs (preparing a launch or a
+/// restart), and while one does (then its bookkeeping retries next tick).
+const PREPARE_PATIENCE: Duration = Duration::from_secs(600);
+const SUPERVISE_PATIENCE: Duration = Duration::from_secs(1);
+/// Store trouble met while supervising a provider: reported once per kind
+/// per launch, never fatal to the provider.
+struct Hiccups {
+    seen: std::collections::BTreeSet<&'static str>,
+    /// Whether the provider is still running (it only affects the report).
+    running: bool,
+}
+impl Default for Hiccups {
+    fn default() -> Self {
+        Self {
+            seen: Default::default(),
+            running: true,
+        }
+    }
+}
+impl Hiccups {
+    fn note<T>(&mut self, what: &'static str, result: Result<T>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(err) => {
+                if self.seen.insert(what) {
+                    let then = if self.running {
+                        "the provider keeps running"
+                    } else {
+                        "carrying on without it"
+                    };
+                    eprintln!("aswap: {what} failed ({err}); {then}");
+                }
+                None
+            }
+        }
     }
 }
 /// Whether the provider hit a usage limit. Claude records each limit in its

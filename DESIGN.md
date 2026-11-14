@@ -101,6 +101,16 @@ a session living for days could exhaust it and then sit at a limit). Limit
 rejections lapse after a doubling hold once a fresh reading is below the
 threshold; login and model rejections last the run. No code changes the caller's cwd.
 
+Store trouble (a full disk, EIO, EAGAIN) never ends a provider. Store locks and
+private writes retry with backoff; a supervisor waits up to ten minutes while
+no provider runs (preparing a launch or a restart) and one second per attempt
+while one does, when a failed bookkeeping step (leases, tracking, choosing an
+account, recording a limit) is reported once and retried on later ticks. If
+a switch can't be committed, the conversation resumes on the same account. The
+monitor logs a failed tick and tries again. Locks and directories are chmodded
+only when their mode differs, since a full ZFS/btrfs refuses even an unchanged
+chmod.
+
 OAuth refresh now follows the provider-native flows below on an explicit owner.
 Every managed CLI receives an access-only view, on the owner as well as followers.
 Active local runs refresh canonical credentials through aswap; inactive background
