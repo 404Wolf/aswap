@@ -13,6 +13,16 @@ Gitea. Push only there. `github.com/404Wolf/aswap` is a mirror of it: don't push
 to it directly, so the two mains can't diverge again as they did on
 2026-11-11.
 
+Home Manager fetches aswap from the GitHub mirror, because not every
+machine can reach the Gitea. Its pin must be a commit that is already on
+Gitea main. Until Gitea pushes to the mirror itself, mirror by hand after
+each push to Gitea, as a fast-forward of the same commit:
+
+```sh
+git push origin main
+git push https://github.com/404Wolf/aswap.git main:main
+```
+
 ## Install
 
 From this checkout:
