@@ -23,6 +23,9 @@ const TAIL: u64 = 1024 * 1024;
 const STEP: u64 = 4 * 1024 * 1024;
 /// A line longer than this is skipped (Claude's error entries are small).
 const LINE: usize = 1024 * 1024;
+/// How many bytes before the read position are kept to notice a transcript
+/// rewritten in place (truncated and written again, to any length).
+const ANCHOR: usize = 256;
 /// Without a known transcript, a limit on screen counts only when shown this
 /// long after launch: a resumed provider's redraw is over by then.
 pub const UNCONFIRMED: Duration = Duration::from_secs(10);
@@ -40,8 +43,19 @@ pub struct Limits {
 struct Tail {
     path: PathBuf,
     offset: u64,
+    /// The bytes just before `offset`, as last read.
+    anchor: Vec<u8>,
     partial: Vec<u8>,
     skipping: bool,
+}
+
+/// Up to `ANCHOR` bytes of `file` just before `offset`.
+fn anchor(file: &mut File, offset: u64) -> Option<Vec<u8>> {
+    let start = offset.saturating_sub(ANCHOR as u64);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(offset - start).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 impl Limits {
@@ -97,9 +111,14 @@ impl Limits {
 
 impl Tail {
     fn at(path: PathBuf, offset: u64, skipping: bool) -> Self {
+        let anchor = File::open(&path)
+            .ok()
+            .and_then(|mut file| anchor(&mut file, offset))
+            .unwrap_or_default();
         Self {
             path,
             offset,
+            anchor,
             partial: Vec::new(),
             skipping,
         }
@@ -131,9 +150,13 @@ impl Tail {
         let Ok(len) = file.metadata().map(|m| m.len()) else {
             return false;
         };
-        if len < self.offset {
-            // Replaced or truncated: read the new file from its start.
+        if len < self.offset
+            || anchor(&mut file, self.offset).is_none_or(|bytes| bytes != self.anchor)
+        {
+            // Truncated or rewritten: read it again from its start (entries
+            // from before launch are told apart by their timestamps).
             self.offset = 0;
+            self.anchor.clear();
             self.partial.clear();
             self.skipping = false;
         }
@@ -141,10 +164,14 @@ impl Tail {
             return false;
         }
         let mut chunk = Vec::new();
-        let Ok(n) = file.take(STEP).read_to_end(&mut chunk) else {
+        let Ok(n) = (&mut file).take(STEP).read_to_end(&mut chunk) else {
             return false;
         };
         self.offset += n as u64;
+        self.anchor
+            .extend_from_slice(&chunk[chunk.len().saturating_sub(ANCHOR)..]);
+        let excess = self.anchor.len().saturating_sub(ANCHOR);
+        self.anchor.drain(..excess);
         let mut found = false;
         for byte in chunk {
             if byte != b'\n' {
@@ -318,6 +345,20 @@ mod tests {
             .unwrap()
             .write_all((entry(SystemTime::now(), "rate_limit") + "\n").as_bytes())
             .unwrap();
+        assert!(limits.check(Some(&tracker), false, false));
+    }
+
+    #[test]
+    fn a_transcript_rewritten_to_the_same_length_is_read_again() {
+        let first = entry(hours_ago(4), "rate_limit") + "\n";
+        let (_home, path, tracker) = setup(&first);
+        let mut limits = Limits::new(Some(&tracker));
+        assert!(!limits.check(Some(&tracker), false, false));
+        // Truncated and written again; a live limit of exactly the old length.
+        std::thread::sleep(Duration::from_millis(5));
+        let live = entry(SystemTime::now(), "rate_limit") + "\n";
+        assert_eq!(live.len(), first.len());
+        std::fs::write(&path, &live).unwrap();
         assert!(limits.check(Some(&tracker), false, false));
     }
 
