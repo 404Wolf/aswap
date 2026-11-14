@@ -358,6 +358,21 @@ rotation; no peer silently becomes an owner. Provider token
 reload behavior is version-sensitive and synthetic process tests cannot prove
 arbitrary future provider versions; explicit resume is the recovery path.
 
+A login error whose account token changed after the provider started is a
+rotation race, not an expired account: the run resumes the exact conversation
+on the same account (at most three times per run) and marks the account expired
+only when a provider started with the current token fails too. A restarted
+provider redraws the conversation it resumes, old errors included, so its login
+errors are held with their read times; those read more than 50ms after its
+transcript first changes (the resume prompt being recorded) count, earlier ones
+are the redraw, and after 10 seconds without a change the held ones are dropped.
+This assumes `claude --resume` appends to the same transcript and redraws
+before writing to it; not yet checked against a real Claude. Follow-ups:
+a Codex `resume` that writes a new rollout file under the same id leaves the
+tracker on the old file, so held errors wait the full 10 seconds; and limit and
+model-unsupported lines are not held, so a redrawn limit message can still mark
+the account a run has just failed over to (older than this change).
+
 Every owner request shares its existing store-locked per-profile TTL/backoff, so
 three monitors do not triple quota API traffic. Peers serialize SSH pulls and
 schedule them using receipt time on their own clock, not remote wall-clock order.

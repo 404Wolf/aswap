@@ -388,6 +388,8 @@ fn above_threshold_fallback_skips_rejected_accounts_and_aliases_after_cache_repl
 fn a_login_error_right_after_a_rotation_resumes_on_the_same_account() {
     // rotation401: the token rotated under the provider, so the account is
     // fine, even though the resumed provider redraws the old login error.
+    // rotationredraw401: the same, with the redraw read 20ms after the
+    // resume prompt is recorded.
     // rotationlate401: the conversation is identified only after the error;
     // the run keeps retrying and resumes once it is known. rotationcap401:
     // after three same-account restarts the account counts as expired.
@@ -396,6 +398,7 @@ fn a_login_error_right_after_a_rotation_resumes_on_the_same_account() {
     // too, so the account really expired and the run fails over.
     runner_safety_cases(&[
         "rotation401",
+        "rotationredraw401",
         "rotationlate401",
         "rotationcap401",
         "rotationfail401",
@@ -429,17 +432,25 @@ if case.startswith('rotation'):
     with (root/'identities').open('a') as f: f.write(token+'\n')
     first=len((root/'calls').read_text().splitlines())==1
     if not first:
-        # A resumed Claude redraws the conversation, including the error
-        # that ended the previous provider...
-        print('  ⎿ Login expired · Please run /login',flush=True)
-        time.sleep(.3)
-        # ...then records the resume prompt and makes a live API call.
         transcript=view/'projects'/'-synthetic'/('11111111-2222-4333-8444-555555555555.jsonl')
         transcript.parent.mkdir(parents=True,exist_ok=True)
-        with transcript.open('a') as t: t.write('{"synthetic":"resume prompt"}\n')
+        def record():
+            with transcript.open('a') as t: t.write('{"synthetic":"resume prompt"}\n')
+        if case=='rotationredraw401':
+            # The redraw reaches the terminal just after the prompt is recorded.
+            record()
+            time.sleep(.02)
+            print('  ⎿ Login expired · Please run /login',flush=True)
+        else:
+            # A resumed Claude redraws the conversation, including the error
+            # that ended the previous provider...
+            print('  ⎿ Login expired · Please run /login',flush=True)
+            time.sleep(.3)
+            # ...then records the resume prompt and makes a live API call.
+            record()
         # A revoked token fails fast: one quick 401 and a failed refresh.
         time.sleep(.15 if case=='rotationfast401' else 1.5)
-    if token=='synthetic-two' or (case in ('rotation401','rotationlate401') and not first):
+    if token=='synthetic-two' or (case in ('rotation401','rotationredraw401','rotationlate401') and not first):
         (root/'completed').write_text('resumed provider completed its work')
         sys.exit(0)
     if token.startswith('synthetic-one') and (first or case=='rotationcap401'):

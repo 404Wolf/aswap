@@ -576,7 +576,11 @@ impl Quiet {
             return;
         }
         if self.transcript.is_none() {
+            // Found only now: its stamp at discovery is the baseline, so
+            // finding it does not count as the prompt being recorded.
             self.transcript = tracker.and_then(|t| t.transcript());
+            self.launch = self.transcript.as_deref().and_then(crate::shared::stamp);
+            return;
         }
         if let Some(path) = &self.transcript
             && crate::shared::stamp(path) != self.launch
