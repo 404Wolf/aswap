@@ -181,6 +181,14 @@ pub fn run(
             account.label,
             std::process::id()
         );
+        // A restarted provider redraws the conversation it resumes, including
+        // the login error that ended the previous one. Ignore its login
+        // errors until it has recorded the resume prompt in the transcript
+        // (a live API call can only fail after that), or RESUME_QUIET at most.
+        let resumed = switches > 0;
+        let quiet_from = Instant::now();
+        let launch_transcript = tracker.as_ref().and_then(|t| t.transcript());
+        let mut recorded: Option<Instant> = None;
         let mut cmd = provider.command(&view.path);
         cmd.args(&launch_args);
         let supervisor = std::process::id();
@@ -209,6 +217,9 @@ pub fn run(
             },
             auto,
         );
+        if let Some(terminal) = &mut terminal {
+            terminal.quiet_auth = resumed;
+        }
         lease.child(child.0.id())?;
         if let Some(history) = &history_lease
             && !Arc::ptr_eq(history, &lease)
@@ -261,6 +272,18 @@ pub fn run(
             if let Some(tracker) = &mut tracker {
                 tracker.observe(child.0.id())?;
             }
+            if let Some(terminal) = terminal.as_mut().filter(|t| t.quiet_auth) {
+                if recorded.is_none()
+                    && tracker.as_ref().and_then(|t| t.transcript()) != launch_transcript
+                {
+                    recorded = Some(Instant::now());
+                }
+                if quiet_from.elapsed() >= RESUME_QUIET
+                    || recorded.is_some_and(|at| at.elapsed() >= RESUME_LIVE)
+                {
+                    terminal.quiet_auth = false;
+                }
+            }
             if let Some(status) = child.0.try_wait().safe("cannot wait for provider")? {
                 break status;
             }
@@ -282,8 +305,8 @@ pub fn run(
                 {
                     // The provider called the API in the moment between the
                     // revocation and its view getting the new token. The
-                    // account is fine: resume the conversation on it.
-                    rotated = true;
+                    // account is fine: resume the conversation on it. Until
+                    // the conversation is known, retry on every tick.
                     match prepare_resume(
                         store,
                         provider,
@@ -291,6 +314,7 @@ pub fn run(
                         tracker.as_ref().unwrap(),
                     ) {
                         Ok(args) => {
+                            rotated = true;
                             prepared_resume = Some(args);
                             break stop(&mut child.0)?;
                         }
@@ -520,6 +544,12 @@ pub fn run(
 const AUTH_RESTARTS: u32 = 3;
 /// How long a follower waits for the owner's rotated token after a login error.
 const AUTH_SETTLE: Duration = Duration::from_secs(10);
+/// Login errors from a restarted provider count this long after it records
+/// the resume prompt, or after RESUME_QUIET if that is never seen. Its
+/// redraw comes before the prompt; a live failure takes at least an API
+/// call and a refresh attempt after it.
+const RESUME_LIVE: Duration = Duration::from_millis(500);
+const RESUME_QUIET: Duration = Duration::from_secs(10);
 /// A digest of an auth file's access token: enough to tell that the token
 /// changed, without keeping the token itself in memory.
 fn access_print(provider: Provider, path: &std::path::Path) -> Option<Vec<u8>> {

@@ -346,8 +346,10 @@ Whoever writes a rotated token into a profile (the owner's refresh, a duplicate
 alias, a follower installing a packet) hands it to every live run's view in the
 same pass: each liveness record names its run's view, and each view is replaced
 by temporary file and rename under the view's own lock (`run-*.lock` beside it,
-holding the label of the account the view carries), with no store lock and no
-fsync. A view that has switched to another account is skipped. Forty views take
+holding the label of the account the view carries), with no fsync. The
+hand-out takes no store lock of its own: every writer already holds it, so all
+views are written within that one hold instead of each run taking the lock in
+turn. A view that has switched to another account is skipped. Forty views take
 tens of milliseconds, where copying on each run's tick took seconds, and the
 provider never reads a partial file. Live views still stat their profile auth
 every 250ms and copy a changed token, for runs from older releases. If the

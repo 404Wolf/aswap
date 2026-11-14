@@ -287,8 +287,25 @@ fn tokens_refresh_well_before_expiry_but_short_lived_ones_do_not_spin() {
             .unwrap()
         );
     }
+    // A token that is useless at once (a one-second lifetime, or a clock
+    // running ahead) still rotates at most once a minute.
+    let at = due + 300;
     assert!(
-        refresh::refresh_with(&store, &a, due + 300, false, |_, _| Ok(
+        refresh::refresh_with(&store, &a, at, false, |_, _| Ok(
+            json!({"access_token":"synthetic-instant","expires_in":1})
+        ))
+        .unwrap()
+    );
+    for later in [at + 1, at + refresh::MIN_INTERVAL - 1] {
+        assert!(
+            !refresh::refresh_with(&store, &a, later, false, |_, _| panic!(
+                "an expired token must not rotate on every check"
+            ))
+            .unwrap()
+        );
+    }
+    assert!(
+        refresh::refresh_with(&store, &a, at + refresh::MIN_INTERVAL, false, |_, _| Ok(
             json!({"access_token":"synthetic-next","expires_in":3600})
         ))
         .unwrap()

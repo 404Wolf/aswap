@@ -45,6 +45,9 @@ pub struct Terminal {
     diagnostics: Diagnostics,
     pub auth_expired: bool,
     pub model_unsupported: bool,
+    /// While set, login errors in the output are not counted: the provider
+    /// is redrawing a resumed conversation, not reporting a live failure.
+    pub quiet_auth: bool,
 }
 impl Terminal {
     pub fn open() -> Result<Self> {
@@ -97,6 +100,7 @@ impl Terminal {
             diagnostics: Diagnostics::default(),
             auth_expired: false,
             model_unsupported: false,
+            quiet_auth: false,
         })
     }
     pub fn spawn(&mut self, command: &mut Command) -> Result<Child> {
@@ -122,6 +126,7 @@ impl Terminal {
         self.diagnostics = Diagnostics::default();
         self.auth_expired = false;
         self.model_unsupported = false;
+        self.quiet_auth = false;
         self.resize();
         command.spawn().safe("cannot launch provider in terminal")
     }
@@ -194,7 +199,7 @@ impl Terminal {
                     stdout.flush().safe("cannot flush provider output")?;
                     let signals = self.diagnostics.feed(&buffer[..n]);
                     limited = signals.0;
-                    self.auth_expired |= signals.1;
+                    self.auth_expired |= signals.1 && !self.quiet_auth;
                     self.model_unsupported |= signals.2;
                 }
                 Err(e) if e.raw_os_error() == Some(libc::EIO) => {}

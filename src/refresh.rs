@@ -14,6 +14,8 @@ pub const CODEX_CLIENT: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// old access token at once however early it happens, so the margin is room
 /// for the failure backoff (1, 2, 4 then 8 minutes) to retry before expiry.
 pub const MARGIN: u64 = 900;
+/// The shortest time between two unforced refreshes of one login.
+pub const MIN_INTERVAL: u64 = 60;
 pub fn expires_at(provider: Provider, auth: &Value) -> Option<u64> {
     if provider == Provider::Claude {
         auth.pointer("/claudeAiOauth/expiresAt")?
@@ -299,13 +301,14 @@ where
     crate::usage::credentials_changed(store, account)
         .map_err(|_| Failure::new("usage-unavailable"))?;
     // A token that lives under twice the margin would be due again soon, or
-    // on every check: the next unforced refresh waits half its lifetime.
+    // on every check: the next unforced refresh waits half its lifetime, and
+    // never less than a minute, even for a token that is already expired.
     let lifetime = expires_at(account.provider, &auth).map(|expiry| expiry.saturating_sub(at));
     if let Some(lifetime) = lifetime.filter(|lifetime| *lifetime < MARGIN.saturating_mul(2)) {
         store::json_write(
             &gate,
             &Backoff {
-                next: at.saturating_add(lifetime / 2),
+                next: at.saturating_add((lifetime / 2).max(MIN_INTERVAL)),
                 failures: 0,
             },
         )

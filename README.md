@@ -530,7 +530,9 @@ on the **same** account with the new token instead (at most three times per
 run, within the usual cap of eight restarts). The account is only marked
 expired, and the run moves to another, when a provider started with the current
 token fails too. A follower first waits up to 10 seconds for the owner's new
-token, and asks the owner for it at once.
+token, and asks the owner for it at once. A resumed provider redraws its
+conversation, including the error that ended the previous provider, so its login
+errors only count once it has recorded the resume prompt (or after 10 seconds).
 
 Refresh tokens are normally renewed automatically. A revoked/expired refresh
 login needs the provider's interactive login again. In an owner/follower setup,

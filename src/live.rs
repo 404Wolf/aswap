@@ -290,3 +290,68 @@ mod session_tests {
         assert!(sessions(&store).unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+mod hand_out_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    #[test]
+    fn hand_out_skips_dead_viewless_lockless_and_vanished_views() {
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let a = Account {
+            provider: crate::provider::Provider::Claude,
+            label: "one".into(),
+        };
+        let old = json!({"claudeAiOauth":{"accessToken":"synthetic-old","refreshToken":"synthetic-old-sentinel"}});
+        let view = |name: &str, lock: bool| {
+            let path = store.root.join("runtimes/claude/one").join(name);
+            store::json_write(&path.join(".credentials.json"), &old).unwrap();
+            if lock {
+                fs::write(path.with_extension("lock"), "one").unwrap();
+            }
+            path
+        };
+        let live = view("run-live", true);
+        // A run from an older release has no view lock.
+        let lockless = view("run-lockless", false);
+        let dead = view("run-dead", true);
+        let vanished = view("run-vanished", true);
+        fs::remove_dir_all(&vanished).unwrap();
+        let _lock = store.lock().unwrap();
+        let _leases: Vec<Lease> = [
+            Some(&live),
+            Some(&lockless),
+            Some(&dead),
+            Some(&vanished),
+            None,
+        ]
+        .into_iter()
+        .map(|path| {
+            let lease = register(&store, &a).unwrap();
+            if let Some(path) = path {
+                let mut record: Record = store::json_read(&lease.path).unwrap();
+                record.view = Some(path.clone());
+                if path == &dead {
+                    record.parent.start += 1;
+                }
+                store::json_write(&lease.path, &record).unwrap();
+            }
+            lease
+        })
+        .collect();
+        let new = json!({"claudeAiOauth":{"accessToken":"synthetic-new","refreshToken":"synthetic-real-refresh","expiresAt":1000}});
+        assert_eq!(crate::shared::hand_out(&store, &a, &new), 1);
+        let token = |path: &PathBuf| -> Value {
+            store::json_read::<Value>(&path.join(".credentials.json")).unwrap()["claudeAiOauth"]
+                ["accessToken"]
+                .clone()
+        };
+        assert_eq!(token(&live), "synthetic-new");
+        assert_eq!(token(&lockless), "synthetic-old");
+        assert_eq!(token(&dead), "synthetic-old");
+        assert!(!vanished.exists());
+        let handed: Value = store::json_read(&live.join(".credentials.json")).unwrap();
+        assert_eq!(handed["claudeAiOauth"]["refreshToken"], "aswap-owner-managed");
+    }
+}

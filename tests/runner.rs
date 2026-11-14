@@ -387,9 +387,18 @@ fn above_threshold_fallback_skips_rejected_accounts_and_aliases_after_cache_repl
 #[test]
 fn a_login_error_right_after_a_rotation_resumes_on_the_same_account() {
     // rotation401: the token rotated under the provider, so the account is
-    // fine. rotationfail401: a provider started with the fresh token fails
+    // fine, even though the resumed provider redraws the old login error.
+    // rotationlate401: the conversation is identified only after the error;
+    // the run keeps retrying and resumes once it is known. rotationcap401:
+    // after three same-account restarts the account counts as expired.
+    // rotationfail401: a provider started with the fresh token fails
     // too, so the account really expired and the run fails over.
-    runner_safety_cases(&["rotation401", "rotationfail401"]);
+    runner_safety_cases(&[
+        "rotation401",
+        "rotationlate401",
+        "rotationcap401",
+        "rotationfail401",
+    ]);
 }
 
 #[test]
@@ -413,21 +422,38 @@ case=os.environ['ASWAP_SAFETY_CASE']
 if '--help' in sys.argv: sys.exit(0)
 with (root/'calls').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
 if case.startswith('rotation'):
-    token=json.loads((pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])/'.credentials.json').read_text())['claudeAiOauth']['accessToken']
+    view=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])
+    token=json.loads((view/'.credentials.json').read_text())['claudeAiOauth']['accessToken']
     with (root/'identities').open('a') as f: f.write(token+'\n')
-    if token=='synthetic-two' or (case=='rotation401' and token=='synthetic-one-rotated'):
+    first=len((root/'calls').read_text().splitlines())==1
+    if not first:
+        # A resumed Claude redraws the conversation, including the error
+        # that ended the previous provider...
+        print('  ⎿ Login expired · Please run /login',flush=True)
+        time.sleep(.3)
+        # ...then records the resume prompt and makes a live API call.
+        transcript=view/'projects'/'-synthetic'/('11111111-2222-4333-8444-555555555555.jsonl')
+        transcript.parent.mkdir(parents=True,exist_ok=True)
+        with transcript.open('a') as t: t.write('{"synthetic":"resume prompt"}\n')
+        time.sleep(1.5)
+    if token=='synthetic-two' or (case in ('rotation401','rotationlate401') and not first):
         (root/'completed').write_text('resumed provider completed its work')
         sys.exit(0)
-    if token=='synthetic-one':
+    if token.startswith('synthetic-one') and (first or case=='rotationcap401'):
         # The owner rotates the account mid-call and the old token is revoked
         # before this provider's view has the new one.
         profile=pathlib.Path(os.environ['ASWAP_TEST_CACHE']).parent/'.credentials.json'
         data=json.loads(profile.read_text())
-        data['claudeAiOauth']['accessToken']='synthetic-one-rotated'
+        data['claudeAiOauth']['accessToken']=token+('-rotated' if first else '-again')
         rotating=profile.with_name('.credentials.rotating')
         rotating.write_text(json.dumps(data))
         rotating.replace(profile)
     print('Login expired · Please run /login',flush=True)
+    if case=='rotationlate401' and first:
+        # Only now does the provider register its conversation.
+        time.sleep(.8)
+        (view/'sessions'/(str(os.getpid())+'.json')).write_text(json.dumps({'pid':os.getpid(),'sessionId':'11111111-2222-4333-8444-555555555555'}))
+        time.sleep(30)
     time.sleep(.4)
     sys.exit(1)
 if case.startswith('bounded'):
@@ -500,7 +526,13 @@ time.sleep(1)
         if case.starts_with("rotation") {
             let identities = fs::read_to_string(home.join("identities")).unwrap();
             let mut expected = vec!["synthetic-one", "synthetic-one-rotated"];
-            if case == "rotationfail401" {
+            if case == "rotationcap401" {
+                expected.extend([
+                    "synthetic-one-rotated-again",
+                    "synthetic-one-rotated-again-again",
+                ]);
+            }
+            if matches!(case, "rotationfail401" | "rotationcap401") {
                 expected.push("synthetic-two");
             }
             assert_eq!(identities.lines().collect::<Vec<_>>(), expected, "{case}");
@@ -508,18 +540,24 @@ time.sleep(1)
             assert!(
                 calls
                     .lines()
+                    .skip(1)
                     .all(|call| call.contains("--resume") && call.contains(ID)),
                 "{case}: every restart must resume the exact conversation"
             );
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert_eq!(
                 stderr.matches("resuming on the same account").count(),
-                1,
+                if case == "rotationcap401" { 3 } else { 1 },
                 "{case}: {stderr}"
             );
             assert_eq!(
                 stderr.contains("login expired for claude:one"),
-                case == "rotationfail401",
+                matches!(case, "rotationfail401" | "rotationcap401"),
+                "{case}: {stderr}"
+            );
+            assert_eq!(
+                stderr.contains("keeping the current provider running"),
+                case == "rotationlate401",
                 "{case}: {stderr}"
             );
             assert!(home.join("completed").exists(), "{case}");
@@ -679,7 +717,7 @@ fn runner_safety_child() {
                 .join("usage-cache.json"),
         );
     }
-    let args = if case == "unknown" {
+    let args = if matches!(case.as_str(), "unknown" | "rotationlate401") {
         vec!["--continue".into()]
     } else if case == "ambiguous" {
         vec![
@@ -698,7 +736,7 @@ fn runner_safety_child() {
         assert_ne!(result.unwrap(), 0);
     } else if matches!(case.as_str(), "unknown" | "ambiguous") {
         assert!(result.is_err());
-    } else if case == "rotationfail401" {
+    } else if matches!(case.as_str(), "rotationfail401" | "rotationcap401") {
         assert_eq!(result.unwrap(), 0);
         let cache: Cached = store::json_read(
             &store
