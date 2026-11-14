@@ -10,6 +10,10 @@ use std::io::Read;
 // Public OAuth application identifiers from the providers' published clients.
 pub const CLAUDE_CLIENT: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const CODEX_CLIENT: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+/// Refresh this many seconds before a token expires. A rotation revokes the
+/// old access token at once however early it happens, so the margin is room
+/// for the failure backoff (1, 2, 4 then 8 minutes) to retry before expiry.
+pub const MARGIN: u64 = 900;
 pub fn expires_at(provider: Provider, auth: &Value) -> Option<u64> {
     if provider == Provider::Claude {
         auth.pointer("/claudeAiOauth/expiresAt")?
@@ -236,7 +240,7 @@ where
     }
     if !force
         && !expires_at(account.provider, &old)
-            .is_some_and(|expiry| expiry <= at.saturating_add(300))
+            .is_some_and(|expiry| expiry <= at.saturating_add(MARGIN))
     {
         return Ok(false);
     }
@@ -294,7 +298,19 @@ where
     propagate(store, account, &auth).map_err(|_| Failure::new("usage-unavailable"))?;
     crate::usage::credentials_changed(store, account)
         .map_err(|_| Failure::new("usage-unavailable"))?;
-    if gate.exists() {
+    // A token that lives under twice the margin would be due again soon, or
+    // on every check: the next unforced refresh waits half its lifetime.
+    let lifetime = expires_at(account.provider, &auth).map(|expiry| expiry.saturating_sub(at));
+    if let Some(lifetime) = lifetime.filter(|lifetime| *lifetime < MARGIN.saturating_mul(2)) {
+        store::json_write(
+            &gate,
+            &Backoff {
+                next: at.saturating_add(lifetime / 2),
+                failures: 0,
+            },
+        )
+        .map_err(|_| Failure::new("usage-unavailable"))?;
+    } else if gate.exists() {
         std::fs::remove_file(&gate).map_err(|_| Failure::new("usage-unavailable"))?;
     }
     Ok(true)

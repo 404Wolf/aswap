@@ -274,8 +274,14 @@ records while preserving unrelated extensions, including when those aliases are
 in use. Live views cannot restore stale tokens: all runtimes use access-only
 credentials and periodically re-read canonical auth. Refresh failures share an
 identity cooldown (exponential up to 15m, honoring longer Retry-After); explicit
-forced refresh can bypass it. Usage-only app-servers also receive access-only
-auth snapshots. No real credential or transcript files were used in tests.
+forced refresh can bypass it. Unforced refresh starts 15 minutes before expiry
+(refresh::MARGIN, formerly 5), so the cooldown has room to retry before the
+token lapses; a token that lives under 30 minutes waits half its lifetime
+between unforced rotations instead of rotating on every check. No grace period
+is assumed: the refresh_token grant is the only one the published clients use,
+and on Nov 14 the old access token failed within two seconds of a rotation.
+Moving the refresh earlier does not shrink that window; the hand-out does.
+Usage-only app-servers also receive access-only auth snapshots. No real credential or transcript files were used in tests.
 
 Claude also keeps MCP server OAuth (`mcpOAuth`: dynamic client registrations,
 access and refresh tokens) in .credentials.json. That state belongs to the user,

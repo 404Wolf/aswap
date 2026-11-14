@@ -256,3 +256,41 @@ fn failed_refresh_is_cooled_down_across_live_sessions() {
         .unwrap()
     );
 }
+
+#[test]
+fn tokens_refresh_well_before_expiry_but_short_lived_ones_do_not_spin() {
+    let (_t, store, a) = seed();
+    coordination::owner(&store).unwrap();
+    let _lock = store.lock().unwrap();
+    // The seeded token expires at 999s.
+    let early = 999 - refresh::MARGIN - 1;
+    assert!(
+        !refresh::refresh_with(&store, &a, early, false, |_, _| panic!(
+            "a token outside the margin must not rotate"
+        ))
+        .unwrap()
+    );
+    let due = 999 - refresh::MARGIN;
+    assert!(
+        refresh::refresh_with(&store, &a, due, false, |_, _| Ok(
+            json!({"access_token":"synthetic-short","expires_in":600})
+        ))
+        .unwrap()
+    );
+    // A 600s token is always inside the 900s margin, yet the next unforced
+    // refresh waits half its lifetime instead of rotating on every check.
+    for at in [due + 1, due + 299] {
+        assert!(
+            !refresh::refresh_with(&store, &a, at, false, |_, _| panic!(
+                "a short-lived token must not rotate on every check"
+            ))
+            .unwrap()
+        );
+    }
+    assert!(
+        refresh::refresh_with(&store, &a, due + 300, false, |_, _| Ok(
+            json!({"access_token":"synthetic-next","expires_in":3600})
+        ))
+        .unwrap()
+    );
+}
