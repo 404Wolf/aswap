@@ -432,9 +432,9 @@ fn a_limit_switches_only_when_the_transcript_records_it() {
 
 #[test]
 fn an_unusable_store_never_ends_the_provider() {
-    // While the provider runs, the store's lock and state can't be opened (as
-    // when the disk is full): the supervisor keeps the provider running,
-    // then switches once the store is usable again.
+    // While the provider runs, the store's lock and state can't be opened for
+    // five seconds (as when the disk is full): the supervisor keeps the
+    // provider running, then switches once the store is usable again.
     runner_safety_cases(&["limitstorefull"]);
 }
 
@@ -491,8 +491,9 @@ if case.startswith('limit'):
         limit_entry(view,now())
         print('  ⎿  '+NOTICE,flush=True)
         # The supervisor can't decide anything now, but must not stop this
-        # provider over it.
-        time.sleep(2.5)
+        # provider over it. Long enough for several of its 1s lock attempts
+        # to fail, including the one choosing another account.
+        time.sleep(5)
         (root/'survived').write_text('provider kept running while the store was unusable')
         for name in ['store.lock','state.json']:
             (store/name).rmdir()
@@ -683,7 +684,16 @@ time.sleep(1)
             if case == "limitstorefull" {
                 assert!(home.join("survived").exists());
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                assert!(stderr.contains("the provider keeps running"), "{stderr}");
+                // Choosing an account failed while the store was unusable,
+                // without stopping the provider; once the store is back the
+                // run switches (the commit itself succeeded, so no
+                // same-account fallback).
+                assert!(
+                    stderr.contains("choosing another account failed")
+                        && stderr.contains("the provider keeps running"),
+                    "{stderr}"
+                );
+                assert!(stderr.contains("using claude:two"), "{stderr}");
             }
             continue;
         }
