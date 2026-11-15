@@ -393,9 +393,12 @@ impl Tracker {
         };
         if let Some(id) = registered {
             self.known = Some(id);
-        } else if self.provider == Provider::Claude && self.known.is_some() {
-            // An explicit/previously proven Claude UUID is not invalidated by
-            // shared history activity. Open files may belong to subagents.
+        } else if self.known.is_some() && (self.provider == Provider::Claude || owned.is_empty()) {
+            // Shared history activity cannot contradict a known UUID. In
+            // particular, an exited Codex has no descriptors left: another
+            // terminal writing then must not strand its exact resume ID.
+            // Claude's open files may belong to subagents; Codex can still
+            // prove an actual session change with its owned rollout below.
         } else if owned.len() == 1 {
             self.known = owned.into_iter().next();
         } else if owned.len() > 1 || changed.iter().any(|s| self.known.as_ref() != Some(s)) {
@@ -536,5 +539,53 @@ mod tracker_tests {
             let tracker = Tracker::new(provider, home.path(), parsed.id).unwrap();
             assert!(tracker.id().is_err());
         }
+    }
+
+    fn rollout(home: &Path, id: &str) -> PathBuf {
+        let dir = home.join("sessions");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-synthetic-{id}.jsonl"));
+        fs::write(&path, "synthetic").unwrap();
+        path
+    }
+
+    #[test]
+    fn explicit_codex_identity_survives_other_sessions_writing_after_child_exit() {
+        let home = tempfile::tempdir().unwrap();
+        let mut tracker = Tracker::new(Provider::Codex, home.path(), Some(MAIN.into())).unwrap();
+        let other = rollout(home.path(), OTHER);
+        // No rollout is held by this child (as after it exits).
+        tracker.observe(std::process::id()).unwrap();
+        assert_eq!(tracker.id().unwrap(), MAIN);
+        fs::write(other, "synthetic changed by another session").unwrap();
+        tracker.observe(std::process::id()).unwrap();
+        assert_eq!(tracker.id().unwrap(), MAIN);
+    }
+
+    #[test]
+    fn codex_owned_rollouts_still_prove_changes_and_refuse_ambiguity() {
+        let home = tempfile::tempdir().unwrap();
+        let mut tracker = Tracker::new(Provider::Codex, home.path(), Some(MAIN.into())).unwrap();
+        let other = rollout(home.path(), OTHER);
+        let held = fs::File::open(other).unwrap();
+        tracker.observe(std::process::id()).unwrap();
+        assert_eq!(tracker.id().unwrap(), OTHER);
+        let main = rollout(home.path(), MAIN);
+        let _main_held = fs::File::open(main).unwrap();
+        tracker.observe(std::process::id()).unwrap();
+        assert!(
+            tracker.id().is_err(),
+            "two owned identities remain ambiguous"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn unowned_codex_history_does_not_establish_an_unknown_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let mut tracker = Tracker::new(Provider::Codex, home.path(), None).unwrap();
+        rollout(home.path(), OTHER);
+        tracker.observe(std::process::id()).unwrap();
+        assert!(tracker.id().is_err());
     }
 }
