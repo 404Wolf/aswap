@@ -151,6 +151,14 @@ impl Terminal {
     }
     /// Forward terminal I/O and inspect a bounded trailing slice for limit errors.
     pub fn pump(&mut self, wait_ms: i32) -> Result<bool> {
+        self.pump_inner(wait_ms, true)
+    }
+    /// Keep cancellation responsive while no provider exists. Typed input
+    /// must not queue up in the PTY and replay when the session resumes.
+    pub fn wait_for_restart(&mut self, wait_ms: i32) -> Result<()> {
+        self.pump_inner(wait_ms, false).map(|_| ())
+    }
+    fn pump_inner(&mut self, wait_ms: i32, forward_input: bool) -> Result<bool> {
         if self
             .interrupt
             .flag
@@ -186,10 +194,12 @@ impl Terminal {
                 .safe("cannot read terminal input")?;
             if n == 0 {
                 self.input_open = false;
-            } else {
+            } else if forward_input {
                 self.master
                     .write_all(&buffer[..n])
                     .safe("cannot forward terminal input")?;
+            } else if buffer[..n].iter().any(|byte| matches!(byte, 3 | 4)) {
+                return Err(Error("provider session interrupted"));
             }
         }
         let mut limited = false;

@@ -171,7 +171,7 @@ Claude's own PID registry, or transcript filenames held open by that child/proce
 tree. Transcript contents are not read for identity. The tracker never picks the globally
 newest conversation: if identity cannot be established unambiguously, it refuses
 the restart. Claude’s PID registry can identify session selection inside the
-provider, even when subagents open other transcripts. A known Claude UUID survives
+provider, even when subagents open other transcripts. A known UUID survives
 unrelated shared history writes. A fork must establish its new identity first.
 
 Candidates need fresh known quota below the threshold, ten points of improvement
@@ -200,6 +200,18 @@ an owner replaces their usage caches. An account rejected for a usage limit come
 back only after a hold (15 minutes, doubling with each new limit on it, up to 4
 hours) and a fresh reading below the auto threshold, so a reset account is used
 again while two accounts near 100% never trade a session back and forth.
+When every account is exhausted, a limited session watches all accounts rather
+than waiting only for its current login. It checks at the earliest known session
+or weekly reset, at normal quota-cache refreshes, and at least every five minutes
+(plus a one-to-five-second stagger between supervisors). A reset timestamp alone
+never proves quota is available: a fresh reading must confirm it. The first
+eligible account resumes the exact same session with its options preserved,
+including the current account if it recovers first. A verified reading below the
+threshold after a known reset releases that account's hold early; ordinary
+readings retain the hold, and another limit starts a new doubled hold. A provider
+that exits unsuccessfully at a limit also waits for recovery; Ctrl-C or a signal
+cancels the wait. Input typed while the provider is gone is discarded. Waits and
+the account chosen for resume are logged.
 Restarts are capped at eight per hour. A full disk or other store I/O failure
 never ends a running provider: the supervisor reports it once, keeps the
 provider running and retries; before a launch it waits (up to ten minutes)

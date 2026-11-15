@@ -443,6 +443,98 @@ fn automatic_restarts_stop_after_eight_switches() {
     runner_safety_cases(&["boundedcap"]);
 }
 
+/// Quota exhaustion and the hourly cap now keep the supervisor alive after
+/// an unsuccessful CLI exit. Observe that wait, then cancel our own child;
+/// the launch/identity assertions below still prove the anti-flap bounds.
+/// The late-identity fixture also uses stderr to order its registry write.
+fn observed_safety_output(
+    mut command: Command,
+    home: &std::path::Path,
+    case: &str,
+) -> std::process::Output {
+    use std::{
+        io::BufRead,
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    struct Owned(Option<std::process::Child>);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let mut child = Owned(Some(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let stderr = child.0.as_mut().unwrap().stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        for line in std::io::BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.push(b'\n');
+            let _ = tx.send(line);
+        }
+        bytes
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut waiting = false;
+    let late_identity = case == "rotationlate401";
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "{case}: supervisor never reported waiting"
+        );
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(25)) {
+            if late_identity && line.contains("keeping the current provider running") {
+                fs::write(
+                    home.join("register-session"),
+                    "supervisor observed the missing identity",
+                )
+                .unwrap();
+                break;
+            }
+            waiting |= line.contains("watching all accounts")
+                || line.contains("eight-restarts-per-hour cap");
+        }
+        assert!(
+            child.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "{case}: exhausted supervisor exited instead of waiting"
+        );
+        let ready = if case == "boundedcap" {
+            home.join("cap-completed").exists()
+        } else {
+            fs::read_to_string(home.join("calls"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+                == 2
+        };
+        if waiting && ready {
+            break;
+        }
+    }
+    if !late_identity {
+        // SAFETY: this is our unreaped supervisor child, so its PID cannot be reused.
+        assert_eq!(
+            unsafe { libc::kill(child.0.as_ref().unwrap().id() as i32, libc::SIGTERM) },
+            0
+        );
+    }
+    let mut output = child.0.take().unwrap().wait_with_output().unwrap();
+    output.stderr = reader.join().unwrap();
+    output
+}
+
 fn runner_safety_cases(cases: &[&str]) {
     let t = tempfile::tempdir().unwrap();
     let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
@@ -548,7 +640,12 @@ if case.startswith('rotation'):
     print('Login expired · Please run /login',flush=True)
     if case=='rotationlate401' and first:
         # Only now does the provider register its conversation.
-        time.sleep(.8)
+        # Let the supervisor first observe the missing identity, regardless
+        # of how long this machine takes to schedule its first tick.
+        deadline=time.monotonic()+10
+        while not (root/'register-session').exists():
+            assert time.monotonic()<deadline, 'supervisor never checked the identity'
+            time.sleep(.01)
         (view/'sessions'/(str(os.getpid())+'.json')).write_text(json.dumps({'pid':os.getpid(),'sessionId':'11111111-2222-4333-8444-555555555555'}))
         time.sleep(30)
     time.sleep(.4)
@@ -605,16 +702,22 @@ time.sleep(1)
     for &case in cases {
         let home = t.path().join(case);
         fs::create_dir(&home).unwrap();
-        let out = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args(["--exact", "runner_safety_child", "--nocapture"])
             .env_clear()
             .env("PATH", &path)
             .env("HOME", &home)
             .env("XDG_DATA_HOME", home.join("data"))
             .env("CLAUDE_CONFIG_DIR", home.join("claude"))
-            .env("ASWAP_SAFETY_CASE", case)
-            .output()
-            .unwrap();
+            .env("ASWAP_SAFETY_CASE", case);
+        let out = if (case.starts_with("bounded") && !case.ends_with("401"))
+            || case == "rotationlate401"
+        {
+            observed_safety_output(command, &home, case)
+        } else {
+            command.output().unwrap()
+        };
         assert!(
             out.status.success(),
             "{case}: {}\n{}",
@@ -874,8 +977,11 @@ fn runner_safety_child() {
         vec!["--resume".into(), ID.into()]
     };
     let result = aswap::runner::run(&store, provider, Some("one"), &args, true);
-    if case == "boundedcap" {
-        assert_eq!(result.unwrap(), 1);
+    if bounded && !case.ends_with("401") {
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "provider session interrupted"
+        );
     } else if bounded {
         assert_ne!(result.unwrap(), 0);
     } else if matches!(case.as_str(), "unknown" | "ambiguous") {

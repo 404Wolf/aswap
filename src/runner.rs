@@ -246,6 +246,7 @@ pub fn run(
         let mut expired = false;
         let mut unsupported = false;
         let mut reported_none = false;
+        let mut reported_cap = false;
         // How this launch rejected its account: once, so a session that sits
         // on its limited account doesn't escalate the hold every period
         // (`Some(true)` for a limit, which a login or model error replaces).
@@ -255,6 +256,8 @@ pub fn run(
         let mut auth_seen: Option<Instant> = None;
         let mut rotated = false;
         let mut reported_resume = false;
+        let mut model_blocked = false;
+        let mut wake = Wake::new(u64::from(std::process::id()));
         let status = loop {
             // Whether the screen showed a limit this tick; for Claude, its
             // transcript decides whether that is live (see `limit_seen`).
@@ -372,36 +375,37 @@ pub fn run(
                     "aswap: current account rejected the session model; looking for a compatible account"
                 );
             }
-            if auto && (limited || expired || unsupported) {
+            if auto
+                && (limited || expired || unsupported)
+                && (expired || unsupported || wake.due(now()))
+            {
                 let decided = (|| -> Result<Option<Account>> {
                     let limit = !expired && !unsupported;
                     if rejected_as.is_none() || (rejected_as == Some(true) && !limit) {
                         rejected.reject(store, &account, limit)?;
+                        if limit {
+                            usage::mark_limited(store, &account)?;
+                        }
                         rejected_as = Some(limit);
                     }
                     view.sync(store, &account)?;
                     let (entries, settings) = observations(store, provider)?;
+                    wake.schedule(&entries, rejected.next_lapse(now()), now());
                     let entries = rejected.filter(
                         store,
                         &account.label,
                         settings.threshold,
                         models.filter(store, &account.label, entries),
                     );
-                    Ok(usage::choose(
-                        &account.label,
-                        &entries,
-                        settings.threshold,
-                        settings.prefer,
-                        settings.last_switch,
-                        now(),
-                        true,
-                    )
-                    .cloned())
+                    model_blocked = model_blocks_recovery(&account.label, &entries, now());
+                    Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
                 })();
                 // An unreadable store leaves the decision to the next tick.
                 let decided = hiccups.note("choosing another account", decided);
                 if let Some(choice) = &decided {
                     target = choice.clone();
+                } else {
+                    wake.retry(now());
                 }
                 if target.is_some() && !restarts.capped() {
                     match prepare_resume(
@@ -422,9 +426,18 @@ pub fn run(
                         }
                     }
                 }
+                if target.is_some() && restarts.capped() && !reported_cap {
+                    eprintln!(
+                        "aswap: usage-limit resume is waiting for the eight-restarts-per-hour cap"
+                    );
+                    reported_cap = true;
+                }
                 if decided.is_some() && target.is_none() && !reported_none {
                     models.report_none();
                     reported_none = true;
+                }
+                if limited && !expired && !unsupported && target.is_none() && decided.is_some() {
+                    wake.report(provider, &account.label, now());
                 }
             }
             if terminal.is_none() {
@@ -499,10 +512,16 @@ pub fn run(
         if did_limit {
             let limit = !expired && !unsupported;
             if rejected_as.is_none() || (rejected_as == Some(true) && !limit) {
-                hiccups.note(
+                let recorded = hiccups.note(
                     "rejecting the account",
                     rejected.reject(store, &account, limit),
                 );
+                if recorded.is_some() {
+                    rejected_as = Some(limit);
+                    if limit {
+                        hiccups.note("recording the limit", usage::mark_limited(store, &account));
+                    }
+                }
             }
             if expired {
                 hiccups.note(
@@ -513,42 +532,36 @@ pub fn run(
                     "aswap: login expired for {provider}:{}; selecting another account",
                     account.label
                 );
-            } else if !unsupported {
-                hiccups.note("recording the limit", usage::mark_limited(store, &account));
             }
-            let decided = (|| -> Result<Option<Account>> {
-                let (entries, settings) = observations(store, provider)?;
-                let entries = rejected.filter(
-                    store,
-                    &account.label,
-                    settings.threshold,
-                    models.filter(store, &account.label, entries),
-                );
-                Ok(usage::choose(
-                    &account.label,
-                    &entries,
-                    settings.threshold,
-                    settings.prefer,
-                    settings.last_switch,
-                    now(),
-                    true,
-                )
-                .cloned())
-            })();
-            // Keep the decision that stopped the provider if this one fails.
-            if let Some(choice) = hiccups.note("choosing another account", decided) {
-                target = choice.or(target);
+            if target.is_none() {
+                let decided = (|| -> Result<Option<Account>> {
+                    let (entries, settings) = observations(store, provider)?;
+                    wake.schedule(&entries, rejected.next_lapse(now()), now());
+                    let entries = rejected.filter(
+                        store,
+                        &account.label,
+                        settings.threshold,
+                        models.filter(store, &account.label, entries),
+                    );
+                    model_blocked = model_blocks_recovery(&account.label, &entries, now());
+                    Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
+                })();
+                // Keep the decision that stopped the provider if this one fails.
+                if let Some(choice) = hiccups.note("choosing another account", decided) {
+                    target = choice.or(target);
+                }
             }
         }
         // Resume the same interactive history; never replay command arguments.
         // Bound restarts even if provider observations are misleading.
-        if (!did_limit && target.is_none()) || restarts.capped() {
+        let quota_wait = limited && !expired && !unsupported && !model_blocked;
+        if (!did_limit && target.is_none()) || (!quota_wait && restarts.capped()) {
             return Ok(status.code().unwrap_or(1));
         }
-        let Some(_) = target else {
+        if target.is_none() && !quota_wait {
             models.report_none();
             return Ok(status.code().filter(|code| *code != 0).unwrap_or(1));
-        };
+        }
         let resume_args = match prepared_resume {
             Some(args) => args,
             None => prepare_resume(
@@ -558,6 +571,59 @@ pub fn run(
                 tracker.as_ref().unwrap(),
             )?,
         };
+        // A CLI may exit on a limit instead of leaving a dialog open. Keep
+        // the supervisor and exact resume argv until any account recovers.
+        while quota_wait && (target.is_none() || restarts.capped()) {
+            if wake.due(now()) {
+                let decided = (|| -> Result<Option<Account>> {
+                    if rejected_as.is_none() {
+                        rejected.reject(store, &account, true)?;
+                        usage::mark_limited(store, &account)?;
+                        rejected_as = Some(true);
+                    }
+                    let (entries, settings) = observations(store, provider)?;
+                    wake.schedule(&entries, rejected.next_lapse(now()), now());
+                    let entries = rejected.filter(
+                        store,
+                        &account.label,
+                        settings.threshold,
+                        models.filter(store, &account.label, entries),
+                    );
+                    Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
+                })();
+                if let Some(choice) = hiccups.note("waiting for usable quota", decided) {
+                    target = choice;
+                } else {
+                    wake.retry(now());
+                }
+            }
+            if target.is_none() {
+                wake.report(provider, &account.label, now());
+            } else if restarts.capped() && !reported_cap {
+                eprintln!(
+                    "aswap: usage-limit resume is waiting for the eight-restarts-per-hour cap"
+                );
+                reported_cap = true;
+            }
+            terminal
+                .as_mut()
+                .expect("auto terminal")
+                .wait_for_restart(250)?;
+        }
+        if quota_wait {
+            eprintln!(
+                "aswap: quota available on {provider}:{}; resuming the same session{}",
+                target.as_ref().expect("recovery target").label,
+                if target
+                    .as_ref()
+                    .is_some_and(|next| next.label == account.label)
+                {
+                    " on the current account"
+                } else {
+                    ""
+                }
+            );
+        }
         // Revalidate, reserve a new per-session lease and commit the decision
         // together. Other sessions using the best account do not exclude it.
         // If that fails, resume on the same account: the session goes on, and
@@ -566,7 +632,7 @@ pub fn run(
             let _lock = store.lock()?;
             let mut state = store.load()?;
             let settings = state.auto.get(&provider).cloned().unwrap_or_default();
-            let next = usage::choose(
+            let next = recovery_target(
                 &account.label,
                 &rejected.filter(
                     store,
@@ -578,23 +644,23 @@ pub fn run(
                         entries_from_cache(store, provider)?,
                     ),
                 ),
-                settings.threshold,
-                settings.prefer,
-                0,
+                &settings,
                 now(),
-                true,
             )
             .cloned()
             .ok_or(crate::Error(
                 "no eligible account after automatic switch decision",
             ))?;
-            let next_lease = if next.label == history_owner {
+            let next_lease = if next.label == account.label {
+                Arc::clone(&lease)
+            } else if next.label == history_owner {
                 Arc::clone(history_lease.as_ref().expect("auto session history lease"))
             } else {
                 Arc::new(store.lease_locked(&next)?)
             };
             state.auto.entry(provider).or_default().last_switch = now();
             store.save(&state)?;
+            rejected.resumed(store, &next, &state.accounts);
             Ok((next, next_lease))
         };
         // Retried with the store lock released between attempts.
@@ -848,6 +914,96 @@ fn omit_one_shot(args: &crate::session::AutoArgs, terminal: &mut Option<Terminal
     }
     Ok(())
 }
+/// A limited provider can resume on its own account once that account's
+/// rejection lapses. Other targets retain the usual forced-switch ranking
+/// and below-100% fallback. Rejected entries have already been filtered.
+fn recovery_target<'a>(
+    current: &str,
+    entries: &'a [(Account, usage::Cached)],
+    settings: &store::Auto,
+    at: u64,
+) -> Option<&'a Account> {
+    usage::choose(
+        current,
+        entries,
+        settings.threshold,
+        settings.prefer,
+        settings.last_switch,
+        at,
+        true,
+    )
+    .or_else(|| {
+        entries.iter().find_map(|(account, cache)| {
+            (account.label == current
+                && cache.used(at).is_some_and(|used| used < settings.threshold))
+            .then_some(account)
+        })
+    })
+}
+
+/// Preserve the existing failure for an exited CLI when quota is available
+/// but every such target rejects the requested model. Quota exhaustion waits.
+fn model_blocks_recovery(current: &str, entries: &[(Account, usage::Cached)], at: u64) -> bool {
+    entries.iter().any(|(_, cache)| {
+        cache.error.as_deref() == Some("model-unavailable")
+            && at.saturating_sub(cache.fetched_at) <= 600
+            && cache.usage.used(at).is_some_and(|used| used < 100.0)
+    }) && !entries.iter().any(|(account, cache)| {
+        account.label != current && cache.used(at).is_some_and(|used| used < 100.0)
+    })
+}
+
+/// Pure wall-clock schedule, also used with synthetic time in tests. Shared
+/// quota caching serializes provider requests; per-supervisor jitter spreads
+/// the cache reads and resumed CLI launches after a common reset.
+struct Wake {
+    next: u64,
+    stagger: u64,
+    reported: Option<u64>,
+}
+impl Wake {
+    fn new(seed: u64) -> Self {
+        Self {
+            next: 0,
+            stagger: 1 + seed % 5,
+            reported: None,
+        }
+    }
+    fn due(&self, at: u64) -> bool {
+        at >= self.next
+    }
+    fn schedule(&mut self, entries: &[(Account, usage::Cached)], hold: Option<u64>, at: u64) {
+        let next = entries
+            .iter()
+            .flat_map(|(_, cache)| {
+                cache
+                    .usage
+                    .windows
+                    .iter()
+                    .filter_map(|window| window.resets_at)
+                    .chain(std::iter::once(cache.next_poll_at))
+            })
+            .chain(hold)
+            .filter(|when| *when > at)
+            .min()
+            .unwrap_or(at.saturating_add(300))
+            .min(at.saturating_add(300));
+        self.next = next.saturating_add(self.stagger);
+    }
+    fn retry(&mut self, at: u64) {
+        self.next = at.saturating_add(5 + self.stagger);
+    }
+    fn report(&mut self, provider: Provider, current: &str, at: u64) {
+        if self.reported != Some(self.next) {
+            eprintln!(
+                "aswap: {provider}:{current} is waiting on a usage limit; watching all accounts, next quota/reset check in {}s",
+                self.next.saturating_sub(at)
+            );
+            self.reported = Some(self.next);
+        }
+    }
+}
+
 // Run-local rejection survives owner cache replacement and refresh observations.
 // Keep identity keys private/in-memory so aliases cannot bounce a session back
 // onto credentials that this provider process has already rejected.
@@ -868,6 +1024,10 @@ struct Rejected {
 struct Lapse {
     at: u64,
     count: u32,
+    /// A known window boundary when the account rejected the session. Only a
+    /// fresh, successful post-reset observation may release the hold early.
+    reset: Option<u64>,
+    resumed: bool,
 }
 const LIMIT_HOLD: u64 = 15 * 60;
 const LIMIT_HOLD_MAX: u64 = 4 * 3600;
@@ -876,7 +1036,10 @@ impl Lapse {
         (LIMIT_HOLD << self.count.saturating_sub(1).min(8)).min(LIMIT_HOLD_MAX)
     }
     fn lapsed(&self, cache: &usage::Cached, threshold: f64, at: u64) -> bool {
-        at >= self.at.saturating_add(self.hold())
+        (at >= self.at.saturating_add(self.hold())
+            || self
+                .reset
+                .is_some_and(|reset| at >= reset && cache.fetched_at >= reset))
             && cache.fetched_at > self.at
             && cache.used(at).is_some_and(|used| used < threshold)
     }
@@ -884,36 +1047,82 @@ impl Lapse {
     /// after the rejection lapsed is a new one, held twice as long.
     fn again(previous: Option<Self>, at: u64) -> Self {
         match previous {
-            Some(p) if at < p.at.saturating_add(p.hold()) => p,
+            Some(p) if !p.resumed && at < p.at.saturating_add(p.hold()) => p,
             Some(p) => Self {
                 at,
                 count: p.count.saturating_add(1),
+                reset: None,
+                resumed: false,
             },
-            None => Self { at, count: 1 },
+            None => Self {
+                at,
+                count: 1,
+                reset: None,
+                resumed: false,
+            },
         }
     }
 }
 impl Rejected {
+    /// Consuming a verified reset is one recovery. If this new provider hits
+    /// a limit too, begin a new, doubled hold even before the old hold ends.
+    fn resumed(&mut self, store: &Store, account: &Account, accounts: &[Account]) {
+        for label in std::iter::once(account.label.clone())
+            .chain(crate::identity::duplicates(store, account, accounts))
+        {
+            if let Some(Some(lapse)) = self.labels.get_mut(&label) {
+                lapse.resumed = true;
+            }
+        }
+        if let Some(key) = Self::key(store, account)
+            && let Some(Some(lapse)) = self.identities.get_mut(&key)
+        {
+            lapse.resumed = true;
+        }
+    }
     /// Reject `account` (and its aliases and identity) for the run, or, for
     /// a `limit`, until the rejection lapses.
     fn reject(&mut self, store: &Store, account: &Account, limit: bool) -> Result<()> {
         let at = now();
         let mut keys = vec![account.label.clone()];
-        let identity = {
+        let (identity, reset) = {
             let _lock = store.lock()?;
             keys.extend(crate::identity::duplicates(
                 store,
                 account,
                 &store.load()?.accounts,
             ));
-            Self::key(store, account)
+            let path = store
+                .profile(account.provider, &account.label)?
+                .join("usage-cache.json");
+            let cache: usage::Cached = if path.exists() {
+                store::json_read(&path)?
+            } else {
+                usage::Cached::default()
+            };
+            (
+                Self::key(store, account),
+                cache
+                    .usage
+                    .windows
+                    .iter()
+                    .filter_map(|window| window.resets_at)
+                    .filter(|reset| *reset > at)
+                    .min(),
+            )
         };
         let mark = |map: &mut std::collections::BTreeMap<String, Option<Lapse>>, key: String| {
             let next = match map.get(&key) {
                 // A login or model rejection is never weakened by a limit.
                 Some(None) => None,
                 _ if !limit => None,
-                previous => Some(Lapse::again(previous.copied().flatten(), at)),
+                previous => {
+                    let mut lapse = Lapse::again(previous.copied().flatten(), at);
+                    if lapse.at == at {
+                        lapse.reset = reset;
+                    }
+                    Some(lapse)
+                }
             };
             map.insert(key, next);
         };
@@ -940,7 +1149,25 @@ impl Rejected {
         threshold: f64,
         entries: Vec<(Account, usage::Cached)>,
     ) -> Vec<(Account, usage::Cached)> {
-        let at = now();
+        self.filter_at(store, current, threshold, entries, now())
+    }
+    fn next_lapse(&self, at: u64) -> Option<u64> {
+        self.labels
+            .values()
+            .chain(self.identities.values())
+            .flatten()
+            .map(|lapse| lapse.at.saturating_add(lapse.hold()))
+            .filter(|when| *when > at)
+            .min()
+    }
+    fn filter_at(
+        &self,
+        store: &Store,
+        current: &str,
+        threshold: f64,
+        entries: Vec<(Account, usage::Cached)>,
+        at: u64,
+    ) -> Vec<(Account, usage::Cached)> {
         let held = |rejection: Option<&Option<Lapse>>, cache: &usage::Cached| match rejection {
             None => false,
             Some(None) => true,
@@ -948,11 +1175,20 @@ impl Rejected {
         };
         entries
             .into_iter()
-            .filter(|(a, cache)| {
-                a.label == current
-                    || (!held(self.labels.get(&a.label), cache)
-                        && Self::key(store, a)
-                            .is_none_or(|key| !held(self.identities.get(&key), cache)))
+            .filter_map(|(a, mut cache)| {
+                let rejected = held(self.labels.get(&a.label), &cache)
+                    || Self::key(store, &a)
+                        .is_some_and(|key| held(self.identities.get(&key), &cache));
+                if a.label == current {
+                    // choose() needs the current entry even while rejected,
+                    // but same-account recovery must respect its hold too.
+                    if rejected {
+                        cache.error = Some("run-rejected".into());
+                    }
+                    Some((a, cache))
+                } else {
+                    (!rejected).then_some((a, cache))
+                }
             })
             .collect()
     }
@@ -1134,6 +1370,8 @@ mod rejection_tests {
         let lapse = Lapse {
             at: 10_000,
             count: 1,
+            reset: None,
+            resumed: false,
         };
         let later = 10_000 + LIMIT_HOLD;
         // Held for the hold, however good the reading.
@@ -1160,8 +1398,30 @@ mod rejection_tests {
         assert_eq!((same.at, same.count), (1_000, 1));
         let second = Lapse::again(Some(first), 1_000 + LIMIT_HOLD);
         assert_eq!((second.count, second.hold()), (2, 2 * LIMIT_HOLD));
-        let many = Lapse { at: 0, count: 30 };
+        let many = Lapse {
+            at: 0,
+            count: 30,
+            reset: None,
+            resumed: false,
+        };
         assert_eq!(many.hold(), LIMIT_HOLD_MAX);
+    }
+
+    #[test]
+    fn a_new_limit_after_an_early_reset_starts_a_new_doubled_hold() {
+        let first = Lapse {
+            at: 1_000,
+            count: 1,
+            reset: Some(1_030),
+            resumed: true,
+        };
+        let next = Lapse::again(Some(first), 1_031);
+        assert_eq!(
+            (next.at, next.count, next.hold()),
+            (1_031, 2, 2 * LIMIT_HOLD)
+        );
+        assert_eq!(next.reset, None);
+        assert!(!next.lapsed(&cache(2.0, 1_032), 90.0, 1_032));
     }
 
     #[test]
@@ -1180,6 +1440,8 @@ mod rejection_tests {
             Some(Lapse {
                 at: at - 7200,
                 count: 1,
+                reset: None,
+                resumed: false,
             }),
         );
         rejected.labels.insert("expired".into(), None);
@@ -1323,6 +1585,7 @@ mod wake_tests {
             at: AT,
             count: 3,
             reset: Some(AT + 30),
+            resumed: false,
         };
         let (_, mut fresh) = entry(Provider::Claude, "a", 4.0, Some(AT + 3600), AT + 30);
         assert!(lapse.lapsed(&fresh, 90.0, AT + 30));
@@ -1350,6 +1613,7 @@ mod wake_tests {
                             at: AT,
                             count: 1,
                             reset: Some(AT + if label == first { 30 } else { 60 }),
+                            resumed: false,
                         }),
                     );
                 }
@@ -1386,6 +1650,7 @@ mod wake_tests {
                 at: AT,
                 count: 1,
                 reset: None,
+                resumed: false,
             }),
         );
         let choose = |rejected: &Rejected, at| {
@@ -1406,5 +1671,16 @@ mod wake_tests {
         );
         rejected.labels.insert("current".into(), None);
         assert_eq!(choose(&rejected, AT + LIMIT_HOLD_MAX), None);
+    }
+
+    #[test]
+    fn exhausted_model_candidates_wait_but_incompatible_available_quota_keeps_its_error() {
+        let mut entries = vec![entry(Provider::Codex, "other", 100.0, None, AT)];
+        entries[0].1.error = Some("model-unavailable".into());
+        assert!(!model_blocks_recovery("current", &entries, AT));
+        entries[0].1.usage.windows[0].used_percent = 5.0;
+        assert!(model_blocks_recovery("current", &entries, AT));
+        entries.push(entry(Provider::Codex, "compatible", 15.0, None, AT));
+        assert!(!model_blocks_recovery("current", &entries, AT));
     }
 }
