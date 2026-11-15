@@ -1232,3 +1232,179 @@ mod rejection_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    const AT: u64 = 10_000;
+
+    fn entry(
+        provider: Provider,
+        label: &str,
+        used: f64,
+        reset: Option<u64>,
+        at: u64,
+    ) -> (Account, usage::Cached) {
+        (
+            Account {
+                provider,
+                label: label.into(),
+            },
+            usage::Cached {
+                usage: usage::Usage {
+                    windows: vec![usage::Window {
+                        name: "weekly".into(),
+                        used_percent: used,
+                        resets_at: reset,
+                        duration_minutes: Some(10080),
+                    }],
+                    ..Default::default()
+                },
+                fetched_at: at,
+                next_poll_at: at + usage::TTL,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn wake_watches_every_accounts_weekly_and_session_reset() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut entries = vec![
+                entry(provider, "current", 100.0, Some(AT + 200), AT),
+                entry(provider, "other", 100.0, Some(AT + 60), AT),
+            ];
+            entries[0].1.usage.windows.push(usage::Window {
+                name: "session".into(),
+                used_percent: 100.0,
+                resets_at: Some(AT + 30),
+                duration_minutes: Some(300),
+            });
+            let mut wake = Wake::new(17);
+            wake.schedule(&entries, None, AT);
+            assert!((AT + 30..=AT + 35).contains(&wake.next));
+            assert!(!wake.due(AT + 29));
+            assert!(wake.due(AT + 35));
+        }
+    }
+
+    #[test]
+    fn unknown_and_past_resets_keep_polling_without_spinning() {
+        let mut wake = Wake::new(42);
+        for reset in [None, Some(AT - 1)] {
+            let mut entries = vec![entry(Provider::Claude, "current", 100.0, reset, AT - 600)];
+            entries[0].1.next_poll_at = AT - 1;
+            wake.schedule(&entries, None, AT);
+            assert!((AT + 300..=AT + 305).contains(&wake.next));
+            assert!(!wake.due(AT + 1));
+        }
+        wake.schedule(&[], Some(AT + 20), AT);
+        assert!((AT + 20..=AT + 25).contains(&wake.next));
+    }
+
+    #[test]
+    fn stalled_sessions_stagger_checks_and_observe_normal_cache_refreshes() {
+        let entries = vec![entry(Provider::Codex, "current", 100.0, None, AT)];
+        let times = (0..32)
+            .map(|seed| {
+                let mut wake = Wake::new(seed);
+                wake.schedule(&entries, None, AT);
+                assert!((AT + usage::TTL..=AT + usage::TTL + 5).contains(&wake.next));
+                wake.next
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(times.len() > 1);
+    }
+
+    #[test]
+    fn only_verified_post_reset_quota_releases_a_hold_early() {
+        let lapse = Lapse {
+            at: AT,
+            count: 3,
+            reset: Some(AT + 30),
+        };
+        let (_, mut fresh) = entry(Provider::Claude, "a", 4.0, Some(AT + 3600), AT + 30);
+        assert!(lapse.lapsed(&fresh, 90.0, AT + 30));
+        fresh.fetched_at = AT + 29;
+        assert!(!lapse.lapsed(&fresh, 90.0, AT + 30));
+        fresh.fetched_at = AT + 30;
+        fresh.usage.windows[0].used_percent = 95.0;
+        assert!(!lapse.lapsed(&fresh, 90.0, AT + 30));
+        fresh.usage.windows[0].used_percent = 4.0;
+        fresh.error = Some("network".into());
+        assert!(!lapse.lapsed(&fresh, 90.0, AT + 30));
+    }
+
+    #[test]
+    fn the_first_verified_account_wakes_the_session_even_when_it_is_current() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("store")).unwrap();
+        for provider in [Provider::Claude, Provider::Codex] {
+            for first in ["current", "other"] {
+                let mut rejected = Rejected::default();
+                for label in ["current", "other"] {
+                    rejected.labels.insert(
+                        label.into(),
+                        Some(Lapse {
+                            at: AT,
+                            count: 1,
+                            reset: Some(AT + if label == first { 30 } else { 60 }),
+                        }),
+                    );
+                }
+                let mut entries = vec![
+                    entry(provider, "current", 100.0, Some(AT + 30), AT),
+                    entry(provider, "other", 100.0, Some(AT + 30), AT),
+                ];
+                let choose = |entries, at| {
+                    recovery_target(
+                        "current",
+                        &rejected.filter_at(&store, "current", 90.0, entries, at),
+                        &store::Auto::default(),
+                        at,
+                    )
+                    .map(|a| a.label.clone())
+                };
+                // A timestamp passing is not evidence of usable quota.
+                assert_eq!(choose(entries.clone(), AT + 30), None);
+                let recovered = entries.iter_mut().find(|(a, _)| a.label == first).unwrap();
+                recovered.1 = entry(provider, first, 3.0, Some(AT + 3600), AT + 30).1;
+                assert_eq!(choose(entries, AT + 30).as_deref(), Some(first));
+            }
+        }
+    }
+
+    #[test]
+    fn same_account_recovery_keeps_ordinary_holds_and_permanent_rejections() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("store")).unwrap();
+        let mut rejected = Rejected::default();
+        rejected.labels.insert(
+            "current".into(),
+            Some(Lapse {
+                at: AT,
+                count: 1,
+                reset: None,
+            }),
+        );
+        let choose = |rejected: &Rejected, at| {
+            let entries = rejected.filter_at(
+                &store,
+                "current",
+                90.0,
+                vec![entry(Provider::Codex, "current", 5.0, None, at)],
+                at,
+            );
+            recovery_target("current", &entries, &store::Auto::default(), at)
+                .map(|a| a.label.clone())
+        };
+        assert_eq!(choose(&rejected, AT + 10), None);
+        assert_eq!(
+            choose(&rejected, AT + LIMIT_HOLD).as_deref(),
+            Some("current")
+        );
+        rejected.labels.insert("current".into(), None);
+        assert_eq!(choose(&rejected, AT + LIMIT_HOLD_MAX), None);
+    }
+}
