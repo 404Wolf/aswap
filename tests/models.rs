@@ -7,6 +7,52 @@ use serde_json::json;
 use std::{fs, os::unix::fs::PermissionsExt, process::Command};
 const ID: &str = "11111111-2222-4333-8444-555555555555";
 
+fn cancel_quota_wait(mut command: Command) -> std::process::Output {
+    use std::{io::BufRead, process::Stdio, time::Duration};
+    struct Owned(Option<std::process::Child>);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let mut child = Owned(Some(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let stderr = child.0.as_mut().unwrap().stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        for line in std::io::BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            if line.contains("watching all accounts") {
+                let _ = tx.send(());
+            }
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.push(b'\n');
+        }
+        bytes
+    });
+    rx.recv_timeout(Duration::from_secs(15))
+        .expect("compatible current account must remain a recovery candidate");
+    assert!(child.0.as_mut().unwrap().try_wait().unwrap().is_none());
+    // SAFETY: this is our owned, unreaped supervisor child.
+    assert_eq!(
+        unsafe { libc::kill(child.0.as_ref().unwrap().id() as i32, libc::SIGTERM) },
+        0
+    );
+    let mut output = child.0.take().unwrap().wait_with_output().unwrap();
+    output.stderr = reader.join().unwrap();
+    output
+}
+
 fn scenario(mode: &str, source: &str) -> std::process::Output {
     let t = tempfile::tempdir().unwrap();
     let home = t.path().join("home");
@@ -132,17 +178,21 @@ time.sleep(.5);sys.exit(1)
             command.args(["--model=synthetic-sol"]);
         }
     }
-    let output = command
+    command
         .env_clear()
         .env("HOME", &home)
         .env("CODEX_HOME", &codex)
         .env("XDG_DATA_HOME", t.path().join("data"))
+        .env("XDG_CONFIG_HOME", t.path().join("config"))
         .env("PATH", std::env::var_os("PATH").unwrap())
         .env("ASWAP_CODEX_BIN", &fake)
         .env("ASWAP_TEST_LOG", &log)
-        .env("ASWAP_TEST_MODE", mode)
-        .output()
-        .unwrap();
+        .env("ASWAP_TEST_MODE", mode);
+    let output = if matches!(mode, "none" | "unknown" | "loop") {
+        cancel_quota_wait(command)
+    } else {
+        command.output().unwrap()
+    };
     if mode == "runtime-rejected" {
         let cache: Cached = store::json_read(
             &store

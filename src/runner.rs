@@ -256,7 +256,6 @@ pub fn run(
         let mut auth_seen: Option<Instant> = None;
         let mut rotated = false;
         let mut reported_resume = false;
-        let mut model_blocked = false;
         let mut wake = Wake::new(u64::from(std::process::id()));
         let status = loop {
             // Whether the screen showed a limit this tick; for Claude, its
@@ -278,7 +277,8 @@ pub fn run(
                     } else {
                         left
                     };
-                    screen_limit |= terminal.pump(step.as_millis().max(1) as i32)?;
+                    screen_limit |=
+                        terminal.pump_child(step.as_millis().max(1) as i32, &mut child.0)?;
                     if terminal.quiet_auth {
                         quiet.check(tracker.as_ref(), false);
                     }
@@ -397,7 +397,6 @@ pub fn run(
                         settings.threshold,
                         models.filter(store, &account.label, entries),
                     );
-                    model_blocked = model_blocks_recovery(&account.label, &entries, now());
                     Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
                 })();
                 // An unreadable store leaves the decision to the next tick.
@@ -447,7 +446,7 @@ pub fn run(
         drop(child);
         hiccups.running = false;
         if let Some(terminal) = &mut terminal {
-            let screen_limit = terminal.pump(0)?;
+            let screen_limit = terminal.child_exited()?;
             limited |= limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, true);
             // The provider is gone and the tracker will not walk again: look
             // for a transcript it created in its last moments afresh.
@@ -543,7 +542,6 @@ pub fn run(
                         settings.threshold,
                         models.filter(store, &account.label, entries),
                     );
-                    model_blocked = model_blocks_recovery(&account.label, &entries, now());
                     Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
                 })();
                 // Keep the decision that stopped the provider if this one fails.
@@ -554,7 +552,7 @@ pub fn run(
         }
         // Resume the same interactive history; never replay command arguments.
         // Bound restarts even if provider observations are misleading.
-        let quota_wait = limited && !expired && !unsupported && !model_blocked;
+        let quota_wait = limited && !expired && !unsupported;
         if (!did_limit && target.is_none()) || (!quota_wait && restarts.capped()) {
             return Ok(status.code().unwrap_or(1));
         }
@@ -573,113 +571,115 @@ pub fn run(
         };
         // A CLI may exit on a limit instead of leaving a dialog open. Keep
         // the supervisor and exact resume argv until any account recovers.
-        while quota_wait && (target.is_none() || restarts.capped()) {
-            if wake.due(now()) {
-                let decided = (|| -> Result<Option<Account>> {
-                    if rejected_as.is_none() {
-                        rejected.reject(store, &account, true)?;
-                        usage::mark_limited(store, &account)?;
-                        rejected_as = Some(true);
+        let (next, next_lease) = loop {
+            while quota_wait && (target.is_none() || restarts.capped()) {
+                if wake.due(now()) {
+                    let decided = (|| -> Result<Option<Account>> {
+                        if rejected_as.is_none() {
+                            rejected.reject(store, &account, true)?;
+                            usage::mark_limited(store, &account)?;
+                            rejected_as = Some(true);
+                        }
+                        let (entries, settings) = observations(store, provider)?;
+                        wake.schedule(&entries, rejected.next_lapse(now()), now());
+                        let entries = rejected.filter(
+                            store,
+                            &account.label,
+                            settings.threshold,
+                            models.filter(store, &account.label, entries),
+                        );
+                        Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
+                    })();
+                    if let Some(choice) = hiccups.note("waiting for usable quota", decided) {
+                        target = choice;
+                    } else {
+                        wake.retry(now());
                     }
-                    let (entries, settings) = observations(store, provider)?;
-                    wake.schedule(&entries, rejected.next_lapse(now()), now());
-                    let entries = rejected.filter(
+                }
+                if target.is_none() {
+                    wake.report(provider, &account.label, now());
+                } else if restarts.capped() && !reported_cap {
+                    eprintln!(
+                        "aswap: usage-limit resume is waiting for the eight-restarts-per-hour cap"
+                    );
+                    reported_cap = true;
+                }
+                terminal
+                    .as_mut()
+                    .expect("auto terminal")
+                    .wait_for_restart(250)?;
+            }
+            // Eligibility can change after stopping the old provider. A lost
+            // target is a normal wait outcome; store failures retain their own
+            // retry policy. Neither permits launching a rejected account.
+            let commit = || -> Result<Option<(Account, Arc<crate::live::Lease>)>> {
+                let _lock = store.lock()?;
+                let mut state = store.load()?;
+                let settings = state.auto.get(&provider).cloned().unwrap_or_default();
+                let Some(next) = recovery_target(
+                    &account.label,
+                    &rejected.filter(
                         store,
                         &account.label,
                         settings.threshold,
-                        models.filter(store, &account.label, entries),
-                    );
-                    Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
-                })();
-                if let Some(choice) = hiccups.note("waiting for usable quota", decided) {
-                    target = choice;
+                        models.filter_cached(
+                            store,
+                            &account.label,
+                            entries_from_cache(store, provider)?,
+                        ),
+                    ),
+                    &settings,
+                    now(),
+                )
+                .cloned() else {
+                    return Ok(None);
+                };
+                let next_lease = if next.label == account.label {
+                    Arc::clone(&lease)
+                } else if next.label == history_owner {
+                    Arc::clone(history_lease.as_ref().expect("auto session history lease"))
                 } else {
-                    wake.retry(now());
+                    Arc::new(store.lease_locked(&next)?)
+                };
+                state.auto.entry(provider).or_default().last_switch = now();
+                store.save(&state)?;
+                rejected.resumed(store, &next, &state.accounts);
+                Ok(Some((next, next_lease)))
+            };
+            // Retried with the store lock released between attempts.
+            let committed = store::retry_for(
+                "switching accounts",
+                COMMIT_PATIENCE,
+                Duration::from_millis(200),
+                commit,
+            );
+            match committed {
+                Ok(Some(next)) => break next,
+                Ok(None) if quota_wait => {
+                    eprintln!(
+                        "aswap: quota recovery lost eligibility before commit; waiting for verified quota"
+                    );
                 }
+                Err(err) if quota_wait => {
+                    hiccups.note::<()>("committing quota recovery", Err(err));
+                }
+                Ok(None) => return Ok(status.code().filter(|code| *code != 0).unwrap_or(1)),
+                Err(err) => return Err(err),
             }
-            if target.is_none() {
-                wake.report(provider, &account.label, now());
-            } else if restarts.capped() && !reported_cap {
-                eprintln!(
-                    "aswap: usage-limit resume is waiting for the eight-restarts-per-hour cap"
-                );
-                reported_cap = true;
-            }
-            terminal
-                .as_mut()
-                .expect("auto terminal")
-                .wait_for_restart(250)?;
-        }
+            target = None;
+            wake.retry(now());
+        };
         if quota_wait {
             eprintln!(
                 "aswap: quota available on {provider}:{}; resuming the same session{}",
-                target.as_ref().expect("recovery target").label,
-                if target
-                    .as_ref()
-                    .is_some_and(|next| next.label == account.label)
-                {
+                next.label,
+                if next.label == account.label {
                     " on the current account"
                 } else {
                     ""
                 }
             );
         }
-        // Revalidate, reserve a new per-session lease and commit the decision
-        // together. Other sessions using the best account do not exclude it.
-        // If that fails, resume on the same account: the session goes on, and
-        // a limit there is detected and acted on again.
-        let commit = || -> Result<(Account, Arc<crate::live::Lease>)> {
-            let _lock = store.lock()?;
-            let mut state = store.load()?;
-            let settings = state.auto.get(&provider).cloned().unwrap_or_default();
-            let next = recovery_target(
-                &account.label,
-                &rejected.filter(
-                    store,
-                    &account.label,
-                    settings.threshold,
-                    models.filter_cached(
-                        store,
-                        &account.label,
-                        entries_from_cache(store, provider)?,
-                    ),
-                ),
-                &settings,
-                now(),
-            )
-            .cloned()
-            .ok_or(crate::Error(
-                "no eligible account after automatic switch decision",
-            ))?;
-            let next_lease = if next.label == account.label {
-                Arc::clone(&lease)
-            } else if next.label == history_owner {
-                Arc::clone(history_lease.as_ref().expect("auto session history lease"))
-            } else {
-                Arc::new(store.lease_locked(&next)?)
-            };
-            state.auto.entry(provider).or_default().last_switch = now();
-            store.save(&state)?;
-            rejected.resumed(store, &next, &state.accounts);
-            Ok((next, next_lease))
-        };
-        // Retried with the store lock released between attempts.
-        let committed = store::retry_for(
-            "switching accounts",
-            COMMIT_PATIENCE,
-            Duration::from_millis(200),
-            commit,
-        );
-        let (next, next_lease) = match committed {
-            Ok(next) => next,
-            Err(err) => {
-                eprintln!(
-                    "aswap: cannot switch accounts ({err}); resuming on {provider}:{}",
-                    account.label
-                );
-                (account.clone(), Arc::clone(&lease))
-            }
-        };
         drop(lease);
         account = next;
         lease = next_lease;
@@ -698,8 +698,7 @@ pub fn run(
 /// restart), and while one does (then its bookkeeping retries next tick).
 const PREPARE_PATIENCE: Duration = Duration::from_secs(600);
 const SUPERVISE_PATIENCE: Duration = Duration::from_secs(1);
-/// How long a switch is retried before the conversation resumes on the same
-/// account instead.
+/// How long store I/O at commit is retried before returning to quota waiting.
 const COMMIT_PATIENCE: Duration = Duration::from_secs(60);
 /// Retry a step that takes and releases the store lock itself, for as long
 /// as no provider runs: under the lock, store I/O gives up within seconds so
@@ -938,18 +937,6 @@ fn recovery_target<'a>(
                 && cache.used(at).is_some_and(|used| used < settings.threshold))
             .then_some(account)
         })
-    })
-}
-
-/// Preserve the existing failure for an exited CLI when quota is available
-/// but every such target rejects the requested model. Quota exhaustion waits.
-fn model_blocks_recovery(current: &str, entries: &[(Account, usage::Cached)], at: u64) -> bool {
-    entries.iter().any(|(_, cache)| {
-        cache.error.as_deref() == Some("model-unavailable")
-            && at.saturating_sub(cache.fetched_at) <= 600
-            && cache.usage.used(at).is_some_and(|used| used < 100.0)
-    }) && !entries.iter().any(|(account, cache)| {
-        account.label != current && cache.used(at).is_some_and(|used| used < 100.0)
     })
 }
 
@@ -1671,16 +1658,5 @@ mod wake_tests {
         );
         rejected.labels.insert("current".into(), None);
         assert_eq!(choose(&rejected, AT + LIMIT_HOLD_MAX), None);
-    }
-
-    #[test]
-    fn exhausted_model_candidates_wait_but_incompatible_available_quota_keeps_its_error() {
-        let mut entries = vec![entry(Provider::Codex, "other", 100.0, None, AT)];
-        entries[0].1.error = Some("model-unavailable".into());
-        assert!(!model_blocks_recovery("current", &entries, AT));
-        entries[0].1.usage.windows[0].used_percent = 5.0;
-        assert!(model_blocks_recovery("current", &entries, AT));
-        entries.push(entry(Provider::Codex, "compatible", 15.0, None, AT));
-        assert!(!model_blocks_recovery("current", &entries, AT));
     }
 }

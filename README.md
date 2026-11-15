@@ -600,8 +600,11 @@ the current account for the rest of this run without marking its quota spent.
 
 When no compatible account has verified quota below the threshold, aswap prints
 `no eligible account with verified support for model ... and available quota`.
-An open provider stays open; a provider that has already exited returns failure.
-The launcher never substitutes another model. The initial explicitly selected
-account remains usable even if its catalog cannot be queried; every automatic
-switch target must pass verification. Restart the supervisor after changing
+An open provider stays open. After a quota limit, the supervisor keeps waiting
+for the current account to recover even if every alternative lacks the model.
+Losing a target's quota before
+the switch commits returns to that wait. Login and explicit model rejections
+remain permanent for the run. The launcher never substitutes another model.
+The initial explicitly selected account remains usable even if its catalog cannot
+be queried; every automatic switch target must pass verification. Restart the supervisor after changing
 model selection inside the provider UI so aswap uses the new required model.

@@ -22,6 +22,10 @@ impl Drop for Children {
 }
 
 fn scenario(provider: Provider, recovered: &str, exited: bool, count: usize) {
+    review_scenario(provider, recovered, exited, count, "ordinary");
+}
+
+fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usize, mode: &str) {
     let interrupted = recovered == "interrupt";
     let temp = tempfile::tempdir().unwrap();
     let store = Store::open(temp.path().join("data/aswap")).unwrap();
@@ -55,7 +59,11 @@ fn scenario(provider: Provider, recovered: &str, exited: bool, count: usize) {
                         resets_at: Some(if label == recovered {
                             reset
                         } else {
-                            reset + 60
+                            if mode == "model" {
+                                reset + 10
+                            } else {
+                                reset + 60
+                            }
                         }),
                         duration_minutes: Some(10080),
                     }],
@@ -81,6 +89,7 @@ fn scenario(provider: Provider, recovered: &str, exited: bool, count: usize) {
     let fake = temp.path().join("bin").join(provider.to_string());
     fs::write(&fake, format!("#!{}\n{}", python.display(), r#"
 import datetime,json,os,pathlib,sys,time
+mode=os.environ['ASWAP_TEST_MODE']
 provider=pathlib.Path(sys.argv[0]).name
 p=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'] if provider=='claude' else os.environ['CODEX_HOME'])
 args=sys.argv[1:]
@@ -88,7 +97,7 @@ if 'app-server' in args:
     for line in sys.stdin:
         req=json.loads(line)
         if req.get('method')=='initialize': result={}
-        elif req.get('method')=='model/list': result={'data':[{'id':'synthetic-model','model':'synthetic-model'}]}
+        elif req.get('method')=='model/list': result={'data':[] if mode=='model' and 'synthetic-other' in (p/'auth.json').read_text() else [{'id':'synthetic-model','model':'synthetic-model'}]}
         else: continue
         print(json.dumps({'id':req['id'],'result':result}),flush=True)
     sys.exit(0)
@@ -101,7 +110,7 @@ label='current' if 'synthetic-current' in auth else 'other'
 log=pathlib.Path(os.environ['ASWAP_TEST_LOG'])
 transcript=p/'projects'/'-synthetic'/(id+'.jsonl') if provider=='claude' else p/'sessions'/('rollout-synthetic-'+id+'.jsonl')
 if (log/(id+'-initial')).exists():
-    assert label==os.environ['ASWAP_TEST_RECOVERED']
+    assert label==('current' if mode=='model' else os.environ['ASWAP_TEST_RECOVERED'])
     assert args==base+['--','You were interrupted by a usage-limit account switch. Continue exactly where you left off.']
     assert 'synthetic conversation' in transcript.read_text()
     if os.environ['ASWAP_TEST_EXITED']=='yes':
@@ -119,7 +128,19 @@ if provider=='claude':
 print("You've hit your weekly limit" if provider=='claude' else 'usage_limit_reached',flush=True)
 (log/(id+'-initial')).write_text('limited')
 if os.environ['ASWAP_TEST_EXITED']=='yes': sys.exit(1)
-time.sleep(25)
+if mode=='race':
+    import signal
+    def quota_lost(*unused):
+        cache=pathlib.Path(os.environ['XDG_DATA_HOME'])/'aswap'/'profiles'/provider/'other'/'usage-cache.json'
+        value=json.loads(cache.read_text())
+        value['error']='provider-limit'
+        value['usage']['windows'][0]['used_percent']=100
+        draft=cache.with_suffix('.new')
+        draft.write_text(json.dumps(value));draft.replace(cache)
+        (log/'revoked').write_text('quota revoked before commit')
+        sys.exit(1)
+    signal.signal(signal.SIGTERM,quota_lost)
+time.sleep(12 if mode=='model' else 25)
 sys.exit(9)
 "#)).unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
@@ -152,6 +173,8 @@ sys.exit(9)
                 .env("CODEX_HOME", temp.path().join("codex"))
                 .env(provider.bin_var(), &fake)
                 .env("ASWAP_TEST_LOG", &log)
+                .env("ASWAP_TEST_MODE", mode)
+                .env("XDG_CONFIG_HOME", temp.path().join("config"))
                 .env("ASWAP_TEST_RECOVERED", recovered)
                 .env("ASWAP_TEST_EXITED", if exited { "yes" } else { "no" })
                 .stdin(if exited {
@@ -165,11 +188,21 @@ sys.exit(9)
                 .unwrap(),
         );
     }
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut sent = false;
     while aswap::now() < reset {
         assert!(Instant::now() < deadline);
-        if exited && !sent && aswap::now() >= reset - 1 {
+        if exited
+            && !sent
+            && (if mode == "input" {
+                fs::read_dir(&log).unwrap().count() == count
+            } else {
+                aswap::now() >= reset - 1
+            })
+        {
+            if mode == "input" {
+                std::thread::sleep(Duration::from_millis(60));
+            }
             for child in &mut children.0 {
                 use std::io::Write;
                 child
@@ -212,6 +245,45 @@ sys.exit(9)
         cache.usage.windows[0].resets_at = Some(reset + 3600);
         store::json_write(&cache_path, &cache).unwrap();
     }
+    if mode == "model" || mode == "race" {
+        while if mode == "model" {
+            aswap::now() < reset + 10
+        } else {
+            !log.join("revoked").exists()
+        } {
+            assert!(Instant::now() < deadline, "review barrier timed out");
+            for child in &mut children.0 {
+                if let Some(status) = child.try_wait().unwrap() {
+                    let mut stderr = String::new();
+                    std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr)
+                        .unwrap();
+                    panic!("supervisor abandoned quota recovery: {status}: {stderr}");
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if mode == "race" {
+            std::thread::sleep(Duration::from_millis(750));
+        }
+        for child in &mut children.0 {
+            if let Some(status) = child.try_wait().unwrap() {
+                let mut stderr = String::new();
+                std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+                panic!("supervisor launched without verified quota: {status}: {stderr}");
+            }
+        }
+        let label = if mode == "model" { "current" } else { "other" };
+        let path = store
+            .profile(provider, label)
+            .unwrap()
+            .join("usage-cache.json");
+        let mut cache: Cached = store::json_read(&path).unwrap();
+        cache.error = None;
+        cache.fetched_at = aswap::now();
+        cache.usage.windows[0].used_percent = 2.0;
+        cache.usage.windows[0].resets_at = Some(reset + 3600);
+        store::json_write(&path, &cache).unwrap();
+    }
     for child in &mut children.0 {
         while child.try_wait().unwrap().is_none() {
             assert!(
@@ -228,10 +300,28 @@ sys.exit(9)
             assert!(stderr.contains("provider session interrupted"), "{stderr}");
             continue;
         }
-        assert!(status.success(), "{stderr}");
+        if !status.success() {
+            let mut stdout = String::new();
+            std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+            panic!("{stderr}\n{stdout}");
+        }
+        if mode == "race" {
+            assert!(
+                stderr.contains("lost eligibility before commit; waiting"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("resuming on claude:current"), "{stderr}");
+        }
         assert!(stderr.contains("watching all accounts"), "{stderr}");
         assert!(
-            stderr.contains(&format!("quota available on {provider}:{recovered}")),
+            stderr.contains(&format!(
+                "quota available on {provider}:{}",
+                if mode == "model" {
+                    "current"
+                } else {
+                    recovered
+                }
+            )),
             "{stderr}"
         );
         if recovered == "current" {
@@ -240,7 +330,7 @@ sys.exit(9)
     }
     assert_eq!(
         fs::read_dir(log).unwrap().count(),
-        count * if interrupted { 1 } else { 2 }
+        count * if interrupted { 1 } else { 2 } + usize::from(mode == "race")
     );
 }
 
@@ -274,4 +364,22 @@ fn waiting_after_provider_exit_can_be_cancelled_without_a_restart() {
     for provider in [Provider::Claude, Provider::Codex] {
         scenario(provider, "interrupt", true, 1);
     }
+}
+
+// Adapted from the independent reviewer reproductions in ~/handoff.
+#[test]
+fn review_input_queued_after_exit_claude() {
+    review_scenario(Provider::Claude, "other", true, 1, "input");
+}
+#[test]
+fn review_input_queued_after_exit_codex() {
+    review_scenario(Provider::Codex, "other", true, 1, "input");
+}
+#[test]
+fn review_incompatible_other_does_not_abort_current_recovery() {
+    review_scenario(Provider::Codex, "other", false, 1, "model");
+}
+#[test]
+fn review_quota_revoked_between_selection_and_commit() {
+    review_scenario(Provider::Claude, "other", false, 1, "race");
 }

@@ -42,6 +42,8 @@ pub struct Terminal {
     slave: File,
     original: Option<libc::termios>,
     input_open: bool,
+    started: bool,
+    childless: bool,
     diagnostics: Diagnostics,
     pub auth_expired: bool,
     pub model_unsupported: bool,
@@ -99,6 +101,8 @@ impl Terminal {
             slave,
             original,
             input_open: true,
+            started: false,
+            childless: true,
             diagnostics: Diagnostics::default(),
             auth_expired: false,
             model_unsupported: false,
@@ -126,13 +130,46 @@ impl Terminal {
                 Ok(())
             });
         }
+        self.resize();
+        if self.started {
+            // Preparation/commit can take time after the last wait pump.
+            // Drain outer input at the relaunch boundary, including a TTY,
+            // and clear bytes forwarded before the previous exit was seen.
+            self.childless = true;
+            self.wait_for_restart(0)?;
+            while self.input_open {
+                let mut input = libc::pollfd {
+                    fd: 0,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: a single initialized descriptor, with no wait.
+                let ready = unsafe { libc::poll(&mut input, 1, 0) };
+                if ready < 0 {
+                    if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(Error("cannot drain terminal input before resume"));
+                }
+                if ready == 0 {
+                    break;
+                }
+                self.wait_for_restart(0)?;
+            }
+            // SAFETY: the private slave remains open while no provider runs.
+            if unsafe { libc::tcflush(self.slave.as_raw_fd(), libc::TCIFLUSH) } != 0 {
+                return Err(Error("cannot clear provider input before resume"));
+            }
+        }
         self.diagnostics = Diagnostics::default();
         self.auth_expired = false;
         self.model_unsupported = false;
         self.quiet_auth = false;
         self.held_auth.clear();
-        self.resize();
-        command.spawn().safe("cannot launch provider in terminal")
+        let child = command.spawn().safe("cannot launch provider in terminal")?;
+        self.started = true;
+        self.childless = false;
+        Ok(child)
     }
     pub fn discard_piped_input(&mut self) {
         if !io::stdin().is_terminal() {
@@ -151,14 +188,29 @@ impl Terminal {
     }
     /// Forward terminal I/O and inspect a bounded trailing slice for limit errors.
     pub fn pump(&mut self, wait_ms: i32) -> Result<bool> {
-        self.pump_inner(wait_ms, true)
+        self.pump_inner(wait_ms, !self.childless, None)
+    }
+    /// Recheck liveness after polling and before forwarding newly read input:
+    /// the child can exit while poll waits for a keystroke.
+    pub fn pump_child(&mut self, wait_ms: i32, child: &mut Child) -> Result<bool> {
+        self.pump_inner(wait_ms, !self.childless, Some(child))
+    }
+    pub fn child_exited(&mut self) -> Result<bool> {
+        self.childless = true;
+        self.pump_inner(0, false, None)
     }
     /// Keep cancellation responsive while no provider exists. Typed input
     /// must not queue up in the PTY and replay when the session resumes.
     pub fn wait_for_restart(&mut self, wait_ms: i32) -> Result<()> {
-        self.pump_inner(wait_ms, false).map(|_| ())
+        self.childless = true;
+        self.pump_inner(wait_ms, false, None).map(|_| ())
     }
-    fn pump_inner(&mut self, wait_ms: i32, forward_input: bool) -> Result<bool> {
+    fn pump_inner(
+        &mut self,
+        wait_ms: i32,
+        mut forward_input: bool,
+        child: Option<&mut Child>,
+    ) -> Result<bool> {
         if self
             .interrupt
             .flag
@@ -192,6 +244,12 @@ impl Terminal {
             let n = io::stdin()
                 .read(&mut buffer)
                 .safe("cannot read terminal input")?;
+            if let Some(child) = child
+                && child.try_wait().safe("cannot wait for provider")?.is_some()
+            {
+                self.childless = true;
+                forward_input = false;
+            }
             if n == 0 {
                 self.input_open = false;
             } else if forward_input {
