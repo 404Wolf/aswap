@@ -6,6 +6,7 @@ use aswap::{
 use serde_json::json;
 use std::{
     fs,
+    io::Read,
     os::unix::fs::PermissionsExt,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -87,62 +88,15 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
         .unwrap();
     fs::create_dir(temp.path().join("bin")).unwrap();
     let fake = temp.path().join("bin").join(provider.to_string());
-    fs::write(&fake, format!("#!{}\n{}", python.display(), r#"
-import datetime,json,os,pathlib,sys,time
-mode=os.environ['ASWAP_TEST_MODE']
-provider=pathlib.Path(sys.argv[0]).name
-p=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'] if provider=='claude' else os.environ['CODEX_HOME'])
-args=sys.argv[1:]
-if 'app-server' in args:
-    for line in sys.stdin:
-        req=json.loads(line)
-        if req.get('method')=='initialize': result={}
-        elif req.get('method')=='model/list': result={'data':[] if mode=='model' and 'synthetic-other' in (p/'auth.json').read_text() else [{'id':'synthetic-model','model':'synthetic-model'}]}
-        else: continue
-        print(json.dumps({'id':req['id'],'result':result}),flush=True)
-    sys.exit(0)
-if provider=='codex':
-    assert args[:2]==['-c','cli_auth_credentials_store="file"'];args=args[2:]
-id=args[1]
-base=['--resume' if provider=='claude' else 'resume',id,'--model','synthetic-model']
-auth=(p/('.credentials.json' if provider=='claude' else 'auth.json')).read_text()
-label='current' if 'synthetic-current' in auth else 'other'
-log=pathlib.Path(os.environ['ASWAP_TEST_LOG'])
-transcript=p/'projects'/'-synthetic'/(id+'.jsonl') if provider=='claude' else p/'sessions'/('rollout-synthetic-'+id+'.jsonl')
-if (log/(id+'-initial')).exists():
-    assert label==('current' if mode=='model' else os.environ['ASWAP_TEST_RECOVERED'])
-    assert args==base+['--','You were interrupted by a usage-limit account switch. Continue exactly where you left off.']
-    assert 'synthetic conversation' in transcript.read_text()
-    if os.environ['ASWAP_TEST_EXITED']=='yes':
-        import select
-        assert not select.select([sys.stdin],[],[],0)[0], 'input typed while waiting was replayed'
-    (log/(id+'-resumed')).write_text(json.dumps(args))
-    sys.exit(0)
-assert label=='current' and args==base
-transcript.parent.mkdir(parents=True,exist_ok=True)
-transcript.write_text('synthetic conversation\n')
-if provider=='claude':
-    (p/'sessions'/(str(os.getpid())+'.json')).write_text(json.dumps({'pid':os.getpid(),'sessionId':id}))
-    with transcript.open('a') as out:
-        out.write(json.dumps({'type':'assistant','timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat(),'isApiErrorMessage':True,'error':'rate_limit'})+'\n')
-print("You've hit your weekly limit" if provider=='claude' else 'usage_limit_reached',flush=True)
-(log/(id+'-initial')).write_text('limited')
-if os.environ['ASWAP_TEST_EXITED']=='yes': sys.exit(1)
-if mode=='race':
-    import signal
-    def quota_lost(*unused):
-        cache=pathlib.Path(os.environ['XDG_DATA_HOME'])/'aswap'/'profiles'/provider/'other'/'usage-cache.json'
-        value=json.loads(cache.read_text())
-        value['error']='provider-limit'
-        value['usage']['windows'][0]['used_percent']=100
-        draft=cache.with_suffix('.new')
-        draft.write_text(json.dumps(value));draft.replace(cache)
-        (log/'revoked').write_text('quota revoked before commit')
-        sys.exit(1)
-    signal.signal(signal.SIGTERM,quota_lost)
-time.sleep(12 if mode=='model' else 25)
-sys.exit(9)
-"#)).unwrap();
+    fs::write(
+        &fake,
+        format!(
+            "#!{}\n{}",
+            python.display(),
+            include_str!("fixtures/wake_provider.py")
+        ),
+    )
+    .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
     let mut children = Children(Vec::new());
     for index in 0..count {
@@ -286,10 +240,28 @@ sys.exit(9)
     }
     for child in &mut children.0 {
         while child.try_wait().unwrap().is_none() {
-            assert!(
-                Instant::now() < deadline,
-                "supervisor never woke after reset"
-            );
+            if Instant::now() >= deadline {
+                let cache: Cached = store::json_read(
+                    &store
+                        .profile(provider, recovered)
+                        .unwrap()
+                        .join("usage-cache.json"),
+                )
+                .unwrap();
+                let mut diagnostics =
+                    format!("supervisor never woke after reset; cache={cache:?}\n");
+                let _ = child.kill();
+                let _ = child.wait();
+                let mut stderr = String::new();
+                child
+                    .stderr
+                    .as_mut()
+                    .unwrap()
+                    .read_to_string(&mut stderr)
+                    .unwrap();
+                diagnostics.push_str(&stderr);
+                panic!("{diagnostics}");
+            }
             std::thread::sleep(Duration::from_millis(25));
         }
         let mut stderr = String::new();
@@ -344,18 +316,6 @@ fn claude_limit_dialog_wakes_on_current_or_other_account() {
 fn codex_limit_dialog_wakes_on_current_or_other_account() {
     for recovered in ["current", "other"] {
         scenario(Provider::Codex, recovered, false, 1);
-    }
-}
-#[test]
-fn exited_claude_waits_and_many_sessions_resume_on_the_first_reset() {
-    for recovered in ["current", "other"] {
-        scenario(Provider::Claude, recovered, true, 4);
-    }
-}
-#[test]
-fn exited_codex_waits_and_many_sessions_resume_on_the_first_reset() {
-    for recovered in ["current", "other"] {
-        scenario(Provider::Codex, recovered, true, 4);
     }
 }
 

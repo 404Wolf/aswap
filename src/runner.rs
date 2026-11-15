@@ -1,6 +1,11 @@
+#[cfg(not(test))]
+use crate::now;
+#[cfg(test)]
+use wake_process_tests::now;
+
 use crate::terminal::Terminal;
 use crate::{
-    Result, Safe, now,
+    Result, Safe,
     provider::Provider,
     store::{self, Account, Store},
     usage,
@@ -1660,3 +1665,7 @@ mod wake_tests {
         assert_eq!(choose(&rejected, AT + LIMIT_HOLD_MAX), None);
     }
 }
+
+#[cfg(test)]
+#[path = "runner/wake_process_tests.rs"]
+mod wake_process_tests;
