@@ -17,6 +17,11 @@
           version = "0.1.0";
           src = pkgs.lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          # nixpkgs' cargoSetupHook sets LIBSQLITE3_SYS_USE_PKG_CONFIG=1
+          # (NixOS/nixpkgs 44cddf92c4), which overrides rusqlite's "bundled"
+          # feature and links the system SQLite instead.
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.sqlite ];
           nativeCheckInputs = [ pkgs.python3 ];
           preCheck = ''
             aswapTestRoot=$(mktemp -d)
