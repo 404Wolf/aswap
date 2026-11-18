@@ -98,6 +98,16 @@ aswap run pi --auto       # resume the session on another account at a limit
 - `aswap add pi` moves the login out of pi's `auth.json`, leaving pi's other
   logins and API keys there. Two programs refreshing one rotating token
   break each other. `/login` in plain pi again for an independent login.
+  The move happens under pi's own lock: the login is saved and checked in
+  aswap first, and taken out of pi only then, so a failure leaves it in pi.
+- An aswap pi run only has that ChatGPT login: pi's API keys and other
+  logins, and `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` in the environment, are
+  not passed in (account isolation). The same holds for `--via pi`.
+- `--auto` follows pi's own session changes (`/new`, `/resume`, `/fork`)
+  through a small extension aswap loads with `-e`. It needs to know the
+  session: start without a session option, or with `--session-id <uuid>`;
+  `--session <path>` or `--continue` leave it unknown, and aswap then never
+  restarts that run.
 - A run gets a private `auth.json` holding an access-only copy of the
   login. pi's settings, sessions, extensions, themes and models are shared
   with your normal `~/.pi/agent` (or `PI_CODING_AGENT_DIR`). aswap refreshes

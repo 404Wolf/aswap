@@ -153,6 +153,37 @@ fn shared_home(store: &Store, provider: Provider, mut home: PathBuf) -> Result<P
     }
     Err(Error("provider home is a chain of aswap launch views"))
 }
+/// Removes a run's launch view, with its lock and session report, when the
+/// run ends, but only once `synced` says its last sync published everything
+/// it holds of the user's: what remains is disposable (an access-only login,
+/// account config already merged back, symlinks). A view whose last sync
+/// failed is kept, so nothing written there is lost.
+pub struct ViewCleanup {
+    path: PathBuf,
+    pub synced: bool,
+}
+impl ViewCleanup {
+    pub fn new(view: &View) -> Self {
+        Self {
+            path: view.path.clone(),
+            synced: false,
+        }
+    }
+}
+impl Drop for ViewCleanup {
+    fn drop(&mut self) {
+        if !self.synced {
+            return;
+        }
+        // remove_dir_all never follows the view's links into shared state.
+        let _ = fs::remove_dir_all(&self.path);
+        for suffix in [".lock", ".session.json"] {
+            let mut name = self.path.as_os_str().to_owned();
+            name.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(name));
+        }
+    }
+}
 /// A private auth/config view; actual history lives in the caller's home.
 pub struct View {
     pub path: PathBuf,
@@ -372,6 +403,13 @@ impl View {
         store
             .profile(account.provider, &account.label)
             .is_ok_and(|p| stamp(&p.join(account.provider.auth_file())) != self.auth_stamp)
+    }
+    /// Where the provider reports its current session: beside the view, never
+    /// inside the provider home, like the view's lock.
+    pub fn report_path(&self) -> PathBuf {
+        let mut name = self.path.as_os_str().to_owned();
+        name.push(".session.json");
+        PathBuf::from(name)
     }
     pub fn select(&mut self, store: &Store, account: &Account) -> Result<()> {
         let _lock = store.lock()?;

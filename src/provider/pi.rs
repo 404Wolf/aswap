@@ -10,6 +10,7 @@
 //! sentinel refresh token: pi never refreshes, aswap refreshes the profile
 //! and hands the new token to every view, and pi picks it up on its next
 //! request.
+mod lock;
 pub mod login;
 
 use super::{Claims, Encoding, Refresh, SessionArg, Spec, codex, jwt_claims, text};
@@ -19,11 +20,12 @@ use crate::{
     store,
     usage::{Failure, Usage},
 };
+use lock::{LockError, PiLock};
 use login::{AccountId, EpochMillis, Kind, Login, RefreshToken};
 use serde_json::{Value, json};
 use std::{
     path::Path,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 /// Sign in with ChatGPT's token endpoint and resource (pi-ai's
@@ -38,6 +40,43 @@ const VIEW_GRACE_MS: u64 = 86_400_000;
 /// How long `aswap add pi` waits for a running pi to release its lock.
 const LOCK_PATIENCE: Duration = Duration::from_secs(5);
 
+/// Replace pi's file as pi does (a 0600 temporary file renamed over it),
+/// leaving the directory and its mode as pi and the user keep them.
+fn replace_file(path: &Path, value: &Value) -> std::io::Result<()> {
+    use std::{io::Write, os::unix::fs::PermissionsExt};
+    let dir = path.parent().ok_or(std::io::ErrorKind::NotFound)?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".auth.json.aswap-")
+        .permissions(std::fs::Permissions::from_mode(0o600))
+        .tempfile_in(dir)?;
+    temp.write_all(&serde_json::to_vec_pretty(value)?)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)?;
+    Ok(())
+}
+/// The ChatGPT login in a pi `auth.json`, exactly as pi wrote it.
+pub(crate) fn raw_login(auth: &Value) -> std::result::Result<(Kind, Value), login::Error> {
+    let kind = Login::parse(auth)?.kind;
+    Ok((kind, auth[kind.id()].clone()))
+}
+/// Where the session extension writes its report.
+pub const SESSION_REPORT: &str = "ASWAP_PI_SESSION_REPORT";
+/// The pi extension that reports the current session (written under the
+/// store, loaded with `-e` into supervised pi launches only).
+const SESSION_EXTENSION: &str = r#"// Written by aswap: tell the supervising aswap run which pi session is current.
+import { renameSync, writeFileSync } from "node:fs";
+
+export default function (pi: any) {
+	const report = process.env.ASWAP_PI_SESSION_REPORT;
+	if (!report) return;
+	pi.on("session_start", async (_event: unknown, ctx: any) => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		const temporary = `${report}.${process.pid}.tmp`;
+		writeFileSync(temporary, JSON.stringify({ sessionId }), { mode: 0o600 });
+		renameSync(temporary, report);
+	});
+}
+"#;
 /// The account a Codex-backend access token belongs to.
 fn token_account(access: &str) -> Option<AccountId> {
     AccountId::new(text(&jwt_claims(access)?, &[ACCOUNT])?)
@@ -72,44 +111,32 @@ impl Spec for Pi {
     fn auth_file(&self) -> &'static str {
         "auth.json"
     }
-    /// Only the ChatGPT login: other entries (API keys, other providers'
-    /// OAuth) stay the user's and never enter a profile.
-    fn select_login(&self, auth: Value) -> Value {
-        Login::parse(&auth).map_or(json!({}), |login| login.to_value())
-    }
     /// Move, not copy: pi would go on refreshing the same login in its own
-    /// `auth.json`, and the first rotation would break the other copy. The
-    /// entry is removed under pi's own lock (proper-lockfile's
-    /// `auth.json.lock` directory); every other entry stays.
-    fn release(&self, source: &Path, saved: &Value) -> Result<()> {
-        let Ok(login) = Login::parse(saved) else {
-            return Ok(());
-        };
+    /// `auth.json`, and the first rotation would break the other copy.
+    /// Under pi's own lock, held throughout so pi cannot rotate the token
+    /// meanwhile: read the file, hand `keep` the exact raw ChatGPT entry (no
+    /// other entry ever enters a profile), then remove that entry and leave
+    /// every other one. pi replaces its file the same way, by rename.
+    fn take_login(&self, source: &Path, keep: &mut dyn FnMut(Value) -> Result<()>) -> Result<()> {
         let path = source.join(self.auth_file());
         store::no_links(&path)?;
-        let lock = source.join("auth.json.lock");
-        let deadline = Instant::now() + LOCK_PATIENCE;
-        while std::fs::create_dir(&lock).is_err() {
-            if Instant::now() >= deadline {
-                return Err(crate::Error(
-                    "pi's auth.json is locked by a running pi; retry when it is idle",
-                ));
+        let _lock = PiLock::acquire(&path, LOCK_PATIENCE).map_err(|e| match e {
+            LockError::Held => {
+                crate::Error("pi's auth.json is locked by a running pi; retry when it is idle")
             }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let result = (|| {
-            let mut auth: Value = store::json_read(&path)?;
-            let id = login.kind.id();
-            if auth.get(id) == login.to_value().get(id)
-                && let Some(entries) = auth.as_object_mut()
-            {
-                entries.remove(id);
-                store::json_write(&path, &auth)?;
-            }
-            Ok(())
-        })();
-        let _ = std::fs::remove_dir(&lock);
-        result
+            LockError::Io(_) => crate::Error("cannot lock pi's auth.json"),
+        })?;
+        let mut auth: Value = store::json_read(&path)?;
+        let (kind, entry) = raw_login(&auth)?;
+        keep(json!({ kind.id(): entry }))?;
+        auth.as_object_mut()
+            .ok_or(crate::Error("pi's auth.json must be an object"))?
+            .remove(kind.id());
+        replace_file(&path, &auth).map_err(|_| {
+            crate::Error(
+                "cannot take the login out of pi's auth.json; it stays in pi, nothing was added",
+            )
+        })
     }
     fn auth_valid(&self, auth: &Value) -> bool {
         Login::parse(auth).is_ok()
@@ -252,6 +279,25 @@ impl Spec for Pi {
     fn resume_args(&self, id: &SessionId) -> Vec<String> {
         vec!["--session-id".into(), id.to_string()]
     }
+    /// pi appends with open/close, so no descriptor or file says which
+    /// session a pi process writes. A small extension aswap ships reports it:
+    /// pi fires `session_start` at launch and after `/new`, `/resume`,
+    /// `/fork` and `/clone`.
+    fn report_session(
+        &self,
+        store: &crate::store::Store,
+        report: &Path,
+        cmd: &mut std::process::Command,
+    ) -> Result<bool> {
+        let dir = store.root.join("extensions");
+        store::private_dir(&dir)?;
+        let path = dir.join("aswap-pi-session.ts");
+        if std::fs::read(&path).ok().as_deref() != Some(SESSION_EXTENSION.as_bytes()) {
+            store::atomic(&path, SESSION_EXTENSION.as_bytes())?;
+        }
+        cmd.arg("-e").arg(&path).env(SESSION_REPORT, report);
+        Ok(true)
+    }
     /// pi appends with open/close, so no descriptor names its session; other
     /// pi sessions writing in the shared home cannot contradict a known ID.
     fn trusts_known_session(&self) -> bool {
@@ -331,6 +377,9 @@ pub(crate) fn codex_auth(login: &Login) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn selected(auth: Value) -> Value {
+        raw_login(&auth).map_or(json!({}), |(kind, entry)| json!({ kind.id(): entry }))
+    }
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     fn jwt(claims: Value) -> String {
         format!(
@@ -349,15 +398,15 @@ mod tests {
     }
     #[test]
     fn a_profile_keeps_only_the_chatgpt_login() {
-        let saved = Pi.select_login(home_auth());
+        let saved = selected(home_auth());
         assert_eq!(saved.as_object().unwrap().len(), 1);
         // The login round-trips exactly, unknown fields included.
         assert_eq!(saved["openai-codex"], home_auth()["openai-codex"]);
         assert!(saved.get("openai-codex").is_some());
         assert!(Pi.auth_valid(&saved));
-        assert!(
-            !Pi.auth_valid(&Pi.select_login(json!({"anthropic": {"type": "api_key", "key": "k"}})))
-        );
+        assert!(!Pi.auth_valid(&selected(
+            json!({"anthropic": {"type": "api_key", "key": "k"}})
+        )));
         assert_eq!(Pi.expires_at(&saved), Some(2_000_000_000));
         let claims = Pi.claims(&saved, &Value::Null);
         assert_eq!(claims.email.as_deref(), Some("someone@example.com"));
@@ -366,7 +415,7 @@ mod tests {
     }
     #[test]
     fn views_carry_no_refresh_token_and_never_expire_inside_pi() {
-        let saved = Pi.select_login(home_auth());
+        let saved = selected(home_auth());
         let view = crate::refresh::launch_auth(super::super::Provider::Pi, &saved);
         let entry = &view["openai-codex"];
         assert_eq!(entry["refresh"], "aswap-owner-managed");
@@ -377,7 +426,7 @@ mod tests {
     }
     #[test]
     fn both_chatgpt_logins_refresh_at_their_own_endpoints() {
-        let codex = Pi.refresh(&Pi.select_login(home_auth())).unwrap();
+        let codex = Pi.refresh(&selected(home_auth())).unwrap();
         assert_eq!(codex.url, codex::TOKEN_URL);
         assert!(matches!(codex.encoding, Encoding::Json));
         assert_eq!(codex.body["client_id"], codex::CLIENT);
@@ -411,7 +460,7 @@ mod tests {
     }
     #[test]
     fn usage_reads_the_codex_login_through_codex_auth_only() {
-        let saved = Pi.select_login(home_auth());
+        let saved = selected(home_auth());
         let codex = codex_auth(&Login::parse(&saved).unwrap()).unwrap();
         assert_eq!(codex["tokens"]["account_id"], "acct-synthetic");
         assert_eq!(codex["tokens"]["refresh_token"], "");

@@ -326,6 +326,8 @@ pub struct Tracker {
     home: PathBuf,
     known: Option<String>,
     files: BTreeMap<PathBuf, Stamp>,
+    /// Where the provider reports its current session (`Spec::report_session`).
+    report: Option<PathBuf>,
 }
 impl Tracker {
     pub fn new(provider: Provider, home: &Path, id: Option<String>) -> Result<Self> {
@@ -334,6 +336,7 @@ impl Tracker {
             home: home.into(),
             known: id,
             files: files(provider, home)?,
+            report: None,
         })
     }
     pub fn observe(&mut self, pid: u32) -> Result<()> {
@@ -377,6 +380,7 @@ impl Tracker {
             .provider
             .spec()
             .registered_session(&self.home, pid)
+            .or_else(|| self.reported())
             .map(|id| id.to_string());
         if let Some(id) = registered {
             self.known = Some(id);
@@ -410,6 +414,19 @@ impl Tracker {
         paths
             .find(|path| filename_id(self.provider, path).as_deref() == Some(id))
             .cloned()
+    }
+    /// Follow the session the provider reports to `path`.
+    pub(crate) fn report_to(&mut self, path: PathBuf) {
+        self.report = Some(path);
+    }
+    fn reported(&self) -> Option<SessionId> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Report {
+            session_id: String,
+        }
+        let bytes = fs::read(self.report.as_ref()?).ok()?;
+        SessionId::parse(&serde_json::from_slice::<Report>(&bytes).ok()?.session_id)
     }
     pub(crate) fn provider(&self) -> Provider {
         self.provider

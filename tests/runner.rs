@@ -57,7 +57,7 @@ if 'synthetic-second' in auth:
     expected=base+sticky
     assert args==expected or args==expected+['--','You were interrupted by a usage-limit account switch. Continue exactly where you left off.']
     assert transcript.read_text().startswith('synthetic shared conversation')
-    (p/'resume-args').write_text(json.dumps(args))
+    pathlib.Path(os.environ['ASWAP_TEST_RESULTS'], str(os.getpid())).write_text(json.dumps(args))
     for label in ['one','two']:
         result=subprocess.run([os.environ['ASWAP_TEST_BINARY'],'rename',provider,label,'must-not-rename','--json'],capture_output=True)
         assert result.returncode!=0
@@ -88,6 +88,8 @@ with transcript.open('a') as held:
         std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
     .unwrap();
+    let results = t.path().join("results");
+    fs::create_dir(&results).unwrap();
     let cwd = t.path().join("actual-project");
     fs::create_dir(&cwd).unwrap();
     let out = Command::new(std::env::current_exe().unwrap())
@@ -103,6 +105,7 @@ with transcript.open('a') as held:
         .env("ASWAP_TEST_FAILURE", failure)
         .env("ASWAP_TEST_BINARY", env!("CARGO_BIN_EXE_aswap"))
         .env("ASWAP_EXPECT_CWD", &cwd)
+        .env("ASWAP_TEST_RESULTS", &results)
         .env("OPENAI_API_KEY", "synthetic-override")
         .env("ANTHROPIC_API_KEY", "synthetic-override")
         .output()
@@ -207,27 +210,22 @@ fn runner_child() {
                 aswap::runner::run(&store, provider, Some("one"), &initial, true).unwrap(),
                 0
             );
-            let views = fs::read_dir(
-                store
-                    .root
-                    .join("runtimes")
-                    .join(provider.as_str())
-                    .join("one"),
-            )
-            .unwrap();
+            // Finished runs leave no launch view behind.
+            let runtimes = store.root.join("runtimes").join(provider.as_str());
+            for label in ["one", "two"] {
+                let left: Vec<_> = fs::read_dir(runtimes.join(label))
+                    .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+                    .unwrap_or_default();
+                assert!(left.is_empty(), "{label}: {left:?}");
+            }
+            let views = fs::read_dir(std::env::var_os("ASWAP_TEST_RESULTS").unwrap()).unwrap();
             let expected = AutoArgs::parse(provider, &initial)
                 .unwrap()
                 .resume(provider, ID, prompt.as_deref())
                 .unwrap();
-            assert!(
-                views
-                    .map(|e| e.unwrap().path().join("resume-args"))
-                    .filter(|p| p.exists())
-                    .any(
-                        |p| serde_json::from_slice::<Vec<String>>(&fs::read(p).unwrap()).unwrap()
-                            == expected
-                    )
-            );
+            assert!(views.map(|e| e.unwrap().path()).any(|p| {
+                serde_json::from_slice::<Vec<String>>(&fs::read(p).unwrap()).unwrap() == expected
+            }));
         }
         let cache = store
             .profile(provider, "one")

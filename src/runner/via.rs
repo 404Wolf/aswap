@@ -102,13 +102,25 @@ pub(super) fn shim_text(aswap: &Path, claude: &OsStr) -> std::result::Result<Vec
     text.extend_from_slice(b" run claude --pick -- \"$@\"\n");
     Ok(text)
 }
+/// A path to this same binary that survives garbage collection of its store
+/// path: the first `aswap` on `PATH` that resolves to `exe` (a profile's
+/// symlink), else `exe` itself.
+fn stable_path(exe: &Path, path: Option<&OsStr>) -> PathBuf {
+    let real = std::fs::canonicalize(exe).ok();
+    path.into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join("aswap"))
+        .find(|candidate| real.is_some() && std::fs::canonicalize(candidate).ok() == real)
+        .unwrap_or_else(|| exe.to_path_buf())
+}
 /// Write the shim under the store (0700), replacing it atomically so a pi
 /// already running never reads half of it.
 fn shim(store: &Store) -> Result<PathBuf> {
     let dir = store.root.join("bin");
     store::private_dir(&dir)?;
     let path = dir.join("claude-pick");
-    let aswap = std::env::current_exe().safe("cannot locate the aswap binary")?;
+    let exe = std::env::current_exe().safe("cannot locate the aswap binary")?;
+    let aswap = stable_path(&exe, std::env::var_os("PATH").as_deref());
     let text = shim_text(&aswap, &claude_binary())?;
     if std::fs::read(&path).is_ok_and(|old| old == text) {
         return Ok(path);
@@ -171,6 +183,26 @@ mod tests {
         );
         assert!(lines[3].ends_with(" -- \"$@\""));
         assert!(shim_text(Path::new("/a\0b"), claude).is_err());
+    }
+    #[test]
+    fn the_shim_names_a_profile_link_to_this_binary_when_there_is_one() {
+        let t = tempfile::tempdir().unwrap();
+        let store_path = t.path().join("store/aswap");
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        std::fs::write(&store_path, b"").unwrap();
+        let other = t.path().join("other");
+        let profile = t.path().join("profile");
+        for dir in [&other, &profile] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(other.join("aswap"), b"").unwrap();
+        std::os::unix::fs::symlink(&store_path, profile.join("aswap")).unwrap();
+        let path = std::env::join_paths([&other, &profile]).unwrap();
+        // Another aswap comes first on PATH, but only the link is this binary.
+        assert_eq!(stable_path(&store_path, Some(&path)), profile.join("aswap"));
+        let none = std::env::join_paths([&other]).unwrap();
+        assert_eq!(stable_path(&store_path, Some(&none)), store_path);
+        assert_eq!(stable_path(&store_path, None), store_path);
     }
     #[test]
     fn only_claude_can_be_driven_by_pi() {

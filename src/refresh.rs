@@ -88,6 +88,20 @@ where
         request(provider, &refresh.body)
     })
 }
+/// `refresh_with`, with the whole request (URL, encoding and body) given to
+/// `request`, so a test can check each provider's request end to end.
+pub fn refresh_request_with<F>(
+    store: &Store,
+    account: &Account,
+    at: u64,
+    force: bool,
+    request: F,
+) -> std::result::Result<bool, Failure>
+where
+    F: FnOnce(Provider, &Refresh) -> std::result::Result<Value, Failure>,
+{
+    refresh_inner(store, account, at, force, false, request)
+}
 pub(crate) fn refresh_inner<F>(
     store: &Store,
     account: &Account,

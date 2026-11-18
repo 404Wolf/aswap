@@ -220,6 +220,7 @@ pub fn launch(
         crate::shared::View::prepare(store, &account)
     })?;
     patiently("recording the session's view", || lease.view(&view.path))?;
+    let mut cleanup = crate::shared::ViewCleanup::new(&view);
     if auto_args.as_ref().is_some_and(|a| a.ambiguous) {
         let help = crate::session::option_help(provider, &view.path, args);
         auto_args = Some(crate::session::AutoArgs::parse_with_help(
@@ -280,10 +281,18 @@ pub fn launch(
         let resumed = switches > 0;
         let mut quiet = Quiet::new(tracker.as_ref());
         let mut limits = crate::limits::Limits::new(tracker.as_ref());
+        cleanup.synced = false;
         let mut cmd = match how.via {
             Some(via) => via.command(provider, &view.path),
             None => provider.command(&view.path),
         };
+        if let Some(tracker) = &mut tracker
+            && provider
+                .spec()
+                .report_session(store, &view.report_path(), &mut cmd)?
+        {
+            tracker.report_to(view.report_path());
+        }
         cmd.args(&launch_args);
         let supervisor = std::process::id();
         // SAFETY: only async-signal-safe Linux syscalls run after fork. Close the
@@ -538,7 +547,9 @@ pub fn launch(
             // for a transcript it created in its last moments afresh.
             quiet.apply(terminal, tracker.as_ref(), true);
         }
-        hiccups.note("saving the provider's view", view.sync(store, &account));
+        cleanup.synced = hiccups
+            .note("saving the provider's view", view.sync(store, &account))
+            .is_some();
         if !auto {
             return Ok(status.code().unwrap_or(1));
         }

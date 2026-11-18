@@ -19,7 +19,8 @@ auth = json.load(open(os.path.join(home, 'auth.json')))
 print(json.dumps({'home': home, 'auth': auth, 'args': sys.argv[1:],
     'sessions': os.path.realpath(os.path.join(home, 'sessions')),
     'settings': open(os.path.join(home, 'settings.json')).read(),
-    'openai_key': os.environ.get('OPENAI_API_KEY')}))
+    'openai_key': os.environ.get('OPENAI_API_KEY'),
+    'auth_mode': os.stat(os.path.join(home, 'auth.json')).st_mode & 0o777}))
 sys.exit(4)
 "#;
 /// A Codex app-server answering account/rateLimits/read, recording the auth
@@ -190,14 +191,9 @@ fn a_pi_launch_has_a_private_access_only_login_and_shared_state() {
     assert_eq!(seen["settings"], r#"{"theme":"synthetic"}"#);
     assert_eq!(seen["openai_key"], Value::Null);
     // The view's login file is private; pi's own auth.json is untouched.
-    assert_eq!(
-        fs::metadata(home.join("auth.json"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
+    assert_eq!(seen["auth_mode"], 0o600);
+    // The finished run's view is gone.
+    assert!(!home.exists());
     assert_eq!(t.auth(), json!({}));
 }
 
@@ -320,10 +316,139 @@ fn auto_resumes_the_same_pi_session_on_another_account_at_a_limit() {
         .collect();
     assert_eq!(sessions.len(), 1, "{sessions:?}");
     let id = &sessions[0][sessions[0].len() - 42..sessions[0].len() - 6];
+    // aswap's session extension, then the same session and options.
+    assert_eq!(args[0], "-e");
+    assert!(args[1].ends_with("/aswap/extensions/aswap-pi-session.ts"));
+    let args = &args[2..];
     assert_eq!(
         args[..4],
         ["--session-id", id, "--model", "openai-codex/gpt-6.1-sol"]
     );
     assert_eq!(args[4], "--");
     assert!(args[5].contains("usage-limit account switch"));
+}
+
+/// Like FAKE_PI_AUTO, but on account one the user starts a new conversation
+/// (pi's /new) before the limit: aswap's extension reports the switch, and
+/// the limit is recorded in the new conversation's transcript.
+const FAKE_PI_SWITCH: &str = r#"
+import datetime, json, os, sys, time
+home = os.environ['PI_CODING_AGENT_DIR']
+args = sys.argv[1:]
+extension = args[args.index('-e') + 1]
+assert 'session_start' in open(extension).read()
+report = os.environ['ASWAP_PI_SESSION_REPORT']
+def reported(id):
+    open(report + '.tmp', 'w').write(json.dumps({'sessionId': id}))
+    os.rename(report + '.tmp', report)
+access = json.load(open(os.path.join(home, 'auth.json')))['openai-codex']['access']
+id = args[args.index('--session-id') + 1]
+now = lambda: datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+sessions = os.path.join(home, 'sessions', '--synthetic--')
+os.makedirs(sessions, exist_ok=True)
+transcript = lambda id: os.path.join(sessions, '2026-11-18T00-00-00-000Z_' + id + '.jsonl')
+reported(id)
+if access == os.environ['ASWAP_TEST_SECOND']:
+    open(os.path.join(home, 'sessions', 'resumed-args.json'), 'w').write(json.dumps(args))
+    sys.exit(0)
+open(transcript(id), 'w').write(json.dumps({'type': 'session', 'id': id, 'timestamp': now()}) + '\n')
+time.sleep(0.6)
+new = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+open(transcript(new), 'w').write(json.dumps({'type': 'session', 'id': new, 'timestamp': now()}) + '\n')
+reported(new)
+time.sleep(0.6)
+with open(transcript(new), 'a') as t:
+    t.write(json.dumps({'type': 'message', 'id': 'a1', 'timestamp': now(), 'message': {
+        'role': 'assistant', 'content': [], 'stopReason': 'error',
+        'errorMessage': 'You have hit your ChatGPT usage limit (plus plan).'}}) + '\n')
+time.sleep(60)
+"#;
+
+#[test]
+fn auto_follows_a_conversation_switch_inside_pi() {
+    let t = Sandbox::new();
+    let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|p| p.join("python3"))
+        .find(|p| p.is_file())
+        .unwrap();
+    fs::write(
+        t.bin().join("pi"),
+        format!("#!{}\n{FAKE_PI_SWITCH}", python.display()),
+    )
+    .unwrap();
+    for (label, account, used) in [("one", "acct-one", 20.0), ("two", "acct-two", 10.0)] {
+        t.write_auth(&json!({"openai-codex": login(account)}));
+        t.ok(&["add", "pi", label, "--json"]);
+        let cache = json!({"usage": {"windows": [{"name": "five_hour", "used_percent": used,
+            "resets_at": null, "duration_minutes": 300}]},
+            "fetched_at": aswap::now(), "next_poll_at": aswap::now() + 3600});
+        fs::write(t.profile(label).join("usage-cache.json"), cache.to_string()).unwrap();
+    }
+    let path = std::env::join_paths(
+        std::iter::once(t.bin()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_aswap"))
+        .args(["run", "pi", "--account", "one", "--auto"])
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", t.root())
+        .env("XDG_DATA_HOME", t.root().join("data"))
+        .env("XDG_CONFIG_HOME", t.root().join("config"))
+        .env("PI_CODING_AGENT_DIR", t.pi())
+        .env(
+            "ASWAP_TEST_SECOND",
+            login("acct-two")["access"].as_str().unwrap(),
+        )
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("aswap: using pi:two"), "{stderr}");
+    let args: Vec<String> =
+        serde_json::from_slice(&fs::read(t.pi().join("sessions/resumed-args.json")).unwrap())
+            .unwrap();
+    // The conversation pi switched to, not the one it was launched with.
+    let at = args.iter().position(|a| a == "--session-id").unwrap();
+    assert_eq!(args[at + 1], "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+}
+
+#[test]
+fn a_sign_in_with_chatgpt_refresh_is_form_encoded_with_its_own_client() {
+    use aswap::{
+        provider::{Encoding, Provider},
+        refresh,
+        store::{Account, Store},
+    };
+    let t = Sandbox::new();
+    let mut chatgpt = login("acct-one");
+    chatgpt["clientId"] = json!("client-synthetic");
+    chatgpt["expires"] = json!(1_000_000u64);
+    t.write_auth(&json!({"openai": chatgpt}));
+    t.ok(&["add", "pi", "one", "--json"]);
+    let store = Store::open(t.root().join("data/aswap")).unwrap();
+    aswap::coordination::owner(&store).unwrap();
+    let account = Account {
+        provider: Provider::Pi,
+        label: "one".into(),
+    };
+    let _lock = store.lock().unwrap();
+    let rotated = refresh::refresh_request_with(&store, &account, 2000, false, |provider, request| {
+        assert_eq!(provider, Provider::Pi);
+        assert_eq!(request.url, "https://auth.openai.com/api/accounts/oauth/token");
+        assert_eq!(request.encoding, Encoding::Form);
+        assert_eq!(request.body["client_id"], "client-synthetic");
+        assert_eq!(request.body["refresh_token"], "synthetic-refresh-acct-one");
+        assert_eq!(request.body["resource"], "https://api.openai.com/v1");
+        Ok(json!({"access_token": "synthetic-rotated", "refresh_token": "synthetic-refresh-rotated",
+            "expires_in": 3600, "scope": "openid offline_access"}))
+    })
+    .unwrap();
+    assert!(rotated);
+    let saved: Value =
+        serde_json::from_slice(&fs::read(t.profile("one").join("auth.json")).unwrap()).unwrap();
+    assert_eq!(saved["openai"]["access"], "synthetic-rotated");
+    assert_eq!(saved["openai"]["refresh"], "synthetic-refresh-rotated");
+    assert_eq!(saved["openai"]["expires"], 5_600_000u64);
+    assert_eq!(saved["openai"]["clientId"], "client-synthetic");
 }

@@ -44,6 +44,7 @@ pub struct Claims {
     pub organization: Option<String>,
 }
 /// How a refresh request is encoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Encoding {
     Json,
     /// `application/x-www-form-urlencoded`; the body is an object of strings.
@@ -141,15 +142,17 @@ pub trait Spec: Sync {
     fn account_config(&self) -> Option<&'static str> {
         None
     }
-    /// The login `aswap add` saves from the provider's own auth file.
-    fn select_login(&self, auth: Value) -> Value {
-        auth
-    }
-    /// After `aswap add` saved `saved`, take it out of the provider's own
-    /// home `source` if the provider would otherwise keep refreshing the
-    /// same token there (two refreshers of one rotating token break both).
-    fn release(&self, _source: &Path, _saved: &Value) -> Result<()> {
-        Ok(())
+    /// Hand the login in the provider's own home `source` to `keep`, which
+    /// saves it into a profile. By default the auth file is copied as it is.
+    /// A provider whose own client would go on refreshing that login moves
+    /// it instead (two refreshers of one rotating token break each other):
+    /// it reads under the provider's lock, runs `keep` under it, and removes
+    /// the entry only once `keep` succeeded. If that removal fails it
+    /// returns the error, `keep`'s caller rolls back, and the login stays
+    /// where it was. A login is never in neither place.
+    fn take_login(&self, source: &Path, keep: &mut dyn FnMut(Value) -> Result<()>) -> Result<()> {
+        let auth = store::read_private(&source.join(self.auth_file()))?;
+        keep(serde_json::from_slice(&auth).safe("invalid credential JSON; contents redacted")?)
     }
     /// Extra profile files written when a login is added from `source`.
     fn capture(&self, _source: &Path, _profile: &Path) -> Result<()> {
@@ -208,6 +211,12 @@ pub trait Spec: Sync {
     /// The session the provider itself says process `pid` runs.
     fn registered_session(&self, _home: &Path, _pid: u32) -> Option<SessionId> {
         None
+    }
+    /// Have a supervised launch report its current session to `report`
+    /// (`{"sessionId": ...}`), rewritten whenever the user switches
+    /// conversations inside the provider. Returns whether it will.
+    fn report_session(&self, _store: &Store, _report: &Path, _cmd: &mut Command) -> Result<bool> {
+        Ok(false)
     }
     /// Whether a known session ID stands until the provider says otherwise:
     /// other writers in the shared home cannot contradict it.
@@ -394,9 +403,26 @@ pub fn validate_auth(provider: Provider, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 pub fn add(store: &Store, provider: Provider, name: &str) -> Result<Account> {
+    add_with(
+        store,
+        provider,
+        name,
+        &provider.current_home()?,
+        &mut |store, state| store.save(state),
+    )
+}
+/// `add` from the provider home `source`, with the state save injectable so
+/// tests can fail it.
+fn add_with(
+    store: &Store,
+    provider: Provider,
+    name: &str,
+    source: &Path,
+    save: &mut dyn FnMut(&Store, &store::State) -> Result<()>,
+) -> Result<Account> {
     store::label(name)?;
     let _lock = store.lock()?;
-    let mut state = store.load()?;
+    let state = store.load()?;
     if state
         .accounts
         .iter()
@@ -404,41 +430,44 @@ pub fn add(store: &Store, provider: Provider, name: &str) -> Result<Account> {
     {
         return Err(Error("account already exists"));
     }
-    let source = provider.current_home()?;
-    let home_auth: Value =
-        serde_json::from_slice(&store::read_private(&source.join(provider.auth_file()))?)
-            .safe("invalid credential JSON; contents redacted")?;
-    let bytes = serde_json::to_vec(&provider.spec().select_login(home_auth))
-        .safe("cannot encode credentials")?;
-    validate_auth(provider, &bytes)?;
     let target = store.profile(provider, name)?;
     if target.exists() {
         return Err(Error("profile already exists; refusing to overwrite"));
     }
-    store::private_dir(&target)?;
-    let result = (|| {
-        store::atomic(&target.join(provider.auth_file()), &bytes)?;
-        provider.spec().capture(&source, &target)?;
-        provider.spec().release(
-            &source,
-            &serde_json::from_slice(&bytes).safe("cannot encode credentials")?,
-        )?;
-        let account = Account {
-            provider,
-            label: name.to_owned(),
-        };
-        state.accounts.push(account.clone());
-        state
-            .active
+    let account = Account {
+        provider,
+        label: name.to_owned(),
+    };
+    let mut saved = None;
+    let result = provider.spec().take_login(source, &mut |login| {
+        let bytes = serde_json::to_vec(&login).safe("cannot encode credentials")?;
+        validate_auth(provider, &bytes)?;
+        store::private_dir(&target)?;
+        let path = target.join(provider.auth_file());
+        store::atomic(&path, &bytes)?;
+        // Verify before anything can take the login out of its source.
+        if store::read_private(&path)? != bytes {
+            return Err(Error("cannot verify the saved login"));
+        }
+        provider.spec().capture(source, &target)?;
+        let mut next = state.clone();
+        next.accounts.push(account.clone());
+        next.active
             .entry(provider)
             .or_insert_with(|| name.to_owned());
-        store.save(&state)?;
-        Ok(account)
-    })();
-    if result.is_err() {
+        save(store, &next)?;
+        saved = Some(next);
+        Ok(())
+    });
+    if let Err(err) = result {
+        if saved.is_some() {
+            // The provider kept the login: forget the account again.
+            let _ = store.save(&state);
+        }
         let _ = std::fs::remove_dir_all(&target);
+        return Err(err);
     }
-    result
+    Ok(account)
 }
 /// Activate a stored login. Never follow Home Manager symlinks or replace unreadable config.
 pub fn switch(store: &Store, provider: Provider, name: &str, activate: bool) -> Result<Account> {
@@ -584,4 +613,104 @@ pub fn remove(store: &Store, provider: Provider, name: &str) -> Result<Vec<Strin
         std::fs::remove_dir_all(profile).safe("cannot remove private profile")?;
     }
     Ok(duplicates)
+}
+
+#[cfg(test)]
+mod add_tests {
+    use super::*;
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+    fn pi_home(t: &Path, auth: &Value) -> PathBuf {
+        let home = t.join("pi-agent");
+        std::fs::create_dir_all(&home).unwrap();
+        store::json_write(&home.join("auth.json"), auth).unwrap();
+        home
+    }
+    fn login() -> Value {
+        // Null optional fields, as pi may write them: kept exactly.
+        json!({"type": "oauth", "access": "synthetic-access", "refresh": "synthetic-refresh",
+            "expires": 4_000_000_000_000u64, "accountId": null, "clientId": null, "scopes": null})
+    }
+    fn auth_in(home: &Path) -> Value {
+        store::json_read(&home.join("auth.json")).unwrap()
+    }
+    #[test]
+    fn a_moved_pi_login_is_kept_exactly_and_leaves_pi() {
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let other = json!({"type": "api_key", "key": "synthetic-key"});
+        let home = pi_home(
+            t.path(),
+            &json!({"anthropic": other, "openai-codex": login()}),
+        );
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        add_with(&store, Provider::Pi, "one", &home, &mut |s, st| s.save(st)).unwrap();
+        // pi's directory is pi's: its mode is left alone.
+        assert_eq!(
+            std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let saved: Value = store::json_read(
+            &store
+                .profile(Provider::Pi, "one")
+                .unwrap()
+                .join("auth.json"),
+        )
+        .unwrap();
+        assert_eq!(saved, json!({"openai-codex": login()}));
+        assert_eq!(auth_in(&home), json!({"anthropic": other}));
+        assert!(!home.join("auth.json.lock").exists());
+    }
+    #[test]
+    fn a_failed_save_leaves_the_login_in_pi() {
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let before = json!({"openai-codex": login()});
+        let home = pi_home(t.path(), &before);
+        let err = add_with(&store, Provider::Pi, "one", &home, &mut |_, _| {
+            Err(Error("synthetic full disk"))
+        })
+        .unwrap_err();
+        assert_eq!(err.0, "synthetic full disk");
+        assert_eq!(auth_in(&home), before, "pi keeps its login");
+        assert!(!store.profile(Provider::Pi, "one").unwrap().exists());
+        assert!(store.load().unwrap().accounts.is_empty());
+        assert!(!home.join("auth.json.lock").exists());
+    }
+    #[test]
+    fn a_failed_removal_from_pi_rolls_the_account_back() {
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let before = json!({"openai-codex": login()});
+        let home = pi_home(t.path(), &before);
+        // The save succeeds, then pi's directory can't take a new file.
+        let readonly =
+            |mode| std::fs::set_permissions(&home, std::fs::Permissions::from_mode(mode)).unwrap();
+        let result = add_with(&store, Provider::Pi, "one", &home, &mut |s, st| {
+            s.save(st)?;
+            readonly(0o500);
+            Ok(())
+        });
+        readonly(0o700);
+        assert!(result.is_err());
+        assert_eq!(auth_in(&home), before, "pi keeps its login");
+        assert!(!store.profile(Provider::Pi, "one").unwrap().exists());
+        let state = store.load().unwrap();
+        assert!(state.accounts.is_empty() && state.active.is_empty());
+    }
+    #[test]
+    fn nothing_moves_while_a_live_pi_holds_its_lock() {
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let before = json!({"openai-codex": login()});
+        let home = pi_home(t.path(), &before);
+        std::fs::create_dir(home.join("auth.json.lock")).unwrap();
+        let err =
+            add_with(&store, Provider::Pi, "one", &home, &mut |s, st| s.save(st)).unwrap_err();
+        assert!(err.0.contains("locked by a running pi"));
+        assert_eq!(auth_in(&home), before);
+        assert!(!store.profile(Provider::Pi, "one").unwrap().exists());
+        // The live pi's lock is its own.
+        assert!(home.join("auth.json.lock").is_dir());
+    }
 }

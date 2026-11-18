@@ -51,7 +51,7 @@ impl Default for Auto {
         }
     }
 }
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct State {
     pub accounts: Vec<Account>,
     pub active: BTreeMap<Provider, String>,

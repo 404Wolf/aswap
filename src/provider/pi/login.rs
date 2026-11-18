@@ -8,16 +8,37 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// What can be wrong with a pi login.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    #[error("pi's auth.json has no ChatGPT login; run /login in pi first")]
     Missing,
-    #[error("pi's ChatGPT login is malformed")]
     Malformed,
-    #[error("pi's Sign in with ChatGPT login has no client ID; log in again in pi")]
     NoClient,
-    #[error("pi's ChatGPT login has no refresh token")]
     NoRefresh,
+}
+impl Error {
+    /// The one wording of each error, for `Display` and for the crate's
+    /// static error messages.
+    pub const fn message(self) -> &'static str {
+        match self {
+            Error::Missing => "pi's auth.json has no ChatGPT login; run /login in pi first",
+            Error::Malformed => "pi's ChatGPT login is malformed",
+            Error::NoClient => {
+                "pi's Sign in with ChatGPT login has no client ID; log in again in pi"
+            }
+            Error::NoRefresh => "pi's ChatGPT login has no refresh token",
+        }
+    }
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+impl std::error::Error for Error {}
+impl From<Error> for crate::Error {
+    fn from(e: Error) -> Self {
+        crate::Error(e.message())
+    }
 }
 
 /// Which pi provider holds the login.

@@ -302,3 +302,40 @@ fn pick_leaves_a_default_whose_quota_is_unknown() {
     let answers = lines(&String::from_utf8(out.stdout).unwrap());
     assert_eq!(answers[0]["token"], "synthetic-two");
 }
+
+#[test]
+fn concurrent_picks_each_run_and_leave_no_launch_view() {
+    let t = Sandbox::new();
+    let outs: Vec<_> = std::thread::scope(|scope| {
+        let calls: Vec<_> = (0..6)
+            .map(|i| {
+                let t = &t;
+                scope.spawn(move || {
+                    t.aswap(
+                        &["run", "claude", "--pick", "--", "-p"],
+                        Some(&format!("call {i}\n")),
+                    )
+                })
+            })
+            .collect();
+        calls.into_iter().map(|c| c.join().unwrap()).collect()
+    });
+    for (i, out) in outs.iter().enumerate() {
+        let answers = lines(&String::from_utf8(out.stdout.clone()).unwrap());
+        assert_eq!(answers[0]["line"], format!("call {i}"));
+        assert_eq!(answers[0]["token"], "synthetic-two");
+    }
+    let runtimes = t.root().join("data/aswap/runtimes/claude");
+    for label in ["one", "two"] {
+        let left: Vec<_> = fs::read_dir(runtimes.join(label))
+            .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "{label} kept launch views: {left:?}");
+    }
+    // No lease outlives its run either.
+    let live = t.root().join("data/aswap/live/claude");
+    for label in ["one", "two"] {
+        let left = fs::read_dir(live.join(label)).map_or(0, |d| d.count());
+        assert_eq!(left, 0, "{label} kept a lease");
+    }
+}

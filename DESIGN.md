@@ -331,8 +331,17 @@ proper-lockfile lock, and re-reads `auth.json` whenever the file's revision
 changes. A launch view therefore carries the access token, a sentinel
 refresh token and `expires` a day late: pi never refreshes, and aswap's
 refresh and hand-out reach it on its next request. `aswap add pi` moves the
-entry out of pi's own file under that lock, since copying it would leave two
-refreshers of one rotating token. Quota comes from a usage-only Codex
+entry out of pi's own file, since copying it would leave two refreshers of
+one rotating token. It takes pi's lock (`provider/pi/lock.rs`, the
+proper-lockfile protocol: a `auth.json.lock` directory, broken once older
+than 30s) and holds it throughout, so pi cannot rotate the token meanwhile:
+read the file, save the exact raw entry into the profile, read it back,
+save the account, and only then replace pi's file without the entry (a 0600
+temporary file renamed over it, leaving pi's directory mode alone). A
+failure before that last step deletes the profile and the account; a failed
+last step rolls them back too. The login is never in neither place; a crash
+right before the last step leaves it in both (two refreshers, until one
+copy is removed), which is the recoverable side. Quota comes from a usage-only Codex
 app-server given the `openai-codex` access token as Codex auth (no refresh
 token); a fake token there gets an HTTP 401 from the backend, so the format
 is accepted. Sign in with ChatGPT tokens are for api.openai.com and report no
@@ -340,8 +349,28 @@ quota (`usage-unsupported`).
 
 Sessions are `sessions/--<cwd>--/<time>_<id>.jsonl`; a supervised run
 starts new sessions with `--session-id <uuid>` and resumes with the same
-flag. pi appends with open/close, so no descriptor names the session; the
-known ID stands. A usage limit counts when the transcript gains an
+flag. pi appends with open/close, so no descriptor names the session.
+Supervised pi launches load a small extension aswap writes under the store
+(`extensions/aswap-pi-session.ts`, `-e`): on every `session_start` (launch,
+`/new`, `/resume`, `/fork`, `/clone`) it writes `{"sessionId"}` to the run's
+report file beside its view, which the tracker reads as Claude's PID
+registry is read. The limit tail follows that transcript.
+
+A run's launch view, with its lock and session report, is removed when the
+run ends, once its last sync succeeded (a failed sync keeps it). Views of
+dead runs are not pruned: a view a run from an older release still uses is
+not named by any lease, so it can't be told from an abandoned one.
+
+Facts about pi checked against pi 1.4.0 on small-pickle with no login (no
+model call): `-e` loads the extension, `session_start` fires with
+`ctx.sessionManager.getSessionId()`, and `--session-id <uuid>` creates a new
+session with exactly that ID. Still to confirm with a real ChatGPT login:
+`--session-id` reopening an existing session; both refresh requests (the
+openai-codex one is sent as JSON, as for Codex; pi itself form-encodes it);
+the Sign in with ChatGPT token endpoint and `resource`; pi picking up a
+handed-out token without restarting; quota for a real openai-codex token;
+and that a resolved symlink to auth.json is not where pi locks (aswap
+refuses links there anyway). A usage limit counts when the transcript gains an
 assistant message with `stopReason: "error"` and a usage-limit
 `errorMessage` after launch.
 
