@@ -703,6 +703,46 @@ pub fn prefer_at_launch<'a>(
     (best.0.label != current && sooner).then_some(&best.0)
 }
 
+/// For a one-call `run --pick`: `choose` keeps a current account whose quota
+/// is unknown, as a supervised launch should. A single call is better off
+/// elsewhere when the current account's reading is an error (an expired
+/// login) or its last reading is over the threshold: it takes the best
+/// account whose last error-free reading is below the threshold. Readings
+/// may be stale here (a follower's come from the owner, often older than the
+/// freshness limit); a stale reading still tells a live account from a dead
+/// one.
+pub fn best_known<'a>(
+    current: &str,
+    entries: &'a [(Account, Cached)],
+    threshold: f64,
+    prefer: Prefer,
+    at: u64,
+) -> Option<&'a Account> {
+    let known = |c: &Cached| c.error.is_none().then(|| c.usage.used(at)).flatten();
+    let (_, mine) = entries.iter().find(|(a, _)| a.label == current)?;
+    if mine.used(at).is_some()
+        || (mine.error.is_none() && known(mine).is_some_and(|v| v < threshold))
+    {
+        return None;
+    }
+    entries
+        .iter()
+        .filter_map(|(a, c)| Some((a, c, known(c).filter(|v| *v < threshold)?)))
+        .filter(|(a, _, _)| a.label != current)
+        .min_by(|(_, a, x), (_, b, y)| {
+            let by_reset = match prefer {
+                Prefer::Headroom => std::cmp::Ordering::Equal,
+                Prefer::WeeklyReset => match (a.usage.weekly_reset(at), b.usage.weekly_reset(at)) {
+                    (Some(p), Some(q)) => p.cmp(&q),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                },
+            };
+            by_reset.then_with(|| x.total_cmp(y))
+        })
+        .map(|(a, _, _)| a)
+}
 /// A provider rejected this session's credentials; preserve quota as last-known.
 pub fn mark_auth_expired(store: &Store, account: &Account) -> Result<()> {
     let _lock = store.lock()?;
@@ -803,5 +843,59 @@ mod isolation_tests {
                 10.0 + index as f64 * 30.0
             );
         }
+    }
+    #[test]
+    fn a_single_call_leaves_an_account_of_unknown_quota_for_a_known_one() {
+        let at = 10_000;
+        let entry = |label: &str, used: Option<f64>| {
+            let mut cache = Cached {
+                fetched_at: at,
+                ..Default::default()
+            };
+            match used {
+                Some(used) => cache.usage.windows.push(Window {
+                    name: "five_hour".into(),
+                    used_percent: used,
+                    resets_at: None,
+                    duration_minutes: Some(300),
+                }),
+                None => cache.error = Some("http-401".into()),
+            }
+            (
+                Account {
+                    provider: Provider::Claude,
+                    label: label.into(),
+                },
+                cache,
+            )
+        };
+        let entries = vec![
+            entry("expired", None),
+            entry("full", Some(95.0)),
+            entry("busy", Some(40.0)),
+            entry("free", Some(10.0)),
+        ];
+        let pick = |current| {
+            best_known(current, &entries, 90.0, Prefer::Headroom, at).map(|a| a.label.as_str())
+        };
+        assert_eq!(pick("expired"), Some("free"));
+        // A known current account is left to `choose`.
+        assert_eq!(pick("busy"), None);
+        assert_eq!(pick("full"), None);
+        // Stale but error-free readings still count; a stale current account
+        // below the threshold stays.
+        let mut stale = entries.clone();
+        for (_, cache) in &mut stale {
+            cache.fetched_at = at - 3600;
+        }
+        let pick_stale = |current| {
+            best_known(current, &stale, 90.0, Prefer::Headroom, at).map(|a| a.label.as_str())
+        };
+        assert_eq!(pick_stale("expired"), Some("free"));
+        assert_eq!(pick_stale("full"), Some("free"));
+        assert_eq!(pick_stale("busy"), None);
+        // Nothing known below the threshold: stay.
+        let only = vec![entry("expired", None), entry("full", Some(95.0))];
+        assert!(best_known("expired", &only, 90.0, Prefer::Headroom, at).is_none());
     }
 }

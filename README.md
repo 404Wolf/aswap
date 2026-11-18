@@ -68,6 +68,44 @@ aswap auto claude threshold 90          # when --auto switches
 
 Arguments after `--` go to the provider unchanged.
 
+### One call, picked by quota
+
+`--auto` runs the provider in a PTY, which suits an interactive session but
+breaks `claude -p` pipes. `--pick` chooses the account the way `--auto` does at
+launch, then runs with plain stdin/stdout/stderr and no supervision:
+
+```sh
+echo '{"type":"user",...}' | aswap run claude --pick -- -p --output-format stream-json
+```
+
+If the default account's quota is unknown because its login expired or its
+reading failed, or its last reading is over the threshold, `--pick` takes the
+best account whose last reading is below the threshold.
+
+### Claude inside pi
+
+[pi-claude-code-provider](https://www.npmjs.com/package/pi-claude-code-provider)
+lets pi use Claude by running the real `claude -p` once per turn, so turns
+draw on the Claude plan. aswap can choose the account for it:
+
+```sh
+aswap run claude --via pi -- --model pi-claude-code-provider/sonnet     # account picked per turn
+aswap run claude --via pi --account work -- --model pi-claude-code-provider/sonnet  # one account
+```
+
+- Without `--account`, pi's provider runs a private shim
+  (`~/.local/share/aswap/bin/claude-pick`) as `claude`. The shim is
+  `aswap run claude --pick`, so each turn picks its account by quota, and a
+  turn after a limit or an `aswap switch` moves without restarting pi.
+- With `--account`, pi runs on that account's launch view, and every turn
+  uses that account.
+- Arguments after `--` go to pi. Install the provider in pi yourself
+  (`pi install npm:pi-claude-code-provider`, or `-e <path>`).
+- The provider refuses a `claude` that always adds
+  `--dangerously-skip-permissions`. If your `claude` on `PATH` is such a
+  wrapper, set `ASWAP_CLAUDE_BIN` to the plain binary. `ASWAP_PI_BIN` names
+  the pi binary.
+
 ## How it works
 
 - Each account's login is stored privately under `~/.local/share/aswap/`

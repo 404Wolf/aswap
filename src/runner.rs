@@ -5,7 +5,7 @@ use wake_process_tests::now;
 
 use crate::terminal::Terminal;
 use crate::{
-    Result, Safe,
+    Error, Result, Safe,
     provider::Provider,
     store::{self, Account, Store},
     usage,
@@ -23,12 +23,14 @@ mod patience;
 mod quiet;
 mod recovery;
 mod rotation;
+mod via;
 use monitor::entries_from_cache;
 pub use monitor::{observations, tick};
 use patience::{COMMIT_PATIENCE, Hiccups, PREPARE_PATIENCE, SUPERVISE_PATIENCE, patiently};
 use quiet::{QUIET_STEP, Quiet};
 use recovery::{Rejected, Restarts, Wake, recovery_target};
 use rotation::{access_print, rotated_since, rotation_by};
+pub use via::Via;
 
 fn stop(child: &mut Child) -> Result<std::process::ExitStatus> {
     // SAFETY: the pid belongs to our unreaped child; no other process can reuse it.
@@ -61,6 +63,18 @@ impl Drop for Running {
     }
 }
 
+/// How `aswap run` launches a provider.
+#[derive(Clone, Copy, Default)]
+pub struct Launch {
+    /// Supervise in a PTY: at a usage limit or an expired login, resume the
+    /// same conversation on another account.
+    pub auto: bool,
+    /// Pick the account by quota at launch, as `auto` does, but run with
+    /// plain inherited stdio and no supervision (`claude -p` pipes).
+    pub pick: bool,
+    /// Run another program in front of the provider.
+    pub via: Option<Via>,
+}
 /// Every run has its own live lease and access-only authentication view.
 /// Auto sessions keep a stable history directory while changing credentials.
 pub fn run(
@@ -70,6 +84,43 @@ pub fn run(
     args: &[String],
     auto: bool,
 ) -> Result<i32> {
+    launch(
+        store,
+        provider,
+        name,
+        args,
+        Launch {
+            auto,
+            ..Launch::default()
+        },
+    )
+}
+pub fn launch(
+    store: &Store,
+    provider: Provider,
+    name: Option<&str>,
+    args: &[String],
+    how: Launch,
+) -> Result<i32> {
+    let auto = how.auto;
+    if let Some(via) = how.via {
+        via.check(provider)?;
+        if auto || how.pick {
+            return Err(Error(
+                "--via picks an account per call without --account; it takes no --auto or --pick",
+            ));
+        }
+        if name.is_none() {
+            return via::per_call(store, provider, via, args);
+        }
+    }
+    if how.pick && (auto || name.is_some()) {
+        return Err(Error(
+            "--pick chooses the account; it takes no --account or --auto",
+        ));
+    }
+    // Whether the account is chosen by quota at launch.
+    let pick = auto || how.pick;
     // Nothing runs yet: wait out a full disk or a busy store rather than exit.
     store::set_patience(PREPARE_PATIENCE);
     let mut auto_args = if auto {
@@ -103,13 +154,15 @@ pub fn run(
     };
     if auto {
         models.resolve(store, &account)?;
+    }
+    if pick {
         let (entries, _) = patiently("reading usage", || observations(store, provider))?;
         let _ = models.filter(store, &account.label, entries);
     }
     let mut lease = patiently("reserving the account", || {
         let mut account = account.clone();
         let _lock = store.lock()?;
-        if auto {
+        if pick {
             let state = store.load()?;
             let settings = state.auto.get(&provider).cloned().unwrap_or_default();
             let entries =
@@ -131,6 +184,19 @@ pub fn run(
                     settings.prefer,
                     now(),
                 )
+            })
+            .or_else(|| {
+                how.pick
+                    .then(|| {
+                        usage::best_known(
+                            &account.label,
+                            &entries,
+                            settings.threshold,
+                            settings.prefer,
+                            now(),
+                        )
+                    })
+                    .flatten()
             }) {
                 account = best.clone();
             }
@@ -214,7 +280,10 @@ pub fn run(
         let resumed = switches > 0;
         let mut quiet = Quiet::new(tracker.as_ref());
         let mut limits = crate::limits::Limits::new(tracker.as_ref());
-        let mut cmd = provider.command(&view.path);
+        let mut cmd = match how.via {
+            Some(via) => via.command(provider, &view.path),
+            None => provider.command(&view.path),
+        };
         cmd.args(&launch_args);
         let supervisor = std::process::id();
         // SAFETY: only async-signal-safe Linux syscalls run after fork. Close the

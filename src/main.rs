@@ -88,6 +88,19 @@ enum Action {
             help = "Supervise quota/limit switching, preserving options and resuming the exact session"
         )]
         auto: bool,
+        #[arg(
+            long,
+            conflicts_with_all = ["auto", "account"],
+            help = "Pick the account by quota as --auto does, without its PTY (for claude -p pipes)"
+        )]
+        pick: bool,
+        #[arg(
+            long,
+            value_enum,
+            conflicts_with_all = ["auto", "pick"],
+            help = "Run pi in front of Claude (pi-claude-code-provider): one account with --account, else one picked per claude call"
+        )]
+        via: Option<runner::Via>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -442,7 +455,17 @@ fn execute(cli: Cli) -> Result<i32> {
             account,
             args,
             auto,
-        } => return runner::run(&store, provider, account.as_deref(), &args, auto),
+            pick,
+            via,
+        } => {
+            return runner::launch(
+                &store,
+                provider,
+                account.as_deref(),
+                &args,
+                runner::Launch { auto, pick, via },
+            );
+        }
         Action::Auto {
             provider,
             action,
