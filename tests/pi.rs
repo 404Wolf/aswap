@@ -231,3 +231,99 @@ fn pi_quota_comes_from_a_codex_app_server_with_access_only_auth() {
     let waybar = t.ok(&["waybar", "--once"]);
     assert!(waybar["text"].as_str().unwrap().contains("pi:one 63%"));
 }
+
+/// pi under `--auto`: on account one it records a ChatGPT usage limit in its
+/// session transcript and stays open, as interactive pi does; on account two
+/// it records the arguments it was resumed with and exits.
+const FAKE_PI_AUTO: &str = r#"
+import datetime, json, os, sys, time
+home = os.environ['PI_CODING_AGENT_DIR']
+assert os.isatty(0) and os.isatty(1)
+args = sys.argv[1:]
+access = json.load(open(os.path.join(home, 'auth.json')))['openai-codex']['access']
+id = args[args.index('--session-id') + 1]
+now = lambda: datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+sessions = os.path.join(home, 'sessions', '--synthetic--')
+os.makedirs(sessions, exist_ok=True)
+path = os.path.join(sessions, '2026-11-18T00-00-00-000Z_' + id + '.jsonl')
+if not os.path.exists(path):
+    open(path, 'w').write(json.dumps({'type': 'session', 'id': id, 'timestamp': now()}) + '\n')
+if access == os.environ['ASWAP_TEST_SECOND']:
+    open(os.path.join(home, 'sessions', 'resumed-args.json'), 'w').write(json.dumps(args))
+    sys.exit(0)
+with open(path, 'a') as t:
+    t.write(json.dumps({'type': 'message', 'id': 'a1', 'timestamp': now(), 'message': {
+        'role': 'assistant', 'content': [], 'stopReason': 'error',
+        'errorMessage': 'You have hit your ChatGPT usage limit (plus plan). Try again in ~42 min.'}}) + '\n')
+print('You have hit your ChatGPT usage limit', flush=True)
+time.sleep(60)
+"#;
+
+#[test]
+fn auto_resumes_the_same_pi_session_on_another_account_at_a_limit() {
+    let t = Sandbox::new();
+    let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|p| p.join("python3"))
+        .find(|p| p.is_file())
+        .unwrap();
+    fs::write(
+        t.bin().join("pi"),
+        format!("#!{}\n{FAKE_PI_AUTO}", python.display()),
+    )
+    .unwrap();
+    for (label, account, used) in [("one", "acct-one", 20.0), ("two", "acct-two", 10.0)] {
+        t.write_auth(&json!({"openai-codex": login(account)}));
+        t.ok(&["add", "pi", label, "--json"]);
+        let cache = json!({"usage": {"windows": [{"name": "five_hour", "used_percent": used,
+            "resets_at": null, "duration_minutes": 300}]},
+            "fetched_at": aswap::now(), "next_poll_at": aswap::now() + 3600});
+        fs::write(t.profile(label).join("usage-cache.json"), cache.to_string()).unwrap();
+    }
+    let path = std::env::join_paths(
+        std::iter::once(t.bin()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_aswap"))
+        .args([
+            "run",
+            "pi",
+            "--account",
+            "one",
+            "--auto",
+            "--",
+            "--model",
+            "openai-codex/gpt-6.1-sol",
+        ])
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", t.root())
+        .env("XDG_DATA_HOME", t.root().join("data"))
+        .env("XDG_CONFIG_HOME", t.root().join("config"))
+        .env("PI_CODING_AGENT_DIR", t.pi())
+        .env(
+            "ASWAP_TEST_SECOND",
+            login("acct-two")["access"].as_str().unwrap(),
+        )
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("aswap: using pi:one"), "{stderr}");
+    assert!(stderr.contains("aswap: using pi:two"), "{stderr}");
+    let args: Vec<String> =
+        serde_json::from_slice(&fs::read(t.pi().join("sessions/resumed-args.json")).unwrap())
+            .unwrap();
+    // The same session, the same options, then the resume prompt.
+    let sessions: Vec<_> = fs::read_dir(t.pi().join("sessions/--synthetic--"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let id = &sessions[0][sessions[0].len() - 42..sessions[0].len() - 6];
+    assert_eq!(
+        args[..4],
+        ["--session-id", id, "--model", "openai-codex/gpt-6.1-sol"]
+    );
+    assert_eq!(args[4], "--");
+    assert!(args[5].contains("usage-limit account switch"));
+}
