@@ -41,6 +41,8 @@ pub struct Limits {
     scanned: Option<Instant>,
     seen: bool,
     screen_seen: bool,
+    /// The tracked provider, which decides what a limit entry looks like.
+    spec: Option<&'static dyn crate::provider::Spec>,
 }
 
 /// What has been read of one transcript.
@@ -80,6 +82,7 @@ impl Limits {
             scanned: None,
             seen: false,
             screen_seen: false,
+            spec: tracker.map(|t| t.provider().spec()),
         }
     }
 
@@ -91,6 +94,9 @@ impl Limits {
     pub fn check(&mut self, tracker: Option<&Tracker>, screen: bool, fresh: bool) -> bool {
         if self.seen {
             return true;
+        }
+        if let Some(t) = tracker {
+            self.spec = Some(t.provider().spec());
         }
         // Follow the tracker: a /clear or another conversation picked inside
         // the provider moves its writes, limits included, to a new transcript.
@@ -108,8 +114,8 @@ impl Limits {
             self.subagents.clear();
             self.scanned = None;
         }
-        if let Some(tail) = &mut self.main {
-            self.seen = tail.read(self.launched_wall);
+        if let (Some(tail), Some(spec)) = (&mut self.main, self.spec) {
+            self.seen = tail.read(self.launched_wall, spec);
             let dir = tail.path.with_extension("").join("subagents");
             self.seen |= self.subagents_limited(&dir, fresh);
             return self.seen;
@@ -129,6 +135,9 @@ impl Limits {
         }
         self.scanned = Some(Instant::now());
         let since = self.launched_wall;
+        let Some(spec) = self.spec else {
+            return false;
+        };
         let mut files = Vec::new();
         subagent_files(dir, 0, since, &mut files);
         let mut found = false;
@@ -137,7 +146,7 @@ impl Limits {
                 .subagents
                 .entry(path.clone())
                 .or_insert_with(|| Tail::found(path, since));
-            found |= tail.read(since);
+            found |= tail.read(since, spec);
         }
         found
     }
@@ -206,7 +215,7 @@ impl Tail {
 
     /// Read what was appended since the last read; whether it holds a limit
     /// entry stamped at or after `since`.
-    fn read(&mut self, since: SystemTime) -> bool {
+    fn read(&mut self, since: SystemTime, spec: &dyn crate::provider::Spec) -> bool {
         let Ok(mut file) = File::open(&self.path) else {
             return false;
         };
@@ -247,7 +256,7 @@ impl Tail {
             }
             if !self.skipping {
                 found |= serde_json::from_slice::<Value>(&self.partial)
-                    .is_ok_and(|entry| limit_entry(&entry, since));
+                    .is_ok_and(|entry| spec.limit_entry(&entry, since));
             }
             self.partial.clear();
             self.skipping = false;
@@ -258,20 +267,9 @@ impl Tail {
 
 /// A Claude transcript entry recording a usage-limit error at or after `since`.
 pub fn limit_entry(entry: &Value, since: SystemTime) -> bool {
-    if entry.get("isApiErrorMessage").and_then(Value::as_bool) != Some(true)
-        || entry.get("error").and_then(Value::as_str) != Some("rate_limit")
-    {
-        return false;
-    }
-    let Some(at) = entry
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-    else {
-        return false;
-    };
-    // Entries carry milliseconds.
-    at >= chrono::DateTime::<chrono::Utc>::from(since - Duration::from_millis(1))
+    crate::provider::Provider::Claude
+        .spec()
+        .limit_entry(entry, since)
 }
 
 #[cfg(test)]

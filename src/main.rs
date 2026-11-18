@@ -240,7 +240,7 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
     let auto: std::collections::BTreeMap<Provider, store::Auto> =
         serde_json::from_value(value["auto"].clone()).unwrap_or_default();
     let default = store::Auto::default();
-    let policies: Vec<_> = [Provider::Claude, Provider::Codex]
+    let policies: Vec<_> = Provider::ALL
         .into_iter()
         .map(|provider| (provider, auto.get(&provider).unwrap_or(&default)))
         .map(|(provider, a)| aswap::display::Policy {

@@ -1,7 +1,9 @@
 //! Pass-through auto-mode argv and session identity tracking. Transcript contents are
 //! never read: only filenames, metadata, /proc descriptors and PID registry JSON.
-use crate::{Error, Result, Safe, provider::Provider, store};
-use serde_json::Value;
+use crate::{
+    Error, Result, Safe,
+    provider::{Provider, SessionArg},
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -55,14 +57,11 @@ impl AutoArgs {
         let mut selection = false;
         let mut fork = false;
         let mut one_shot = false;
-        if provider == Provider::Codex
-            && args
-                .first()
-                .is_some_and(|s| matches!(s.as_str(), "resume" | "fork" | "exec"))
-        {
+        let spec = provider.spec();
+        if let Some(sub) = args.first().and_then(|s| spec.subcommand(s)) {
             selection = true;
-            one_shot = args[0] == "exec";
-            fork = args[0] == "fork";
+            one_shot = sub.one_shot;
+            fork = sub.fork;
             i = 1;
             if let Some(value) = args.get(i).filter(|s| !s.starts_with('-')) {
                 if valid_id(value) {
@@ -80,9 +79,8 @@ impl AutoArgs {
                 one_shot |= i + 1 < args.len();
                 break;
             }
-            let takes_session =
-                provider == Provider::Claude && matches!(key, "--resume" | "-r" | "--session-id");
-            if takes_session {
+            let session = spec.session_arg(key);
+            if session == Some(SessionArg::Id) {
                 selection = true;
                 let value = inline.or_else(|| {
                     args.get(i + 1)
@@ -97,13 +95,10 @@ impl AutoArgs {
                         i += 1;
                     }
                 }
-            } else if (provider == Provider::Claude
-                && matches!(key, "--continue" | "-c" | "--fork-session"))
-                || (provider == Provider::Codex && key == "--last")
-            {
+            } else if matches!(session, Some(SessionArg::Continue | SessionArg::Fork)) {
                 selection = true;
-                fork |= key == "--fork-session";
-            } else if provider == Provider::Claude && matches!(key, "--print" | "-p") {
+                fork |= session == Some(SessionArg::Fork);
+            } else if session == Some(SessionArg::OneShot) {
                 one_shot = true;
             } else if flag.starts_with('-') {
                 sticky.push(flag.clone());
@@ -165,7 +160,7 @@ impl AutoArgs {
                         | "--config"
                         | "--remote"
                         | "--remote-auth-token-env"
-                ) || (provider == Provider::Codex && matches!(key, "-c" | "-p"));
+                ) || spec.takes_value(key);
                 let described = schema.get(key).copied();
                 let variadic = matches!(
                     key,
@@ -205,7 +200,7 @@ impl AutoArgs {
             i += 1;
         }
         let mut initial = args.to_vec();
-        if provider == Provider::Claude && !selection {
+        if let Some(flag) = spec.new_session_flag().filter(|_| !selection) {
             let mut bytes = [0u8; 16];
             use ring::rand::SecureRandom;
             ring::rand::SystemRandom::new()
@@ -227,7 +222,7 @@ impl AutoArgs {
                 .iter()
                 .position(|s| s == "--")
                 .unwrap_or(initial.len());
-            initial.splice(at..at, ["--session-id".into(), uuid.clone()]);
+            initial.splice(at..at, [flag.into(), uuid.clone()]);
             id = Some(uuid);
         }
         if fork {
@@ -258,10 +253,7 @@ impl AutoArgs {
                 "exact session identity unavailable; refusing an automatic restart",
             ));
         }
-        let mut args = match provider {
-            Provider::Claude => vec!["--resume".into(), id.into()],
-            Provider::Codex => vec!["resume".into(), id.into()],
-        };
+        let mut args = provider.spec().resume_args(id);
         args.extend(self.sticky.clone());
         if let Some(prompt) = prompt {
             args.extend(["--".into(), prompt.into()]);
@@ -286,7 +278,7 @@ fn files(provider: Provider, home: &Path) -> Result<BTreeMap<PathBuf, Stamp>> {
             let p = e.path();
             let ty = e.file_type().safe("cannot inspect session metadata")?;
             if ty.is_dir() {
-                if provider == Provider::Codex || depth == 0 {
+                if depth < provider.spec().transcript_depth() {
                     walk(provider, &p, depth + 1, out)?;
                 }
             } else if ty.is_file() && filename_id(provider, &p).is_some() {
@@ -299,11 +291,7 @@ fn files(provider: Provider, home: &Path) -> Result<BTreeMap<PathBuf, Stamp>> {
     let mut out = BTreeMap::new();
     walk(
         provider,
-        &home.join(if provider == Provider::Claude {
-            "projects"
-        } else {
-            "sessions"
-        }),
+        &home.join(provider.spec().transcripts()),
         0,
         &mut out,
     )?;
@@ -314,11 +302,7 @@ fn filename_id(provider: Provider, path: &Path) -> Option<String> {
     if path.extension()? != "jsonl" {
         return None;
     }
-    let id = if provider == Provider::Codex {
-        stem.get(stem.len().checked_sub(36)?..)?
-    } else {
-        stem
-    };
+    let id = provider.spec().transcript_id(stem)?;
     valid_id(id).then(|| id.to_owned())
 }
 pub struct Tracker {
@@ -358,11 +342,7 @@ impl Tracker {
         }
         let mut descriptors = Vec::new();
         process_files(pid, 0, &mut descriptors);
-        let root = self.home.join(if self.provider == Provider::Claude {
-            "projects"
-        } else {
-            "sessions"
-        });
+        let root = self.home.join(self.provider.spec().transcripts());
         let owned: BTreeSet<_> = descriptors
             .iter()
             .filter(|p| p.starts_with(&root))
@@ -374,26 +354,15 @@ impl Tracker {
             .filter(|(p, s)| self.files.get(*p) != Some(*s))
             .filter_map(|(p, _)| filename_id(self.provider, p))
             .collect();
-        // Claude's PID registry identifies the main conversation even while
-        // subagents hold other transcripts open or unrelated terminals write.
-        let registered = if self.provider == Provider::Claude {
-            let registry = self.home.join("sessions").join(format!("{pid}.json"));
-            store::json_read::<Value>(&registry).ok().and_then(|v| {
-                (v.get("pid").and_then(Value::as_u64) == Some(pid as u64))
-                    .then(|| {
-                        v.get("sessionId")
-                            .and_then(Value::as_str)
-                            .filter(|s| valid_id(s))
-                            .map(str::to_owned)
-                    })
-                    .flatten()
-            })
-        } else {
-            None
-        };
+        // A provider's own registry (Claude's PID registry) identifies the
+        // main conversation even while subagents hold other transcripts open
+        // or unrelated terminals write.
+        let registered = self.provider.spec().registered_session(&self.home, pid);
         if let Some(id) = registered {
             self.known = Some(id);
-        } else if self.known.is_some() && (self.provider == Provider::Claude || owned.is_empty()) {
+        } else if self.known.is_some()
+            && (self.provider.spec().trusts_known_session() || owned.is_empty())
+        {
             // Shared history activity cannot contradict a known UUID. In
             // particular, an exited Codex has no descriptors left: another
             // terminal writing then must not strand its exact resume ID.
@@ -422,6 +391,9 @@ impl Tracker {
             .find(|path| filename_id(self.provider, path).as_deref() == Some(id))
             .cloned()
     }
+    pub(crate) fn provider(&self) -> Provider {
+        self.provider
+    }
     pub fn id(&self) -> Result<&str> {
         self.known.as_deref().ok_or(Error(
             "exact session identity unavailable; refusing an automatic restart",
@@ -438,12 +410,11 @@ pub fn option_help(provider: Provider, view: &Path, args: &[String]) -> String {
         time::{Duration, Instant},
     };
     let mut command = provider.command(view);
-    if provider == Provider::Codex
-        && args
-            .first()
-            .is_some_and(|s| matches!(s.as_str(), "resume" | "fork" | "exec"))
+    if let Some(first) = args
+        .first()
+        .filter(|s| provider.spec().subcommand(s).is_some())
     {
-        command.arg(&args[0]);
+        command.arg(first);
     }
     let Ok(mut child) = command
         .arg("--help")
@@ -483,6 +454,7 @@ pub fn option_help(provider: Provider, view: &Path, args: &[String]) -> String {
 #[cfg(test)]
 mod tracker_tests {
     use super::*;
+    use crate::store;
     const MAIN: &str = "11111111-2222-4333-8444-555555555555";
     const OTHER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 

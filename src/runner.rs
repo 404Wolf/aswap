@@ -383,7 +383,7 @@ pub fn run(
                 }
             }
             if !unsupported
-                && provider == Provider::Codex
+                && provider.spec().model_catalog()
                 && terminal.as_ref().is_some_and(|t| t.model_unsupported)
             {
                 unsupported = true;
@@ -512,8 +512,8 @@ pub fn run(
             continue;
         }
         expired |= auth_failed;
-        unsupported |=
-            provider == Provider::Codex && terminal.as_ref().is_some_and(|t| t.model_unsupported);
+        unsupported |= provider.spec().model_catalog()
+            && terminal.as_ref().is_some_and(|t| t.model_unsupported);
         if unsupported {
             models.reject(&account);
         }
@@ -723,7 +723,7 @@ fn limit_seen(
     screen: bool,
     fresh: bool,
 ) -> bool {
-    if provider == Provider::Claude && tracker.is_some() {
+    if provider.spec().records_limits() && tracker.is_some() {
         limits.check(tracker, screen, fresh)
     } else {
         screen

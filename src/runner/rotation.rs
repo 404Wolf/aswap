@@ -9,12 +9,7 @@ use std::time::{Duration, Instant};
 /// changed, without keeping the token itself in memory.
 pub(super) fn access_print(provider: Provider, path: &std::path::Path) -> Option<Vec<u8>> {
     let auth: serde_json::Value = store::json_read(path).ok()?;
-    let pointer = if provider == Provider::Claude {
-        "/claudeAiOauth/accessToken"
-    } else {
-        "/tokens/access_token"
-    };
-    let token = auth.pointer(pointer)?.as_str()?;
+    let token = provider.spec().access_token(&auth)?;
     Some(
         ring::digest::digest(&ring::digest::SHA256, token.as_bytes())
             .as_ref()

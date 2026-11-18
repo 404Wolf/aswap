@@ -3,7 +3,6 @@
 use super::MCP_OAUTH;
 use crate::{
     Error, Result, Safe,
-    provider::Provider,
     store::{self, Account, Store},
 };
 use serde_json::Value;
@@ -89,7 +88,7 @@ pub(super) fn hand_to(view: &Path, account: &Account, fresh: &Value) -> Result<b
     let path = view.join(account.provider.auth_file());
     let seen: Value = store::json_read(&path)?;
     let mut next = fresh.clone();
-    if account.provider == Provider::Claude
+    if account.provider.spec().mcp_oauth()
         && let Some(next) = next.as_object_mut()
     {
         // MCP OAuth in the view is the user's; the run's own sync merges it.

@@ -417,28 +417,27 @@ pub(crate) fn codex_request(
     result
 }
 pub fn fetch(account: &Account, profile: &Path) -> std::result::Result<Usage, Failure> {
-    if account.provider == Provider::Codex {
-        let diagnostic = std::cell::Cell::new(Failure::new("codex-rpc-unavailable"));
-        let result = (|| -> Result<Value> {
-            // The usage-only app-server cannot rotate auth behind a running CLI.
-            let temporary = tempfile::tempdir().safe("cannot prepare usage auth")?;
-            let auth: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
-            store::json_write(
-                &temporary.path().join(account.provider.auth_file()),
-                &crate::refresh::access_only(account.provider, &auth),
-            )?;
-            codex_rpc_inner(temporary.path(), &diagnostic)
-        })();
-        return result.and_then(|v| parse_codex(&v)).map_err(|e| {
-            let mut failure = diagnostic.get();
-            if e.0 == "cannot start Codex app-server" {
-                failure.kind = "codex-rpc-start-failed";
-            } else if e.0 == "app-server response timed out or disconnected" {
-                failure.kind = "codex-rpc-timeout";
-            }
-            failure
-        });
-    }
+    account.provider.spec().usage(profile)
+}
+/// Quota through a usage-only Codex app-server, given access-only Codex auth.
+pub(crate) fn fetch_codex(auth: Result<Value>) -> std::result::Result<Usage, Failure> {
+    let diagnostic = std::cell::Cell::new(Failure::new("codex-rpc-unavailable"));
+    let result = (|| -> Result<Value> {
+        let temporary = tempfile::tempdir().safe("cannot prepare usage auth")?;
+        store::json_write(&temporary.path().join(Provider::Codex.auth_file()), &auth?)?;
+        codex_rpc_inner(temporary.path(), &diagnostic)
+    })();
+    result.and_then(|v| parse_codex(&v)).map_err(|e| {
+        let mut failure = diagnostic.get();
+        if e.0 == "cannot start Codex app-server" {
+            failure.kind = "codex-rpc-start-failed";
+        } else if e.0 == "app-server response timed out or disconnected" {
+            failure.kind = "codex-rpc-timeout";
+        }
+        failure
+    })
+}
+pub(crate) fn fetch_claude(profile: &Path) -> std::result::Result<Usage, Failure> {
     fetch_claude_with(profile, request_claude)
 }
 fn fetch_claude_with<F>(profile: &Path, request: F) -> std::result::Result<Usage, Failure>

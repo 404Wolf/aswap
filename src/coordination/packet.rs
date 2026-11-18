@@ -54,10 +54,14 @@ pub(super) fn packet(store: &Store, request: &Request) -> Result<Packet> {
         let _lock = store.lock()?;
         let path = store.profile(account.provider, &account.label)?;
         let auth: Value = store::json_read(&path.join(account.provider.auth_file()))?;
-        let config = if account.provider == Provider::Claude && path.join(".claude.json").exists() {
-            crate::shared::account_config(&store::json_read(&path.join(".claude.json"))?)
-        } else {
-            json!({})
+        let config = match account
+            .provider
+            .spec()
+            .account_config()
+            .map(|f| path.join(f))
+        {
+            Some(file) if file.exists() => crate::shared::account_config(&store::json_read(&file)?),
+            _ => json!({}),
         };
         profiles.push(Profile {
             auth: crate::refresh::access_only(account.provider, &auth),
@@ -136,11 +140,8 @@ pub(super) fn install_permitted(
             crate::shared::hand_out(store, &p.account, &auth);
             changed = true;
         }
-        if p.account.provider == Provider::Claude {
-            write_changed(
-                &path.join(".claude.json"),
-                &crate::shared::account_config(&p.config),
-            )?;
+        if let Some(file) = p.account.provider.spec().account_config() {
+            write_changed(&path.join(file), &crate::shared::account_config(&p.config))?;
         }
         write_changed(&path.join("usage-cache.json"), &p.cache)?;
         if !state

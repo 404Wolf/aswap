@@ -73,7 +73,7 @@ fn option(arg: &str) -> (&str, Option<&str>) {
 }
 impl Gate {
     pub fn new(provider: Provider, args: &[String]) -> Result<Self> {
-        if provider != Provider::Codex {
+        if !provider.spec().model_catalog() {
             return Ok(Self::default());
         }
         let mut gate = Self {
@@ -197,7 +197,7 @@ impl Gate {
         ))
     }
     pub fn resolve(&mut self, store: &Store, current: &Account) -> Result<()> {
-        if current.provider != Provider::Codex || self.required.is_some() {
+        if !current.provider.spec().model_catalog() || self.required.is_some() {
             return Ok(());
         }
         let home = self.probe_home(store, current)?;

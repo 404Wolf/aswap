@@ -51,7 +51,7 @@ fn private(provider: Provider, name: &OsStr) -> bool {
         || name.contains("credential")
 }
 fn global_config(provider: Provider, home: &Path) -> Result<PathBuf> {
-    if provider != Provider::Claude {
+    if provider.spec().account_config().is_none() {
         return Ok(home.join(".unused-config"));
     }
     let legacy = home.join(".config.json");
@@ -78,7 +78,7 @@ fn migrate_root(
         return Ok(());
     }
     let config = source.join(".claude.json");
-    if provider == Provider::Claude && config.exists() {
+    if provider.spec().account_config().is_some() && config.exists() {
         let old: Value = store::json_read(&config)?;
         let mut shared = read_config(config_path)?;
         let before = shared.clone();
@@ -120,36 +120,12 @@ fn migrate_root(
     Ok(())
 }
 /// Entries a launch view always links to the shared home of the same name.
-fn shared_names(provider: Provider) -> &'static [&'static str] {
-    if provider == Provider::Claude {
-        &[
-            "projects",
-            "sessions",
-            "todos",
-            "shell-snapshots",
-            "statsig",
-            "plans",
-            "file-history",
-            "skills",
-            "plugins",
-            "agents",
-            "commands",
-            "tasks",
-            "debug",
-            "cache",
-        ]
-    } else {
-        &[
-            "sessions",
-            "archived_sessions",
-            "skills",
-            "plugins",
-            "rules",
-            "memories",
-            "tmp",
-            "logs",
-        ]
-    }
+fn shared_names(provider: Provider) -> impl Iterator<Item = &'static str> {
+    let spec = provider.spec();
+    spec.shared_dirs()
+        .iter()
+        .copied()
+        .chain(spec.history_file())
 }
 /// A provider started inside an aswap run inherits CODEX_HOME or
 /// CLAUDE_CONFIG_DIR pointing at that run's launch view. Treating the view
@@ -162,11 +138,7 @@ fn shared_home(store: &Store, provider: Provider, mut home: PathBuf) -> Result<P
         if !home.starts_with(&runtimes) {
             return Ok(home);
         }
-        let names = shared_names(provider)
-            .iter()
-            .copied()
-            .chain(["history.jsonl"]);
-        let target = names.into_iter().find_map(|name| {
+        let target = shared_names(provider).find_map(|name| {
             let target = fs::read_link(home.join(name)).ok()?;
             (target.is_absolute() && target.file_name() == Some(OsStr::new(name)))
                 .then(|| target.parent().map(Path::to_path_buf))
@@ -176,10 +148,7 @@ fn shared_home(store: &Store, provider: Provider, mut home: PathBuf) -> Result<P
         // home is the provider's default one.
         home = match target {
             Some(target) => target,
-            None => provider::home()?.join(match provider {
-                Provider::Claude => ".claude",
-                Provider::Codex => ".codex",
-            }),
+            None => provider::home()?.join(provider.spec().home_dir()),
         };
     }
     Err(Error("provider home is a chain of aswap launch views"))
@@ -277,24 +246,26 @@ impl View {
             .into_iter()
             .map(|p| p.file_name().unwrap().to_owned())
             .collect();
-        let dirs = shared_names(account.provider);
-        for name in dirs {
+        let spec = account.provider.spec();
+        for name in spec.shared_dirs() {
             names.insert((*name).into());
             if !exists(&home.join(name)) {
                 dir(&home.join(name))?;
             }
         }
-        let history = home.join("history.jsonl");
-        if !exists(&history) {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&history)
-                .safe("cannot create shared history")?;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .safe("cannot secure shared history")?;
+        if let Some(name) = spec.history_file() {
+            let history = home.join(name);
+            if !exists(&history) {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&history)
+                    .safe("cannot create shared history")?;
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .safe("cannot secure shared history")?;
+            }
+            names.insert(name.into());
         }
-        names.insert("history.jsonl".into());
         drop(lock);
         let mut view = Self {
             path,
@@ -325,7 +296,7 @@ impl View {
             }
         }
         let _lock = store.lock()?;
-        if view.provider == Provider::Claude {
+        if view.provider.spec().account_config().is_some() {
             view.baseline = shared_config(&read_config(&view.config_path)?);
         }
         view.select_locked(store, account)?;
@@ -344,7 +315,7 @@ impl View {
         // Switch the view and its account label together: a hand-out for the
         // previous account that arrives after this sees the new label.
         let lock = view_lock(&self.path, true)?;
-        if account.provider == Provider::Claude {
+        if account.provider.spec().mcp_oauth() {
             let seen = store::json_read::<Value>(&auth_path).ok();
             auth = with_mcp(auth, &self.merge_mcp(store, seen.as_ref())?);
         }
@@ -353,7 +324,7 @@ impl View {
         carry(&lock, account)?;
         drop(lock);
         self.auth_stamp = observed;
-        if account.provider == Provider::Claude {
+        if account.provider.spec().account_config().is_some() {
             let mut config = if self.path.join(".claude.json").exists() {
                 shared_config(&store::json_read(&self.path.join(".claude.json"))?)
             } else {
@@ -420,7 +391,7 @@ impl View {
         let auth_path = self.path.join(account.provider.auth_file());
         let seen = store::json_read::<Value>(&auth_path).ok();
         let mut auth = crate::refresh::launch_auth(account.provider, &canonical);
-        if self.provider == Provider::Claude {
+        if self.provider.spec().mcp_oauth() {
             auth = with_mcp(auth, &self.merge_mcp(store, seen.as_ref())?);
         }
         // Rewrite only on change, and never over a native write that landed
@@ -437,7 +408,7 @@ impl View {
             self.auth_stamp = observed;
         }
         drop(held);
-        if self.provider == Provider::Claude {
+        if self.provider.spec().account_config().is_some() {
             let config: Value = store::json_read(&self.path.join(".claude.json"))?;
             if !crate::coordination::follower(store)? {
                 let after = account_config(&config);
