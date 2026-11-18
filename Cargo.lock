@@ -66,8 +66,10 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "shlex",
  "signal-hook",
  "tempfile",
+ "thiserror",
  "toml",
 ]
 

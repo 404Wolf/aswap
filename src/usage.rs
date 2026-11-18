@@ -118,6 +118,7 @@ impl Cached {
             "refresh-invalid-response" => "refresh-invalid-response",
             "sync-unavailable" => "sync-unavailable",
             "owner-profile-missing" => "owner-profile-missing",
+            "usage-unsupported" => "usage-unsupported",
             "http-error" | "usage-http-error" | "refresh-http-error" => "http-error",
             _ => "usage-unavailable",
         };
@@ -253,7 +254,7 @@ impl Failure {
             },
         }
     }
-    fn unavailable() -> Self {
+    pub(crate) fn unavailable() -> Self {
         Self {
             status: None,
             kind: "usage-unavailable",

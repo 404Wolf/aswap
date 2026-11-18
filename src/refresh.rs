@@ -37,9 +37,7 @@ fn request(_provider: Provider, refresh: &Refresh) -> std::result::Result<Value,
     let request = client.post(refresh.url);
     let request = match refresh.encoding {
         Encoding::Json => request.json(&refresh.body),
-        Encoding::Form => request
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body(form(&refresh.body)),
+        Encoding::Form => request.form(&refresh.body),
     };
     let response = request.send().map_err(|_| Failure::new("network"))?;
     let status = response.status().as_u16();
@@ -73,26 +71,6 @@ fn request(_provider: Provider, refresh: &Refresh) -> std::result::Result<Value,
         return Err(failure);
     }
     Ok(value)
-}
-/// `application/x-www-form-urlencoded` for an object of strings.
-fn form(body: &Value) -> String {
-    fn encode(s: &str) -> String {
-        s.bytes()
-            .map(|b| match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                    (b as char).to_string()
-                }
-                b' ' => "+".into(),
-                _ => format!("%{b:02X}"),
-            })
-            .collect()
-    }
-    body.as_object()
-        .into_iter()
-        .flatten()
-        .filter_map(|(k, v)| Some(format!("{}={}", encode(k), encode(v.as_str()?))))
-        .collect::<Vec<_>>()
-        .join("&")
 }
 /// Caller holds the store lock. Only the canonical owner can rotate tokens;
 /// access-only live sessions never hold or compete for the refresh lock.

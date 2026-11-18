@@ -16,7 +16,7 @@ use std::{
 #[command(
     name = "aswap",
     version,
-    about = "Private account profiles for Claude Code and Codex CLI"
+    about = "Private account profiles for Claude Code, Codex CLI and pi"
 )]
 struct Cli {
     #[arg(
@@ -275,7 +275,7 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
 fn rows_text(value: &Value) -> String {
     let rows = value["accounts"].as_array().unwrap();
     if rows.is_empty() {
-        return "No managed accounts. Use aswap add claude|codex LABEL.".into();
+        return "No managed accounts. Use aswap add claude|codex|pi LABEL.".into();
     }
     rows.iter()
         .map(|row| {

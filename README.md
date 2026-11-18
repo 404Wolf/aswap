@@ -1,6 +1,6 @@
 # aswap
 
-aswap keeps several Claude Code and Codex CLI logins on one Linux machine and
+aswap keeps several Claude Code, Codex CLI and pi logins on one Linux machine and
 picks which one each session uses. It can switch a running session to another
 account when the current one hits its usage limit, resuming the same
 conversation. It also shows quota per account in the terminal and in Waybar.
@@ -81,6 +81,32 @@ echo '{"type":"user",...}' | aswap run claude --pick -- -p --output-format strea
 If the default account's quota is unknown because its login expired or its
 reading failed, or its last reading is over the threshold, `--pick` takes the
 best account whose last reading is below the threshold.
+
+### pi with its own ChatGPT login
+
+pi is a provider like the other two: an aswap pi account is one ChatGPT
+subscription login in pi's `auth.json` (`openai-codex` or `openai`, Sign in
+with ChatGPT).
+
+```sh
+pi            # /login with ChatGPT
+aswap add pi personal
+aswap run pi -- --model openai-codex/gpt-6.1-sol
+aswap run pi --auto       # resume the session on another account at a limit
+```
+
+- `aswap add pi` moves the login out of pi's `auth.json`, leaving pi's other
+  logins and API keys there. Two programs refreshing one rotating token
+  break each other. `/login` in plain pi again for an independent login.
+- A run gets a private `auth.json` holding an access-only copy of the
+  login. pi's settings, sessions, extensions, themes and models are shared
+  with your normal `~/.pi/agent` (or `PI_CODING_AGENT_DIR`). aswap refreshes
+  the token; pi re-reads the file when it changes.
+- Quota (`usage`, `status`, `list`, Waybar) is read for `openai-codex`
+  logins, through Codex's app-server. Sign in with ChatGPT logins report no
+  quota, so they show as unknown.
+- `switch pi --activate-live` is refused: pi's default login stays in pi's
+  hands.
 
 ### Claude inside pi
 

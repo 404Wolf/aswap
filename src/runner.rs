@@ -30,7 +30,7 @@ use patience::{COMMIT_PATIENCE, Hiccups, PREPARE_PATIENCE, SUPERVISE_PATIENCE, p
 use quiet::{QUIET_STEP, Quiet};
 use recovery::{Rejected, Restarts, Wake, recovery_target};
 use rotation::{access_print, rotated_since, rotation_by};
-pub use via::Via;
+pub use via::{PI_BIN, Via, ViaError};
 
 fn stop(child: &mut Child) -> Result<std::process::ExitStatus> {
     // SAFETY: the pid belongs to our unreaped child; no other process can reuse it.

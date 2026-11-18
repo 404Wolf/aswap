@@ -2,7 +2,9 @@
 //! and quota from its app-server.
 use super::{Claims, Refresh, SessionArg, Spec, Subcommand, jwt_claims, text};
 use crate::{
-    Result, store,
+    Result,
+    session::SessionId,
+    store,
     usage::{Failure, Usage},
 };
 use serde_json::{Value, json};
@@ -204,8 +206,8 @@ impl Spec for Codex {
     fn takes_value(&self, key: &str) -> bool {
         matches!(key, "-c" | "-p")
     }
-    fn resume_args(&self, id: &str) -> Vec<String> {
-        vec!["resume".into(), id.into()]
+    fn resume_args(&self, id: &SessionId) -> Vec<String> {
+        vec!["resume".into(), id.to_string()]
     }
     fn model_catalog(&self) -> bool {
         true

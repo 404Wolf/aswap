@@ -20,6 +20,23 @@ pub fn valid_id(id: &str) -> bool {
             }
         })
 }
+/// A conversation's exact ID: a 36-character UUID, as Claude, Codex and the
+/// sessions aswap starts in pi use. Parsed once; never guessed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionId(String);
+impl SessionId {
+    pub fn parse(id: &str) -> Option<Self> {
+        valid_id(id).then(|| Self(id.to_owned()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 pub struct AutoArgs {
     pub initial: Vec<String>,
     pub sticky: Vec<String>,
@@ -80,7 +97,8 @@ impl AutoArgs {
                 break;
             }
             let session = spec.session_arg(key);
-            if session == Some(SessionArg::Id) {
+            if matches!(session, Some(SessionArg::Id | SessionArg::ForkFrom)) {
+                fork |= session == Some(SessionArg::ForkFrom);
                 selection = true;
                 let value = inline.or_else(|| {
                     args.get(i + 1)
@@ -248,12 +266,10 @@ impl AutoArgs {
                 "provider option arity unavailable; refusing to replay ambiguous one-shot input",
             ));
         }
-        if !valid_id(id) {
-            return Err(Error(
-                "exact session identity unavailable; refusing an automatic restart",
-            ));
-        }
-        let mut args = provider.spec().resume_args(id);
+        let id = SessionId::parse(id).ok_or(Error(
+            "exact session identity unavailable; refusing an automatic restart",
+        ))?;
+        let mut args = provider.spec().resume_args(&id);
         args.extend(self.sticky.clone());
         if let Some(prompt) = prompt {
             args.extend(["--".into(), prompt.into()]);
@@ -357,7 +373,11 @@ impl Tracker {
         // A provider's own registry (Claude's PID registry) identifies the
         // main conversation even while subagents hold other transcripts open
         // or unrelated terminals write.
-        let registered = self.provider.spec().registered_session(&self.home, pid);
+        let registered = self
+            .provider
+            .spec()
+            .registered_session(&self.home, pid)
+            .map(|id| id.to_string());
         if let Some(id) = registered {
             self.known = Some(id);
         } else if self.known.is_some()

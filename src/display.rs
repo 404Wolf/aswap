@@ -273,7 +273,7 @@ pub fn render_with(
     let paint = Paint(color);
     if rows.is_empty() {
         return wrap(
-            "No managed accounts. Use aswap add claude|codex LABEL.",
+            "No managed accounts. Use aswap add claude|codex|pi LABEL.",
             width,
         )
         .join("\n");

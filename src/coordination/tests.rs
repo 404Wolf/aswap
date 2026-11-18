@@ -34,10 +34,7 @@ fn seed() -> (tempfile::TempDir, Store) {
 #[test]
 fn owner_packets_share_one_cache_and_never_export_refresh_capability_or_project_state() {
     let (_t, store) = seed();
-    let request = Request {
-        protocol: 1,
-        force: None,
-    };
+    let request = Request::new(1, None);
     let one = packet(&store, &request).unwrap();
     let two = packet(&store, &request).unwrap();
     assert_eq!(
@@ -118,10 +115,7 @@ fn duplicate_identities_are_aliases_but_duplicate_labels_and_identity_changes_ar
         label: "alias".into(),
     });
     store.save(&state).unwrap();
-    let request = Request {
-        protocol: 1,
-        force: None,
-    };
+    let request = Request::new(1, None);
     let p = packet(&store, &request).unwrap();
     assert_eq!(duplicate_count(&p), 1);
     let peer_dir = tempfile::tempdir().unwrap();
@@ -157,15 +151,7 @@ fn duplicate_identities_are_aliases_but_duplicate_labels_and_identity_changes_ar
 #[test]
 fn owner_role_and_protocol_are_distinct_and_owner_cannot_be_silently_demoted() {
     let (_t, store) = seed();
-    let err = packet(
-        &store,
-        &Request {
-            protocol: 2,
-            force: None,
-        },
-    )
-    .err()
-    .unwrap();
+    let err = packet(&store, &Request::new(2, None)).err().unwrap();
     assert_eq!(err.0, "sync: version-mismatch");
     assert!(
         configure(&store, "synthetic-peer")
@@ -175,15 +161,7 @@ fn owner_role_and_protocol_are_distinct_and_owner_cannot_be_silently_demoted() {
     );
     assert!(is_owner(&store).unwrap());
     off(&store).unwrap();
-    let err = packet(
-        &store,
-        &Request {
-            protocol: 1,
-            force: None,
-        },
-    )
-    .err()
-    .unwrap();
+    let err = packet(&store, &Request::new(1, None)).err().unwrap();
     assert!(err.0.contains("owner-not-configured"));
 }
 #[test]
@@ -209,10 +187,7 @@ fn first_line_filter_never_forwards_unknown_text_or_suffixes() {
 }
 #[test]
 fn exchange_timeout_bad_response_and_stderr_drain_are_bounded() {
-    let request = Request {
-        protocol: 1,
-        force: None,
-    };
+    let request = Request::new(1, None);
     let mut command = Command::new("sh");
     command.args(["-c", "sleep 10"]);
     let start = Instant::now();
@@ -255,14 +230,7 @@ fn follower_store() -> (tempfile::TempDir, Store) {
     (t, store)
 }
 fn owner_packet(owner: &Store) -> Packet {
-    packet(
-        owner,
-        &Request {
-            protocol: 1,
-            force: None,
-        },
-    )
-    .unwrap()
+    packet(owner, &Request::new(1, None)).unwrap()
 }
 fn policy(store: &Store, value: Value) {
     std::fs::write(&store.sync_policy_path, serde_json::to_vec(&value).unwrap()).unwrap();

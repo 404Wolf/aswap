@@ -3,7 +3,9 @@
 //! endpoint.
 use super::{Claims, Refresh, SessionArg, Spec, text};
 use crate::{
-    Result, store,
+    Result,
+    session::SessionId,
+    store,
     usage::{Failure, Usage},
 };
 use serde_json::{Value, json};
@@ -226,21 +228,20 @@ impl Spec for Claude {
     fn new_session_flag(&self) -> Option<&'static str> {
         Some("--session-id")
     }
-    fn resume_args(&self, id: &str) -> Vec<String> {
-        vec!["--resume".into(), id.into()]
+    fn resume_args(&self, id: &SessionId) -> Vec<String> {
+        vec!["--resume".into(), id.to_string()]
     }
     /// Claude's published CLI registers `sessions/<pid>.json` with its
     /// session ID: it names the main conversation even while subagents hold
     /// other transcripts open.
-    fn registered_session(&self, home: &Path, pid: u32) -> Option<String> {
+    fn registered_session(&self, home: &Path, pid: u32) -> Option<SessionId> {
         let registry = home.join("sessions").join(format!("{pid}.json"));
         let v = store::json_read::<Value>(&registry).ok()?;
         (v.get("pid").and_then(Value::as_u64) == Some(pid as u64))
             .then(|| {
                 v.get("sessionId")
                     .and_then(Value::as_str)
-                    .filter(|s| crate::session::valid_id(s))
-                    .map(str::to_owned)
+                    .and_then(SessionId::parse)
             })
             .flatten()
     }

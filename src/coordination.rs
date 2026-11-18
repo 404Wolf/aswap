@@ -200,13 +200,7 @@ fn poll_with(
         return Ok(0);
     };
     log(store, "poll", "claim", None, None);
-    let result = exchange(
-        &host,
-        &Request {
-            protocol: 1,
-            force: force.cloned(),
-        },
-    );
+    let result = exchange(&host, &Request::new(1, force.cloned()));
     let _lock = store.lock()?;
     if settings(store)?.host.as_deref() != Some(host.as_str()) {
         return Err(Error("sync: configuration changed during sync"));

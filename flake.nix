@@ -78,6 +78,7 @@
                   autoswitch.claude.resumePrompt = ''synthetic "quotes" $HOME %n'';
                   autoswitch.codex.enable = true;
                   autoswitch.codex.resumePrompt = null;
+                  autoswitch.pi.enable = true;
                   waybar.enable = true;
                 };
               }
@@ -136,6 +137,7 @@
             };
             assert hm.config.systemd.user.services.aswap-claude.Service.UMask == "0077";
             assert hm.config.systemd.user.services.aswap-codex.Service.RestartSec == 60;
+            assert hm.config.systemd.user.services.aswap-pi.Service.ExecStart == [ "${package}/bin/aswap auto pi watch" ];
             assert pkgs.lib.hasInfix " sync --owner" (builtins.head hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre);
             assert pkgs.lib.hasInfix " sync -- " (builtins.head hmPeer.config.systemd.user.services.aswap-claude.Service.ExecStartPre);
             assert pkgs.lib.hasInfix "synthetic-owner" (builtins.head hmPeer.config.systemd.user.services.aswap-claude.Service.ExecStartPre);

@@ -4,9 +4,11 @@
 //! `provider/<name>.rs`; the rest of aswap only asks `provider.spec()`.
 mod claude;
 mod codex;
+mod pi;
 
 use crate::{
     Error, Result, Safe,
+    session::SessionId,
     store::{self, Account, Store},
     usage::{Failure, Usage},
 };
@@ -29,6 +31,7 @@ use std::{
 pub enum Provider {
     Claude,
     Codex,
+    Pi,
 }
 
 /// Account hints read from a login, for display and duplicate detection.
@@ -70,6 +73,8 @@ pub enum SessionArg {
     Continue,
     /// Forks the selected conversation into a new one.
     Fork,
+    /// Forks the conversation it names (`--fork <id>`) into a new one.
+    ForkFrom,
     /// Prints one answer and exits.
     OneShot,
 }
@@ -140,6 +145,12 @@ pub trait Spec: Sync {
     fn select_login(&self, auth: Value) -> Value {
         auth
     }
+    /// After `aswap add` saved `saved`, take it out of the provider's own
+    /// home `source` if the provider would otherwise keep refreshing the
+    /// same token there (two refreshers of one rotating token break both).
+    fn release(&self, _source: &Path, _saved: &Value) -> Result<()> {
+        Ok(())
+    }
     /// Extra profile files written when a login is added from `source`.
     fn capture(&self, _source: &Path, _profile: &Path) -> Result<()> {
         Ok(())
@@ -193,9 +204,9 @@ pub trait Spec: Sync {
     fn new_session_flag(&self) -> Option<&'static str> {
         None
     }
-    fn resume_args(&self, id: &str) -> Vec<String>;
+    fn resume_args(&self, id: &SessionId) -> Vec<String>;
     /// The session the provider itself says process `pid` runs.
-    fn registered_session(&self, _home: &Path, _pid: u32) -> Option<String> {
+    fn registered_session(&self, _home: &Path, _pid: u32) -> Option<SessionId> {
         None
     }
     /// Whether a known session ID stands until the provider says otherwise:
@@ -254,11 +265,12 @@ fn stamped_since(timestamp: Option<&Value>, since: SystemTime) -> bool {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 2] = [Self::Claude, Self::Codex];
+    pub const ALL: [Provider; 3] = [Self::Claude, Self::Codex, Self::Pi];
     pub fn spec(self) -> &'static dyn Spec {
         match self {
             Self::Claude => &claude::Claude,
             Self::Codex => &codex::Codex,
+            Self::Pi => &pi::Pi,
         }
     }
     pub fn as_str(self) -> &'static str {
@@ -407,6 +419,10 @@ pub fn add(store: &Store, provider: Provider, name: &str) -> Result<Account> {
     let result = (|| {
         store::atomic(&target.join(provider.auth_file()), &bytes)?;
         provider.spec().capture(&source, &target)?;
+        provider.spec().release(
+            &source,
+            &serde_json::from_slice(&bytes).safe("cannot encode credentials")?,
+        )?;
         let account = Account {
             provider,
             label: name.to_owned(),

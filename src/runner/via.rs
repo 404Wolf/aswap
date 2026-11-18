@@ -34,16 +34,15 @@ pub const PI_BIN: &str = "ASWAP_PI_BIN";
 pub const PROVIDER_PATH: &str = "PI_CLAUDE_CODE_PROVIDER_PATH";
 
 impl Via {
-    pub fn check(self, provider: Provider) -> Result<()> {
+    /// Whether this program can drive `provider`.
+    pub fn check(self, provider: Provider) -> std::result::Result<(), ViaError> {
         match (self, provider) {
             (Self::Pi, Provider::Claude) => Ok(()),
-            _ => Err(Error("--via pi drives Claude accounts only")),
+            _ => Err(ViaError::Provider),
         }
     }
     fn binary(self) -> OsString {
-        std::env::var_os(PI_BIN)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "pi".into())
+        Provider::Pi.binary()
     }
     /// pi on one account's launch view: every `claude` it starts uses
     /// `view` and the real Claude binary.
@@ -72,28 +71,36 @@ fn claude_binary() -> OsString {
         .find_map(|key| std::env::var_os(key).filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "claude".into())
 }
-/// A POSIX shell word for `value`.
-fn quote(value: &OsStr) -> Vec<u8> {
-    let mut out = b"'".to_vec();
-    for &b in value.as_bytes() {
-        if b == b'\'' {
-            out.extend_from_slice(b"'\\''");
-        } else {
-            out.push(b);
-        }
+/// What can stop a `--via` launch.
+#[derive(Debug, thiserror::Error)]
+pub enum ViaError {
+    #[error("--via pi drives Claude accounts only")]
+    Provider,
+    #[error("a path for the claude shim cannot be quoted for /bin/sh")]
+    Unquotable,
+}
+impl From<ViaError> for Error {
+    fn from(e: ViaError) -> Self {
+        Error(match e {
+            ViaError::Provider => "--via pi drives Claude accounts only",
+            ViaError::Unquotable => "a path for the claude shim cannot be quoted for /bin/sh",
+        })
     }
-    out.push(b'\'');
-    out
 }
 /// The shim pi's provider runs as `claude`: one `aswap run claude --pick`
 /// per call, with the real Claude binary.
-pub(super) fn shim_text(aswap: &Path, claude: &OsStr) -> Vec<u8> {
+pub(super) fn shim_text(aswap: &Path, claude: &OsStr) -> std::result::Result<Vec<u8>, ViaError> {
+    let quote = |word: &OsStr| {
+        shlex::bytes::try_quote(word.as_bytes())
+            .map(|q| q.into_owned())
+            .map_err(|_| ViaError::Unquotable)
+    };
     let mut text = b"#!/bin/sh\n# Written by aswap run claude --via pi: one account per claude call.\nexport ASWAP_CLAUDE_BIN=".to_vec();
-    text.extend(quote(claude));
+    text.extend(quote(claude)?);
     text.extend_from_slice(b"\nexec ");
-    text.extend(quote(aswap.as_os_str()));
+    text.extend(quote(aswap.as_os_str())?);
     text.extend_from_slice(b" run claude --pick -- \"$@\"\n");
-    text
+    Ok(text)
 }
 /// Write the shim under the store (0700), replacing it atomically so a pi
 /// already running never reads half of it.
@@ -102,7 +109,7 @@ fn shim(store: &Store) -> Result<PathBuf> {
     store::private_dir(&dir)?;
     let path = dir.join("claude-pick");
     let aswap = std::env::current_exe().safe("cannot locate the aswap binary")?;
-    let text = shim_text(&aswap, &claude_binary());
+    let text = shim_text(&aswap, &claude_binary())?;
     if std::fs::read(&path).is_ok_and(|old| old == text) {
         return Ok(path);
     }
@@ -142,20 +149,33 @@ mod tests {
     use super::*;
     #[test]
     fn the_shim_quotes_paths_and_passes_every_argument() {
-        let text = shim_text(
-            Path::new("/opt/it's aswap/bin/aswap"),
-            OsStr::new("/nix/store/x/claude"),
+        let aswap = Path::new("/opt/it's aswap/bin/aswap");
+        let claude = OsStr::new("/nix/store/x y/claude");
+        let text = String::from_utf8(shim_text(aswap, claude).unwrap()).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines[0], "#!/bin/sh");
+        let export = shlex::split(lines[2]).unwrap();
+        assert_eq!(export, ["export", "ASWAP_CLAUDE_BIN=/nix/store/x y/claude"]);
+        let exec = shlex::split(lines[3]).unwrap();
+        assert_eq!(
+            exec,
+            [
+                "exec",
+                "/opt/it's aswap/bin/aswap",
+                "run",
+                "claude",
+                "--pick",
+                "--",
+                "$@"
+            ]
         );
-        let text = String::from_utf8(text).unwrap();
-        assert!(text.starts_with("#!/bin/sh\n"));
-        assert!(text.contains("export ASWAP_CLAUDE_BIN='/nix/store/x/claude'\n"));
-        assert!(
-            text.ends_with("exec '/opt/it'\\''s aswap/bin/aswap' run claude --pick -- \"$@\"\n")
-        );
+        assert!(lines[3].ends_with(" -- \"$@\""));
+        assert!(shim_text(Path::new("/a\0b"), claude).is_err());
     }
     #[test]
     fn only_claude_can_be_driven_by_pi() {
         assert!(Via::Pi.check(Provider::Claude).is_ok());
         assert!(Via::Pi.check(Provider::Codex).is_err());
+        assert!(Via::Pi.check(Provider::Pi).is_err());
     }
 }

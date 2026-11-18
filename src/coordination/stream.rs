@@ -169,10 +169,7 @@ pub(super) fn watch_session(
     let (accepted, result) = match command(&host) {
         Ok(command) => stream_command(
             command,
-            &Request {
-                protocol: WATCH_PROTOCOL,
-                force: None,
-            },
+            &Request::new(WATCH_PROTOCOL, None),
             first,
             idle,
             |packet| {
@@ -318,6 +315,7 @@ pub(super) fn serve_watch(store: &Store) -> Result<()> {
     let single = Request {
         protocol: 1,
         force: None,
+        providers: request.providers,
     };
     let mut sent: Option<(Vec<Option<crate::shared::Stamp>>, Instant)> = None;
     while !closed.load(std::sync::atomic::Ordering::SeqCst) {

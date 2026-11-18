@@ -314,6 +314,47 @@ first writer wins. A view's auth file is rewritten only when its content
 changes, and not when a native write landed after the sync read it; that edit
 merges on the next pass. The record is never exported by owner sync.
 
+## pi as a provider
+
+Every provider fact lives behind `provider::Spec`, with one implementation
+per provider (`provider/{claude,codex,pi}.rs`). pi (pi.dev 1.4.0, read from
+its published dist) keeps logins in `$PI_CODING_AGENT_DIR/auth.json`
+(default `~/.pi/agent`), one entry per pi provider. A ChatGPT subscription
+login is an OAuth entry `{type, access, refresh, expires (ms), ...}` under
+`openai-codex` (Codex's public client, `accountId`) or `openai` (Sign in with
+ChatGPT: a client registered per login, `clientId`, form-encoded refresh at
+`/api/accounts/oauth/token` with `resource=https://api.openai.com/v1`).
+`provider/pi/login.rs` parses it into types; unknown fields round-trip.
+
+pi refreshes when `expires` is under five minutes away, under its
+proper-lockfile lock, and re-reads `auth.json` whenever the file's revision
+changes. A launch view therefore carries the access token, a sentinel
+refresh token and `expires` a day late: pi never refreshes, and aswap's
+refresh and hand-out reach it on its next request. `aswap add pi` moves the
+entry out of pi's own file under that lock, since copying it would leave two
+refreshers of one rotating token. Quota comes from a usage-only Codex
+app-server given the `openai-codex` access token as Codex auth (no refresh
+token); a fake token there gets an HTTP 401 from the backend, so the format
+is accepted. Sign in with ChatGPT tokens are for api.openai.com and report no
+quota (`usage-unsupported`).
+
+Sessions are `sessions/--<cwd>--/<time>_<id>.jsonl`; a supervised run
+starts new sessions with `--session-id <uuid>` and resumes with the same
+flag. pi appends with open/close, so no descriptor names the session; the
+known ID stands. A usage limit counts when the transcript gains an
+assistant message with `stopReason: "error"` and a usage-limit
+`errorMessage` after launch.
+
+Followers send the providers they can install (`providers` in the sync
+request). An older follower sends none and gets only Claude and Codex
+profiles, since one unknown provider would fail its whole packet.
+
+`run claude --pick` picks the account as `--auto` does at launch, but with
+plain stdio. `run claude --via pi` runs pi with pi-claude-code-provider:
+with `--account`, on that account's view; without it, the provider's
+`PI_CLAUDE_CODE_PROVIDER_PATH` is a private shim, `aswap run claude --pick`,
+one pick per `claude -p` turn.
+
 ## Multi-machine design: one authority, access-only followers
 
 The simplest robust implementation is an explicit single refresh/usage owner,

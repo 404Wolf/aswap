@@ -17,6 +17,27 @@ pub(super) fn write_changed<T: Serialize>(path: &std::path::Path, value: &T) -> 
 pub(super) struct Request {
     pub(super) protocol: u8,
     pub(super) force: Option<Account>,
+    /// The providers this follower can install. An older follower sends
+    /// none: it gets Claude and Codex profiles only, since a profile of a
+    /// provider it doesn't know would fail its whole packet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) providers: Option<Vec<String>>,
+}
+impl Request {
+    pub(super) fn new(protocol: u8, force: Option<Account>) -> Self {
+        Self {
+            protocol,
+            force,
+            providers: Some(Provider::ALL.iter().map(|p| p.as_str().into()).collect()),
+        }
+    }
+    /// Whether this follower can install `provider`'s profiles.
+    pub(super) fn accepts(&self, provider: Provider) -> bool {
+        match &self.providers {
+            Some(list) => list.iter().any(|p| p == provider.as_str()),
+            None => matches!(provider, Provider::Claude | Provider::Codex),
+        }
+    }
 }
 #[derive(Serialize, Deserialize)]
 pub(super) struct Profile {
@@ -45,7 +66,7 @@ pub(super) fn packet(store: &Store, request: &Request) -> Result<Packet> {
         store.load()?.accounts
     };
     let mut profiles = Vec::new();
-    for account in accounts {
+    for account in accounts.into_iter().filter(|a| request.accepts(a.provider)) {
         let force = request
             .force
             .as_ref()

@@ -116,6 +116,11 @@ in {
     autoswitch = {
       claude = mkOption { type = types.submodule providerOptions; default = {}; };
       codex = mkOption { type = types.submodule providerOptions; default = {}; };
+      pi = mkOption {
+        type = types.submodule providerOptions;
+        default = {};
+        description = "pi's own ChatGPT logins (aswap add pi).";
+      };
     };
     refreshOwner = mkOption {
       type = types.nullOr types.bool;
