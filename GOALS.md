@@ -149,3 +149,10 @@ Never edit the headline (line 1).
 - [x] Refuse imports when excluded local profiles already exist; preserve their credentials, metadata and running sessions for explicit guarded cleanup, and document that busy excluded profiles leave machine compliance unmet.
 - [x] Verify combined recovery and policy behavior with synthetic tests, formatting, Clippy, Home Manager checks and secret scans.
 - [ ] Deploy the combined build and verify each machine's declared policy and existing-profile cleanup through the coordinated rollout.
+
+## M19: pi
+- [x] Split runner.rs, shared.rs and coordination.rs along their seams, and put every provider fact behind a `provider::Spec` trait (Claude, Codex, pi), with no behaviour change.
+- [x] `run claude --pick`: choose the account by quota with plain stdio for `claude -p` pipes; `run claude --via pi [--account]` for pi-claude-code-provider, one account per session or one picked per call.
+- [x] pi as a third provider: `add pi` moves the ChatGPT login out of pi's auth.json; access-only launch views beside shared settings, sessions and extensions; refresh for both pi ChatGPT logins; quota for `openai-codex` logins; list/status/usage/waybar/sessions; sync-safe for older followers; Home Manager `autoswitch.pi`.
+- [x] `run pi --auto`: resume the same pi session on another account at a ChatGPT usage limit.
+- [ ] Smoke-test pi with a real ChatGPT login (add, run, usage, a refresh hand-out).
