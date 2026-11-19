@@ -356,6 +356,9 @@ pub(crate) fn scrub(cmd: &mut Command) {
         "ANTHROPIC_AUTH_TOKEN",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+        // Claude Code 2.1.328 stopped passing it to a nested claude; a
+        // launch on another account must not inherit it either.
+        "CLAUDE_CODE_OAUTH_SCOPES",
         "CLAUDE_SECURESTORAGE_CONFIG_DIR",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
@@ -633,6 +636,29 @@ pub fn remove(store: &Store, provider: Provider, name: &str) -> Result<Vec<Strin
         std::fs::remove_dir_all(profile).safe("cannot remove private profile")?;
     }
     Ok(duplicates)
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::*;
+
+    #[test]
+    fn a_launch_drops_inherited_claude_oauth_overrides() {
+        let mut cmd = Command::new("true");
+        scrub(&mut cmd);
+        let removed: Vec<_> = cmd
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_owned())
+            .collect();
+        for key in [
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_SCOPES",
+            "CLAUDE_CODE_OAUTH_CLIENT_ID",
+        ] {
+            assert!(removed.iter().any(|k| k == key), "{key}");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -573,9 +573,10 @@ fn a_failed_or_hanging_watch_backs_off_itself_but_never_the_poll() {
         )
         .unwrap_err()
     };
-    // An owner that refuses the stream.
+    // An owner that refuses the stream. It reads the request first, as the
+    // real owner does; exiting before that races the write (EPIPE).
     let error = fail(
-        "printf 'aswap: sync: version-mismatch\\n' >&2; exit 1",
+        "head -c 1 >/dev/null; printf 'aswap: sync: version-mismatch\\n' >&2; exit 1",
         Duration::from_secs(5),
     );
     assert_eq!(error.0, "sync: version-mismatch");
