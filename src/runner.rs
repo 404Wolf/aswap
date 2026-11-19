@@ -344,7 +344,7 @@ pub fn run(
                     &mut limits,
                     tracker.as_ref(),
                     screen_limit,
-                    terminal.as_ref().and_then(|terminal| terminal.last_input),
+                    terminal.as_ref(),
                     false,
                 );
             }
@@ -519,7 +519,7 @@ pub fn run(
                     &mut limits,
                     tracker.as_ref(),
                     screen_limit,
-                    terminal.last_input,
+                    Some(terminal),
                     true,
                 );
             }
@@ -853,7 +853,7 @@ fn limit_seen(
     limits: &mut crate::limits::Limits,
     tracker: Option<&crate::session::Tracker>,
     screen: crate::terminal::ScreenLimits,
-    last_input: Option<Instant>,
+    terminal: Option<&Terminal>,
     fresh: bool,
 ) -> bool {
     if account.provider != Provider::Claude || tracker.is_none() {
@@ -864,9 +864,9 @@ fn limit_seen(
     }
     limits.check_quota(
         screen,
-        last_input,
+        || terminal.map(Terminal::input_activity).unwrap_or_default(),
         || usage::cached(store, account).ok(),
-        now(),
+        now,
     )
 }
 /// Same-account restarts after a provider error that followed a token rotation.

@@ -45,7 +45,7 @@ pub struct Terminal {
     started: bool,
     childless: bool,
     diagnostics: Diagnostics,
-    pub(crate) last_input: Option<std::time::Instant>,
+    last_input: Option<std::time::Instant>,
     pub auth_expired: bool,
     pub model_unsupported: bool,
     /// While set, login errors in the output are held in `held_auth` (with
@@ -54,6 +54,13 @@ pub struct Terminal {
     pub quiet_auth: bool,
     pub held_auth: Vec<std::time::Instant>,
 }
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct InputActivity {
+    pub(crate) last_forwarded: Option<std::time::Instant>,
+    pub(crate) waiting: bool,
+}
+
 impl Terminal {
     pub fn open() -> Result<Self> {
         let interrupt = Interrupt::new()?;
@@ -192,7 +199,7 @@ impl Terminal {
     /// Forward terminal I/O and inspect a bounded trailing slice for limit errors.
     pub fn pump(&mut self, wait_ms: i32) -> Result<bool> {
         self.pump_inner(wait_ms, !self.childless, None)
-            .map(ScreenLimits::any)
+            .map(|(limits, _)| limits.any())
     }
     /// Recheck liveness after polling and before forwarding newly read input:
     /// the child can exit while poll waits for a keystroke.
@@ -206,13 +213,27 @@ impl Terminal {
         child: &mut Child,
     ) -> Result<ScreenLimits> {
         self.pump_inner(wait_ms, !self.childless, Some(child))
+            .map(|(limits, _)| limits)
     }
     pub fn child_exited(&mut self) -> Result<bool> {
         self.child_exit_signals().map(ScreenLimits::any)
     }
     pub(crate) fn child_exit_signals(&mut self) -> Result<ScreenLimits> {
         self.childless = true;
-        self.pump_inner(0, false, None)
+        let mut limits = ScreenLimits::default();
+        // The slave stays open for reuse. Drain queued output before treating
+        // the final unterminated row as complete. Bound the drain in case a
+        // descendant still holds the slave and keeps writing after child exit.
+        for _ in 0..16 {
+            let (observed, more_output) = self.pump_inner(0, false, None)?;
+            limits.merge(observed);
+            if !more_output {
+                let signals = self.diagnostics.finish();
+                limits.merge(self.apply_signals(signals));
+                break;
+            }
+        }
+        Ok(limits)
     }
     /// Keep cancellation responsive while no provider exists. Typed input
     /// must not queue up in the PTY and replay when the session resumes.
@@ -220,12 +241,28 @@ impl Terminal {
         self.childless = true;
         self.pump_inner(wait_ms, false, None).map(|_| ())
     }
+
+    pub(crate) fn input_activity(&self) -> InputActivity {
+        let mut input = libc::pollfd {
+            fd: if self.input_open { 0 } else { -1 },
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd and no wait.
+        let ready = unsafe { libc::poll(&mut input, 1, 0) };
+        InputActivity {
+            last_forwarded: self.last_input,
+            waiting: ready < 0 || input.revents & libc::POLLIN != 0,
+        }
+    }
+
+    // The second result indicates that the PTY may still have output to read.
     fn pump_inner(
         &mut self,
         wait_ms: i32,
         mut forward_input: bool,
         child: Option<&mut Child>,
-    ) -> Result<ScreenLimits> {
+    ) -> Result<(ScreenLimits, bool)> {
         if self
             .interrupt
             .flag
@@ -250,7 +287,7 @@ impl Terminal {
         let count = unsafe { libc::poll(fds.as_mut_ptr(), 2, wait_ms) };
         if count < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                return Ok(ScreenLimits::default());
+                return Ok((ScreenLimits::default(), true));
             }
             return Err(Error("provider terminal polling failed"));
         }
@@ -277,6 +314,7 @@ impl Terminal {
             }
         }
         let mut limited = ScreenLimits::default();
+        let mut more_output = false;
         if fds[0].revents & libc::POLLIN != 0 {
             match self.master.read(&mut buffer) {
                 Ok(n) => {
@@ -286,19 +324,25 @@ impl Terminal {
                         .safe("cannot forward provider output")?;
                     stdout.flush().safe("cannot flush provider output")?;
                     let signals = self.diagnostics.feed(&buffer[..n]);
-                    limited = signals.0;
-                    if signals.1 && self.quiet_auth {
-                        self.held_auth.push(std::time::Instant::now());
-                    } else {
-                        self.auth_expired |= signals.1;
-                    }
-                    self.model_unsupported |= signals.2;
+                    limited = self.apply_signals(signals);
+                    more_output = n != 0;
                 }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => more_output = true,
                 Err(e) if e.raw_os_error() == Some(libc::EIO) => {}
                 Err(_) => return Err(Error("cannot read provider terminal")),
             }
         }
-        Ok(limited)
+        Ok((limited, more_output))
+    }
+
+    fn apply_signals(&mut self, (limits, auth, model): (ScreenLimits, bool, bool)) -> ScreenLimits {
+        if auth && self.quiet_auth {
+            self.held_auth.push(std::time::Instant::now());
+        } else {
+            self.auth_expired |= auth;
+        }
+        self.model_unsupported |= model;
+        limits
     }
 }
 impl Drop for Terminal {
@@ -374,9 +418,7 @@ impl Diagnostics {
             match byte {
                 0x1b => self.escape = 1,
                 b'\n' | b'\r' => {
-                    self.inspect(&mut signals, true);
-                    self.line.clear();
-                    self.truncated = false;
+                    self.finish_row(&mut signals);
                 }
                 _ => {
                     // Preserve UTF-8 bytes until the diagnostic is inspected.
@@ -388,18 +430,26 @@ impl Diagnostics {
                 }
             }
         }
-        self.inspect(&mut signals, false);
         signals
     }
 
-    fn inspect(&mut self, signals: &mut (ScreenLimits, bool, bool), complete: bool) {
+    fn finish(&mut self) -> (ScreenLimits, bool, bool) {
+        let mut signals = (ScreenLimits::default(), false, false);
+        self.finish_row(&mut signals);
+        signals
+    }
+
+    fn finish_row(&mut self, signals: &mut (ScreenLimits, bool, bool)) {
         if self.truncated {
             self.menu_header = false;
+            self.line.clear();
+            self.truncated = false;
             return;
         }
         let decoded = normalize(&self.line);
+        self.line.clear();
         let line = decoded.as_str();
-        let (limit, auth, model) = diagnostic_line(line, complete);
+        let (limit, auth, model) = diagnostic_line(line);
         signals.0.notice |= limit;
         signals.1 |= auth;
         signals.2 |= model;
@@ -411,7 +461,7 @@ impl Diagnostics {
         signals.0.claude_menu |= option.is_some_and(claude_limit_option);
         // A CRLF generates an empty row after the CR. Keep the header until
         // the next visible row, including when the option arrives later.
-        if complete && !line.is_empty() {
+        if !line.is_empty() {
             self.menu_header = line == HEADER;
         }
     }
@@ -428,14 +478,14 @@ fn normalize(line: &[u8]) -> String {
 }
 const CODEX_LIMIT: &str = "you've hit your usage limit";
 
-fn diagnostic_line(line: &str, complete: bool) -> (bool, bool, bool) {
+fn diagnostic_line(line: &str) -> (bool, bool, bool) {
     // The square is Codex's diagnostic marker. Strip it only for the exact
     // usage error, so other output with a square keeps its existing meaning.
     let codex = line.strip_prefix('■').unwrap_or(line).trim_start();
     let codex = codex
         .strip_prefix("error running remote compact task:")
         .map_or(codex, str::trim_start);
-    if codex_limit_notice(codex, complete) {
+    if codex_limit_notice(codex) {
         return (true, false, false);
     }
     let api = line
@@ -461,13 +511,12 @@ fn diagnostic_line(line: &str, complete: bool) -> (bool, bool, bool) {
     )
 }
 
-fn codex_limit_notice(line: &str, complete: bool) -> bool {
+fn codex_limit_notice(line: &str) -> bool {
     let Some(suffix) = line.strip_prefix(CODEX_LIMIT) else {
         return false;
     };
     if matches!(suffix, "" | ".") {
-        // A read may end after the first sentence of a longer line.
-        return complete;
+        return true;
     }
     if suffix.starts_with(" · resets ") {
         return true;
@@ -758,6 +807,38 @@ mod diagnostic_tests {
             assert_eq!(actual, expected, "{line}");
             assert_eq!(detector.feed(b"ordinary output\n"), Default::default());
         }
+    }
+
+    #[test]
+    fn quoted_diagnostics_do_not_match_when_reads_split_at_a_valid_prefix() {
+        for (header, prefix, suffix) in [
+            (
+                "",
+                "\x1b[31m■ You've hit your usage limit. Try again later.\x1b[0m",
+                " This sentence quotes an old error.\r\n",
+            ),
+            (
+                "What do you want to do?\n",
+                "1. Stop and wait for limit to reset",
+                " is a quoted example, then continue working.\n",
+            ),
+        ] {
+            let whole = format!("{header}{prefix}{suffix}");
+            assert!(!Diagnostics::default().feed(whole.as_bytes()).0.any());
+            let mut split = Diagnostics::default();
+            assert!(!split.feed(header.as_bytes()).0.any());
+            assert!(!split.feed(prefix.as_bytes()).0.any());
+            assert!(!split.feed(suffix.as_bytes()).0.any());
+        }
+    }
+
+    #[test]
+    fn an_unterminated_diagnostic_counts_only_after_output_is_finished() {
+        let mut detector = Diagnostics::default();
+        let notice = "■ You've hit your usage limit. Try again later.";
+        assert!(!detector.feed(notice.as_bytes()).0.any());
+        assert!(detector.finish().0.notice);
+        assert!(!detector.finish().0.any());
     }
 
     #[test]
