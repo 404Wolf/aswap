@@ -709,8 +709,10 @@ pub fn choose<'a>(
     at: u64,
     limited: bool,
 ) -> Option<&'a Account> {
-    let used = entries.iter().find(|(a, _)| a.label == current)?.1.used(at);
-    let exhausted = limited || used.is_some_and(|v| v >= 100.0);
+    let (_, current_cache) = entries.iter().find(|(a, _)| a.label == current)?;
+    let used = current_cache.used(at);
+    let exhausted =
+        limited || !current_cache.unverified_limits.is_empty() || used.is_some_and(|v| v >= 100.0);
     if !exhausted
         && used.is_none_or(|v| v < threshold || (v < 100.0 && at.saturating_sub(last_switch) < 300))
     {

@@ -112,7 +112,9 @@ fn weekly(p: f64, reset: Option<u64>, at: u64) -> Cached {
 fn partial_provider_success_preserves_each_unverified_hard_limit() {
     use serde_json::json;
 
-    let reset = chrono::DateTime::from_timestamp(1200, 0).unwrap().to_rfc3339();
+    let reset = chrono::DateTime::from_timestamp(1200, 0)
+        .unwrap()
+        .to_rfc3339();
     let cases = [
         (
             usage::parse_claude(&json!({
@@ -154,6 +156,15 @@ fn partial_provider_success_preserves_each_unverified_hard_limit() {
         let partial = serde_json::from_value(serde_json::to_value(partial).unwrap()).unwrap();
         let still_missing = usage::updated(partial, Ok(omitted.unwrap()), 1200);
         assert_eq!(still_missing.used(1200), None);
+        let entries = [
+            (account("current"), still_missing.clone()),
+            (account("verified"), observation(95.0, 1200)),
+        ];
+        assert_eq!(
+            usage::choose("current", &entries, 90.0, Prefer::Headroom, 1200, 1200, false)
+                .map(|a| a.label.as_str()),
+            Some("verified")
+        );
 
         let failed = usage::updated(still_missing, Err(usage::Failure::new("network")), 1210);
         assert_eq!(failed.used(1210), None);
@@ -735,15 +746,17 @@ fn duplicate_logins_share_one_fresh_fetch() {
         Ok(weekly(100.0, Some(2000), 1200).usage)
     })
     .unwrap();
-    usage::cached_mode_with(&store, &b, 1280, true, |_| {
-        Ok(observation(39.0, 1280).usage)
-    })
+    usage::cached_mode_with(
+        &store,
+        &b,
+        1280,
+        true,
+        |_| Ok(observation(39.0, 1280).usage),
+    )
     .unwrap();
     // A sibling's newer partial snapshot cannot replace the known limit.
-    let partial = usage::cached_with(&store, &a, 1380, |_| {
-        Ok(observation(39.0, 1380).usage)
-    })
-    .unwrap();
+    let partial =
+        usage::cached_with(&store, &a, 1380, |_| Ok(observation(39.0, 1380).usage)).unwrap();
     assert_eq!(partial.fetched_at, 1380);
     assert_eq!(partial.used(1380), None);
 }
