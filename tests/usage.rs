@@ -161,8 +161,16 @@ fn partial_provider_success_preserves_each_unverified_hard_limit() {
             (account("verified"), observation(95.0, 1200)),
         ];
         assert_eq!(
-            usage::choose("current", &entries, 90.0, Prefer::Headroom, 1200, 1200, false)
-                .map(|a| a.label.as_str()),
+            usage::choose(
+                "current",
+                &entries,
+                90.0,
+                Prefer::Headroom,
+                1200,
+                1200,
+                false
+            )
+            .map(|a| a.label.as_str()),
             Some("verified")
         );
 
