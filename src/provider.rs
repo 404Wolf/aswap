@@ -208,9 +208,22 @@ pub trait Spec: Sync {
         None
     }
     fn resume_args(&self, id: &SessionId) -> Vec<String>;
-    /// The session the provider itself says process `pid` runs.
-    fn registered_session(&self, _home: &Path, _pid: u32) -> Option<SessionId> {
+    /// The file where the provider itself records the session that process
+    /// `pid` runs. It is read again only when its stamp changes.
+    fn session_registry(&self, _home: &Path, _pid: u32) -> Option<PathBuf> {
         None
+    }
+    /// The session that `registry` (read from `session_registry`) says
+    /// process `pid` runs.
+    fn registered_session(&self, _registry: &Value, _pid: u32) -> Option<SessionId> {
+        None
+    }
+    /// Whether only the transcript the provider holds open for writing
+    /// proves its session (Codex: a retained reader can outlive a switch).
+    /// Its descriptors are then rescanned on a cadence, and once more just
+    /// before a resume.
+    fn session_by_writer(&self) -> bool {
+        false
     }
     /// Have a supervised launch report its current session to `report`
     /// (`{"sessionId": ...}`), rewritten whenever the user switches

@@ -182,6 +182,9 @@ impl Spec for Codex {
     fn transcript_depth(&self) -> usize {
         5
     }
+    fn session_by_writer(&self) -> bool {
+        true
+    }
     /// `rollout-<time>-<UUID>.jsonl`.
     fn transcript_id<'a>(&self, stem: &'a str) -> Option<&'a str> {
         stem.get(stem.len().checked_sub(36)?..)

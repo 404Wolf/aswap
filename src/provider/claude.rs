@@ -9,7 +9,10 @@ use crate::{
     usage::{Failure, Usage},
 };
 use serde_json::{Value, json};
-use std::{path::Path, time::SystemTime};
+use std::{
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 /// Public OAuth application identifier from Claude's published client.
 pub const CLIENT: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -234,13 +237,15 @@ impl Spec for Claude {
     /// Claude's published CLI registers `sessions/<pid>.json` with its
     /// session ID: it names the main conversation even while subagents hold
     /// other transcripts open.
-    fn registered_session(&self, home: &Path, pid: u32) -> Option<SessionId> {
-        let registry = home.join("sessions").join(format!("{pid}.json"));
-        let v = store::json_read::<Value>(&registry).ok()?;
-        (v.get("pid").and_then(Value::as_u64) == Some(pid as u64))
+    fn session_registry(&self, home: &Path, pid: u32) -> Option<PathBuf> {
+        Some(home.join("sessions").join(format!("{pid}.json")))
+    }
+    fn registered_session(&self, registry: &Value, pid: u32) -> Option<SessionId> {
+        (registry.get("pid")?.as_u64()? == u64::from(pid))
             .then(|| {
-                v.get("sessionId")
-                    .and_then(Value::as_str)
+                registry
+                    .get("sessionId")?
+                    .as_str()
                     .and_then(SessionId::parse)
             })
             .flatten()

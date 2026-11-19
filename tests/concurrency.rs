@@ -95,6 +95,7 @@ while not (ready/'release').exists():time.sleep(.025)
                         used_percent: percent,
                         resets_at: None,
                         duration_minutes: Some(300),
+                        codex_slot: None,
                     }],
                     ..Default::default()
                 },

@@ -94,6 +94,7 @@ impl Sandbox {
                     used_percent: used,
                     resets_at: None,
                     duration_minutes: Some(300),
+                    codex_slot: None,
                 }],
                 ..Default::default()
             },

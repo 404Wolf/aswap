@@ -87,6 +87,7 @@ fn scenario(mode: &str, source: &str) -> std::process::Output {
                         used_percent: percent,
                         resets_at: None,
                         duration_minutes: Some(10080),
+                        codex_slot: None,
                     }],
                     ..Default::default()
                 },

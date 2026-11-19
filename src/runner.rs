@@ -379,14 +379,16 @@ pub fn launch(
                     }
                     // While login errors are held, look at the transcript
                     // every QUIET_STEP to know closely when it changed.
-                    let step = if terminal.quiet_auth {
+                    let check_quiet = terminal.quiet_auth && quiet.needs_check();
+                    let step = if check_quiet {
                         left.min(QUIET_STEP)
                     } else {
                         left
                     };
-                    screen_limit |=
-                        terminal.pump_child(step.as_millis().max(1) as i32, &mut child.0)?;
-                    if terminal.quiet_auth {
+                    // Round up so an idle poll reaches the bookkeeping deadline.
+                    let wait_ms = step.as_nanos().div_ceil(1_000_000) as i32;
+                    screen_limit |= terminal.pump_child(wait_ms, &mut child.0)?;
+                    if check_quiet {
                         quiet.check();
                     }
                 }
@@ -413,7 +415,19 @@ pub fn launch(
                 let _ = view.sync(store, &account);
             }
             if let Some(tracker) = &mut tracker {
-                hiccups.note("tracking the conversation", tracker.observe(child.0.id()));
+                // Refresh while the provider still owns its descriptors. A
+                // diagnostic can be followed immediately by provider exit.
+                let fresh = (screen_limit && !limited)
+                    || terminal.as_ref().is_some_and(|t| {
+                        (t.auth_expired && auth_seen.is_none())
+                            || (t.model_unsupported && !unsupported)
+                    });
+                let observed = if fresh {
+                    tracker.observe_now(child.0.id())
+                } else {
+                    tracker.observe(child.0.id())
+                };
+                hiccups.note("tracking the conversation", observed);
             }
             limited |= limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, false);
             if let Some(terminal) = &mut terminal {
@@ -442,11 +456,12 @@ pub fn launch(
                     // revocation and its view getting the new token. The
                     // account is fine: resume the conversation on it. Until
                     // the conversation is known, retry on every tick.
-                    match prepare_resume(
+                    match prepare_live_resume(
                         store,
                         provider,
                         auto_args.as_ref().unwrap(),
-                        tracker.as_ref().unwrap(),
+                        tracker.as_mut().unwrap(),
+                        child.0.id(),
                     ) {
                         Ok(args) => {
                             rotated = true;
@@ -514,11 +529,12 @@ pub fn launch(
                     wake.retry(now());
                 }
                 if target.is_some() && !restarts.capped() {
-                    match prepare_resume(
+                    match prepare_live_resume(
                         store,
                         provider,
                         auto_args.as_ref().unwrap(),
-                        tracker.as_ref().unwrap(),
+                        tracker.as_mut().unwrap(),
+                        child.0.id(),
                     ) {
                         Ok(args) => {
                             prepared_resume = Some(args);
@@ -733,7 +749,8 @@ pub fn launch(
                 let _lock = store.lock()?;
                 let mut state = store.load()?;
                 let settings = state.auto.get(&provider).cloned().unwrap_or_default();
-                let entries = rejected.filter(
+                let at = now();
+                let entries = rejected.filter_at(
                     store,
                     &account.label,
                     settings.threshold,
@@ -742,9 +759,9 @@ pub fn launch(
                         &account.label,
                         entries_from_cache(store, provider)?,
                     ),
+                    at,
                 );
-                let Some(next) =
-                    recovery_target(&account.label, &entries, &settings, now()).cloned()
+                let Some(next) = recovery_target(&account.label, &entries, &settings, at).cloned()
                 else {
                     return Ok(None);
                 };
@@ -755,10 +772,10 @@ pub fn launch(
                 } else {
                     Arc::new(store.lease_locked(&next)?)
                 };
-                state.auto.entry(provider).or_default().last_switch = now();
+                state.auto.entry(provider).or_default().last_switch = at;
                 store.save(&state)?;
                 rejected.resumed(store, &next, &state.accounts);
-                let fallback = quota_fallback(&next, &entries, &settings, now());
+                let fallback = quota_fallback(&next, &entries, &settings, at);
                 Ok(Some((next, next_lease, fallback)))
             };
             // Retried with the store lock released between attempts.
@@ -840,6 +857,21 @@ fn omit_one_shot(args: &crate::session::AutoArgs, terminal: &mut Option<Terminal
         }
     }
     Ok(())
+}
+/// `prepare_resume` for a provider that is still running: a provider whose
+/// session only its writer proves (`Spec::session_by_writer`) is rescanned
+/// first, so a switch made since the last periodic scan is resumed.
+fn prepare_live_resume(
+    store: &Store,
+    provider: Provider,
+    args: &crate::session::AutoArgs,
+    tracker: &mut crate::session::Tracker,
+    pid: u32,
+) -> Result<Vec<String>> {
+    if provider.spec().session_by_writer() {
+        tracker.observe_now(pid)?;
+    }
+    prepare_resume(store, provider, args, tracker)
 }
 // Build the exact argv before stopping a live provider. Unknown identity or
 // ambiguous option arity must leave the current conversation available.

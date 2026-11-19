@@ -3,11 +3,14 @@
 use crate::{
     Error, Result, Safe,
     provider::{Provider, SessionArg},
+    shared, store,
 };
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::ErrorKind,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -280,10 +283,14 @@ impl AutoArgs {
 }
 const TRANSCRIPT_CHECK: Duration = Duration::from_secs(5);
 const TRANSCRIPT_RETRY_MAX: Duration = Duration::from_secs(60);
+// Check the known rollout writer each tick, including its access mode. A full
+// scan on this cadence also catches additional rollouts alongside that writer.
+const FD_CHECK: Duration = Duration::from_secs(20);
 
 #[cfg(test)]
 thread_local! {
     static TRANSCRIPT_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FD_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn find_transcript(provider: Provider, root: &Path, id: &str) -> Result<Option<PathBuf>> {
@@ -334,6 +341,11 @@ fn is_transcript_file(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
+fn writable_proc_fd(path: &Path) -> bool {
+    // Linux gives /proc/<pid>/fd symlinks the access mode of the open fd.
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink() && m.mode() & libc::S_IWUSR != 0)
+}
+
 pub struct Tracker {
     provider: Provider,
     home: PathBuf,
@@ -344,6 +356,11 @@ pub struct Tracker {
     retry_delay: Duration,
     /// Where the provider reports its current session (`Spec::report_session`).
     report: Option<PathBuf>,
+    /// The last `Spec::session_registry` read: its process, stamp and session.
+    registry: Option<(u32, shared::Stamp, SessionId)>,
+    last_fd_scan: Option<(u32, Instant)>,
+    /// The `/proc` descriptor and path of the one owned transcript writer.
+    rollout_writer: Option<(PathBuf, PathBuf)>,
 }
 impl Tracker {
     pub fn new(provider: Provider, home: &Path, id: Option<String>) -> Result<Self> {
@@ -365,54 +382,101 @@ impl Tracker {
             retry_delay: TRANSCRIPT_CHECK,
             transcript,
             report: None,
+            registry: None,
+            last_fd_scan: None,
+            rollout_writer: None,
         })
     }
     pub fn observe(&mut self, pid: u32) -> Result<()> {
+        self.observe_with(pid, false)
+    }
+    pub(crate) fn observe_now(&mut self, pid: u32) -> Result<()> {
+        self.observe_with(pid, true)
+    }
+    fn observe_with(&mut self, pid: u32, fresh: bool) -> Result<()> {
         // Codex's rollout writer may live in its app-server child. Inspect only
         // this process tree's open descriptors, never another terminal's files.
-        fn process_files(pid: u32, depth: usize, out: &mut Vec<PathBuf>) {
+        fn process_files(pid: u32, depth: usize, root: &Path, out: &mut Vec<(PathBuf, PathBuf)>) {
             if depth > 5 {
                 return;
             }
             if let Ok(dir) = fs::read_dir(format!("/proc/{pid}/fd")) {
                 for e in dir.flatten() {
-                    if let Ok(p) = fs::read_link(e.path()) {
-                        out.push(p);
+                    let fd = e.path();
+                    if let Ok(path) = fs::read_link(&fd)
+                        && path.starts_with(root)
+                    {
+                        out.push((fd, path));
                     }
                 }
             }
             if let Ok(children) = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
                 for child in children.split_whitespace().filter_map(|s| s.parse().ok()) {
-                    process_files(child, depth + 1, out);
+                    process_files(child, depth + 1, root, out);
                 }
             }
         }
-        let mut descriptors = Vec::new();
-        process_files(pid, 0, &mut descriptors);
-        let owned: BTreeSet<_> = descriptors
-            .iter()
-            .filter(|p| p.starts_with(&self.root))
-            .filter_map(|p| filename_id(self.provider, p))
-            .collect();
+        let now = Instant::now();
+        if let Some(path) = &self.transcript
+            && self.next_check.is_some_and(|at| at <= now)
+        {
+            if is_transcript_file(path) {
+                self.next_check = Some(now + TRANSCRIPT_CHECK);
+            } else {
+                self.transcript = None;
+            }
+        }
         // A provider's own registry (Claude's PID registry, or the session
         // pi reports) identifies the main conversation even while subagents
         // hold other transcripts open or unrelated terminals write.
+        self.refresh_registry(pid);
         let registered = self
-            .provider
-            .spec()
-            .registered_session(&self.home, pid)
-            .or_else(|| self.reported())
-            .map(|id| id.to_string());
-        let known = if let Some(id) = registered.as_deref() {
+            .registry
+            .as_ref()
+            .map(|(_, _, id)| id.clone())
+            .or_else(|| self.reported());
+        let registered = registered.as_ref().map(SessionId::as_str);
+        let by_writer = self.provider.spec().session_by_writer();
+        let fd_due = by_writer
+            && (fresh
+                || self.last_fd_scan.is_none_or(|(previous, at)| {
+                    previous != pid || now.duration_since(at) >= FD_CHECK
+                })
+                || self.rollout_writer.as_ref().is_none_or(|(fd, path)| {
+                    fs::read_link(fd).ok().as_ref() != Some(path) || !writable_proc_fd(fd)
+                }));
+        let scan = registered.is_none() && (self.transcript.is_none() || fd_due);
+        let mut descriptors = Vec::new();
+        if scan {
+            self.last_fd_scan = Some((pid, now));
+            #[cfg(test)]
+            FD_SCANS.with(|scans| scans.set(scans.get() + 1));
+            process_files(pid, 0, &self.root, &mut descriptors);
+        }
+        let owned: BTreeSet<_> = descriptors
+            .iter()
+            .filter_map(|(_, path)| filename_id(self.provider, path))
+            .collect();
+        if scan && by_writer {
+            // A retained history reader can outlive a switch to another
+            // conversation. Throttle only while an owned writer is present.
+            self.rollout_writer = owned.first().filter(|_| owned.len() == 1).and_then(|id| {
+                descriptors
+                    .iter()
+                    .find(|(fd, path)| {
+                        filename_id(self.provider, path) == Some(*id) && writable_proc_fd(fd)
+                    })
+                    .cloned()
+            });
+        }
+        let known = if let Some(id) = registered {
             Some(id)
         } else if (self.provider.spec().trusts_known_session() && self.known.is_some())
             || owned.is_empty()
         {
-            // Shared history activity cannot contradict a known UUID. In
-            // particular, an exited Codex has no descriptors left: another
-            // terminal writing then must not strand its exact resume ID.
-            // Claude's open files may belong to subagents; Codex can still
-            // prove an actual session change with its owned rollout below.
+            // Keep transcript attribution through an empty scan. A trusted
+            // known ID (Claude's open files can belong to subagents) also
+            // takes precedence here.
             self.known.as_deref()
         } else if owned.len() == 1 {
             owned.first().copied()
@@ -428,22 +492,13 @@ impl Tracker {
         let Some(id) = self.known.as_deref() else {
             return Ok(());
         };
-        let now = Instant::now();
-        let due = self.next_check.is_none_or(|at| at <= now);
-        if let Some(path) = &self.transcript {
-            if !due {
-                return Ok(());
-            }
-            if is_transcript_file(path) {
-                self.next_check = Some(now + TRANSCRIPT_CHECK);
-                return Ok(());
-            }
-            self.transcript = None;
+        if self.transcript.is_some() {
+            return Ok(());
         }
         // An open descriptor can name the exact file without guessing how
         // Claude encodes project directories, even between history lookups.
         // Exclude deeper subagent paths.
-        let direct = descriptors.into_iter().find(|path| {
+        let direct = descriptors.into_iter().map(|(_, path)| path).find(|path| {
             path.strip_prefix(&self.root).is_ok_and(|relative| {
                 relative.components().count() <= self.provider.spec().transcript_depth() + 1
                     && filename_id(self.provider, relative) == Some(id)
@@ -452,10 +507,33 @@ impl Tracker {
         });
         if let Some(path) = direct {
             self.cache_transcript(path, now);
-        } else if due {
+        } else if (registered.is_some() && fresh) || self.next_check.is_none_or(|at| at <= now) {
             self.walk_for_transcript(now)?;
         }
         Ok(())
+    }
+    fn refresh_registry(&mut self, pid: u32) {
+        // One stat per tick detects /clear and atomic replacement. Read the
+        // JSON again only when it changes or the last read did not prove an ID.
+        let spec = self.provider.spec();
+        let Some((path, stamp)) = spec
+            .session_registry(&self.home, pid)
+            .and_then(|path| shared::stamp(&path).map(|stamp| (path, stamp)))
+        else {
+            self.registry = None;
+            return;
+        };
+        if self
+            .registry
+            .as_ref()
+            .is_some_and(|(previous, old, _)| *previous == pid && *old == stamp)
+        {
+            return;
+        }
+        self.registry = store::json_read::<Value>(&path)
+            .ok()
+            .and_then(|value| spec.registered_session(&value, pid))
+            .map(|id| (pid, stamp, id));
     }
     /// The cached path, if the conversation and its transcript are known.
     pub(crate) fn transcript(&self) -> Option<PathBuf> {
@@ -608,10 +686,20 @@ mod tracker_tests {
         ];
         let pid = std::process::id();
         let registry = home.path().join("sessions").join(format!("{pid}.json"));
+        store::json_write(&registry, &serde_json::json!({"pid":pid,"sessionId":MAIN})).unwrap();
+        let scans = || FD_SCANS.with(std::cell::Cell::get);
+        let before = scans();
+        for _ in 0..3 {
+            tracker.observe(pid).unwrap();
+            assert_eq!(tracker.id().unwrap(), MAIN);
+        }
+        assert_eq!(scans(), before, "a valid registry avoids descriptor scans");
+
         store::json_write(&registry, &serde_json::json!({"pid":pid,"sessionId":OTHER})).unwrap();
         tracker.observe(pid).unwrap();
         assert_eq!(tracker.id().unwrap(), OTHER);
         assert_eq!(tracker.transcript(), Some(other));
+        assert_eq!(scans(), before, "a registry switch also avoids a scan");
     }
 
     #[test]
@@ -724,6 +812,10 @@ mod tracker_tests {
         path
     }
 
+    fn rollout_writer(path: &Path) -> fs::File {
+        fs::OpenOptions::new().append(true).open(path).unwrap()
+    }
+
     #[test]
     fn explicit_codex_identity_survives_other_sessions_writing_after_child_exit() {
         let home = tempfile::tempdir().unwrap();
@@ -742,21 +834,118 @@ mod tracker_tests {
         let home = tempfile::tempdir().unwrap();
         let mut tracker = Tracker::new(Provider::Codex, home.path(), Some(MAIN.into())).unwrap();
         let other = rollout(home.path(), OTHER);
-        let held = fs::File::open(&other).unwrap();
+        let held = rollout_writer(&other);
         let before = TRANSCRIPT_WALKS.with(std::cell::Cell::get);
         tracker.observe(std::process::id()).unwrap();
         assert_eq!(tracker.id().unwrap(), OTHER);
         assert_eq!(tracker.transcript(), Some(other));
         assert_eq!(TRANSCRIPT_WALKS.with(std::cell::Cell::get), before);
         let main = rollout(home.path(), MAIN);
-        let _main_held = fs::File::open(main).unwrap();
+        let main_held = rollout_writer(&main);
+        let scans = FD_SCANS.with(std::cell::Cell::get);
         tracker.observe(std::process::id()).unwrap();
+        assert_eq!(tracker.known_id(), Some(OTHER));
+        assert_eq!(FD_SCANS.with(std::cell::Cell::get), scans);
+
+        // Recovery rechecks even before the cadence expires.
+        tracker.observe_now(std::process::id()).unwrap();
         assert!(
             tracker.id().is_err(),
             "two owned identities remain ambiguous"
         );
         assert!(tracker.transcript().is_none());
         drop(held);
+        tracker.observe(std::process::id()).unwrap();
+        assert_eq!(
+            tracker.id().unwrap(),
+            MAIN,
+            "retry immediately when unresolved"
+        );
+        let _held = rollout_writer(&rollout(home.path(), OTHER));
+        let pid = std::process::id();
+        tracker.last_fd_scan = Some((pid, Instant::now() - FD_CHECK));
+        tracker.observe(pid).unwrap();
+        assert!(
+            tracker.id().is_err(),
+            "the periodic scan catches a second rollout"
+        );
+        drop(main_held);
+    }
+
+    #[test]
+    fn a_codex_switch_before_exit_resumes_the_new_conversation() {
+        let home = tempfile::tempdir().unwrap();
+        let main = rollout(home.path(), MAIN);
+        let other = rollout(home.path(), OTHER);
+        let mut tracker = Tracker::new(Provider::Codex, home.path(), None).unwrap();
+        let pid = std::process::id();
+        let held_main = rollout_writer(&main);
+        tracker.observe(pid).unwrap();
+        assert_eq!(tracker.id().unwrap(), MAIN);
+        drop(held_main);
+
+        let held_other = rollout_writer(&other);
+        // /new has switched the writer, but the next periodic scan is far off.
+        for _ in 0..3 {
+            tracker.observe(pid).unwrap();
+        }
+        assert_eq!(tracker.known_id(), Some(OTHER));
+        drop(held_other);
+        tracker.observe_now(pid).unwrap();
+        let args = AutoArgs::parse(Provider::Codex, &[]).unwrap();
+        let resume = args
+            .resume(Provider::Codex, tracker.id().unwrap(), None)
+            .unwrap();
+        assert_eq!(resume, ["resume", OTHER]);
+    }
+
+    #[test]
+    fn an_unchanged_codex_writer_can_resume_after_an_idle_exit() {
+        let home = tempfile::tempdir().unwrap();
+        let writer = rollout_writer(&rollout(home.path(), MAIN));
+        let mut tracker = Tracker::new(Provider::Codex, home.path(), None).unwrap();
+        let pid = std::process::id();
+        tracker.observe(pid).unwrap();
+        let scans = FD_SCANS.with(std::cell::Cell::get);
+        for _ in 0..3 {
+            tracker.observe(pid).unwrap();
+        }
+        assert_eq!(
+            FD_SCANS.with(std::cell::Cell::get),
+            scans,
+            "a stable writer stays on the cheap path"
+        );
+
+        drop(writer);
+        tracker.observe_now(pid).unwrap();
+        let args = AutoArgs::parse(Provider::Codex, &[]).unwrap();
+        let resume = args
+            .resume(Provider::Codex, tracker.id().unwrap(), None)
+            .unwrap();
+        assert_eq!(resume, ["resume", MAIN]);
+    }
+
+    #[test]
+    fn a_retained_codex_reader_does_not_prove_identity_after_exit() {
+        let home = tempfile::tempdir().unwrap();
+        let main = rollout(home.path(), MAIN);
+        let other = rollout(home.path(), OTHER);
+        let mut tracker = Tracker::new(Provider::Codex, home.path(), None).unwrap();
+        let pid = std::process::id();
+        let reader = fs::File::open(main).unwrap();
+        tracker.observe(pid).unwrap();
+        assert_eq!(tracker.id().unwrap(), MAIN);
+
+        let writer = rollout_writer(&other);
+        for _ in 0..3 {
+            tracker.observe(pid).unwrap();
+        }
+        assert!(tracker.id().is_err(), "the live scan sees both IDs");
+        drop((reader, writer));
+
+        // Both descriptors can vanish before the diagnostic forces a scan.
+        tracker.observe_now(pid).unwrap();
+        assert!(tracker.id().is_err());
     }
 
     #[test]

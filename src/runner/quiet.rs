@@ -69,6 +69,11 @@ impl Quiet {
             recorded: None,
         }
     }
+    /// Whether `check` can still learn anything: the prompt is not yet
+    /// recorded and the transcript is known.
+    pub(super) fn needs_check(&self) -> bool {
+        self.recorded.is_none() && self.transcript.is_some()
+    }
     /// Check the cached transcript's stamp without walking the history.
     pub(super) fn check(&mut self) {
         if self.recorded.is_some() {
@@ -121,8 +126,58 @@ impl Quiet {
 mod quiet_tests {
     use super::*;
     use crate::{provider::Provider, session::Tracker};
-    use std::fs::FileTimes;
-    use std::io::Write;
+    use std::{
+        fs::{self, FileTimes},
+        io::Write,
+        os::unix::fs::PermissionsExt,
+    };
+
+    #[test]
+    fn a_redraw_just_after_the_prompt_stays_quiet() {
+        let mut quiet = Quiet::new(None);
+        let prompt = Instant::now() - 2 * RESUME_LIVE;
+        quiet.recorded = Some(prompt);
+        let mut terminal = Terminal::open().unwrap();
+        terminal.quiet_auth = true;
+        terminal.held_auth.push(prompt + Duration::from_millis(20));
+        quiet.apply(&mut terminal, None);
+        assert!(!terminal.auth_expired);
+
+        terminal.quiet_auth = true;
+        terminal
+            .held_auth
+            .push(prompt + RESUME_LIVE + Duration::from_millis(1));
+        quiet.apply(&mut terminal, None);
+        assert!(terminal.auth_expired);
+    }
+
+    #[test]
+    fn chmod_does_not_make_a_redrawn_login_error_live() {
+        let home = tempfile::tempdir().unwrap();
+        let id = "11111111-2222-4333-8444-555555555555";
+        let dir = home.path().join("projects/-synthetic");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.jsonl"));
+        fs::write(&path, "{\"type\":\"user\"}\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let tracker = Tracker::new(Provider::Claude, home.path(), Some(id.into())).unwrap();
+        let mut quiet = Quiet::new(Some(&tracker));
+        let mut terminal = Terminal::open().unwrap();
+        terminal.quiet_auth = true;
+
+        std::thread::sleep(Duration::from_millis(5));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        quiet.check();
+        std::thread::sleep(RESUME_LIVE + Duration::from_millis(10));
+        terminal.held_auth.push(Instant::now());
+        quiet.apply(&mut terminal, Some(&tracker));
+
+        assert!(
+            !terminal.auth_expired,
+            "securing the transcript did not record the prompt"
+        );
+        assert!(terminal.quiet_auth);
+    }
 
     #[test]
     fn a_login_failure_after_a_late_discovered_prompt_counts_at_exit() {

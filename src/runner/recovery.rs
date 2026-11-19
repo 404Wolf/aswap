@@ -34,7 +34,8 @@ pub(super) fn report_quota_fallback(account: &Account, fallback: Option<(f64, f6
 
 /// A limited provider can resume on its own account once that account's
 /// rejection lapses. Other targets retain the usual forced-switch ranking
-/// and below-100% fallback. Rejected entries have already been filtered.
+/// and below-100% fallback. `Cached::used` requires fresh coverage of every
+/// known exhausted window, including in the caches reloaded at commit.
 pub(super) fn recovery_target<'a>(
     current: &str,
     entries: &'a [(Account, usage::Cached)],
@@ -87,10 +88,7 @@ impl Wake {
             .iter()
             .flat_map(|(_, cache)| {
                 cache
-                    .usage
-                    .windows
-                    .iter()
-                    .filter_map(|window| window.resets_at)
+                    .reset_times()
                     .chain(std::iter::once(cache.next_poll_at))
             })
             .chain(hold)
@@ -215,13 +213,7 @@ impl Rejected {
             };
             (
                 Self::key(store, account),
-                cache
-                    .usage
-                    .windows
-                    .iter()
-                    .filter_map(|window| window.resets_at)
-                    .filter(|reset| *reset > at)
-                    .min(),
+                cache.reset_times().filter(|reset| *reset > at).min(),
             )
         };
         let mark = |map: &mut std::collections::BTreeMap<String, Option<Lapse>>, key: String| {
@@ -341,6 +333,7 @@ mod rejection_tests {
                     used_percent: used,
                     resets_at: None,
                     duration_minutes: Some(10080),
+                    codex_slot: None,
                 }],
                 ..Default::default()
             },
@@ -482,6 +475,7 @@ mod rejection_tests {
 #[cfg(test)]
 mod wake_tests {
     use super::*;
+    use crate::runner::monitor::entries_from_cache;
 
     const AT: u64 = 10_000;
 
@@ -504,6 +498,7 @@ mod wake_tests {
                         used_percent: used,
                         resets_at: reset,
                         duration_minutes: Some(10080),
+                        codex_slot: None,
                     }],
                     ..Default::default()
                 },
@@ -512,6 +507,83 @@ mod wake_tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn recovery_rechecks_weekly_quota_from_the_locked_cache_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("store")).unwrap();
+        let settings = store::Auto {
+            threshold: 90.0,
+            prefer: store::Prefer::WeeklyReset,
+            ..Default::default()
+        };
+        let (current, exhausted) = entry(Provider::Claude, "current", 100.0, None, AT);
+        let (first, verified) = entry(Provider::Claude, "chatgpt1", 61.0, Some(AT + 6000), AT);
+        let (third, _) = entry(Provider::Claude, "chatgpt3", 100.0, None, AT);
+        let mut state = store.load().unwrap();
+        state.accounts = vec![current.clone(), first.clone(), third.clone()];
+        store.save(&state).unwrap();
+        let write_cache = |account: &Account, cache: &usage::Cached| {
+            let path = store.profile(account.provider, &account.label).unwrap();
+            store::json_write(&path.join("usage-cache.json"), cache).unwrap();
+        };
+        write_cache(&current, &exhausted);
+        write_cache(&first, &verified);
+        let full = |weekly: f64| {
+            usage::parse_claude(&serde_json::json!({
+                "five_hour": {"utilization":39},
+                "seven_day": {
+                    "utilization":weekly,
+                    "resets_at":chrono::DateTime::from_timestamp((AT + 3000) as i64, 0)
+                        .unwrap().to_rfc3339()
+                }
+            }))
+            .unwrap()
+        };
+        let partial = usage::parse_claude(&serde_json::json!({
+            "five_hour": {"utilization":39}, "seven_day":null
+        }))
+        .unwrap();
+        let select = |rejected: &Rejected| {
+            let _lock = store.lock().unwrap();
+            let entries = entries_from_cache(&store, Provider::Claude).unwrap();
+            let entries = rejected.filter_at(&store, "current", settings.threshold, entries, AT);
+            recovery_target("current", &entries, &settings, AT).map(|a| a.label.clone())
+        };
+        let rejected = Rejected::default();
+        let usable = usage::updated(usage::Cached::default(), Ok(full(80.0)), AT - 120);
+        write_cache(&third, &usable);
+        assert_eq!(select(&rejected).as_deref(), Some("chatgpt3"));
+        let stale = usage::updated(usage::Cached::default(), Ok(full(80.0)), AT - 601);
+        write_cache(&third, &stale);
+        assert_eq!(select(&rejected).as_deref(), Some("chatgpt1"));
+
+        let full = usage::updated(usable, Ok(full(100.0)), AT - 60);
+        write_cache(&third, &full);
+        assert_eq!(select(&rejected).as_deref(), Some("chatgpt1"));
+        let mut held = Rejected::default();
+        let lapse = Lapse {
+            at: AT - 60,
+            count: 1,
+            reset: Some(AT),
+            resumed: false,
+        };
+        held.labels.insert(third.label.clone(), Some(lapse));
+        assert_eq!(select(&held).as_deref(), Some("chatgpt1"));
+        let verified_session_reset = usage::updated(full, Ok(partial.clone()), AT);
+        write_cache(&third, &verified_session_reset);
+        assert!(!lapse.lapsed(&verified_session_reset, 90.0, AT));
+        assert_eq!(select(&held).as_deref(), Some("chatgpt1"));
+        assert_eq!(select(&rejected).as_deref(), Some("chatgpt1"));
+
+        let no_weekly_history = usage::updated(usage::Cached::default(), Ok(partial), AT);
+        write_cache(&third, &no_weekly_history);
+        assert_eq!(select(&rejected).as_deref(), Some("chatgpt1"));
+
+        write_cache(&third, &verified_session_reset);
+        write_cache(&first, &usage::Cached::default());
+        assert_eq!(select(&rejected), None);
     }
 
     #[test]
@@ -526,6 +598,7 @@ mod wake_tests {
                 used_percent: 100.0,
                 resets_at: Some(AT + 30),
                 duration_minutes: Some(300),
+                codex_slot: None,
             });
             let mut wake = Wake::new(17);
             wake.schedule(&entries, None, AT);
@@ -596,6 +669,7 @@ mod wake_tests {
                         used_percent: 0.0,
                         resets_at: Some(AT + 30 + 5 * 3600),
                         duration_minutes: Some(300),
+                        codex_slot: None,
                     });
                     let entries = rejected.filter_at(&store, "current", 90.0, entries, AT + 30);
                     assert_eq!(

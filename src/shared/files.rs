@@ -159,10 +159,14 @@ pub(super) fn snapshot(source: &Path, dest: &Path, depth: usize) -> Result<()> {
 /// A file's identity and version: atomic replacement changes the inode.
 #[derive(Clone, PartialEq)]
 pub(crate) struct Stamp(u64, u64, u64, i64, i64);
+impl Stamp {
+    pub(crate) fn from_metadata(m: &fs::Metadata) -> Self {
+        Self(m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec())
+    }
+}
 pub(crate) fn stamp(path: &Path) -> Option<Stamp> {
     let m = fs::symlink_metadata(path).ok()?;
-    m.is_file()
-        .then(|| Stamp(m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec()))
+    m.is_file().then(|| Stamp::from_metadata(&m))
 }
 
 #[cfg(test)]

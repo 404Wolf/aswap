@@ -145,6 +145,7 @@ fn runner_child() {
                         used_percent: pct,
                         resets_at: None,
                         duration_minutes: Some(300),
+                        codex_slot: None,
                     }],
                     ..Default::default()
                 },
@@ -398,8 +399,8 @@ const FAILS_OVER: [&str; 4] = [
 fn a_login_error_right_after_a_rotation_resumes_on_the_same_account() {
     // rotation401: the token rotated under the provider, so the account is
     // fine, even though the resumed provider redraws the old login error.
-    // rotationredraw401: the same, with the redraw read 20ms after the
-    // resume prompt is recorded.
+    // rotationredraw401: the provider writes the prompt before redrawing,
+    // and the supervisor discovers it through the late-transcript path.
     // rotationlate401: the conversation is identified only after the error;
     // the run keeps retrying and resumes once it is known. rotationcap401:
     // after three same-account restarts the account counts as expired.
@@ -445,6 +446,7 @@ fn automatic_restarts_stop_after_eight_switches() {
 /// an unsuccessful CLI exit. Observe that wait, then cancel our own child;
 /// the launch/identity assertions below still prove the anti-flap bounds.
 /// The late-identity fixture also uses stderr to order its registry write.
+/// The redraw fixture uses PTY output as a barrier for transcript discovery.
 fn observed_safety_output(
     mut command: Command,
     home: &std::path::Path,
@@ -472,6 +474,25 @@ fn observed_safety_output(
             .spawn()
             .unwrap(),
     ));
+    if case == "rotationredraw401" {
+        let stdout = child.0.as_mut().unwrap().stdout.take().unwrap();
+        let publish = home.join("publish-resume-transcript");
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            for line in std::io::BufReader::new(stdout).lines() {
+                let line = line.unwrap();
+                if line.contains("⎿ Login expired · Please run /login") {
+                    fs::write(&publish, "supervisor forwarded the redraw").unwrap();
+                }
+                bytes.extend_from_slice(line.as_bytes());
+                bytes.push(b'\n');
+            }
+            bytes
+        });
+        let mut output = child.0.take().unwrap().wait_with_output().unwrap();
+        output.stdout = reader.join().unwrap();
+        return output;
+    }
     let stderr = child.0.as_mut().unwrap().stderr.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -610,16 +631,22 @@ if case.startswith('rotation'):
         record()
     if not first:
         if case=='rotationredraw401':
-            # The redraw reaches the terminal just after the prompt is recorded.
-            record()
-            time.sleep(.02)
+            # Write the prompt before the redraw, but publish its path after
+            # the supervisor forwards the redraw. A future fixture timestamp
+            # exercises production's clamp to the time of late discovery.
+            staged=transcript.with_suffix('.pending')
+            staged.write_text(json.dumps({'type':'user','timestamp':'2099-01-01T00:00:00Z'})+'\n')
             print('  ⎿ Login expired · Please run /login',flush=True)
+            deadline=time.monotonic()+10
+            while not (root/'publish-resume-transcript').exists():
+                assert time.monotonic()<deadline, 'supervisor never forwarded the redraw'
+                time.sleep(.01)
+            staged.replace(transcript)
         else:
-            # A resumed Claude redraws the conversation, including the error
-            # that ended the previous provider...
+            # A resumed Claude redraws the error that ended the previous
+            # provider, then records the prompt and makes a live API call.
             print('  ⎿ Login expired · Please run /login',flush=True)
             time.sleep(.3)
-            # ...then records the resume prompt and makes a live API call.
             record()
         # A revoked token fails fast: one quick 401 and a failed refresh.
         time.sleep(.15 if case in ('rotationfast401','rotationexisting401') else 1.5)
@@ -710,7 +737,7 @@ time.sleep(1)
             .env("CLAUDE_CONFIG_DIR", home.join("claude"))
             .env("ASWAP_SAFETY_CASE", case);
         let out = if (case.starts_with("bounded") && !case.ends_with("401"))
-            || case == "rotationlate401"
+            || matches!(case, "rotationlate401" | "rotationredraw401")
         {
             observed_safety_output(command, &home, case)
         } else {
@@ -921,6 +948,7 @@ fn runner_safety_child() {
                     used_percent: pct,
                     resets_at: None,
                     duration_minutes: Some(300),
+                    codex_slot: None,
                 }],
                 ..Default::default()
             },
