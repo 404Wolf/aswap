@@ -236,6 +236,8 @@ pub(crate) fn retry_for<T>(
         }
     }
 }
+pub(crate) const PRIVATE_FILE_TOO_LARGE: &str = "private file exceeds size limit";
+
 pub fn read_private(path: &Path) -> Result<Vec<u8>> {
     no_links(path)?;
     let mut file = OpenOptions::new()
@@ -256,7 +258,7 @@ pub fn read_private(path: &Path) -> Result<Vec<u8>> {
         .read_to_end(&mut bytes)
         .safe("cannot read private file")?;
     if bytes.len() > 4 * 1024 * 1024 {
-        return Err(Error("private file exceeds size limit"));
+        return Err(Error(PRIVATE_FILE_TOO_LARGE));
     }
     Ok(bytes)
 }

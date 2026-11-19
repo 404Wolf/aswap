@@ -304,8 +304,89 @@ struct Profile {
     account: Account,
     auth: Value,
     config: Value,
+    #[serde(with = "packet_cache")]
     cache: Cached,
 }
+
+mod packet_cache {
+    use crate::usage::{Cached, UnverifiedLimit};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    const UNVERIFIED: &str = "usage-unverified";
+
+    #[derive(Serialize, Deserialize)]
+    struct WireCache {
+        #[serde(flatten)]
+        cache: Cached,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        retained_limits: Vec<UnverifiedLimit>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        named_codex_slots: Vec<Option<u8>>,
+    }
+
+    pub(super) fn serialize<S: Serializer>(cache: &Cached, serializer: S) -> Result<S::Ok, S::Error> {
+        let has_named_slots = cache
+            .usage
+            .windows
+            .iter()
+            .any(|window| window.duration_minutes.is_some() && window.codex_slot.is_some());
+        if cache.unverified_limits.is_empty() && !has_named_slots {
+            return cache.serialize(serializer);
+        }
+        let mut cache = cache.clone();
+        // Protocol 1 readers disagree on the shape of unverified_limits.
+        // Older peers can all decode the base cache and block on an error.
+        let retained_limits = std::mem::take(&mut cache.unverified_limits);
+        if !retained_limits.is_empty() {
+            cache.error.get_or_insert_with(|| UNVERIFIED.into());
+        }
+        // Older readers match named windows with a missing slot. Carry the
+        // newly available identities separately in the same protocol.
+        let named_codex_slots = if has_named_slots {
+            cache
+                .usage
+                .windows
+                .iter_mut()
+                .map(|window| {
+                    if window.duration_minutes.is_some() {
+                        window.codex_slot.take()
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        WireCache {
+            cache,
+            retained_limits,
+            named_codex_slots,
+        }
+        .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Cached, D::Error> {
+        let WireCache {
+            mut cache,
+            retained_limits,
+            named_codex_slots,
+        } = WireCache::deserialize(deserializer)?;
+        if !retained_limits.is_empty() {
+            if cache.error.as_deref() == Some(UNVERIFIED) {
+                cache.error = None;
+            }
+            cache.unverified_limits.extend(retained_limits);
+        }
+        for (window, slot) in cache.usage.windows.iter_mut().zip(named_codex_slots) {
+            if slot.is_some() {
+                window.codex_slot = slot;
+            }
+        }
+        Ok(cache)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Packet {
     protocol: u8,
@@ -1254,6 +1335,64 @@ mod tests {
             json!({"oauthAccount":{"accountUuid":"synthetic-different"}});
         assert!(install(&peer, collision, &mut cfg).is_err());
     }
+
+    #[test]
+    fn protocol_one_packets_keep_unverified_quota_blocked_across_versions() {
+        let (_temp, store) = seed();
+        let at = now();
+        let request = Request {
+            protocol: 1,
+            force: None,
+        };
+        let mut packet = packet(&store, &request).unwrap();
+        let profile = &mut packet.profiles[0];
+        let full = usage::parse_claude(&json!({"seven_day":{"utilization":100}})).unwrap();
+        let old = usage::updated(Cached::default(), Ok(full), at - 10);
+        profile.cache = usage::updated(old, Ok(profile.cache.usage.clone()), at);
+        let wire = serde_json::to_value(&packet).unwrap();
+        let legacy_view = &wire["profiles"][0]["cache"];
+        // Older readers ignore retained_limits and use the base cache error
+        // to keep the account ineligible.
+        assert!(legacy_view.get("unverified_limits").is_none());
+        let legacy_cache: Cached = serde_json::from_value(legacy_view.clone()).unwrap();
+        assert_eq!(legacy_cache.error.as_deref(), Some("usage-unverified"));
+        assert_eq!(legacy_cache.used(at), None);
+
+        let current: Packet = serde_json::from_value(wire.clone()).unwrap();
+        let cache = &current.profiles[0].cache;
+        assert!(cache.error.is_none());
+        assert_eq!(cache.used(at), None);
+        assert_eq!(cache.unverified_limits.len(), 1);
+
+        let mut earlier = wire;
+        let earlier_cache = &mut earlier["profiles"][0]["cache"];
+        let retained = earlier_cache
+            .as_object_mut()
+            .unwrap()
+            .remove("retained_limits")
+            .unwrap();
+        earlier_cache["unverified_limits"] = json!([retained[0]["window"]]);
+        earlier_cache["error"] = Value::Null;
+        let earlier: Packet = serde_json::from_value(earlier).unwrap();
+        let cache = &earlier.profiles[0].cache;
+        assert!(cache.error.is_none());
+        assert_eq!(cache.used(at), None);
+        assert_eq!(cache.unverified_limits.len(), 1);
+
+        let named = usage::parse_codex(&json!({"rateLimits":{
+            "secondary":{"usedPercent":7,"windowDurationMins":10080}
+        }}))
+        .unwrap();
+        packet.profiles[0].cache = usage::updated(Cached::default(), Ok(named), at);
+        let named_wire = serde_json::to_value(&packet).unwrap();
+        let legacy_cache: Cached =
+            serde_json::from_value(named_wire["profiles"][0]["cache"].clone()).unwrap();
+        assert_eq!(legacy_cache.usage.windows[0].codex_slot, None);
+        assert_eq!(legacy_cache.used(at), Some(7.0));
+        let current: Packet = serde_json::from_value(named_wire).unwrap();
+        assert_eq!(current.profiles[0].cache.usage.windows[0].codex_slot, Some(1));
+    }
+
     #[test]
     fn hosts_and_transport_cannot_be_injected_or_used_as_human_credential_output() {
         for bad in [

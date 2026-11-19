@@ -20,7 +20,7 @@ pub struct Window {
     pub used_percent: f64,
     pub resets_at: Option<u64>,
     pub duration_minutes: Option<u64>,
-    /// Codex slot index when a window has no duration to identify it.
+    /// Codex slot index, used to identify windows previously seen without a duration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_slot: Option<u8>,
 }
@@ -55,9 +55,7 @@ fn deserialize_windows<'de, D: serde::Deserializer<'de>>(
     // Upgrade older caches before either JSON or terminal output can expose slot names.
     for w in &mut windows {
         if matches!(w.name.as_str(), "primary" | "secondary") {
-            if w.duration_minutes.is_none() {
-                w.codex_slot = Some(u8::from(w.name == "secondary"));
-            }
+            w.codex_slot = Some(u8::from(w.name == "secondary"));
             w.name = codex_window_name(w.duration_minutes);
         }
     }
@@ -109,10 +107,28 @@ pub struct Cached {
     pub unverified_limits: Vec<UnverifiedLimit>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct UnverifiedLimit {
-    window: Window,
-    observed_at: u64,
+#[serde(untagged)]
+pub enum UnverifiedLimit {
+    Observed { window: Window, observed_at: u64 },
+    Legacy(Window),
 }
+impl UnverifiedLimit {
+    fn window(&self) -> &Window {
+        match self {
+            Self::Observed { window, .. } | Self::Legacy(window) => window,
+        }
+    }
+
+    fn observed_at(&self, fetched_at: u64) -> u64 {
+        match self {
+            Self::Observed { observed_at, .. } => *observed_at,
+            // A flat limit predates this cache's latest successful poll. Use
+            // that later timestamp as a conservative lower bound for clearing it.
+            Self::Legacy(_) => fetched_at,
+        }
+    }
+}
+
 impl Cached {
     pub fn diagnostic(&self) -> Option<serde_json::Value> {
         let error = self.error.as_deref()?;
@@ -163,7 +179,7 @@ impl Cached {
         self.usage
             .windows
             .iter()
-            .chain(self.unverified_limits.iter().map(|limit| &limit.window))
+            .chain(self.unverified_limits.iter().map(UnverifiedLimit::window))
             .filter_map(|window| window.resets_at)
     }
 
@@ -173,7 +189,7 @@ impl Cached {
         for (window, observed_at) in old
             .unverified_limits
             .iter()
-            .map(|limit| (&limit.window, limit.observed_at))
+            .map(|limit| (limit.window(), limit.observed_at(old.fetched_at)))
             .chain(
                 old.usage
                     .windows
@@ -183,13 +199,18 @@ impl Cached {
             )
         {
             let current = |w: &&Window| w.resets_at.is_none_or(|r| r > self.fetched_at);
-            let matching = |w: &Window| w.name == window.name && w.codex_slot == window.codex_slot;
+            let matching = |w: &Window| {
+                w.name == window.name
+                    && (window.name != "quota" || w.codex_slot == window.codex_slot)
+            };
             let mut windows = self.usage.windows.iter().filter(current);
             let observed = self.fetched_at >= observed_at
                 && if window.name == "quota" {
                     // A durationally anonymous Codex window can be verified in
                     // its own slot or by a fresh reading covering both slots.
-                    (window.codex_slot.is_some() && windows.clone().any(matching))
+                    windows
+                        .clone()
+                        .any(|w| window.codex_slot.is_some() && w.codex_slot == window.codex_slot)
                         || windows.nth(1).is_some()
                 } else {
                     windows.any(matching)
@@ -197,16 +218,18 @@ impl Cached {
             if observed {
                 continue;
             }
-            let limit = UnverifiedLimit {
+            let limit = UnverifiedLimit::Observed {
                 window: window.clone(),
                 observed_at,
             };
             match self
                 .unverified_limits
                 .iter_mut()
-                .find(|retained| matching(&retained.window))
+                .find(|retained| matching(retained.window()))
             {
-                Some(retained) if retained.observed_at < observed_at => *retained = limit,
+                Some(retained) if retained.observed_at(self.fetched_at) < observed_at => {
+                    *retained = limit;
+                }
                 Some(_) => (),
                 None => self.unverified_limits.push(limit),
             }
@@ -269,7 +292,7 @@ pub fn parse_codex(v: &Value) -> Result<Usage> {
                     used_percent: percent(w.get("usedPercent"))?,
                     resets_at: w.get("resetsAt").and_then(Value::as_u64),
                     duration_minutes,
-                    codex_slot: duration_minutes.is_none().then_some(slot),
+                    codex_slot: Some(slot),
                 });
             }
         }
@@ -610,6 +633,23 @@ where
 {
     cached_mode_with(store, account, at, false, fetcher)
 }
+
+fn read_cache(path: &Path, ignore_invalid_json: bool) -> Result<Cached> {
+    if !path.exists() {
+        return Ok(Cached::default());
+    }
+    if ignore_invalid_json {
+        // A force poll can replace invalid quota data while retaining the
+        // private-file checks and the atomic write after a fetch attempt.
+        return match store::read_private(path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
+            Err(Error(store::PRIVATE_FILE_TOO_LARGE)) => Ok(Cached::default()),
+            Err(err) => Err(err),
+        };
+    }
+    store::json_read(path)
+}
+
 pub fn cached_mode_with<F>(
     store: &Store,
     account: &Account,
@@ -627,11 +667,7 @@ where
     store.account(&state, account.provider, Some(&account.label))?;
     let profile = store.profile(account.provider, &account.label)?;
     let path = profile.join("usage-cache.json");
-    let mut old: Cached = if path.exists() {
-        store::json_read(&path)?
-    } else {
-        Cached::default()
-    };
+    let mut old = read_cache(&path, force)?;
     if old.error.is_some() && old.retry_after.is_none() {
         old.next_poll_at = old
             .next_poll_at
@@ -682,11 +718,7 @@ pub fn cached_force(store: &Store, account: &Account, force: bool) -> Result<Cac
         let path = store
             .profile(account.provider, &account.label)?
             .join("usage-cache.json");
-        let mut cached: Cached = if path.exists() {
-            store::json_read(&path)?
-        } else {
-            Cached::default()
-        };
+        let mut cached = read_cache(&path, force)?;
         if result.is_err() {
             cached.error = Some("sync-unavailable".into());
             cached.http_status = None;
@@ -831,16 +863,16 @@ pub fn credentials_changed(store: &Store, account: &Account) -> Result<()> {
     let path = store
         .profile(account.provider, &account.label)?
         .join("usage-cache.json");
-    if path.exists() {
-        let mut cache: Cached = store::json_read(&path)?;
-        if cache.http_status == Some(401)
-            || cache.error.as_deref().is_some_and(|s| {
-                matches!(s, "http-401" | "refresh-invalid-grant" | "refresh-http-401")
-            })
-        {
-            cache.next_poll_at = now();
-            store::json_write(&path, &cache)?;
-        }
+    // Invalid quota data has no backoff to clear and must not prevent token
+    // refresh ahead of the poll that repairs the cache.
+    let mut cache = read_cache(&path, true)?;
+    if cache.http_status == Some(401)
+        || cache.error.as_deref().is_some_and(|s| {
+            matches!(s, "http-401" | "refresh-invalid-grant" | "refresh-http-401")
+        })
+    {
+        cache.next_poll_at = now();
+        store::json_write(&path, &cache)?;
     }
     Ok(())
 }

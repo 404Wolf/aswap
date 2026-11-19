@@ -182,26 +182,93 @@ fn partial_provider_success_preserves_each_unverified_hard_limit() {
 }
 
 #[test]
-fn a_codex_slot_without_a_duration_cannot_verify_the_other_slot() {
+fn a_codex_slot_verifies_its_own_anonymous_limit_even_after_gaining_a_duration() {
     use serde_json::json;
 
-    let limited = usage::parse_codex(&json!({"rateLimits":{
-        "secondary":{"usedPercent":100}
-    }}))
+    let read_slot = |slot: &str, duration: Option<u64>, used: f64, reset: u64| {
+        let mut response = json!({"rateLimits":{}});
+        response["rateLimits"][slot] = json!({
+            "usedPercent":used, "resetsAt":reset, "windowDurationMins":duration
+        });
+        usage::parse_codex(&response)
+    };
+    for (slot, other) in [("primary", "secondary"), ("secondary", "primary")] {
+        let limited = read_slot(slot, None, 100.0, 1100).unwrap();
+        let old = usage::updated(Cached::default(), Ok(limited), 1000);
+        for duration in [None, Some(10080)] {
+            let cross_slot = read_slot(other, duration, 8.0, 2000).unwrap();
+            let partial = usage::updated(old.clone(), Ok(cross_slot), 1200);
+            assert_eq!(partial.used(1200), None, "{other} cannot verify {slot}");
+
+            let matching = read_slot(slot, duration, 7.0, 2000).unwrap();
+            let cache = usage::updated(partial, Ok(matching), 1300);
+            let cache: Cached = serde_json::from_value(serde_json::to_value(cache).unwrap()).unwrap();
+            assert_eq!(cache.used(1300), Some(7.0), "{slot} verifies its limit");
+        }
+    }
+}
+
+fn flat_limit_cache() -> serde_json::Value {
+    serde_json::json!({
+        "usage":{"windows":[{"name":"five_hour","used_percent":39.0,
+            "resets_at":3000,"duration_minutes":300}]},
+        "fetched_at":1100,"last_attempt":1100,"next_poll_at":1280,
+        "unverified_limits":[{"name":"seven_day","used_percent":100.0,
+            "resets_at":1200,"duration_minutes":10080}]
+    })
+}
+
+#[test]
+fn flat_retained_limits_decode_and_keep_the_cache_timestamp_when_migrated() {
+    let old: Cached = serde_json::from_value(flat_limit_cache()).unwrap();
+    assert_eq!(old.used(1100), None);
+    assert_eq!(old.reset_times().min(), Some(1200));
+    let stale = weekly(40.0, Some(2000), 1099).usage;
+    let cache = usage::updated(old, Ok(stale.clone()), 1099);
+    assert_eq!(cache.used(1100), None);
+    let encoded = serde_json::to_value(&cache).unwrap();
+    assert_eq!(encoded["unverified_limits"][0]["observed_at"], 1100);
+    let migrated = serde_json::from_value(encoded).unwrap();
+    assert_eq!(usage::updated(migrated, Ok(stale), 1099).used(1100), None);
+}
+
+#[test]
+fn forced_poll_can_repair_earlier_and_undecodable_cache_formats() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("store")).unwrap();
+    let account = account("synthetic");
+    let mut state = store.load().unwrap();
+    state.accounts.push(account.clone());
+    store.save(&state).unwrap();
+    let profile = store.profile(account.provider, &account.label).unwrap();
+    let path = profile.join("usage-cache.json");
+    let flat = serde_json::to_vec(&flat_limit_cache()).unwrap();
+    let oversized = vec![b' '; 4 * 1024 * 1024 + 1];
+    for bytes in [
+        flat.as_slice(),
+        br#"{"truncated":"#,
+        br#"{"usage":42}"#,
+        oversized.as_slice(),
+    ] {
+        aswap::store::atomic(&path, bytes).unwrap();
+        let cache = usage::cached_mode_with(&store, &account, 1200, true, |p| {
+            assert_eq!(p, profile);
+            usage::credentials_changed(&store, &account).unwrap();
+            Ok(weekly(39.0, Some(2400), 1200).usage)
+        })
+        .unwrap();
+        assert_eq!(cache.used(1200), Some(39.0));
+        let repaired: Cached = aswap::store::json_read(&path).unwrap();
+        assert_eq!(repaired.used(1200), Some(39.0));
+    }
+    aswap::store::atomic(&path, &flat).unwrap();
+    let partial = usage::cached_mode_with(&store, &account, 1200, true, |_| {
+        Ok(observation(39.0, 1200).usage)
+    })
     .unwrap();
-    let old = usage::updated(Cached::default(), Ok(limited), 1000);
-    let primary_only = usage::parse_codex(&json!({"rateLimits":{
-        "primary":{"usedPercent":39}
-    }}))
-    .unwrap();
-    let partial = usage::updated(old, Ok(primary_only), 1100);
-    assert_eq!(partial.used(1100), None);
-    let secondary_only = usage::parse_codex(&json!({"rateLimits":{
-        "secondary":{"usedPercent":50}
-    }}))
-    .unwrap();
-    let fresh = usage::updated(partial, Ok(secondary_only), 1200);
-    assert_eq!(fresh.used(1200), Some(50.0));
+    assert_eq!(partial.used(1200), None);
+    let persisted: Cached = aswap::store::json_read(&path).unwrap();
+    assert_eq!(persisted.used(1200), None);
 }
 
 #[test]
