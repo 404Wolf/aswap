@@ -44,7 +44,92 @@ pub(super) struct Profile {
     pub(super) account: Account,
     pub(super) auth: Value,
     pub(super) config: Value,
+    #[serde(with = "packet_cache")]
     pub(super) cache: Cached,
+}
+/// How a cache crosses protocol 1, so older peers still read it safely.
+mod packet_cache {
+    use crate::usage::{Cached, UnverifiedLimit};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    const UNVERIFIED: &str = "usage-unverified";
+
+    #[derive(Serialize, Deserialize)]
+    struct WireCache {
+        #[serde(flatten)]
+        cache: Cached,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        retained_limits: Vec<UnverifiedLimit>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        named_codex_slots: Vec<Option<u8>>,
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        cache: &Cached,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let has_named_slots = cache
+            .usage
+            .windows
+            .iter()
+            .any(|window| window.duration_minutes.is_some() && window.codex_slot.is_some());
+        if cache.unverified_limits.is_empty() && !has_named_slots {
+            return cache.serialize(serializer);
+        }
+        let mut cache = cache.clone();
+        // Protocol 1 readers disagree on the shape of unverified_limits.
+        // Older peers can all decode the base cache and block on an error.
+        let retained_limits = std::mem::take(&mut cache.unverified_limits);
+        if !retained_limits.is_empty() {
+            cache.error.get_or_insert_with(|| UNVERIFIED.into());
+        }
+        // Older readers match named windows with a missing slot. Carry the
+        // newly available identities separately in the same protocol.
+        let named_codex_slots = if has_named_slots {
+            cache
+                .usage
+                .windows
+                .iter_mut()
+                .map(|window| {
+                    if window.duration_minutes.is_some() {
+                        window.codex_slot.take()
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        WireCache {
+            cache,
+            retained_limits,
+            named_codex_slots,
+        }
+        .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Cached, D::Error> {
+        let WireCache {
+            mut cache,
+            retained_limits,
+            named_codex_slots,
+        } = WireCache::deserialize(deserializer)?;
+        if !retained_limits.is_empty() {
+            if cache.error.as_deref() == Some(UNVERIFIED) {
+                cache.error = None;
+            }
+            cache.unverified_limits.extend(retained_limits);
+        }
+        for (window, slot) in cache.usage.windows.iter_mut().zip(named_codex_slots) {
+            if slot.is_some() {
+                window.codex_slot = slot;
+            }
+        }
+        Ok(cache)
+    }
 }
 #[derive(Serialize, Deserialize)]
 pub(super) struct Packet {

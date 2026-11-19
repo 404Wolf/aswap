@@ -925,3 +925,63 @@ fn the_sync_log_is_private_secret_free_capped_and_shown_in_status() {
     assert_eq!(events[1]["code"], "version-mismatch");
     assert!(events[1]["watch_next"].as_u64().unwrap() > now());
 }
+#[test]
+fn protocol_one_packets_keep_unverified_quota_blocked_across_versions() {
+    let (_temp, store) = seed();
+    let at = now();
+    let request = Request {
+        protocol: 1,
+        force: None,
+        providers: None,
+    };
+    let mut packet = packet(&store, &request).unwrap();
+    let profile = &mut packet.profiles[0];
+    let full = usage::parse_claude(&json!({"seven_day":{"utilization":100}})).unwrap();
+    let old = usage::updated(Cached::default(), Ok(full), at - 10);
+    profile.cache = usage::updated(old, Ok(profile.cache.usage.clone()), at);
+    let wire = serde_json::to_value(&packet).unwrap();
+    let legacy_view = &wire["profiles"][0]["cache"];
+    // Older readers ignore retained_limits and use the base cache error
+    // to keep the account ineligible.
+    assert!(legacy_view.get("unverified_limits").is_none());
+    let legacy_cache: Cached = serde_json::from_value(legacy_view.clone()).unwrap();
+    assert_eq!(legacy_cache.error.as_deref(), Some("usage-unverified"));
+    assert_eq!(legacy_cache.used(at), None);
+
+    let current: Packet = serde_json::from_value(wire.clone()).unwrap();
+    let cache = &current.profiles[0].cache;
+    assert!(cache.error.is_none());
+    assert_eq!(cache.used(at), None);
+    assert_eq!(cache.unverified_limits.len(), 1);
+
+    let mut earlier = wire;
+    let earlier_cache = &mut earlier["profiles"][0]["cache"];
+    let retained = earlier_cache
+        .as_object_mut()
+        .unwrap()
+        .remove("retained_limits")
+        .unwrap();
+    earlier_cache["unverified_limits"] = json!([retained[0]["window"]]);
+    earlier_cache["error"] = Value::Null;
+    let earlier: Packet = serde_json::from_value(earlier).unwrap();
+    let cache = &earlier.profiles[0].cache;
+    assert!(cache.error.is_none());
+    assert_eq!(cache.used(at), None);
+    assert_eq!(cache.unverified_limits.len(), 1);
+
+    let named = usage::parse_codex(&json!({"rateLimits":{
+        "secondary":{"usedPercent":7,"windowDurationMins":10080}
+    }}))
+    .unwrap();
+    packet.profiles[0].cache = usage::updated(Cached::default(), Ok(named), at);
+    let named_wire = serde_json::to_value(&packet).unwrap();
+    let legacy_cache: Cached =
+        serde_json::from_value(named_wire["profiles"][0]["cache"].clone()).unwrap();
+    assert_eq!(legacy_cache.usage.windows[0].codex_slot, None);
+    assert_eq!(legacy_cache.used(at), Some(7.0));
+    let current: Packet = serde_json::from_value(named_wire).unwrap();
+    assert_eq!(
+        current.profiles[0].cache.usage.windows[0].codex_slot,
+        Some(1)
+    );
+}

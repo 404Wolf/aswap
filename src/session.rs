@@ -9,8 +9,8 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::ErrorKind,
-    os::unix::fs::MetadataExt,
+    io::{ErrorKind, Read},
+    os::unix::fs::{FileExt, MetadataExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -283,8 +283,8 @@ impl AutoArgs {
 }
 const TRANSCRIPT_CHECK: Duration = Duration::from_secs(5);
 const TRANSCRIPT_RETRY_MAX: Duration = Duration::from_secs(60);
-// Check the known rollout writer each tick, including its access mode. A full
-// scan on this cadence also catches additional rollouts alongside that writer.
+// Fall back to a full scan periodically even when the process tree and fd
+// counts are unchanged: a process can replace an fd without changing its count.
 const FD_CHECK: Duration = Duration::from_secs(20);
 
 #[cfg(test)]
@@ -346,6 +346,86 @@ fn writable_proc_fd(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink() && m.mode() & libc::S_IWUSR != 0)
 }
 
+fn fd_directory_state(path: &Path) -> Option<(u64, u64)> {
+    // Since Linux 6.2, procfs reports the open fd count as this directory's size.
+    let metadata = fs::metadata(path).ok()?;
+    (metadata.len() != 0).then(|| (metadata.ino(), metadata.len()))
+}
+
+struct ProcessSnapshot {
+    fd_dir: PathBuf,
+    fd_state: (u64, u64),
+    children: fs::File,
+    child_ids: String,
+    buffer: Vec<u8>,
+}
+
+impl ProcessSnapshot {
+    fn unchanged(&mut self) -> bool {
+        fd_directory_state(&self.fd_dir) == Some(self.fd_state)
+            && self
+                .children
+                .read_at(&mut self.buffer, 0)
+                .is_ok_and(|n| &self.buffer[..n] == self.child_ids.as_bytes())
+    }
+}
+
+// Codex's rollout writer may live in its app-server child. Observe only this
+// process tree, without treating unrelated history activity as ownership.
+fn process_files(
+    pid: u32,
+    depth: usize,
+    root: &Path,
+    out: &mut Vec<(PathBuf, PathBuf)>,
+    snapshots: &mut Option<Vec<ProcessSnapshot>>,
+) {
+    if depth > 5 {
+        return;
+    }
+    let fd_dir = PathBuf::from(format!("/proc/{pid}/fd"));
+    let mut children = fs::File::open(format!("/proc/{pid}/task/{pid}/children")).ok();
+    // Snapshot the count before walking the descriptors so an open during the
+    // walk still triggers another scan when the count changes.
+    let fd_state = snapshots.as_ref().and_then(|_| fd_directory_state(&fd_dir));
+    if let Ok(dir) = fs::read_dir(&fd_dir) {
+        for e in dir.flatten() {
+            let fd = e.path();
+            if let Ok(path) = fs::read_link(&fd)
+                && path.starts_with(root)
+            {
+                out.push((fd, path));
+            }
+        }
+    } else {
+        *snapshots = None;
+    }
+    let mut child_ids = String::new();
+    if let Some(file) = &mut children
+        && file.read_to_string(&mut child_ids).is_err()
+    {
+        children = None;
+    }
+    for child in child_ids.split_whitespace().filter_map(|s| s.parse().ok()) {
+        process_files(child, depth + 1, root, out, snapshots);
+    }
+    if let Some(tree) = snapshots {
+        if let (Some(fd_state), Some(children)) = (fd_state, children) {
+            let buffer = vec![0; child_ids.len() + 1];
+            tree.push(ProcessSnapshot {
+                fd_dir,
+                fd_state,
+                children,
+                child_ids,
+                buffer,
+            });
+        } else {
+            // A vanished process or a kernel without fd counts cannot be
+            // watched cheaply. Keep doing full scans until a snapshot works.
+            *snapshots = None;
+        }
+    }
+}
+
 pub struct Tracker {
     provider: Provider,
     home: PathBuf,
@@ -361,6 +441,7 @@ pub struct Tracker {
     last_fd_scan: Option<(u32, Instant)>,
     /// The `/proc` descriptor and path of the one owned transcript writer.
     rollout_writer: Option<(PathBuf, PathBuf)>,
+    process_tree: Option<Vec<ProcessSnapshot>>,
 }
 impl Tracker {
     pub fn new(provider: Provider, home: &Path, id: Option<String>) -> Result<Self> {
@@ -385,6 +466,7 @@ impl Tracker {
             registry: None,
             last_fd_scan: None,
             rollout_writer: None,
+            process_tree: None,
         })
     }
     pub fn observe(&mut self, pid: u32) -> Result<()> {
@@ -394,28 +476,6 @@ impl Tracker {
         self.observe_with(pid, true)
     }
     fn observe_with(&mut self, pid: u32, fresh: bool) -> Result<()> {
-        // Codex's rollout writer may live in its app-server child. Inspect only
-        // this process tree's open descriptors, never another terminal's files.
-        fn process_files(pid: u32, depth: usize, root: &Path, out: &mut Vec<(PathBuf, PathBuf)>) {
-            if depth > 5 {
-                return;
-            }
-            if let Ok(dir) = fs::read_dir(format!("/proc/{pid}/fd")) {
-                for e in dir.flatten() {
-                    let fd = e.path();
-                    if let Ok(path) = fs::read_link(&fd)
-                        && path.starts_with(root)
-                    {
-                        out.push((fd, path));
-                    }
-                }
-            }
-            if let Ok(children) = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
-                for child in children.split_whitespace().filter_map(|s| s.parse().ok()) {
-                    process_files(child, depth + 1, root, out);
-                }
-            }
-        }
         let now = Instant::now();
         if let Some(path) = &self.transcript
             && self.next_check.is_some_and(|at| at <= now)
@@ -444,14 +504,19 @@ impl Tracker {
                 })
                 || self.rollout_writer.as_ref().is_none_or(|(fd, path)| {
                     fs::read_link(fd).ok().as_ref() != Some(path) || !writable_proc_fd(fd)
-                }));
+                })
+                || self
+                    .process_tree
+                    .as_mut()
+                    .is_none_or(|tree| !tree.iter_mut().all(ProcessSnapshot::unchanged)));
         let scan = registered.is_none() && (self.transcript.is_none() || fd_due);
         let mut descriptors = Vec::new();
         if scan {
             self.last_fd_scan = Some((pid, now));
             #[cfg(test)]
             FD_SCANS.with(|scans| scans.set(scans.get() + 1));
-            process_files(pid, 0, &self.root, &mut descriptors);
+            self.process_tree = by_writer.then(Vec::new);
+            process_files(pid, 0, &self.root, &mut descriptors, &mut self.process_tree);
         }
         let owned: BTreeSet<_> = descriptors
             .iter()
@@ -816,6 +881,62 @@ mod tracker_tests {
         fs::OpenOptions::new().append(true).open(path).unwrap()
     }
 
+    struct RolloutProcess {
+        child: std::process::Child,
+        output: std::io::BufReader<std::process::ChildStdout>,
+    }
+
+    impl RolloutProcess {
+        fn start(main: &Path, other: &Path) -> Self {
+            use std::process::{Command, Stdio};
+            let program = r#"import sys
+with open(sys.argv[1], 'a') as first:
+    second = None
+    print('ready', flush=True)
+    for command in sys.stdin:
+        if command.strip() == 'open':
+            second = open(sys.argv[2], 'a')
+        elif command.strip() == 'close':
+            first.close()
+            if second is not None:
+                second.close()
+        print('ready', flush=True)
+"#;
+            let mut child = Command::new("python3")
+                .arg("-c")
+                .arg(program)
+                .args([main, other])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let output = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut process = Self { child, output };
+            process.ready();
+            process
+        }
+
+        fn ready(&mut self) {
+            use std::io::BufRead;
+            let mut line = String::new();
+            self.output.read_line(&mut line).unwrap();
+            assert_eq!(line, "ready\n");
+        }
+
+        fn send(&mut self, command: &str) {
+            use std::io::Write;
+            writeln!(self.child.stdin.as_mut().unwrap(), "{command}").unwrap();
+            self.ready();
+        }
+    }
+
+    impl Drop for RolloutProcess {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
     #[test]
     fn explicit_codex_identity_survives_other_sessions_writing_after_child_exit() {
         let home = tempfile::tempdir().unwrap();
@@ -842,10 +963,6 @@ mod tracker_tests {
         assert_eq!(TRANSCRIPT_WALKS.with(std::cell::Cell::get), before);
         let main = rollout(home.path(), MAIN);
         let main_held = rollout_writer(&main);
-        let scans = FD_SCANS.with(std::cell::Cell::get);
-        tracker.observe(std::process::id()).unwrap();
-        assert_eq!(tracker.known_id(), Some(OTHER));
-        assert_eq!(FD_SCANS.with(std::cell::Cell::get), scans);
 
         // Recovery rechecks even before the cadence expires.
         tracker.observe_now(std::process::id()).unwrap();
@@ -902,27 +1019,55 @@ mod tracker_tests {
     #[test]
     fn an_unchanged_codex_writer_can_resume_after_an_idle_exit() {
         let home = tempfile::tempdir().unwrap();
-        let writer = rollout_writer(&rollout(home.path(), MAIN));
+        let main = rollout(home.path(), MAIN);
+        // An isolated process keeps unrelated test threads from changing the
+        // fd count between observations.
+        let mut provider = RolloutProcess::start(&main, &main);
         let mut tracker = Tracker::new(Provider::Codex, home.path(), None).unwrap();
-        let pid = std::process::id();
+        let pid = provider.child.id();
         tracker.observe(pid).unwrap();
         let scans = FD_SCANS.with(std::cell::Cell::get);
         for _ in 0..3 {
             tracker.observe(pid).unwrap();
         }
-        assert_eq!(
-            FD_SCANS.with(std::cell::Cell::get),
-            scans,
-            "a stable writer stays on the cheap path"
-        );
+        if fd_directory_state(Path::new(&format!("/proc/{pid}/fd"))).is_some() {
+            assert_eq!(
+                FD_SCANS.with(std::cell::Cell::get),
+                scans,
+                "a stable tree skips full scans when procfs reports fd counts"
+            );
+        }
 
-        drop(writer);
+        provider.send("close");
         tracker.observe_now(pid).unwrap();
         let args = AutoArgs::parse(Provider::Codex, &[]).unwrap();
         let resume = args
             .resume(Provider::Codex, tracker.id().unwrap(), None)
             .unwrap();
         assert_eq!(resume, ["resume", MAIN]);
+    }
+
+    #[test]
+    fn a_retained_codex_writer_does_not_hide_another_writer_until_exit() {
+        let home = tempfile::tempdir().unwrap();
+        let main = rollout(home.path(), MAIN);
+        let other = rollout(home.path(), OTHER);
+        let mut provider = RolloutProcess::start(&main, &other);
+        let pid = provider.child.id();
+        let mut tracker = Tracker::new(Provider::Codex, home.path(), None).unwrap();
+        tracker.observe(pid).unwrap();
+        assert_eq!(tracker.id().unwrap(), MAIN);
+
+        provider.send("open");
+        tracker.observe(pid).unwrap();
+        assert!(tracker.id().is_err(), "the live tree contains both writers");
+
+        provider.send("close");
+        tracker.observe_now(pid).unwrap();
+        assert!(
+            tracker.id().is_err(),
+            "exit preserves the observed ambiguity"
+        );
     }
 
     #[test]

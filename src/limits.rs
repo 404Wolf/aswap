@@ -4,7 +4,12 @@
 //!
 //! Transcript entries must belong to the current launch. Screen-only
 //! compaction and dialog evidence needs a fresh observation of exhausted quota.
-use crate::{session::Tracker, shared::Stamp, terminal::ScreenLimits, usage};
+use crate::{
+    session::Tracker,
+    shared::Stamp,
+    terminal::{InputActivity, ScreenLimits},
+    usage,
+};
 use serde_json::Value;
 use std::{
     fs::{File, Metadata},
@@ -48,7 +53,7 @@ pub struct Limits {
 struct PendingScreen {
     evidence: ScreenLimits,
     last_input: Option<Instant>,
-    transcript: Option<Stamp>,
+    transcript: Option<TranscriptVersion>,
     retry: Instant,
 }
 
@@ -158,23 +163,32 @@ impl Limits {
     pub(crate) fn check_quota(
         &mut self,
         screen: ScreenLimits,
-        last_input: Option<Instant>,
+        input: impl Fn() -> InputActivity,
         fetch: impl FnOnce() -> Option<usage::Cached>,
-        at: u64,
+        now: impl FnOnce() -> u64,
     ) -> bool {
         let evidence = self.quota_evidence(screen);
         if self.pending.is_none() && !evidence.any() {
             return false;
         }
-        let transcript = self
-            .main
-            .as_ref()
-            .and_then(|tail| crate::shared::stamp(&tail.path));
+        let activity = input();
+        if activity.waiting {
+            self.pending = None;
+            return false;
+        }
+        let transcript_version = || {
+            let tail = self.main.as_ref()?;
+            let metadata = std::fs::symlink_metadata(&tail.path).ok()?;
+            metadata
+                .is_file()
+                .then(|| TranscriptVersion::from_metadata(&metadata))
+        };
+        let transcript = transcript_version();
         // The blocked provider may draw its dialog only once. Recheck quota
         // until it is corroborated, or input or transcript activity supersedes
         // that screen evidence.
         if self.pending.as_ref().is_some_and(|pending| {
-            pending.last_input != last_input || pending.transcript != transcript
+            pending.last_input != activity.last_forwarded || pending.transcript != transcript
         }) {
             self.pending = None;
         }
@@ -182,7 +196,7 @@ impl Limits {
             self.pending
                 .get_or_insert_with(|| PendingScreen {
                     evidence: ScreenLimits::default(),
-                    last_input,
+                    last_input: activity.last_forwarded,
                     transcript,
                     retry: Instant::now(),
                 })
@@ -196,7 +210,14 @@ impl Limits {
             return false;
         }
         pending.retry = Instant::now() + Duration::from_secs(10);
-        fetch().is_some_and(|cache| corroborates(pending.evidence, &cache, at))
+        let cache = fetch();
+        // Fetching quota can wait on the provider or the owner. The child can
+        // write to its transcript and the user can queue input during that time.
+        if input() != activity || transcript_version() != pending.transcript {
+            self.pending = None;
+            return false;
+        }
+        cache.is_some_and(|cache| corroborates(pending.evidence, &cache, now()))
     }
 }
 
@@ -763,29 +784,110 @@ mod tests {
             ..Default::default()
         };
         let now = 10_000;
-        assert!(!limits.check_quota(menu, None, || None, now));
+        assert!(!limits.check_quota(menu, InputActivity::default, || None, || now));
         limits.pending.as_mut().unwrap().retry = Instant::now();
-        let exhausted = usage::Cached {
-            fetched_at: now,
+        assert!(limits.check_quota(
+            ScreenLimits::default(),
+            InputActivity::default,
+            || Some(exhausted_quota(now, now + 10)),
+            || now,
+        ));
+        limits.pending.as_mut().unwrap().retry = Instant::now();
+        assert!(!limits.check_quota(
+            ScreenLimits::default(),
+            || InputActivity {
+                last_forwarded: Some(Instant::now()),
+                ..Default::default()
+            },
+            || panic!("new input superseded the blocked menu"),
+            || now,
+        ));
+    }
+
+    fn exhausted_quota(fetched_at: u64, reset: u64) -> usage::Cached {
+        usage::Cached {
+            fetched_at,
             usage: usage::Usage {
                 windows: vec![usage::Window {
                     name: "weekly".into(),
                     used_percent: 100.0,
-                    resets_at: Some(now + 10),
+                    resets_at: Some(reset),
                     duration_minutes: Some(10080),
                     codex_slot: None,
                 }],
                 ..Default::default()
             },
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn transcript_activity_during_the_quota_fetch_supersedes_the_menu() {
+        let (_home, path, tracker) = setup("");
+        let mut limits = Limits::new(Some(&tracker));
+        let menu = ScreenLimits {
+            claude_menu: true,
+            ..Default::default()
         };
-        assert!(limits.check_quota(ScreenLimits::default(), None, || Some(exhausted), now));
-        limits.pending.as_mut().unwrap().retry = Instant::now();
         assert!(!limits.check_quota(
-            ScreenLimits::default(),
-            Some(Instant::now()),
-            || panic!("new input superseded the blocked menu"),
-            now,
+            menu,
+            InputActivity::default,
+            || {
+                let entry = "{\"type\":\"assistant\",\"message\":\"work continued\"}\n";
+                std::fs::write(&path, entry).unwrap();
+                Some(exhausted_quota(10_000, 20_000))
+            },
+            || 10_000,
         ));
+        assert!(limits.pending.is_none());
+    }
+
+    #[test]
+    fn input_queued_during_the_quota_fetch_supersedes_the_menu() {
+        let mut limits = Limits::new(None);
+        let menu = ScreenLimits {
+            claude_menu: true,
+            ..Default::default()
+        };
+        let waiting = std::cell::Cell::new(false);
+        assert!(!limits.check_quota(
+            menu,
+            || InputActivity {
+                waiting: waiting.get(),
+                ..Default::default()
+            },
+            || {
+                waiting.set(true);
+                Some(exhausted_quota(10_000, 20_000))
+            },
+            || 10_000,
+        ));
+        assert!(limits.pending.is_none());
+    }
+
+    #[test]
+    fn quota_freshness_and_window_reset_are_checked_after_fetch() {
+        let menu = ScreenLimits {
+            claude_menu: true,
+            ..Default::default()
+        };
+        let started_at = 10_000;
+        let decision_at = started_at + 1;
+        for cache in [
+            exhausted_quota(decision_at - usage::TTL, decision_at + 10),
+            exhausted_quota(started_at, decision_at),
+        ] {
+            assert!(corroborates(menu, &cache, started_at));
+            let clock = std::cell::Cell::new(started_at);
+            assert!(!Limits::new(None).check_quota(
+                menu,
+                InputActivity::default,
+                || {
+                    clock.set(decision_at);
+                    Some(cache)
+                },
+                || clock.get(),
+            ));
+        }
     }
 }
