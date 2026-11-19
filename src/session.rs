@@ -271,6 +271,7 @@ impl AutoArgs {
     }
 }
 const TRANSCRIPT_CHECK: Duration = Duration::from_secs(5);
+const TRANSCRIPT_RETRY_MAX: Duration = Duration::from_secs(60);
 
 #[cfg(test)]
 thread_local! {
@@ -342,7 +343,8 @@ pub struct Tracker {
     root: PathBuf,
     known: Option<String>,
     transcript: Option<PathBuf>,
-    checked: Option<Instant>,
+    next_check: Option<Instant>,
+    retry_delay: Duration,
 }
 impl Tracker {
     pub fn new(provider: Provider, home: &Path, id: Option<String>) -> Result<Self> {
@@ -361,7 +363,10 @@ impl Tracker {
             home: home.into(),
             root,
             known: id,
-            checked: transcript.as_ref().map(|_| Instant::now()),
+            next_check: transcript
+                .as_ref()
+                .map(|_| Instant::now() + TRANSCRIPT_CHECK),
+            retry_delay: TRANSCRIPT_CHECK,
             transcript,
         })
     }
@@ -426,32 +431,38 @@ impl Tracker {
         if known != self.known.as_deref() {
             self.known = known.map(str::to_owned);
             self.transcript = None;
-            self.checked = None;
+            self.next_check = None;
+            self.retry_delay = TRANSCRIPT_CHECK;
         }
         let Some(id) = self.known.as_deref() else {
             return Ok(());
         };
-        if self
-            .checked
-            .is_some_and(|at| at.elapsed() < TRANSCRIPT_CHECK)
-        {
-            return Ok(());
-        }
-        self.checked = Some(Instant::now());
-        if self.transcript.as_deref().is_some_and(is_transcript_file) {
-            return Ok(());
+        let now = Instant::now();
+        let due = self.next_check.is_none_or(|at| at <= now);
+        if let Some(path) = &self.transcript {
+            if !due {
+                return Ok(());
+            }
+            if is_transcript_file(path) {
+                self.next_check = Some(now + TRANSCRIPT_CHECK);
+                return Ok(());
+            }
+            self.transcript = None;
         }
         // An open descriptor can name the exact file without guessing how
-        // Claude encodes project directories. Exclude deeper subagent paths.
-        self.transcript = descriptors.into_iter().find(|path| {
+        // Claude encodes project directories, even between history lookups.
+        // Exclude deeper subagent paths.
+        let direct = descriptors.into_iter().find(|path| {
             path.strip_prefix(&self.root).is_ok_and(|relative| {
                 relative.components().count() <= transcript_depth(self.provider) + 1
                     && filename_id(self.provider, relative) == Some(id)
                     && is_transcript_file(path)
             })
         });
-        if self.transcript.is_none() {
-            self.transcript = find_transcript(self.provider, &self.root, id)?;
+        if let Some(path) = direct {
+            self.cache_transcript(path, now);
+        } else if due {
+            self.walk_for_transcript(now)?;
         }
         Ok(())
     }
@@ -461,15 +472,40 @@ impl Tracker {
     }
     /// Refresh the cache after provider exit, when no further `observe` will come.
     pub(crate) fn transcript_now(&mut self) {
-        if let Some(id) = self.known.as_deref() {
-            self.transcript = find_transcript(self.provider, &self.root, id)
-                .ok()
-                .flatten();
-            self.checked = self.transcript.as_ref().map(|_| Instant::now());
+        let now = Instant::now();
+        if self.transcript.as_deref().is_some_and(is_transcript_file) {
+            self.next_check = Some(now + TRANSCRIPT_CHECK);
+        } else {
+            let _ = self.walk_for_transcript(now);
         }
     }
+    fn walk_for_transcript(&mut self, now: Instant) -> Result<()> {
+        let Some(id) = self.known_id() else {
+            return Ok(());
+        };
+        match find_transcript(self.provider, &self.root, id) {
+            Ok(Some(path)) => {
+                self.cache_transcript(path, now);
+                Ok(())
+            }
+            result => {
+                self.transcript = None;
+                self.next_check = Some(now + self.retry_delay);
+                self.retry_delay = (self.retry_delay * 2).min(TRANSCRIPT_RETRY_MAX);
+                result.map(|_| ())
+            }
+        }
+    }
+    fn cache_transcript(&mut self, path: PathBuf, now: Instant) {
+        self.transcript = Some(path);
+        self.next_check = Some(now + TRANSCRIPT_CHECK);
+        self.retry_delay = TRANSCRIPT_CHECK;
+    }
+    pub(crate) fn known_id(&self) -> Option<&str> {
+        self.known.as_deref()
+    }
     pub fn id(&self) -> Result<&str> {
-        self.known.as_deref().ok_or(Error(
+        self.known_id().ok_or(Error(
             "exact session identity unavailable; refusing an automatic restart",
         ))
     }
@@ -588,7 +624,7 @@ mod tracker_tests {
             tracker.observe(pid).unwrap();
             assert_eq!(tracker.transcript().as_ref(), Some(&path));
         }
-        tracker.checked = Some(Instant::now() - TRANSCRIPT_CHECK);
+        tracker.next_check = Some(Instant::now());
         tracker.observe(pid).unwrap();
         assert_eq!(walks(), before + 1, "revalidation needs only a stat");
 
@@ -596,7 +632,7 @@ mod tracker_tests {
         fs::create_dir(&dir).unwrap();
         let moved = dir.join(path.file_name().unwrap());
         fs::rename(&path, &moved).unwrap();
-        tracker.checked = Some(Instant::now() - TRANSCRIPT_CHECK);
+        tracker.next_check = Some(Instant::now());
         tracker.observe(pid).unwrap();
         assert_eq!(tracker.transcript(), Some(moved));
         assert_eq!(walks(), before + 2);
@@ -615,18 +651,45 @@ mod tracker_tests {
         assert!(tracker.transcript().is_none());
         assert_eq!(walks(), before);
 
-        tracker.checked = Some(Instant::now() - TRANSCRIPT_CHECK);
+        tracker.next_check = Some(Instant::now());
         tracker.observe(pid).unwrap();
         assert_eq!(tracker.transcript().as_ref(), Some(&path));
         assert_eq!(walks(), before + 1);
 
         fs::remove_file(&path).unwrap();
-        tracker.checked = Some(Instant::now() - TRANSCRIPT_CHECK);
+        tracker.next_check = Some(Instant::now());
         tracker.observe(pid).unwrap();
         assert!(tracker.transcript().is_none());
         transcript(home.path(), MAIN);
         tracker.transcript_now();
         assert_eq!(tracker.transcript(), Some(path));
+    }
+
+    #[test]
+    fn missing_transcript_walks_back_off_until_an_open_descriptor_resolves_it() {
+        let home = tempfile::tempdir().unwrap();
+        let mut tracker = Tracker::new(Provider::Claude, home.path(), Some(MAIN.into())).unwrap();
+        let pid = std::process::id();
+        let walks = || TRANSCRIPT_WALKS.with(std::cell::Cell::get);
+        let before = walks();
+        for (i, seconds) in [5, 10, 20, 40, 60, 60].into_iter().enumerate() {
+            let start = Instant::now();
+            tracker.next_check = Some(start);
+            tracker.observe(pid).unwrap();
+            let delay = Duration::from_secs(seconds);
+            let deadline = tracker.next_check.unwrap();
+            assert!(deadline >= start + delay && deadline <= Instant::now() + delay);
+            tracker.observe(pid).unwrap();
+            assert_eq!(walks(), before + i + 1);
+        }
+        let path = transcript(home.path(), MAIN);
+        let _held = fs::File::open(&path).unwrap();
+        tracker.observe(pid).unwrap();
+        assert_eq!(tracker.transcript(), Some(path));
+        assert_eq!(walks(), before + 6);
+        assert_eq!(tracker.retry_delay, TRANSCRIPT_CHECK);
+        tracker.transcript_now();
+        assert_eq!(walks(), before + 6, "exit can reuse the existing path");
     }
 
     #[test]

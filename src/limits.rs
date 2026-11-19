@@ -33,6 +33,7 @@ pub const UNCONFIRMED: Duration = Duration::from_secs(10);
 pub struct Limits {
     launched: Instant,
     launched_wall: SystemTime,
+    session_id: Option<String>,
     /// The conversation's transcript, as the tracker last identified it.
     main: Option<Tail>,
     /// Its subagents' transcripts written since launch: a subagent can hit a
@@ -75,6 +76,7 @@ impl Limits {
         Self {
             launched: Instant::now(),
             launched_wall: SystemTime::now(),
+            session_id: tracker.and_then(Tracker::known_id).map(str::to_owned),
             main,
             subagents: Default::default(),
             scanned: None,
@@ -94,11 +96,13 @@ impl Limits {
         }
         // Follow the tracker: a /clear or another conversation picked inside
         // the provider moves its writes, limits included, to a new transcript.
+        let session_id = tracker.and_then(Tracker::known_id);
         let current = tracker.and_then(Tracker::transcript);
-        if let Some(path) = current
-            && self.main.as_ref().is_none_or(|tail| tail.path != path)
+        if self.session_id.as_deref() != session_id
+            || self.main.as_ref().map(|tail| &tail.path) != current.as_ref()
         {
-            self.main = Some(Tail::found(path, self.launched_wall));
+            self.session_id = session_id.map(str::to_owned);
+            self.main = current.map(|path| Tail::found(path, self.launched_wall));
             self.subagents.clear();
             self.scanned = None;
         }
@@ -384,6 +388,51 @@ mod tests {
             .unwrap()
             .write_all((entry(SystemTime::now(), "rate_limit") + "\n").as_bytes())
             .unwrap();
+        assert!(limits.check(Some(&tracker), false, false));
+    }
+
+    #[test]
+    fn old_conversation_tails_are_discarded_while_the_new_file_is_pending() {
+        let (home, old, mut tracker) = setup("");
+        let mut limits = Limits::new(Some(&tracker));
+        limits.launched_wall -= Duration::from_secs(1);
+        let subagents = old.with_extension("").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let subagent = subagents.join("agent-a1.jsonl");
+        std::fs::write(&subagent, entry(SystemTime::now(), "server_error") + "\n").unwrap();
+        assert!(!limits.check(Some(&tracker), false, true));
+        assert!(limits.subagents.contains_key(&subagent));
+
+        let pid = std::process::id();
+        let other = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let registry = home.path().join("sessions").join(format!("{pid}.json"));
+        crate::store::json_write(&registry, &serde_json::json!({"pid":pid,"sessionId":other}))
+            .unwrap();
+        tracker.observe(pid).unwrap();
+        assert!(tracker.transcript().is_none());
+        assert!(!limits.check(Some(&tracker), false, false));
+        assert!(limits.main.is_none());
+        assert!(limits.subagents.is_empty());
+        assert!(limits.scanned.is_none());
+
+        let new = old.with_file_name(format!("{other}.jsonl"));
+        std::fs::write(&new, "{\"type\":\"user\"}\n").unwrap();
+        for path in [old, subagent] {
+            writeln!(
+                File::options().append(true).open(path).unwrap(),
+                "{}",
+                entry(SystemTime::now(), "rate_limit"),
+            )
+            .unwrap();
+        }
+        tracker.observe(pid).unwrap();
+        assert!(tracker.transcript().is_none());
+        assert!(!limits.check(Some(&tracker), false, true));
+
+        // Once the provider opens the new transcript its own limit counts.
+        let mut current = File::options().append(true).open(new).unwrap();
+        writeln!(current, "{}", entry(SystemTime::now(), "rate_limit")).unwrap();
+        tracker.observe(pid).unwrap();
         assert!(limits.check(Some(&tracker), false, false));
     }
 

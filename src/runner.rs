@@ -11,11 +11,13 @@ use crate::{
     usage,
 };
 use std::{
-    io::{IsTerminal, Write},
+    fs::File,
+    io::{IsTerminal, Read, Seek, SeekFrom, Write},
     os::unix::process::CommandExt,
+    path::Path,
     process::{Child, Stdio},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 fn stop(child: &mut Child) -> Result<std::process::ExitStatus> {
@@ -292,7 +294,7 @@ pub fn run(
                     screen_limit |=
                         terminal.pump_child(step.as_millis().max(1) as i32, &mut child.0)?;
                     if terminal.quiet_auth {
-                        quiet.check(tracker.as_ref());
+                        quiet.check();
                     }
                 }
             }
@@ -459,11 +461,17 @@ pub fn run(
         hiccups.running = false;
         if let Some(terminal) = &mut terminal {
             let screen_limit = terminal.child_exited()?;
-            // Pick up a transcript written after the last observation.
-            if let Some(tracker) = &mut tracker {
+            // Refresh only for Claude limit detection or unresolved held errors.
+            let needs_transcript = (!limited && provider == Provider::Claude)
+                || (terminal.quiet_auth
+                    && !terminal.held_auth.is_empty()
+                    && quiet.transcript.is_none());
+            if needs_transcript && let Some(tracker) = &mut tracker {
                 tracker.transcript_now();
             }
-            limited |= limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, true);
+            if !limited {
+                limited = limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, true);
+            }
             quiet.apply(terminal, tracker.as_ref());
         }
         hiccups.note("saving the provider's view", view.sync(store, &account));
@@ -783,12 +791,45 @@ const RESUME_LIVE: Duration = Duration::from_millis(50);
 /// changes; what was held by then is taken for the redraw.
 const RESUME_QUIET: Duration = Duration::from_secs(10);
 const QUIET_STEP: Duration = Duration::from_millis(25);
+/// Maximum transcript data read once when the path is learned after launch.
+const QUIET_HISTORY: u64 = 1024 * 1024;
+
+fn first_transcript_write(path: &Path, since: SystemTime) -> Option<SystemTime> {
+    let mut file = File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    let modified = metadata.modified().ok().filter(|at| *at >= since)?;
+    let created = metadata.created().ok().filter(|at| *at >= since);
+    // A new file has the first write at its head. For an older file, look
+    // for the first record from this launch in its recent tail.
+    let offset = if created.is_some() {
+        0
+    } else {
+        metadata.len().saturating_sub(QUIET_HISTORY)
+    };
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(QUIET_HISTORY).read_to_end(&mut bytes).ok()?;
+    let recorded = bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .skip(usize::from(offset != 0))
+        .find_map(|line| {
+            let entry: serde_json::Value =
+                serde_json::from_slice(line.strip_suffix(b"\n")?).ok()?;
+            let timestamp = entry.get("timestamp")?.as_str()?;
+            let at = SystemTime::from(chrono::DateTime::parse_from_rfc3339(timestamp).ok()?);
+            (at >= since).then_some(at)
+        });
+    // A newly created file can also mark its first write on filesystems
+    // with birth times. With neither signal, use the observed mtime.
+    Some(recorded.or(created).unwrap_or(modified))
+}
+
 /// Tells a restarted provider's redrawn login errors from live ones by when
 /// they were read relative to the first change of its transcript since launch,
 /// which is the resume prompt being recorded.
 struct Quiet {
     since: Instant,
-    since_wall: std::time::SystemTime,
+    since_wall: SystemTime,
     transcript: Option<std::path::PathBuf>,
     launch: Option<crate::shared::Stamp>,
     recorded: Option<Instant>,
@@ -798,35 +839,15 @@ impl Quiet {
         let transcript = tracker.and_then(|t| t.transcript());
         Self {
             since: Instant::now(),
-            since_wall: std::time::SystemTime::now(),
+            since_wall: SystemTime::now(),
             launch: transcript.as_deref().and_then(crate::shared::stamp),
             transcript,
             recorded: None,
         }
     }
     /// Check the cached transcript's stamp without walking the history.
-    fn check(&mut self, tracker: Option<&crate::session::Tracker>) {
+    fn check(&mut self) {
         if self.recorded.is_some() {
-            return;
-        }
-        if self.transcript.is_none() {
-            // Found only now (the tracker learns files between checks). One
-            // unchanged since before launch is the baseline, so finding it is
-            // not a change. One written since launch is the resume prompt
-            // being recorded: date that by its mtime, since finding it lags.
-            self.transcript = tracker.and_then(|t| t.transcript());
-            let Some(path) = &self.transcript else {
-                return;
-            };
-            self.launch = crate::shared::stamp(path);
-            if let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified())
-                && modified >= self.since_wall
-            {
-                let ago = std::time::SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or_default();
-                self.recorded = Some(Instant::now().checked_sub(ago).unwrap_or_else(Instant::now));
-            }
             return;
         }
         if let Some(path) = &self.transcript
@@ -841,7 +862,18 @@ impl Quiet {
         if !terminal.quiet_auth {
             return;
         }
-        self.check(tracker);
+        if self.transcript.is_none()
+            && let Some(path) = tracker.and_then(crate::session::Tracker::transcript)
+        {
+            // The prompt may have been followed by more writes before this
+            // lookup. Date it from the first record of this launch.
+            self.launch = crate::shared::stamp(&path);
+            self.recorded = first_transcript_write(&path, self.since_wall)
+                .and_then(|at| at.duration_since(self.since_wall).ok())
+                .map(|elapsed| (self.since + elapsed).min(Instant::now()));
+            self.transcript = Some(path);
+        }
+        self.check();
         if let Some(recorded) = self.recorded {
             let live = recorded + RESUME_LIVE;
             terminal.auth_expired |= terminal.held_auth.iter().any(|at| *at > live);
@@ -856,6 +888,62 @@ impl Quiet {
         }
     }
 }
+
+#[cfg(test)]
+mod quiet_tests {
+    use super::*;
+    use crate::session::Tracker;
+    use std::fs::FileTimes;
+
+    #[test]
+    fn a_login_failure_after_a_late_discovered_prompt_counts_at_exit() {
+        let home = tempfile::tempdir().unwrap();
+        let id = "11111111-2222-4333-8444-555555555555";
+        let mut tracker = Tracker::new(Provider::Claude, home.path(), Some(id.into())).unwrap();
+        let mut quiet = Quiet::new(Some(&tracker));
+        let mut terminal = Terminal::open().unwrap();
+        terminal.quiet_auth = true;
+        quiet.since -= Duration::from_secs(2);
+        quiet.since_wall -= Duration::from_secs(2);
+        let pid = std::process::id();
+        tracker.observe(pid).unwrap();
+        assert!(tracker.transcript().is_none());
+
+        let dir = home.path().join("projects/-synthetic");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.jsonl"));
+        let prompt = Duration::from_millis(500);
+        let error = Duration::from_millis(900);
+        let since_wall = quiet.since_wall;
+        let entry = |kind: &str, at| {
+            serde_json::json!({"type": kind,
+                "timestamp": chrono::DateTime::<chrono::Utc>::from(since_wall + at)})
+        };
+        std::fs::write(&path, format!("{}\n", entry("user", prompt))).unwrap();
+        tracker.observe(pid).unwrap();
+        assert!(tracker.transcript().is_none(), "the retry is still pending");
+        quiet.apply(&mut terminal, Some(&tracker));
+
+        let mut file = File::options().append(true).open(&path).unwrap();
+        writeln!(file, "{}", entry("assistant", error)).unwrap();
+        file.set_times(FileTimes::new().set_modified(quiet.since_wall + error))
+            .unwrap();
+        drop(file);
+        terminal.held_auth.push(quiet.since + prompt);
+        terminal
+            .held_auth
+            .push(quiet.since + error + Duration::from_millis(10));
+        tracker.transcript_now();
+        quiet.apply(&mut terminal, Some(&tracker));
+
+        assert_eq!(quiet.recorded, Some(quiet.since + prompt));
+        assert!(
+            terminal.auth_expired,
+            "the second error followed the prompt"
+        );
+    }
+}
+
 /// A digest of an auth file's access token: enough to tell that the token
 /// changed, without keeping the token itself in memory.
 fn access_print(provider: Provider, path: &std::path::Path) -> Option<Vec<u8>> {
