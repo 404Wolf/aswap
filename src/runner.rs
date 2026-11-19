@@ -51,6 +51,8 @@ impl Drop for Running {
     }
 }
 
+/// Why a run can't start in a working directory that no longer exists.
+pub const GONE_CWD: &str = "the current directory no longer exists (was it deleted, e.g. a removed worktree?); cd into an existing directory and run again";
 /// Every run has its own live lease and access-only authentication view.
 /// Auto sessions keep a stable history directory while changing credentials.
 pub fn run(
@@ -60,6 +62,9 @@ pub fn run(
     args: &[String],
     auto: bool,
 ) -> Result<i32> {
+    // The provider inherits this directory, and Codex's model lookup needs it:
+    // one deleted under the shell (a removed worktree) fails here, plainly.
+    std::env::current_dir().map_err(|_| crate::Error(GONE_CWD))?;
     // Nothing runs yet: wait out a full disk or a busy store rather than exit.
     store::set_patience(PREPARE_PATIENCE);
     let mut auto_args = if auto {

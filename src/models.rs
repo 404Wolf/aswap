@@ -78,7 +78,7 @@ impl Gate {
         }
         let mut gate = Self {
             home: Provider::Codex.current_home()?,
-            cwd: std::env::current_dir().safe("cannot resolve model config directory")?,
+            cwd: std::env::current_dir().safe(crate::runner::GONE_CWD)?,
             ..Self::default()
         };
         let mut explicit = None;
