@@ -1,13 +1,10 @@
-//! Claude records every usage-limit error in the conversation's transcript as
-//! an API error entry (`"isApiErrorMessage": true, "error": "rate_limit"`) at
-//! the moment it happens. A resumed or resized Claude redraws old errors on
-//! screen but never writes them again, and a limit dialog that the terminal
-//! parser can't read still writes its entry. So for Claude, the transcript, not
-//! the screen, decides whether this provider has hit a limit.
+//! Claude usually records usage limits in the transcript as API errors.
+//! A resumed or resized Claude redraws old errors without recording them
+//! again. Its compaction and limit dialog can also block without a new entry.
 //!
-//! Only lines appended after the provider launched are parsed, only the three
-//! fields below are looked at, and nothing read is kept or logged.
-use crate::{session::Tracker, shared::Stamp};
+//! Transcript entries must belong to the current launch. Screen-only
+//! compaction and dialog evidence needs a fresh observation of exhausted quota.
+use crate::{session::Tracker, shared::Stamp, terminal::ScreenLimits, usage};
 use serde_json::Value;
 use std::{
     fs::{File, Metadata},
@@ -45,6 +42,14 @@ pub struct Limits {
     screen_seen: bool,
     /// The tracked provider, which decides what a limit entry looks like.
     spec: Option<&'static dyn crate::provider::Spec>,
+    pending: Option<PendingScreen>,
+}
+
+struct PendingScreen {
+    evidence: ScreenLimits,
+    last_input: Option<Instant>,
+    transcript: Option<Stamp>,
+    retry: Instant,
 }
 
 /// What has been read of one transcript.
@@ -102,6 +107,7 @@ impl Limits {
             seen: false,
             screen_seen: false,
             spec: tracker.map(|t| t.provider().spec()),
+            pending: None,
         }
     }
 
@@ -128,6 +134,7 @@ impl Limits {
             self.main = current.map(|path| Tail::found(path, self.launched_wall));
             self.subagents.clear();
             self.scanned = None;
+            self.pending = None;
         }
         if let (Some(tail), Some(spec)) = (&mut self.main, self.spec) {
             self.seen = std::fs::metadata(&tail.path)
@@ -139,6 +146,71 @@ impl Limits {
         self.screen_seen |= screen && self.launched.elapsed() >= UNCONFIRMED;
         self.screen_seen
     }
+
+    fn quota_evidence(&self, mut screen: ScreenLimits) -> ScreenLimits {
+        // The active choice menu can appear immediately on resume. The
+        // compaction message by itself can be part of the startup redraw.
+        screen.claude_compaction &= self.launched.elapsed() >= UNCONFIRMED;
+        screen.notice = false;
+        screen
+    }
+
+    pub(crate) fn check_quota(
+        &mut self,
+        screen: ScreenLimits,
+        last_input: Option<Instant>,
+        fetch: impl FnOnce() -> Option<usage::Cached>,
+        at: u64,
+    ) -> bool {
+        let evidence = self.quota_evidence(screen);
+        if self.pending.is_none() && !evidence.any() {
+            return false;
+        }
+        let transcript = self
+            .main
+            .as_ref()
+            .and_then(|tail| crate::shared::stamp(&tail.path));
+        // The blocked provider may draw its dialog only once. Recheck quota
+        // until it is corroborated, or input or transcript activity supersedes
+        // that screen evidence.
+        if self.pending.as_ref().is_some_and(|pending| {
+            pending.last_input != last_input || pending.transcript != transcript
+        }) {
+            self.pending = None;
+        }
+        if evidence.any() {
+            self.pending
+                .get_or_insert_with(|| PendingScreen {
+                    evidence: ScreenLimits::default(),
+                    last_input,
+                    transcript,
+                    retry: Instant::now(),
+                })
+                .evidence
+                .merge(evidence);
+        }
+        let Some(pending) = &mut self.pending else {
+            return false;
+        };
+        if Instant::now() < pending.retry {
+            return false;
+        }
+        pending.retry = Instant::now() + Duration::from_secs(10);
+        fetch().is_some_and(|cache| corroborates(pending.evidence, &cache, at))
+    }
+}
+
+fn corroborates(screen: ScreenLimits, cache: &usage::Cached, at: u64) -> bool {
+    matches!(cache.error.as_deref(), None | Some("provider-limit"))
+        && cache.fetched_at != 0
+        && at.saturating_sub(cache.fetched_at) < usage::TTL
+        && cache.usage.windows.iter().any(|window| {
+            window.used_percent >= 100.0
+                && window.resets_at.is_none_or(|reset| reset > at)
+                && (screen.claude_menu
+                    || (screen.claude_compaction
+                        && matches!(window.name.as_str(), "seven_day" | "weekly")))
+        })
 }
 
 impl Limits {
@@ -607,5 +679,113 @@ mod tests {
         assert!(limits.check(None, true, false));
         assert!(limits.check(None, false, false));
         assert!(!Limits::new(None).check(None, false, false));
+    }
+
+    #[test]
+    fn only_a_live_structured_compaction_error_counts_as_a_limit() {
+        let mut entry = serde_json::json!({
+            "type": "assistant",
+            "isApiErrorMessage": true,
+            "error": "prompt_too_long",
+            "timestamp": stamp(hours_ago(4)),
+            "message": { "content": [{
+                "type": "text",
+                "text": "Prompt is too long · automatic compaction failed: You've hit your weekly limit · resets Nov 22, 9am"
+            }] }
+        });
+        let since = SystemTime::now() - Duration::from_secs(1);
+        assert!(!limit_entry(&entry, since));
+        entry["timestamp"] = stamp(SystemTime::now()).into();
+        assert!(limit_entry(&entry, since));
+        entry["isApiErrorMessage"] = false.into();
+        assert!(!limit_entry(&entry, since));
+        entry["isApiErrorMessage"] = true.into();
+        entry["message"]["content"][0]["text"] =
+            "Prompt is too long · automatic compaction failed: request exceeded its context window"
+                .into();
+        assert!(!limit_entry(&entry, since));
+    }
+
+    #[test]
+    fn claude_screen_fallback_needs_fresh_exhausted_quota_for_the_window() {
+        let mut limits = Limits::new(None);
+        let compaction = ScreenLimits {
+            claude_compaction: true,
+            ..Default::default()
+        };
+        let menu = ScreenLimits {
+            claude_menu: true,
+            ..Default::default()
+        };
+        assert!(!limits.quota_evidence(compaction).any(), "startup redraw");
+        assert!(limits.quota_evidence(menu).any(), "active choice menu");
+        limits.launched -= UNCONFIRMED;
+        assert!(limits.quota_evidence(compaction).any());
+        let now = 10_000;
+        let mut cache = usage::Cached {
+            fetched_at: now - 1,
+            usage: usage::Usage {
+                windows: vec![usage::Window {
+                    name: "five_hour".into(),
+                    used_percent: 100.0,
+                    resets_at: Some(now + 10),
+                    duration_minutes: Some(300),
+                    codex_slot: None,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!corroborates(compaction, &cache, now));
+        assert!(corroborates(menu, &cache, now));
+        cache.usage.windows[0].name = "seven_day".into();
+        assert!(corroborates(compaction, &cache, now));
+        assert!(!corroborates(compaction, &cache, now + 10), "passed reset");
+        cache.usage.windows[0].used_percent = 99.0;
+        assert!(!corroborates(compaction, &cache, now), "headroom");
+        cache.usage.windows[0].used_percent = 100.0;
+        cache.error = Some("network".into());
+        assert!(!corroborates(compaction, &cache, now), "fetch failed");
+        cache.error = Some("provider-limit".into());
+        assert!(
+            corroborates(compaction, &cache, now),
+            "another run marked the limit"
+        );
+        cache.fetched_at = now - usage::TTL;
+        assert!(!corroborates(compaction, &cache, now), "stale quota");
+    }
+
+    #[test]
+    fn a_once_drawn_menu_can_be_corroborated_later_until_input_supersedes_it() {
+        let mut limits = Limits::new(None);
+        let menu = ScreenLimits {
+            claude_menu: true,
+            ..Default::default()
+        };
+        let now = 10_000;
+        assert!(!limits.check_quota(menu, None, || None, now));
+        limits.pending.as_mut().unwrap().retry = Instant::now();
+        let exhausted = usage::Cached {
+            fetched_at: now,
+            usage: usage::Usage {
+                windows: vec![usage::Window {
+                    name: "weekly".into(),
+                    used_percent: 100.0,
+                    resets_at: Some(now + 10),
+                    duration_minutes: Some(10080),
+                    codex_slot: None,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(limits.check_quota(ScreenLimits::default(), None, || Some(exhausted), now));
+        limits.pending.as_mut().unwrap().retry = Instant::now();
+        assert!(!limits.check_quota(
+            ScreenLimits::default(),
+            Some(Instant::now()),
+            || panic!("new input superseded the blocked menu"),
+            now,
+        ));
     }
 }

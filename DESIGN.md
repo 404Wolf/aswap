@@ -462,23 +462,32 @@ a Codex `resume` that writes a new rollout file under the same id leaves the
 tracker on the old file, so held errors wait the full 10 seconds; and
 model-unsupported lines are not held.
 
-A Claude usage limit counts only when the conversation's transcript records it.
-Claude appends an API error entry (`isApiErrorMessage: true`, `error:
-"rate_limit"`) the moment a request hits any limit, whatever the wording or
-dialog on screen, and never writes it again when it redraws the conversation on
-resume or resize. Before a launch, the run notes the known transcript's length
+A Claude usage limit normally arrives as a live transcript API error with
+`isApiErrorMessage: true` and `error: "rate_limit"`. A structured
+`prompt_too_long` error also counts when it reports the automatic compaction
+failure caused by the weekly limit. A resume or resize can redraw these
+errors without writing them again. Before a launch, the run notes the known transcript's length
 and reads only lines appended after it (a transcript first found later is read
 from its last MiB, keeping entries timestamped after launch). The tracker's
 current transcript is followed when the conversation changes (a /clear), and
 the conversation's subagent transcripts written since launch
 (`<id>/subagents/`, and workflow agents in `subagents/workflows/wf_*/`) are
 read too, since a subagent may record a limit before
-the main thread does. Only those three
-fields are looked at; nothing read is kept or logged. While no transcript is
+the main thread does. Transcript content is neither retained nor logged. While no transcript is
 known, a limit notice on screen counts if shown 10 seconds or more after
 launch, when a redraw is over. The 2026-11-14 incident: a resumed conversation
 that had ended on a weekly limit redrew the notice, and the run rejected and
-marked its healthy account and moved to one at 91%.
+marked its healthy account and moved to one at 91%. The choice menu can
+confirm a block immediately when the current account has a fresh, unreset
+window at 100%. The compaction line alone requires fresh weekly exhaustion
+and the end of the startup redraw interval. Input or transcript changes
+discard pending screen evidence while waiting for fresh quota.
+
+When a Codex limit coincides with a change to the canonical access token,
+the supervisor can resume the exact session on the same account if fresh
+quota shows headroom. This uses the existing auth and hourly restart caps.
+Set `ASWAP_TRACE_SELECTION=1` to log candidate windows, quota age,
+eligibility reasons and whether the current credentials changed since launch.
 
 Every owner request shares its existing store-locked per-profile TTL/backoff, so
 three monitors do not triple quota API traffic. Peers serialize SSH pulls and

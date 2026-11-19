@@ -258,11 +258,28 @@ impl Spec for Claude {
     }
     /// Claude appends `isApiErrorMessage: true, error: "rate_limit"` the
     /// moment a request hits any limit, and never writes it again when it
-    /// redraws the conversation.
+    /// redraws the conversation. A compaction that failed on a limit is a
+    /// `prompt_too_long` assistant error whose text names the limit.
     fn limit_entry(&self, entry: &Value, since: SystemTime) -> bool {
         entry.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true)
-            && entry.get("error").and_then(Value::as_str) == Some("rate_limit")
             && super::stamped_since(entry.get("timestamp"), since)
+            && match entry.get("error").and_then(Value::as_str) {
+                Some("rate_limit") => true,
+                Some("prompt_too_long") if entry["type"] == "assistant" => entry
+                    .pointer("/message/content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block["type"] == "text"
+                                && block["text"].as_str().is_some_and(|text| {
+                                    crate::terminal::claude_compaction_limit(
+                                        &text.to_lowercase().replace(['’', '‘'], "'"),
+                                    )
+                                })
+                        })
+                    }),
+                _ => false,
+            }
     }
     fn usage(&self, profile: &Path) -> std::result::Result<Usage, Failure> {
         crate::usage::fetch_claude(profile)

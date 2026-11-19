@@ -1,7 +1,12 @@
 //! Whether a login error raced a token rotation rather than an expired account.
+use super::{
+    now,
+    trace::{trace_candidate, trace_selection_enabled},
+};
 use crate::{
     provider::Provider,
     store::{self, Account, Store},
+    usage,
 };
 use std::time::{Duration, Instant};
 
@@ -48,4 +53,22 @@ pub(super) fn rotation_by(
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+/// Whether the account's own fresh quota still has room, so a limit notice
+/// after a token rotation came from the old login, not the account.
+pub(super) fn current_quota_available(store: &Store, account: &Account) -> bool {
+    let Ok(cache) = usage::cached(store, account) else {
+        return false;
+    };
+    let at = now();
+    let available = cache.fetched_at != 0
+        && at.saturating_sub(cache.fetched_at) < usage::TTL
+        && cache.used(at).is_some_and(|used| used < 100.0);
+    if trace_selection_enabled() {
+        eprintln!(
+            "aswap: selection=credential recovery credentials_changed_since_launch=true available={available}"
+        );
+        trace_candidate(account, &cache, 100.0, at);
+    }
+    available
 }

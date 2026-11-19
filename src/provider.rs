@@ -245,6 +245,13 @@ pub trait Spec: Sync {
     fn limit_entry(&self, _entry: &Value, _since: SystemTime) -> bool {
         false
     }
+    /// Whether a usage-limit notice can come from a login rotated since
+    /// launch rather than from the account (Codex): when the account's own
+    /// fresh quota has room, the conversation resumes on it with the new
+    /// token instead of switching accounts.
+    fn limit_from_stale_login(&self) -> bool {
+        false
+    }
     /// Whether accounts can differ in the models they offer (Codex).
     fn model_catalog(&self) -> bool {
         false

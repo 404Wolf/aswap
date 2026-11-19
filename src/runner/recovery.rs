@@ -284,6 +284,12 @@ impl Rejected {
                 let rejected = held(self.labels.get(&a.label), &cache)
                     || Self::key(store, &a)
                         .is_some_and(|key| held(self.identities.get(&key), &cache));
+                if rejected && super::trace::trace_selection_enabled() {
+                    eprintln!(
+                        "aswap: candidate={}:{} reason=run-rejected",
+                        a.provider, a.label
+                    );
+                }
                 if a.label == current {
                     // choose() needs the current entry even while rejected,
                     // but same-account recovery must respect its hold too.

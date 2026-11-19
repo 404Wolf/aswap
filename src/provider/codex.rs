@@ -185,6 +185,9 @@ impl Spec for Codex {
     fn session_by_writer(&self) -> bool {
         true
     }
+    fn limit_from_stale_login(&self) -> bool {
+        true
+    }
     /// `rollout-<time>-<UUID>.jsonl`.
     fn transcript_id<'a>(&self, stem: &'a str) -> Option<&'a str> {
         stem.get(stem.len().checked_sub(36)?..)

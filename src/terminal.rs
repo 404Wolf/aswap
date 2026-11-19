@@ -45,6 +45,7 @@ pub struct Terminal {
     started: bool,
     childless: bool,
     diagnostics: Diagnostics,
+    pub(crate) last_input: Option<std::time::Instant>,
     pub auth_expired: bool,
     pub model_unsupported: bool,
     /// While set, login errors in the output are held in `held_auth` (with
@@ -104,6 +105,7 @@ impl Terminal {
             started: false,
             childless: true,
             diagnostics: Diagnostics::default(),
+            last_input: None,
             auth_expired: false,
             model_unsupported: false,
             quiet_auth: false,
@@ -162,6 +164,7 @@ impl Terminal {
             }
         }
         self.diagnostics = Diagnostics::default();
+        self.last_input = None;
         self.auth_expired = false;
         self.model_unsupported = false;
         self.quiet_auth = false;
@@ -189,13 +192,25 @@ impl Terminal {
     /// Forward terminal I/O and inspect a bounded trailing slice for limit errors.
     pub fn pump(&mut self, wait_ms: i32) -> Result<bool> {
         self.pump_inner(wait_ms, !self.childless, None)
+            .map(ScreenLimits::any)
     }
     /// Recheck liveness after polling and before forwarding newly read input:
     /// the child can exit while poll waits for a keystroke.
     pub fn pump_child(&mut self, wait_ms: i32, child: &mut Child) -> Result<bool> {
+        self.pump_child_signals(wait_ms, child)
+            .map(ScreenLimits::any)
+    }
+    pub(crate) fn pump_child_signals(
+        &mut self,
+        wait_ms: i32,
+        child: &mut Child,
+    ) -> Result<ScreenLimits> {
         self.pump_inner(wait_ms, !self.childless, Some(child))
     }
     pub fn child_exited(&mut self) -> Result<bool> {
+        self.child_exit_signals().map(ScreenLimits::any)
+    }
+    pub(crate) fn child_exit_signals(&mut self) -> Result<ScreenLimits> {
         self.childless = true;
         self.pump_inner(0, false, None)
     }
@@ -210,7 +225,7 @@ impl Terminal {
         wait_ms: i32,
         mut forward_input: bool,
         child: Option<&mut Child>,
-    ) -> Result<bool> {
+    ) -> Result<ScreenLimits> {
         if self
             .interrupt
             .flag
@@ -235,7 +250,7 @@ impl Terminal {
         let count = unsafe { libc::poll(fds.as_mut_ptr(), 2, wait_ms) };
         if count < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                return Ok(false);
+                return Ok(ScreenLimits::default());
             }
             return Err(Error("provider terminal polling failed"));
         }
@@ -256,11 +271,12 @@ impl Terminal {
                 self.master
                     .write_all(&buffer[..n])
                     .safe("cannot forward terminal input")?;
+                self.last_input = Some(std::time::Instant::now());
             } else if buffer[..n].iter().any(|byte| matches!(byte, 3 | 4)) {
                 return Err(Error("provider session interrupted"));
             }
         }
-        let mut limited = false;
+        let mut limited = ScreenLimits::default();
         if fds[0].revents & libc::POLLIN != 0 {
             match self.master.read(&mut buffer) {
                 Ok(n) => {
@@ -297,15 +313,34 @@ impl Drop for Terminal {
 }
 // Match provider diagnostic lines, never arbitrary prose in a restored
 // conversation. Escape state survives PTY reads (including split CSI codes).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScreenLimits {
+    pub(crate) notice: bool,
+    pub(crate) claude_compaction: bool,
+    pub(crate) claude_menu: bool,
+}
+impl ScreenLimits {
+    pub(crate) fn any(self) -> bool {
+        self.notice || self.claude_compaction || self.claude_menu
+    }
+
+    pub(crate) fn merge(&mut self, next: Self) {
+        self.notice |= next.notice;
+        self.claude_compaction |= next.claude_compaction;
+        self.claude_menu |= next.claude_menu;
+    }
+}
+
 #[derive(Default)]
 struct Diagnostics {
     line: Vec<u8>,
     escape: u8,
     truncated: bool,
+    menu_header: bool,
 }
 impl Diagnostics {
-    fn feed(&mut self, bytes: &[u8]) -> (bool, bool, bool) {
-        let mut signals = (false, false, false);
+    fn feed(&mut self, bytes: &[u8]) -> (ScreenLimits, bool, bool) {
+        let mut signals = (ScreenLimits::default(), false, false);
         for &byte in bytes {
             match self.escape {
                 1 => {
@@ -339,14 +374,7 @@ impl Diagnostics {
             match byte {
                 0x1b => self.escape = 1,
                 b'\n' | b'\r' => {
-                    let next = if self.truncated {
-                        (false, false, false)
-                    } else {
-                        diagnostic_line(&self.line)
-                    };
-                    signals.0 |= next.0;
-                    signals.1 |= next.1;
-                    signals.2 |= next.2;
+                    self.inspect(&mut signals, true);
                     self.line.clear();
                     self.truncated = false;
                 }
@@ -360,16 +388,32 @@ impl Diagnostics {
                 }
             }
         }
-        let next = if self.truncated {
-            (false, false, false)
-        } else {
-            diagnostic_line(&self.line)
-        };
-        (
-            signals.0 || next.0,
-            signals.1 || next.1,
-            signals.2 || next.2,
-        )
+        self.inspect(&mut signals, false);
+        signals
+    }
+
+    fn inspect(&mut self, signals: &mut (ScreenLimits, bool, bool), complete: bool) {
+        if self.truncated {
+            self.menu_header = false;
+            return;
+        }
+        let decoded = normalize(&self.line);
+        let line = decoded.as_str();
+        let (limit, auth, model) = diagnostic_line(line, complete);
+        signals.0.notice |= limit;
+        signals.1 |= auth;
+        signals.2 |= model;
+        signals.0.claude_compaction |= claude_compaction_limit(line);
+        const HEADER: &str = "what do you want to do?";
+        let option = line
+            .strip_prefix(HEADER)
+            .or_else(|| self.menu_header.then_some(line));
+        signals.0.claude_menu |= option.is_some_and(claude_limit_option);
+        // A CRLF generates an empty row after the CR. Keep the header until
+        // the next visible row, including when the option arrives later.
+        if complete && !line.is_empty() {
+            self.menu_header = line == HEADER;
+        }
     }
 }
 /// Box-drawing and quote characters Claude's dialogs and notices may wrap a
@@ -382,15 +426,22 @@ fn normalize(line: &[u8]) -> String {
         |c: char| c.is_whitespace() || c == '\u{23bf}' || ('\u{2500}'..='\u{257f}').contains(&c);
     decoded.trim_matches(frame).to_owned()
 }
-fn diagnostic_line(line: &[u8]) -> (bool, bool, bool) {
-    // Decode bytes accumulated across reads, then remove Claude's result
-    // marker and any dialog border around the notice.
-    let line = normalize(line);
-    let line = line.as_str();
+const CODEX_LIMIT: &str = "you've hit your usage limit";
+
+fn diagnostic_line(line: &str, complete: bool) -> (bool, bool, bool) {
+    // The square is Codex's diagnostic marker. Strip it only for the exact
+    // usage error, so other output with a square keeps its existing meaning.
+    let codex = line.strip_prefix('■').unwrap_or(line).trim_start();
+    let codex = codex
+        .strip_prefix("error running remote compact task:")
+        .map_or(codex, str::trim_start);
+    if codex_limit_notice(codex, complete) {
+        return (true, false, false);
+    }
     let api = line
         .strip_prefix("api error:")
         .or_else(|| line.strip_prefix("error:"));
-    let notice = hit_limit_notice(line);
+    let notice = !line.starts_with(CODEX_LIMIT) && hit_limit_notice(line);
     let standalone = matches!(line, "usage_limit_reached" | "rate_limit_exceeded")
         || (line.starts_with("the ") && unsupported_model_message(line))
         || line.starts_with("oauth token revoked \u{b7} please run /login")
@@ -408,6 +459,57 @@ fn diagnostic_line(line: &[u8]) -> (bool, bool, bool) {
         auth_message(text) || text.trim_start().starts_with("401 "),
         unsupported_model_message(text),
     )
+}
+
+fn codex_limit_notice(line: &str, complete: bool) -> bool {
+    let Some(suffix) = line.strip_prefix(CODEX_LIMIT) else {
+        return false;
+    };
+    if matches!(suffix, "" | ".") {
+        // A read may end after the first sentence of a longer line.
+        return complete;
+    }
+    if suffix.starts_with(" · resets ") {
+        return true;
+    }
+    const SETTINGS: &str = ". visit https://chatgpt.com/settings/usage to purchase more credits";
+    let reset = suffix.strip_prefix(". try again ").or_else(|| {
+        suffix
+            .strip_prefix(SETTINGS)?
+            .strip_prefix(" or try again ")
+    });
+    reset.is_some_and(|reset| {
+        reset == "later."
+            || reset.strip_prefix("at ").is_some_and(|at| {
+                let at = at.strip_suffix('.').unwrap_or(at);
+                let mut parts = at.rsplitn(3, ' ');
+                let (Some(period), Some(time)) = (parts.next(), parts.next()) else {
+                    return false;
+                };
+                matches!(period, "am" | "pm")
+                    && chrono::NaiveTime::parse_from_str(&format!("{time} {period}"), "%I:%M %P")
+                        .is_ok()
+            })
+    })
+}
+
+pub(crate) fn claude_compaction_limit(line: &str) -> bool {
+    let Some(notice) = line.strip_prefix("prompt is too long · automatic compaction failed: ")
+    else {
+        return false;
+    };
+    notice == "you've hit your weekly limit"
+        || notice
+            .strip_prefix("you've hit your weekly limit · resets ")
+            .is_some_and(|reset| !reset.is_empty())
+}
+
+fn claude_limit_option(text: &str) -> bool {
+    let option = text.trim_start().trim_start_matches('❯').trim_start();
+    let Some(rest) = option.strip_prefix("1. stop and wait for limit to reset") else {
+        return false;
+    };
+    matches!(rest.trim(), "" | "2. upgrade")
 }
 /// Claude's usage-limit notice, in every wording it has used: "You've hit
 /// your limit", "… your session limit", "… your 5-hour limit", "… your weekly
@@ -482,7 +584,7 @@ mod tests {
                 format!("\x1b[1m\u{2502}\x1b[0m  {notice}\x1b[2m  \u{2502}\x1b[0m\r\n"),
             ] {
                 let mut detector = super::Diagnostics::default();
-                assert!(detector.feed(line.as_bytes()).0, "{line:?}");
+                assert!(detector.feed(line.as_bytes()).0.notice, "{line:?}");
             }
         }
         for prose in [
@@ -494,7 +596,7 @@ mod tests {
             let mut detector = super::Diagnostics::default();
             assert_eq!(
                 detector.feed(prose.as_bytes()),
-                (false, false, false),
+                Default::default(),
                 "{prose:?}"
             );
         }
@@ -550,7 +652,7 @@ pub fn unsupported_model_message(text: &str) -> bool {
 
 #[cfg(test)]
 mod diagnostic_tests {
-    use super::Diagnostics;
+    use super::{Diagnostics, ScreenLimits};
 
     #[test]
     fn recalled_reports_and_prompts_are_not_live_failures() {
@@ -562,9 +664,16 @@ mod diagnostic_tests {
             "❯ You were interrupted by a usage-limit account switch. Continue exactly where you left off.\n",
             "● Discuss API Error: 429 usage_limit_reached and token has expired.\n",
             "❯ aswap: login expired for claude:synthetic; selecting another account\n",
+            "❯ ■ You've hit your usage limit. Try again at Nov 21st, 2026 4:31 PM.\n",
+            "■ You've hit your usage limit, as someone said earlier.\n",
+            "> Error running remote compact task: You've hit your usage limit.\n",
+            "● Prompt is too long · automatic compaction failed: You've hit your weekly limit · resets tomorrow\n",
+            "❯ What do you want to do? 1. Stop and wait for limit to reset\n",
+            "What do you want to do? Here are some ideas.\n1. Stop and wait for limit to reset\n",
+            "\"You've hit your usage limit. Try again at Nov 21st, 2026 4:31 PM.\"\n",
         ] {
             for chunk in report.as_bytes().chunks(7) {
-                assert_eq!(detector.feed(chunk), (false, false, false), "{report}");
+                assert_eq!(detector.feed(chunk), Default::default(), "{report}");
             }
         }
     }
@@ -574,8 +683,9 @@ mod diagnostic_tests {
         // Terminal text carries no provenance. Keep this limitation explicit;
         // anchored shapes reject surrounding prose, not identical replay bytes.
         let bytes = b"API Error: 401 synthetic authentication failure\n";
-        assert_eq!(Diagnostics::default().feed(bytes), (false, true, false));
-        assert_eq!(Diagnostics::default().feed(bytes), (false, true, false));
+        let expected = (ScreenLimits::default(), true, false);
+        assert_eq!(Diagnostics::default().feed(bytes), expected);
+        assert_eq!(Diagnostics::default().feed(bytes), expected);
     }
 
     #[test]
@@ -606,6 +716,27 @@ mod diagnostic_tests {
                 (true, false, false),
             ),
             ("Error: model_not_found\r\n", (false, false, true)),
+            ("■ You've hit your usage limit\r\n", (true, false, false)),
+            (
+                "■ You've hit your usage limit. Try again later.\r\n",
+                (true, false, false),
+            ),
+            (
+                "■ You've hit your usage limit. Try again at 4:31 PM.\r\n",
+                (true, false, false),
+            ),
+            (
+                "You've hit your usage limit. Try again at Nov 21st, 2026 4:31 PM.\r\n",
+                (true, false, false),
+            ),
+            (
+                "■ You've hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 21st, 2026 4:31 PM.\r\n",
+                (true, false, false),
+            ),
+            (
+                "■ Error running remote compact task: You've hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 21st, 2026 4:31 PM.\r\n",
+                (true, false, false),
+            ),
             (
                 "\x1b]7501;state=blocked;kind=auth\x07  ⎿ OAuth token revoked · Please run /login\r\n",
                 (false, true, false),
@@ -620,12 +751,44 @@ mod diagnostic_tests {
             let mut actual = (false, false, false);
             for byte in input.as_bytes() {
                 let next = detector.feed(&[*byte]);
-                actual.0 |= next.0;
+                actual.0 |= next.0.notice;
                 actual.1 |= next.1;
                 actual.2 |= next.2;
             }
             assert_eq!(actual, expected, "{line}");
-            assert_eq!(detector.feed(b"ordinary output\n"), (false, false, false));
+            assert_eq!(detector.feed(b"ordinary output\n"), Default::default());
         }
+    }
+
+    #[test]
+    fn claude_compaction_and_choice_menu_are_distinct_from_a_plain_limit() {
+        let mut detector = Diagnostics::default();
+        let message = "⎿ Prompt is too long · automatic compaction failed: You’ve hit your weekly limit · resets Nov 22, 9am (America/New_York) · /clear to start fresh";
+        let input = format!("\x1b[31m{message}\x1b[0m\r\n");
+        let mut screen = ScreenLimits::default();
+        for chunk in input.as_bytes().chunks(2) {
+            screen.merge(detector.feed(chunk).0);
+        }
+        assert!(screen.claude_compaction);
+        assert!(!screen.notice && !screen.claude_menu);
+        assert!(!detector.feed(b"What do you want to do?\r\n").0.any());
+        assert!(
+            detector
+                .feed("│ ❯ 1. Stop and wait for limit to reset │\n".as_bytes())
+                .0
+                .claude_menu
+        );
+        assert!(
+            !detector
+                .feed(b"1. Stop and wait for limit to reset\n")
+                .0
+                .any()
+        );
+        assert!(
+            detector
+                .feed("│ What do you want to do?  1. Stop and wait for limit to reset  2. Upgrade │\n".as_bytes())
+                .0
+                .claude_menu
+        );
     }
 }

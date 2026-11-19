@@ -23,13 +23,15 @@ mod patience;
 mod quiet;
 mod recovery;
 mod rotation;
+mod trace;
 mod via;
 use monitor::entries_from_cache;
 pub use monitor::{observations, tick};
 use patience::{COMMIT_PATIENCE, Hiccups, PREPARE_PATIENCE, SUPERVISE_PATIENCE, patiently};
 use quiet::{QUIET_STEP, Quiet};
 use recovery::{Rejected, Restarts, Wake, quota_fallback, recovery_target, report_quota_fallback};
-use rotation::{access_print, rotated_since, rotation_by};
+use rotation::{access_print, current_quota_available, rotated_since, rotation_by};
+use trace::{trace_candidates, trace_recovery};
 pub use via::{PI_BIN, Via, ViaError};
 
 fn stop(child: &mut Child) -> Result<std::process::ExitStatus> {
@@ -173,6 +175,7 @@ pub fn launch(
             let settings = state.auto.get(&provider).cloned().unwrap_or_default();
             let entries =
                 models.filter_cached(store, &account.label, entries_from_cache(store, provider)?);
+            trace_candidates("launch", &entries, settings.threshold, now(), None);
             if let Some(best) = usage::choose(
                 &account.label,
                 &entries,
@@ -367,7 +370,7 @@ pub fn launch(
         let status = loop {
             // Whether the screen showed a limit this tick; for Claude, its
             // transcript decides whether that is live (see `limit_seen`).
-            let mut screen_limit = false;
+            let mut screen_limit = crate::terminal::ScreenLimits::default();
             // Keystrokes and redraws go through as they arrive; the bookkeeping
             // below only runs between these 250ms windows.
             if let Some(terminal) = &mut terminal {
@@ -387,7 +390,7 @@ pub fn launch(
                     };
                     // Round up so an idle poll reaches the bookkeeping deadline.
                     let wait_ms = step.as_nanos().div_ceil(1_000_000) as i32;
-                    screen_limit |= terminal.pump_child(wait_ms, &mut child.0)?;
+                    screen_limit.merge(terminal.pump_child_signals(wait_ms, &mut child.0)?);
                     if check_quiet {
                         quiet.check();
                     }
@@ -417,7 +420,7 @@ pub fn launch(
             if let Some(tracker) = &mut tracker {
                 // Refresh while the provider still owns its descriptors. A
                 // diagnostic can be followed immediately by provider exit.
-                let fresh = (screen_limit && !limited)
+                let fresh = (screen_limit.any() && !limited)
                     || terminal.as_ref().is_some_and(|t| {
                         (t.auth_expired && auth_seen.is_none())
                             || (t.model_unsupported && !unsupported)
@@ -429,7 +432,17 @@ pub fn launch(
                 };
                 hiccups.note("tracking the conversation", observed);
             }
-            limited |= limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, false);
+            if !limited {
+                limited = limit_seen(
+                    store,
+                    &account,
+                    &mut limits,
+                    tracker.as_ref(),
+                    screen_limit,
+                    terminal.as_ref().and_then(|terminal| terminal.last_input),
+                    false,
+                );
+            }
             if let Some(terminal) = &mut terminal {
                 quiet.apply(terminal, tracker.as_ref());
             }
@@ -439,54 +452,6 @@ pub fn launch(
             // Quota observations rank future launches, but cannot establish
             // that an interactive provider is idle. Never cancel active tools
             // merely because cached quota crossed a threshold.
-            if !expired && !rotated && terminal.as_ref().is_some_and(|t| t.auth_expired) {
-                if auth_seen.is_none() {
-                    auth_seen = Some(Instant::now());
-                    if !settle.is_zero() && syncing.is_none() {
-                        syncing = immediate_poll(store);
-                    }
-                }
-                if !limited
-                    && !unsupported
-                    && auth_restarts < AUTH_RESTARTS
-                    && !restarts.capped()
-                    && rotated_since(store, &account, launched.as_deref())
-                {
-                    // The provider called the API in the moment between the
-                    // revocation and its view getting the new token. The
-                    // account is fine: resume the conversation on it. Until
-                    // the conversation is known, retry on every tick.
-                    match prepare_live_resume(
-                        store,
-                        provider,
-                        auto_args.as_ref().unwrap(),
-                        tracker.as_mut().unwrap(),
-                        child.0.id(),
-                    ) {
-                        Ok(args) => {
-                            rotated = true;
-                            prepared_resume = Some(args);
-                            break stop(&mut child.0)?;
-                        }
-                        Err(err) => {
-                            if !reported_resume {
-                                eprintln!("aswap: {err}; keeping the current provider running");
-                                reported_resume = true;
-                            }
-                        }
-                    }
-                } else if auth_seen.is_some_and(|at| at.elapsed() >= settle) {
-                    expired = true;
-                    hiccups.note(
-                        "recording the expired login",
-                        usage::mark_auth_expired(store, &account),
-                    );
-                    eprintln!(
-                        "aswap: login expired for {provider}:{}; looking for another eligible account",
-                        account.label
-                    );
-                }
-            }
             if !unsupported
                 && provider.spec().model_catalog()
                 && terminal.as_ref().is_some_and(|t| t.model_unsupported)
@@ -495,6 +460,64 @@ pub fn launch(
                 models.reject(&account);
                 eprintln!(
                     "aswap: current account rejected the session model; looking for a compatible account"
+                );
+            }
+            let auth_failed = !expired && terminal.as_ref().is_some_and(|t| t.auth_expired);
+            if auth_failed && auth_seen.is_none() {
+                auth_seen = Some(Instant::now());
+                if !settle.is_zero() && syncing.is_none() {
+                    syncing = immediate_poll(store);
+                }
+            }
+            let quota_rotation = limited
+                && !auth_failed
+                && !expired
+                && provider.spec().limit_from_stale_login()
+                && rejected_as.is_none()
+                && wake.due(now());
+            if !unsupported
+                && auth_restarts < AUTH_RESTARTS
+                && (quota_rotation || (auth_failed && !limited))
+                && !restarts.capped()
+                && rotated_since(store, &account, launched.as_deref())
+                && (!quota_rotation || current_quota_available(store, &account))
+            {
+                // The provider errored using an older login. Keep it alive
+                // until we know the exact conversation and can hand over auth.
+                match prepare_live_resume(
+                    store,
+                    provider,
+                    auto_args.as_ref().unwrap(),
+                    tracker.as_mut().unwrap(),
+                    child.0.id(),
+                )
+                .and_then(|args| {
+                    view.sync(store, &account)?;
+                    Ok(args)
+                }) {
+                    Ok(args) => {
+                        rotated = true;
+                        prepared_resume = Some(args);
+                        break stop(&mut child.0)?;
+                    }
+                    Err(err) => {
+                        if !reported_resume {
+                            eprintln!("aswap: {err}; keeping the current provider running");
+                            reported_resume = true;
+                        }
+                    }
+                }
+                continue;
+            }
+            if auth_failed && auth_seen.is_some_and(|at| at.elapsed() >= settle) {
+                expired = true;
+                hiccups.note(
+                    "recording the expired login",
+                    usage::mark_auth_expired(store, &account),
+                );
+                eprintln!(
+                    "aswap: login expired for {provider}:{}; looking for another eligible account",
+                    account.label
                 );
             }
             if auto
@@ -513,12 +536,18 @@ pub fn launch(
                     view.sync(store, &account)?;
                     let (entries, settings) = observations(store, provider)?;
                     wake.schedule(&entries, rejected.next_lapse(now()), now());
-                    let entries = rejected.filter(
+                    let entries = models.filter(store, &account.label, entries);
+                    trace_recovery(
                         store,
-                        &account.label,
-                        settings.threshold,
-                        models.filter(store, &account.label, entries),
+                        &account,
+                        launched.as_deref(),
+                        &entries,
+                        &settings,
+                        "live recovery",
+                        now(),
                     );
+                    let entries =
+                        rejected.filter(store, &account.label, settings.threshold, entries);
                     Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
                 })();
                 // An unreadable store leaves the decision to the next tick.
@@ -569,7 +598,7 @@ pub fn launch(
         drop(child);
         hiccups.running = false;
         if let Some(terminal) = &mut terminal {
-            let screen_limit = terminal.child_exited()?;
+            let screen_limit = terminal.child_exit_signals()?;
             // Refresh only for Claude limit detection or unresolved held errors.
             let needs_transcript = (!limited && provider.spec().records_limits())
                 || (terminal.quiet_auth
@@ -579,7 +608,15 @@ pub fn launch(
                 tracker.transcript_now();
             }
             if !limited {
-                limited = limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, true);
+                limited = limit_seen(
+                    store,
+                    &account,
+                    &mut limits,
+                    tracker.as_ref(),
+                    screen_limit,
+                    terminal.last_input,
+                    true,
+                );
             }
             quiet.apply(terminal, tracker.as_ref());
         }
@@ -590,6 +627,8 @@ pub fn launch(
             return Ok(status.code().unwrap_or(1));
         }
         let auth_failed = terminal.as_ref().is_some_and(|t| t.auth_expired);
+        unsupported |= provider.spec().model_catalog()
+            && terminal.as_ref().is_some_and(|t| t.model_unsupported);
         if auth_failed
             && !rotated
             && !expired
@@ -604,7 +643,22 @@ pub fn launch(
             let deadline = auth_seen.unwrap_or_else(Instant::now) + settle;
             rotated = rotation_by(store, &account, launched.as_deref(), deadline);
         }
+        if limited
+            && provider.spec().limit_from_stale_login()
+            && !rotated
+            && !expired
+            && !auth_failed
+            && !unsupported
+            && rejected_as.is_none()
+            && auth_restarts < AUTH_RESTARTS
+            && !restarts.capped()
+            && rotated_since(store, &account, launched.as_deref())
+            && current_quota_available(store, &account)
+        {
+            rotated = true;
+        }
         if rotated {
+            store::set_patience(PREPARE_PATIENCE);
             let resume_args = match prepared_resume.take() {
                 Some(args) => args,
                 None => prepare_resume(
@@ -619,7 +673,7 @@ pub fn launch(
                 account.label
             );
             let _ = crate::refresh::for_run(store, &account);
-            hiccups.note("handing over the new token", view.sync(store, &account));
+            patiently("handing over the new token", || view.sync(store, &account))?;
             omit_one_shot(auto_args.as_ref().unwrap(), &mut terminal)?;
             launch_args = resume_args;
             switches += 1;
@@ -628,8 +682,6 @@ pub fn launch(
             continue;
         }
         expired |= auth_failed;
-        unsupported |= provider.spec().model_catalog()
-            && terminal.as_ref().is_some_and(|t| t.model_unsupported);
         if unsupported {
             models.reject(&account);
         }
@@ -669,12 +721,18 @@ pub fn launch(
                 let decided = (|| -> Result<Option<Account>> {
                     let (entries, settings) = observations(store, provider)?;
                     wake.schedule(&entries, rejected.next_lapse(now()), now());
-                    let entries = rejected.filter(
+                    let entries = models.filter(store, &account.label, entries);
+                    trace_recovery(
                         store,
-                        &account.label,
-                        settings.threshold,
-                        models.filter(store, &account.label, entries),
+                        &account,
+                        launched.as_deref(),
+                        &entries,
+                        &settings,
+                        "exit recovery",
+                        now(),
                     );
+                    let entries =
+                        rejected.filter(store, &account.label, settings.threshold, entries);
                     Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
                 })();
                 // Keep the decision that stopped the provider if this one fails.
@@ -715,12 +773,18 @@ pub fn launch(
                         }
                         let (entries, settings) = observations(store, provider)?;
                         wake.schedule(&entries, rejected.next_lapse(now()), now());
-                        let entries = rejected.filter(
+                        let entries = models.filter(store, &account.label, entries);
+                        trace_recovery(
                             store,
-                            &account.label,
-                            settings.threshold,
-                            models.filter(store, &account.label, entries),
+                            &account,
+                            launched.as_deref(),
+                            &entries,
+                            &settings,
+                            "waiting recovery",
+                            now(),
                         );
+                        let entries =
+                            rejected.filter(store, &account.label, settings.threshold, entries);
                         Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
                     })();
                     if let Some(choice) = hiccups.note("waiting for usable quota", decided) {
@@ -750,17 +814,22 @@ pub fn launch(
                 let mut state = store.load()?;
                 let settings = state.auto.get(&provider).cloned().unwrap_or_default();
                 let at = now();
-                let entries = rejected.filter_at(
+                let entries = models.filter_cached(
                     store,
                     &account.label,
-                    settings.threshold,
-                    models.filter_cached(
-                        store,
-                        &account.label,
-                        entries_from_cache(store, provider)?,
-                    ),
+                    entries_from_cache(store, provider)?,
+                );
+                trace_recovery(
+                    store,
+                    &account,
+                    launched.as_deref(),
+                    &entries,
+                    &settings,
+                    "commit recovery",
                     at,
                 );
+                let entries =
+                    rejected.filter_at(store, &account.label, settings.threshold, entries, at);
                 let Some(next) = recovery_target(&account.label, &entries, &settings, at).cloned()
                 else {
                     return Ok(None);
@@ -827,25 +896,35 @@ pub fn launch(
         restarts.record();
     }
 }
-/// Whether the provider hit a usage limit. Claude records each limit in its
-/// transcript as it happens, so a limit counts only once that entry appears
-/// (a redrawn conversation shows old limit notices again but never records
-/// them again, and a limit dialog the screen parser can't read still records
-/// one). Codex, and a Claude whose transcript is unknown, go by the screen.
+/// Whether the provider hit a usage limit. A provider that records limits
+/// in its transcript (`Spec::records_limits`) is believed only once that
+/// entry appears: a redrawn conversation shows old notices again but never
+/// records them again. Claude's active limit menu and failed compaction can
+/// also be corroborated by the account's fresh quota. Other providers, and
+/// one whose transcript is unknown, go by the screen.
 fn limit_seen(
-    provider: Provider,
+    store: &Store,
+    account: &Account,
     limits: &mut crate::limits::Limits,
     tracker: Option<&crate::session::Tracker>,
-    screen: bool,
+    screen: crate::terminal::ScreenLimits,
+    last_input: Option<Instant>,
     fresh: bool,
 ) -> bool {
-    if provider.spec().records_limits() && tracker.is_some() {
-        limits.check(tracker, screen, fresh)
-    } else {
-        screen
+    if !account.provider.spec().records_limits() || tracker.is_none() {
+        return screen.notice;
     }
+    if limits.check(tracker, screen.notice, fresh) {
+        return true;
+    }
+    limits.check_quota(
+        screen,
+        last_input,
+        || usage::cached(store, account).ok(),
+        now(),
+    )
 }
-/// Same-account restarts after a login error that followed a token rotation.
+/// Same-account restarts after a provider error that followed a token rotation.
 const AUTH_RESTARTS: u32 = 3;
 /// How long a follower waits for the owner's rotated token after a login error.
 const AUTH_SETTLE: Duration = Duration::from_secs(10);

@@ -24,11 +24,36 @@ fn expired_login_switches_and_resumes_exact_session() {
     runner_case("Login expired · Please run /login");
 }
 fn runner_case(failure: &str) {
+    diagnostic_case(failure, "");
+}
+
+#[test]
+fn codex_usage_limit_reloads_rotated_auth_only_when_quota_is_available() {
+    let notice = "\x1b[31m■ Error running remote compact task: You've hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 21st, 2026 4:31 PM.\x1b[0m";
+    diagnostic_case(notice, "codex-rotated");
+    diagnostic_case(notice, "codex-exhausted");
+}
+
+#[test]
+fn claude_screen_only_limit_requires_an_active_menu_and_exhausted_quota_at_startup() {
+    let menu = "│ What do you want to do?\n│ ❯ 1. Stop and wait for limit to reset\n│   2. Upgrade";
+    diagnostic_case(menu, "claude-menu");
+    diagnostic_case(menu, "claude-healthy-menu");
+    diagnostic_case(
+        "⎿ Prompt is too long · automatic compaction failed: You've hit your weekly limit · resets Nov 22, 9am (America/New_York) · /clear to start fresh",
+        "claude-startup-redraw",
+    );
+}
+
+fn diagnostic_case(failure: &str, scenario: &str) {
     let t = tempfile::tempdir().unwrap();
     let bin = t.path().join("bin");
     fs::create_dir(&bin).unwrap();
     let fake = r##"import json, os, pathlib, subprocess, sys, time
 provider=pathlib.Path(sys.argv[0]).name
+scenario=os.environ['ASWAP_TEST_DIAGNOSTIC']
+# Launch views are removed once a run ends, so results go outside them.
+results=pathlib.Path(os.environ['ASWAP_TEST_RESULTS'])
 p=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'] if provider=='claude' else os.environ['CODEX_HOME'])
 args=sys.argv[1:]
 if args[:1]==['-c']: args=args[2:]
@@ -53,25 +78,46 @@ base=['--resume',id] if provider=='claude' else ['resume',id]
 sticky=['--model','synthetic-model']
 transcript=p/'projects'/'-synthetic'/(id+'.jsonl') if provider=='claude' else p/'sessions'/'2026'/'01'/'01'/('rollout-synthetic-'+id+'.jsonl')
 transcript.parent.mkdir(parents=True,exist_ok=True)
-if 'synthetic-second' in auth:
+if 'synthetic-second' in auth or 'synthetic-rotated' in auth:
+    if scenario=='codex-rotated': assert 'synthetic-rotated' in auth
+    if scenario=='codex-exhausted': assert 'synthetic-second' in auth
+    assert scenario not in ('claude-healthy-menu','claude-startup-redraw')
     expected=base+sticky
     assert args==expected or args==expected+['--','You were interrupted by a usage-limit account switch. Continue exactly where you left off.']
     assert transcript.read_text().startswith('synthetic shared conversation')
-    pathlib.Path(os.environ['ASWAP_TEST_RESULTS'], str(os.getpid())).write_text(json.dumps(args))
-    for label in ['one','two']:
+    results.joinpath('resume-args-'+str(os.getpid())).write_text(json.dumps(args))
+    for label in (['one'] if scenario=='codex-rotated' else ['one','two']):
         result=subprocess.run([os.environ['ASWAP_TEST_BINARY'],'rename',provider,label,'must-not-rename','--json'],capture_output=True)
         assert result.returncode!=0
     sys.exit(0)
 assert args==base+sticky
 transcript.write_text('synthetic shared conversation')
 if provider=='claude': (p/'sessions'/(str(os.getpid())+'.json')).write_text(json.dumps({'pid':os.getpid(),'sessionId':id}))
+profile=pathlib.Path(os.environ['XDG_DATA_HOME'])/'aswap'/'profiles'/provider/'one'
+def replace_json(path, data):
+    replacement=path.with_suffix('.synthetic-replacement')
+    replacement.write_text(json.dumps(data))
+    replacement.replace(path)
+if scenario.startswith('codex-') and 'synthetic-first' in auth:
+    data=json.loads((profile/'auth.json').read_text())
+    data['tokens']['access_token']='synthetic-rotated'
+    replace_json(profile/'auth.json',data)
+if scenario in ('codex-exhausted','claude-menu','claude-startup-redraw') and 'synthetic-first' in auth:
+    cache=json.loads((profile/'usage-cache.json').read_text())
+    cache['usage']['windows']=[{'name':'weekly','used_percent':100,'duration_minutes':10080,'resets_at':int(time.time())+3600}]
+    cache['fetched_at']=int(time.time())
+    replace_json(profile/'usage-cache.json',cache)
 print(os.environ['ASWAP_TEST_FAILURE'],file=sys.stderr,flush=True)
-if provider=='claude' and 'limit' in os.environ['ASWAP_TEST_FAILURE'] and 'synthetic-clean' not in auth:
+if provider=='claude' and not scenario and 'limit' in os.environ['ASWAP_TEST_FAILURE'] and 'synthetic-clean' not in auth:
     # Claude records each usage-limit error in the transcript as it happens.
     import datetime
     with transcript.open('a') as t:
         t.write('\n'+json.dumps({'type':'assistant','timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat(),'isApiErrorMessage':True,'error':'rate_limit'})+'\n')
 if 'synthetic-clean' in auth: sys.exit(0)
+if scenario in ('claude-healthy-menu','claude-startup-redraw'):
+    time.sleep(.8)
+    results.joinpath('completed-'+str(os.getpid())).write_text('provider continued')
+    sys.exit(0)
 with transcript.open('a') as held:
     time.sleep(30)
 "##;
@@ -103,6 +149,11 @@ with transcript.open('a') as held:
         .env("CODEX_HOME", t.path().join("codex"))
         .env("ASWAP_RUNNER_CHILD", "1")
         .env("ASWAP_TEST_FAILURE", failure)
+        .env("ASWAP_TEST_DIAGNOSTIC", scenario)
+        .env(
+            "ASWAP_TRACE_SELECTION",
+            if scenario.is_empty() { "0" } else { "1" },
+        )
         .env("ASWAP_TEST_BINARY", env!("CARGO_BIN_EXE_aswap"))
         .env("ASWAP_EXPECT_CWD", &cwd)
         .env("ASWAP_TEST_RESULTS", &results)
@@ -116,6 +167,18 @@ with transcript.open('a') as held:
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    if scenario.starts_with("codex-") {
+        let trace = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            trace.contains("credentials_changed_since_launch=true"),
+            "{trace}"
+        );
+        assert_eq!(
+            trace.contains("resuming on the same account"),
+            scenario == "codex-rotated"
+        );
+        assert!(!trace.contains("synthetic-rotated"), "{trace}");
+    }
 }
 fn auth(provider: Provider, token: &str) -> serde_json::Value {
     if provider == Provider::Claude {
@@ -130,7 +193,11 @@ fn runner_child() {
         return;
     }
     let store = Store::from_env().unwrap();
+    let scenario = std::env::var("ASWAP_TEST_DIAGNOSTIC").unwrap_or_default();
     for provider in [Provider::Claude, Provider::Codex] {
+        if !scenario.is_empty() && !scenario.starts_with(provider.as_str()) {
+            continue;
+        }
         let source = provider.current_home().unwrap();
         for (name, token, pct) in [
             ("one", "synthetic-first", 20.0),
@@ -205,8 +272,16 @@ fn runner_child() {
                 .join("usage-cache.json");
             let mut c: Cached = store::json_read(&cache).unwrap();
             c.error = None;
+            c.usage.windows[0].used_percent = 20.0;
             c.next_poll_at = aswap::now() + 3600;
             store::json_write(&cache, &c).unwrap();
+            if scenario.starts_with("codex-") {
+                store::json_write(
+                    &cache.with_file_name("auth.json"),
+                    &auth(provider, "synthetic-first"),
+                )
+                .unwrap();
+            }
             assert_eq!(
                 aswap::runner::run(&store, provider, Some("one"), &initial, true).unwrap(),
                 0
@@ -224,9 +299,32 @@ fn runner_child() {
                 .unwrap()
                 .resume(provider, ID, prompt.as_deref())
                 .unwrap();
-            assert!(views.map(|e| e.unwrap().path()).any(|p| {
-                serde_json::from_slice::<Vec<String>>(&fs::read(p).unwrap()).unwrap() == expected
-            }));
+            let files: Vec<_> = views.map(|entry| entry.unwrap().path()).collect();
+            let named = |prefix: &'static str| {
+                files.iter().filter(move |path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(prefix))
+                })
+            };
+            if matches!(
+                scenario.as_str(),
+                "claude-healthy-menu" | "claude-startup-redraw"
+            ) {
+                assert!(named("completed-").next().is_some());
+                assert!(named("resume-args-").next().is_none());
+            } else {
+                assert!(named("resume-args-").any(|path| {
+                    serde_json::from_slice::<Vec<String>>(&fs::read(path).unwrap()).unwrap()
+                        == expected
+                }));
+                if scenario == "codex-rotated" {
+                    assert!(store::json_read::<Cached>(&cache).unwrap().error.is_none());
+                }
+            }
+        }
+        if !scenario.is_empty() {
+            continue;
         }
         let cache = store
             .profile(provider, "one")
