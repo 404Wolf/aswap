@@ -352,6 +352,7 @@ pub struct Tracker {
     registry: Option<(u32, shared::Stamp, String)>,
     last_fd_scan: Option<(u32, Instant)>,
     rollout_fd: Option<(PathBuf, PathBuf)>,
+    codex_scan_skipped: bool,
 }
 impl Tracker {
     pub fn new(provider: Provider, home: &Path, id: Option<String>) -> Result<Self> {
@@ -378,6 +379,7 @@ impl Tracker {
             registry: None,
             last_fd_scan: None,
             rollout_fd: None,
+            codex_scan_skipped: false,
         })
     }
     pub fn observe(&mut self, pid: u32) -> Result<()> {
@@ -444,25 +446,32 @@ impl Tracker {
             .iter()
             .filter_map(|(_, path)| filename_id(self.provider, path))
             .collect();
-        if scan && self.provider == Provider::Codex {
-            self.rollout_fd = match owned.first().filter(|_| owned.len() == 1) {
-                Some(id) => descriptors
-                    .iter()
-                    .find(|(_, path)| filename_id(self.provider, path) == Some(*id))
-                    .cloned(),
-                None => None,
-            };
+        if self.provider == Provider::Codex {
+            if scan {
+                self.rollout_fd = match owned.first().filter(|_| owned.len() == 1) {
+                    Some(id) => descriptors
+                        .iter()
+                        .find(|(_, path)| filename_id(self.provider, path) == Some(*id))
+                        .cloned(),
+                    None => None,
+                };
+                // An empty scan after the writer exits cannot establish which
+                // rollouts were open during the skipped observations.
+                if !owned.is_empty() {
+                    self.codex_scan_skipped = false;
+                }
+            } else {
+                self.codex_scan_skipped = true;
+            }
         }
         // Claude's PID registry identifies the main conversation even while
         // subagents hold other transcripts open or unrelated terminals write.
         let known = if let Some(id) = registered {
             Some(id)
         } else if (self.provider == Provider::Claude && self.known.is_some()) || owned.is_empty() {
-            // Shared history activity cannot contradict a known UUID. In
-            // particular, an exited Codex has no descriptors left: another
-            // terminal writing then must not strand its exact resume ID.
-            // Claude's open files may belong to subagents; Codex can still
-            // prove an actual session change with its owned rollout below.
+            // Keep transcript attribution through an empty scan. Claude's
+            // open files can belong to subagents, so an already known Claude
+            // ID also takes precedence here.
             self.known.as_deref()
         } else if owned.len() == 1 {
             owned.first().copied()
@@ -559,6 +568,14 @@ impl Tracker {
         self.known.as_deref()
     }
     pub fn id(&self) -> Result<&str> {
+        // One matching descriptor can coexist with a writer for another ID.
+        // The cached ID still serves transcript tracking, but recovery needs
+        // a full scan that saw ownership after the most recent skipped tick.
+        if self.codex_scan_skipped {
+            return Err(Error(
+                "Codex session identity could not be confirmed; refusing an automatic restart",
+            ));
+        }
         self.known_id().ok_or(Error(
             "exact session identity unavailable; refusing an automatic restart",
         ))
@@ -809,7 +826,7 @@ mod tracker_tests {
         let main_held = fs::File::open(main).unwrap();
         let scans = FD_SCANS.with(std::cell::Cell::get);
         tracker.observe(std::process::id()).unwrap();
-        assert_eq!(tracker.id().unwrap(), OTHER);
+        assert_eq!(tracker.known_id(), Some(OTHER));
         assert_eq!(FD_SCANS.with(std::cell::Cell::get), scans);
 
         // Recovery rechecks even before the cadence expires.
@@ -838,7 +855,7 @@ mod tracker_tests {
     }
 
     #[test]
-    fn a_codex_switch_before_exit_resumes_the_new_conversation() {
+    fn a_codex_switch_is_tracked_and_can_be_confirmed_before_exit() {
         let home = tempfile::tempdir().unwrap();
         let main = rollout(home.path(), MAIN);
         let other = rollout(home.path(), OTHER);
@@ -854,7 +871,10 @@ mod tracker_tests {
         for _ in 0..3 {
             tracker.observe(pid).unwrap();
         }
-        // The diagnostic arrives after the writer has already closed its fd.
+        assert_eq!(tracker.known_id(), Some(OTHER));
+        assert!(tracker.id().is_err());
+        // A diagnostic while the provider still owns the fd can confirm it.
+        tracker.observe_now(pid).unwrap();
         drop(held_other);
         tracker.observe_now(pid).unwrap();
         let args = AutoArgs::parse(Provider::Codex, &[]).unwrap();
@@ -862,6 +882,30 @@ mod tracker_tests {
             .resume(Provider::Codex, tracker.id().unwrap(), None)
             .unwrap();
         assert_eq!(resume, ["resume", OTHER]);
+    }
+
+    #[test]
+    fn a_retained_codex_reader_does_not_prove_identity_after_exit() {
+        let home = tempfile::tempdir().unwrap();
+        let main = rollout(home.path(), MAIN);
+        let other = rollout(home.path(), OTHER);
+        let mut tracker = Tracker::new(Provider::Codex, home.path(), None).unwrap();
+        let pid = std::process::id();
+        let reader = fs::File::open(main).unwrap();
+        tracker.observe(pid).unwrap();
+        assert_eq!(tracker.id().unwrap(), MAIN);
+
+        let writer = fs::OpenOptions::new().append(true).open(other).unwrap();
+        let scans = FD_SCANS.with(std::cell::Cell::get);
+        for _ in 0..3 {
+            tracker.observe(pid).unwrap();
+        }
+        assert_eq!(FD_SCANS.with(std::cell::Cell::get), scans);
+        drop((reader, writer));
+
+        // Both descriptors can vanish before the diagnostic forces a scan.
+        tracker.observe_now(pid).unwrap();
+        assert!(tracker.id().is_err());
     }
 
     #[test]
