@@ -126,7 +126,7 @@ fn exhausted_accounts_use_remaining_quota_above_the_soft_threshold() {
             )
             .unwrap()
             .label,
-            "soon"
+            "room"
         );
         assert_eq!(
             usage::choose("full", &entries, 90.0, Prefer::Headroom, 999, 1000, limited)
@@ -149,6 +149,22 @@ fn exhausted_accounts_use_remaining_quota_above_the_soft_threshold() {
             .unwrap()
             .label,
         "below"
+    );
+}
+
+#[test]
+fn last_resort_uses_headroom_even_when_weekly_reset_is_preferred() {
+    let mut full = weekly(100.0, Some(9000), 1000);
+    full.error = Some("provider-limit".into());
+    let entries = vec![
+        (account("full"), full),
+        (account("soon"), weekly(97.0, Some(2000), 1000)),
+        (account("room"), weekly(90.0, Some(5000), 1000)),
+    ];
+    assert_eq!(
+        usage::choose("full", &entries, 90.0, Prefer::WeeklyReset, 999, 1000, true)
+            .map(|a| a.label.as_str()),
+        Some("room")
     );
 }
 #[test]

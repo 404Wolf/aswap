@@ -96,6 +96,7 @@ pub fn run(
     }
     let mut lease = patiently("reserving the account", || {
         let mut account = account.clone();
+        let mut fallback = None;
         let _lock = store.lock()?;
         if auto {
             let state = store.load()?;
@@ -121,12 +122,18 @@ pub fn run(
                 )
             }) {
                 account = best.clone();
+                fallback = quota_fallback(&account, &entries, &settings, now());
             }
         }
         store.account(&store.load()?, provider, Some(&account.label))?;
-        Ok((account.clone(), Arc::new(store.lease_locked(&account)?)))
+        Ok((
+            account.clone(),
+            Arc::new(store.lease_locked(&account)?),
+            fallback,
+        ))
     })
-    .map(|(chosen, lease)| {
+    .map(|(chosen, lease, fallback)| {
+        report_quota_fallback(&chosen, fallback);
         account = chosen;
         lease
     })?;
@@ -576,7 +583,7 @@ pub fn run(
         };
         // A CLI may exit on a limit instead of leaving a dialog open. Keep
         // the supervisor and exact resume argv until any account recovers.
-        let (next, next_lease) = loop {
+        let (next, next_lease, fallback) = loop {
             while quota_wait && (target.is_none() || restarts.capped()) {
                 if wake.due(now()) {
                     let decided = (|| -> Result<Option<Account>> {
@@ -617,26 +624,23 @@ pub fn run(
             // Eligibility can change after stopping the old provider. A lost
             // target is a normal wait outcome; store failures retain their own
             // retry policy. Neither permits launching a rejected account.
-            let commit = || -> Result<Option<(Account, Arc<crate::live::Lease>)>> {
+            let commit = || {
                 let _lock = store.lock()?;
                 let mut state = store.load()?;
                 let settings = state.auto.get(&provider).cloned().unwrap_or_default();
-                let Some(next) = recovery_target(
+                let entries = rejected.filter(
+                    store,
                     &account.label,
-                    &rejected.filter(
+                    settings.threshold,
+                    models.filter_cached(
                         store,
                         &account.label,
-                        settings.threshold,
-                        models.filter_cached(
-                            store,
-                            &account.label,
-                            entries_from_cache(store, provider)?,
-                        ),
+                        entries_from_cache(store, provider)?,
                     ),
-                    &settings,
-                    now(),
-                )
-                .cloned() else {
+                );
+                let Some(next) =
+                    recovery_target(&account.label, &entries, &settings, now()).cloned()
+                else {
                     return Ok(None);
                 };
                 let next_lease = if next.label == account.label {
@@ -649,7 +653,8 @@ pub fn run(
                 state.auto.entry(provider).or_default().last_switch = now();
                 store.save(&state)?;
                 rejected.resumed(store, &next, &state.accounts);
-                Ok(Some((next, next_lease)))
+                let fallback = quota_fallback(&next, &entries, &settings, now());
+                Ok(Some((next, next_lease, fallback)))
             };
             // Retried with the store lock released between attempts.
             let committed = store::retry_for(
@@ -674,6 +679,7 @@ pub fn run(
             target = None;
             wake.retry(now());
         };
+        report_quota_fallback(&next, fallback);
         if quota_wait {
             eprintln!(
                 "aswap: quota available on {provider}:{}; resuming the same session{}",
@@ -918,6 +924,29 @@ fn omit_one_shot(args: &crate::session::AutoArgs, terminal: &mut Option<Terminal
     }
     Ok(())
 }
+fn quota_fallback(
+    account: &Account,
+    entries: &[(Account, usage::Cached)],
+    settings: &store::Auto,
+    at: u64,
+) -> Option<(f64, f64)> {
+    let used = entries
+        .iter()
+        .find(|(a, _)| a.provider == account.provider && a.label == account.label)?
+        .1
+        .used(at)?;
+    (used >= settings.threshold && used < 100.0).then_some((used, settings.threshold))
+}
+
+fn report_quota_fallback(account: &Account, fallback: Option<(f64, f64)>) {
+    if let Some((used, threshold)) = fallback {
+        eprintln!(
+            "aswap: last-resort quota fallback to {}:{} ({used:.0}% used, soft threshold {threshold:.0}%); using remaining quota instead of waiting for reset",
+            account.provider, account.label
+        );
+    }
+}
+
 /// A limited provider can resume on its own account once that account's
 /// rejection lapses. Other targets retain the usual forced-switch ranking
 /// and below-100% fallback. Rejected entries have already been filtered.
@@ -938,9 +967,8 @@ fn recovery_target<'a>(
     )
     .or_else(|| {
         entries.iter().find_map(|(account, cache)| {
-            (account.label == current
-                && cache.used(at).is_some_and(|used| used < settings.threshold))
-            .then_some(account)
+            (account.label == current && cache.used(at).is_some_and(|used| used < 100.0))
+                .then_some(account)
         })
     })
 }
@@ -1009,9 +1037,10 @@ struct Rejected {
 }
 /// When a limit rejection lapses: after a hold that doubles with each new
 /// limit on the account (15 minutes, then 30, ... up to 4 hours), and only once
-/// a reading taken after the rejection is below the auto threshold. Two
-/// accounts near 100% therefore never trade a session back and forth: neither
-/// reads below the threshold again until its window resets.
+/// a reading taken after the rejection is below the auto threshold. A verified
+/// window reset permits remaining quota above that soft threshold too. Without
+/// a reset, near-full accounts cannot trade a session back and forth on the
+/// strength of repeated, misleading quota readings.
 #[derive(Clone, Copy)]
 struct Lapse {
     at: u64,
@@ -1028,12 +1057,14 @@ impl Lapse {
         (LIMIT_HOLD << self.count.saturating_sub(1).min(8)).min(LIMIT_HOLD_MAX)
     }
     fn lapsed(&self, cache: &usage::Cached, threshold: f64, at: u64) -> bool {
-        (at >= self.at.saturating_add(self.hold())
-            || self
-                .reset
-                .is_some_and(|reset| at >= reset && cache.fetched_at >= reset))
+        let reset = self
+            .reset
+            .is_some_and(|reset| at >= reset && cache.fetched_at >= reset);
+        (at >= self.at.saturating_add(self.hold()) || reset)
             && cache.fetched_at > self.at
-            && cache.used(at).is_some_and(|used| used < threshold)
+            && cache
+                .used(at)
+                .is_some_and(|used| used < if reset { 100.0 } else { threshold })
     }
     /// The same limit seen again while held stays one rejection; a limit
     /// after the rejection lapsed is a new one, held twice as long.
@@ -1572,6 +1603,52 @@ mod wake_tests {
     }
 
     #[test]
+    fn verified_reset_recovers_remaining_quota_at_or_above_the_soft_threshold() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("store")).unwrap();
+        for provider in [Provider::Claude, Provider::Codex] {
+            for recovered in ["current", "other"] {
+                for used in [90.0, 95.0] {
+                    let mut rejected = Rejected::default();
+                    rejected.labels.insert(
+                        recovered.into(),
+                        Some(Lapse {
+                            at: AT,
+                            count: 3,
+                            reset: Some(AT + 30),
+                            resumed: false,
+                        }),
+                    );
+                    let mut entries = vec![
+                        entry(provider, "current", 100.0, Some(AT + 3600), AT + 30),
+                        entry(provider, "other", 100.0, Some(AT + 3600), AT + 30),
+                    ];
+                    // The five-hour window reset, but the weekly window
+                    // still reads at or above the soft switching threshold.
+                    let (_, cache) = entries
+                        .iter_mut()
+                        .find(|(a, _)| a.label == recovered)
+                        .unwrap();
+                    cache.usage.windows[0].used_percent = used;
+                    cache.usage.windows.push(usage::Window {
+                        name: "session".into(),
+                        used_percent: 0.0,
+                        resets_at: Some(AT + 30 + 5 * 3600),
+                        duration_minutes: Some(300),
+                    });
+                    let entries = rejected.filter_at(&store, "current", 90.0, entries, AT + 30);
+                    assert_eq!(
+                        recovery_target("current", &entries, &store::Auto::default(), AT + 30)
+                            .map(|a| a.label.as_str()),
+                        Some(recovered),
+                        "{provider} {recovered} at {used}%"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn only_verified_post_reset_quota_releases_a_hold_early() {
         let lapse = Lapse {
             at: AT,
@@ -1585,6 +1662,8 @@ mod wake_tests {
         assert!(!lapse.lapsed(&fresh, 90.0, AT + 30));
         fresh.fetched_at = AT + 30;
         fresh.usage.windows[0].used_percent = 95.0;
+        assert!(lapse.lapsed(&fresh, 90.0, AT + 30));
+        fresh.usage.windows[0].used_percent = 100.0;
         assert!(!lapse.lapsed(&fresh, 90.0, AT + 30));
         fresh.usage.windows[0].used_percent = 4.0;
         fresh.error = Some("network".into());
