@@ -324,7 +324,10 @@ mod packet_cache {
         named_codex_slots: Vec<Option<u8>>,
     }
 
-    pub(super) fn serialize<S: Serializer>(cache: &Cached, serializer: S) -> Result<S::Ok, S::Error> {
+    pub(super) fn serialize<S: Serializer>(
+        cache: &Cached,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
         let has_named_slots = cache
             .usage
             .windows
@@ -366,7 +369,9 @@ mod packet_cache {
         .serialize(serializer)
     }
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Cached, D::Error> {
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Cached, D::Error> {
         let WireCache {
             mut cache,
             retained_limits,
@@ -1390,7 +1395,10 @@ mod tests {
         assert_eq!(legacy_cache.usage.windows[0].codex_slot, None);
         assert_eq!(legacy_cache.used(at), Some(7.0));
         let current: Packet = serde_json::from_value(named_wire).unwrap();
-        assert_eq!(current.profiles[0].cache.usage.windows[0].codex_slot, Some(1));
+        assert_eq!(
+            current.profiles[0].cache.usage.windows[0].codex_slot,
+            Some(1)
+        );
     }
 
     #[test]

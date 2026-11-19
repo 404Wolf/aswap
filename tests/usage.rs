@@ -202,7 +202,8 @@ fn a_codex_slot_verifies_its_own_anonymous_limit_even_after_gaining_a_duration()
 
             let matching = read_slot(slot, duration, 7.0, 2000).unwrap();
             let cache = usage::updated(partial, Ok(matching), 1300);
-            let cache: Cached = serde_json::from_value(serde_json::to_value(cache).unwrap()).unwrap();
+            let cache: Cached =
+                serde_json::from_value(serde_json::to_value(cache).unwrap()).unwrap();
             assert_eq!(cache.used(1300), Some(7.0), "{slot} verifies its limit");
         }
     }

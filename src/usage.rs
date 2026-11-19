@@ -867,9 +867,10 @@ pub fn credentials_changed(store: &Store, account: &Account) -> Result<()> {
     // refresh ahead of the poll that repairs the cache.
     let mut cache = read_cache(&path, true)?;
     if cache.http_status == Some(401)
-        || cache.error.as_deref().is_some_and(|s| {
-            matches!(s, "http-401" | "refresh-invalid-grant" | "refresh-http-401")
-        })
+        || cache
+            .error
+            .as_deref()
+            .is_some_and(|s| matches!(s, "http-401" | "refresh-invalid-grant" | "refresh-http-401"))
     {
         cache.next_poll_at = now();
         store::json_write(&path, &cache)?;
