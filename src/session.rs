@@ -272,9 +272,9 @@ impl AutoArgs {
 }
 const TRANSCRIPT_CHECK: Duration = Duration::from_secs(5);
 const TRANSCRIPT_RETRY_MAX: Duration = Duration::from_secs(60);
-// Resolved Codex sessions poll slowly while idle. Recovery refreshes the
-// identity before resuming a conversation.
-const FD_CHECK: Duration = Duration::from_secs(10);
+// Check the known rollout descriptor each tick. A full scan on this cadence
+// also catches additional rollouts opened while that descriptor was unchanged.
+const FD_CHECK: Duration = Duration::from_secs(15);
 
 #[cfg(test)]
 thread_local! {
@@ -351,6 +351,7 @@ pub struct Tracker {
     retry_delay: Duration,
     registry: Option<(u32, shared::Stamp, String)>,
     last_fd_scan: Option<(u32, Instant)>,
+    rollout_fd: Option<(PathBuf, PathBuf)>,
 }
 impl Tracker {
     pub fn new(provider: Provider, home: &Path, id: Option<String>) -> Result<Self> {
@@ -376,6 +377,7 @@ impl Tracker {
             transcript,
             registry: None,
             last_fd_scan: None,
+            rollout_fd: None,
         })
     }
     pub fn observe(&mut self, pid: u32) -> Result<()> {
@@ -387,20 +389,23 @@ impl Tracker {
     fn observe_with(&mut self, pid: u32, fresh: bool) -> Result<()> {
         // Codex's rollout writer may live in its app-server child. Inspect only
         // this process tree's open descriptors, never another terminal's files.
-        fn process_files(pid: u32, depth: usize, out: &mut Vec<PathBuf>) {
+        fn process_files(pid: u32, depth: usize, root: &Path, out: &mut Vec<(PathBuf, PathBuf)>) {
             if depth > 5 {
                 return;
             }
             if let Ok(dir) = fs::read_dir(format!("/proc/{pid}/fd")) {
                 for e in dir.flatten() {
-                    if let Ok(p) = fs::read_link(e.path()) {
-                        out.push(p);
+                    let fd = e.path();
+                    if let Ok(path) = fs::read_link(&fd)
+                        && path.starts_with(root)
+                    {
+                        out.push((fd, path));
                     }
                 }
             }
             if let Ok(children) = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
                 for child in children.split_whitespace().filter_map(|s| s.parse().ok()) {
-                    process_files(child, depth + 1, out);
+                    process_files(child, depth + 1, root, out);
                 }
             }
         }
@@ -422,19 +427,32 @@ impl Tracker {
             && (fresh
                 || self.last_fd_scan.is_none_or(|(previous, at)| {
                     previous != pid || now.duration_since(at) >= FD_CHECK
-                }));
+                })
+                || self
+                    .rollout_fd
+                    .as_ref()
+                    .is_none_or(|(fd, path)| fs::read_link(fd).ok().as_ref() != Some(path)));
+        let scan = registered.is_none() && (self.transcript.is_none() || fd_due);
         let mut descriptors = Vec::new();
-        if registered.is_none() && (self.transcript.is_none() || fd_due) {
+        if scan {
             self.last_fd_scan = Some((pid, now));
             #[cfg(test)]
             FD_SCANS.with(|scans| scans.set(scans.get() + 1));
-            process_files(pid, 0, &mut descriptors);
+            process_files(pid, 0, &self.root, &mut descriptors);
         }
         let owned: BTreeSet<_> = descriptors
             .iter()
-            .filter(|p| p.starts_with(&self.root))
-            .filter_map(|p| filename_id(self.provider, p))
+            .filter_map(|(_, path)| filename_id(self.provider, path))
             .collect();
+        if scan && self.provider == Provider::Codex {
+            self.rollout_fd = match owned.first().filter(|_| owned.len() == 1) {
+                Some(id) => descriptors
+                    .iter()
+                    .find(|(_, path)| filename_id(self.provider, path) == Some(*id))
+                    .cloned(),
+                None => None,
+            };
+        }
         // Claude's PID registry identifies the main conversation even while
         // subagents hold other transcripts open or unrelated terminals write.
         let known = if let Some(id) = registered {
@@ -466,7 +484,7 @@ impl Tracker {
         // An open descriptor can name the exact file without guessing how
         // Claude encodes project directories, even between history lookups.
         // Exclude deeper subagent paths.
-        let direct = descriptors.into_iter().find(|path| {
+        let direct = descriptors.into_iter().map(|(_, path)| path).find(|path| {
             path.strip_prefix(&self.root).is_ok_and(|relative| {
                 relative.components().count() <= transcript_depth(self.provider) + 1
                     && filename_id(self.provider, relative) == Some(id)
@@ -808,12 +826,42 @@ mod tracker_tests {
             MAIN,
             "retry immediately when unresolved"
         );
-        drop(main_held);
         let _held = fs::File::open(rollout(home.path(), OTHER)).unwrap();
         let pid = std::process::id();
         tracker.last_fd_scan = Some((pid, Instant::now() - FD_CHECK));
         tracker.observe(pid).unwrap();
-        assert_eq!(tracker.id().unwrap(), OTHER);
+        assert!(
+            tracker.id().is_err(),
+            "the periodic scan catches a second rollout"
+        );
+        drop(main_held);
+    }
+
+    #[test]
+    fn a_codex_switch_before_exit_resumes_the_new_conversation() {
+        let home = tempfile::tempdir().unwrap();
+        let main = rollout(home.path(), MAIN);
+        let other = rollout(home.path(), OTHER);
+        let mut tracker = Tracker::new(Provider::Codex, home.path(), None).unwrap();
+        let pid = std::process::id();
+        let held_main = fs::File::open(main).unwrap();
+        tracker.observe(pid).unwrap();
+        assert_eq!(tracker.id().unwrap(), MAIN);
+        drop(held_main);
+
+        let held_other = fs::File::open(other).unwrap();
+        // /new has switched the writer, but the next periodic scan is far off.
+        for _ in 0..3 {
+            tracker.observe(pid).unwrap();
+        }
+        // The diagnostic arrives after the writer has already closed its fd.
+        drop(held_other);
+        tracker.observe_now(pid).unwrap();
+        let args = AutoArgs::parse(Provider::Codex, &[]).unwrap();
+        let resume = args
+            .resume(Provider::Codex, tracker.id().unwrap(), None)
+            .unwrap();
+        assert_eq!(resume, ["resume", OTHER]);
     }
 
     #[test]
