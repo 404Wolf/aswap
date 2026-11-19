@@ -67,6 +67,7 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
                             }
                         }),
                         duration_minutes: Some(10080),
+                        codex_slot: None,
                     }],
                     ..Default::default()
                 },

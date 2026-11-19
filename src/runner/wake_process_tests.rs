@@ -134,6 +134,7 @@ fn scenario(provider: Provider, recovered: &str, delayed: bool, recovered_usage:
                             reset + 60
                         }),
                         duration_minutes: Some(10080),
+                        codex_slot: None,
                     }],
                     ..Default::default()
                 },

@@ -20,6 +20,9 @@ pub struct Window {
     pub used_percent: f64,
     pub resets_at: Option<u64>,
     pub duration_minutes: Option<u64>,
+    /// Codex slot index when a window has no duration to identify it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_slot: Option<u8>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Usage {
@@ -52,6 +55,9 @@ fn deserialize_windows<'de, D: serde::Deserializer<'de>>(
     // Upgrade older caches before either JSON or terminal output can expose slot names.
     for w in &mut windows {
         if matches!(w.name.as_str(), "primary" | "secondary") {
+            if w.duration_minutes.is_none() {
+                w.codex_slot = Some(u8::from(w.name == "secondary"));
+            }
             w.name = codex_window_name(w.duration_minutes);
         }
     }
@@ -98,6 +104,14 @@ pub struct Cached {
     pub next_poll_at: u64,
     pub failures: u32,
     pub error: Option<String>,
+    /// Previously exhausted windows missing from the latest usable observation.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unverified_limits: Vec<UnverifiedLimit>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnverifiedLimit {
+    window: Window,
+    observed_at: u64,
 }
 impl Cached {
     pub fn diagnostic(&self) -> Option<serde_json::Value> {
@@ -135,10 +149,67 @@ impl Cached {
         )
     }
     pub fn used(&self, at: u64) -> Option<f64> {
-        if self.error.is_some() || at.saturating_sub(self.fetched_at) > 600 {
+        if self.error.is_some()
+            || !self.unverified_limits.is_empty()
+            || at.saturating_sub(self.fetched_at) > 600
+        {
             None
         } else {
             self.usage.used(at)
+        }
+    }
+
+    pub fn reset_times(&self) -> impl Iterator<Item = u64> + '_ {
+        self.usage
+            .windows
+            .iter()
+            .chain(self.unverified_limits.iter().map(|limit| &limit.window))
+            .filter_map(|window| window.resets_at)
+    }
+
+    // A successful poll can omit a window. Keep its hard limit separate from
+    // the new measurements so neither a partial poll nor time passing clears it.
+    pub(crate) fn preserve_limits(&mut self, old: &Self) {
+        for (window, observed_at) in old
+            .unverified_limits
+            .iter()
+            .map(|limit| (&limit.window, limit.observed_at))
+            .chain(
+                old.usage
+                    .windows
+                    .iter()
+                    .filter(|w| w.used_percent >= 100.0)
+                    .map(|window| (window, old.fetched_at)),
+            )
+        {
+            let current = |w: &&Window| w.resets_at.is_none_or(|r| r > self.fetched_at);
+            let matching = |w: &Window| w.name == window.name && w.codex_slot == window.codex_slot;
+            let mut windows = self.usage.windows.iter().filter(current);
+            let observed = self.fetched_at >= observed_at
+                && if window.name == "quota" {
+                    // A durationally anonymous Codex window can be verified in
+                    // its own slot or by a fresh reading covering both slots.
+                    (window.codex_slot.is_some() && windows.clone().any(matching))
+                        || windows.nth(1).is_some()
+                } else {
+                    windows.any(matching)
+                };
+            if observed {
+                continue;
+            }
+            let limit = UnverifiedLimit {
+                window: window.clone(),
+                observed_at,
+            };
+            match self
+                .unverified_limits
+                .iter_mut()
+                .find(|retained| matching(&retained.window))
+            {
+                Some(retained) if retained.observed_at < observed_at => *retained = limit,
+                Some(_) => (),
+                None => self.unverified_limits.push(limit),
+            }
         }
     }
 }
@@ -170,6 +241,7 @@ pub fn parse_claude(v: &Value) -> Result<Usage> {
                 used_percent: percent(w.get("utilization"))?,
                 resets_at,
                 duration_minutes: Some(if key == "five_hour" { 300 } else { 10080 }),
+                codex_slot: None,
             });
         }
     }
@@ -189,13 +261,15 @@ pub fn parse_codex(v: &Value) -> Result<Usage> {
         .pointer("/rateLimitsByLimitId/codex")
         .or_else(|| v.get("rateLimits"));
     if let Some(bucket) = bucket {
-        for key in ["primary", "secondary"] {
+        for (slot, key) in [(0, "primary"), (1, "secondary")] {
             if let Some(w) = bucket.get(key).filter(|w| !w.is_null()) {
+                let duration_minutes = w.get("windowDurationMins").and_then(Value::as_u64);
                 windows.push(Window {
-                    name: codex_window_name(w.get("windowDurationMins").and_then(Value::as_u64)),
+                    name: codex_window_name(duration_minutes),
                     used_percent: percent(w.get("usedPercent"))?,
                     resets_at: w.get("resetsAt").and_then(Value::as_u64),
-                    duration_minutes: w.get("windowDurationMins").and_then(Value::as_u64),
+                    duration_minutes,
+                    codex_slot: duration_minutes.is_none().then_some(slot),
                 });
             }
         }
@@ -501,16 +575,17 @@ pub fn parse_retry_after(header: Option<&str>, at: u64) -> u64 {
 }
 pub fn updated(old: Cached, result: std::result::Result<Usage, Failure>, at: u64) -> Cached {
     match result {
-        Ok(usage) => Cached {
-            usage,
-            fetched_at: at,
-            next_poll_at: at.saturating_add(TTL),
-            failures: 0,
-            error: None,
-            last_attempt: at,
-            http_status: None,
-            retry_after: None,
-        },
+        Ok(usage) => {
+            let mut entry = Cached {
+                usage,
+                fetched_at: at,
+                next_poll_at: at.saturating_add(TTL),
+                last_attempt: at,
+                ..Cached::default()
+            };
+            entry.preserve_limits(&old);
+            entry
+        }
         Err(e) => {
             let failures = old.failures.saturating_add(1);
             let backoff = 60u64
@@ -562,10 +637,9 @@ where
             .next_poll_at
             .min(old.last_attempt.max(old.fetched_at).saturating_add(900));
     }
-    let reset_due = old.usage.windows.iter().any(|w| {
-        w.resets_at
-            .is_some_and(|r| r <= at && old.last_attempt.max(old.fetched_at) < r)
-    });
+    let reset_due = old
+        .reset_times()
+        .any(|r| r <= at && old.last_attempt.max(old.fetched_at) < r);
     if !force && !reset_due && at < old.next_poll_at {
         return Ok(old);
     }
@@ -579,12 +653,16 @@ where
             if !sibling.exists() {
                 continue;
             }
-            let other: Cached = store::json_read(&sibling)?;
+            let mut other: Cached = store::json_read(&sibling)?;
             if other.error.is_none()
                 && other.fetched_at > old.fetched_at
                 && at < other.fetched_at.saturating_add(TTL)
                 && other.used(at).is_some()
             {
+                other.preserve_limits(&old);
+                if other.used(at).is_none() {
+                    continue;
+                }
                 store::json_write(&path, &other)?;
                 return Ok(other);
             }
@@ -656,8 +734,10 @@ pub fn choose<'a>(
     at: u64,
     limited: bool,
 ) -> Option<&'a Account> {
-    let used = entries.iter().find(|(a, _)| a.label == current)?.1.used(at);
-    let exhausted = limited || used.is_some_and(|v| v >= 100.0);
+    let (_, current_cache) = entries.iter().find(|(a, _)| a.label == current)?;
+    let used = current_cache.used(at);
+    let exhausted =
+        limited || !current_cache.unverified_limits.is_empty() || used.is_some_and(|v| v >= 100.0);
     if !exhausted
         && used.is_none_or(|v| v < threshold || (v < 100.0 && at.saturating_sub(last_switch) < 300))
     {

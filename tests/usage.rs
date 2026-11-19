@@ -17,6 +17,7 @@ fn observation(p: f64, at: u64) -> Cached {
                 used_percent: p,
                 resets_at: None,
                 duration_minutes: Some(300),
+                codex_slot: None,
             }],
             ..Default::default()
         },
@@ -102,9 +103,119 @@ fn weekly(p: f64, reset: Option<u64>, at: u64) -> Cached {
         used_percent: p,
         resets_at: reset,
         duration_minutes: Some(10080),
+        codex_slot: None,
     });
     c
 }
+
+#[test]
+fn partial_provider_success_preserves_each_unverified_hard_limit() {
+    use serde_json::json;
+
+    let reset = chrono::DateTime::from_timestamp(1200, 0)
+        .unwrap()
+        .to_rfc3339();
+    let cases = [
+        (
+            usage::parse_claude(&json!({
+                "five_hour":{"utilization":100},
+                "seven_day":{"utilization":100,"resets_at":reset},
+                "seven_day_opus":{"utilization":100}
+            })),
+            usage::parse_claude(&json!({"five_hour":{"utilization":39},"seven_day":null})),
+            usage::parse_claude(&json!({"five_hour":{"utilization":39}})),
+            usage::parse_claude(&json!({
+                "five_hour":{"utilization":39}, "seven_day":{"utilization":80},
+                "seven_day_opus":{"utilization":50}
+            })),
+        ),
+        (
+            usage::parse_codex(&json!({"rateLimits":{
+                "primary":{"usedPercent":100,"windowDurationMins":300},
+                "secondary":{"usedPercent":100,"resetsAt":1200,"windowDurationMins":10080}
+            }})),
+            usage::parse_codex(&json!({"rateLimits":{
+                "primary":{"usedPercent":39,"windowDurationMins":300},"secondary":null
+            }})),
+            usage::parse_codex(&json!({"rateLimits":{
+                "primary":{"usedPercent":39,"windowDurationMins":300}
+            }})),
+            usage::parse_codex(&json!({"rateLimits":{
+                "primary":{"usedPercent":80,"windowDurationMins":10080},
+                "secondary":{"usedPercent":39,"windowDurationMins":300}
+            }})),
+        ),
+    ];
+    for (full, partial, omitted, usable) in cases {
+        let old = usage::updated(Cached::default(), Ok(full.unwrap()), 1000);
+        // Persist and reload the first partial response before polling again.
+        let partial = usage::updated(old, Ok(partial.unwrap()), 1100);
+        assert_eq!(partial.used(1100), None);
+        assert_eq!(partial.usage.windows.len(), 1);
+        assert_eq!(partial.reset_times().min(), Some(1200));
+        let partial = serde_json::from_value(serde_json::to_value(partial).unwrap()).unwrap();
+        let still_missing = usage::updated(partial, Ok(omitted.unwrap()), 1200);
+        assert_eq!(still_missing.used(1200), None);
+        let entries = [
+            (account("current"), still_missing.clone()),
+            (account("verified"), observation(95.0, 1200)),
+        ];
+        assert_eq!(
+            usage::choose(
+                "current",
+                &entries,
+                90.0,
+                Prefer::Headroom,
+                1200,
+                1200,
+                false
+            )
+            .map(|a| a.label.as_str()),
+            Some("verified")
+        );
+
+        let failed = usage::updated(still_missing, Err(usage::Failure::new("network")), 1210);
+        assert_eq!(failed.used(1210), None);
+        let usable = usage::updated(failed, Ok(usable.unwrap()), 1250);
+        assert_eq!(usable.used(1250), Some(80.0));
+    }
+}
+
+#[test]
+fn a_codex_slot_without_a_duration_cannot_verify_the_other_slot() {
+    use serde_json::json;
+
+    let limited = usage::parse_codex(&json!({"rateLimits":{
+        "secondary":{"usedPercent":100}
+    }}))
+    .unwrap();
+    let old = usage::updated(Cached::default(), Ok(limited), 1000);
+    let primary_only = usage::parse_codex(&json!({"rateLimits":{
+        "primary":{"usedPercent":39}
+    }}))
+    .unwrap();
+    let partial = usage::updated(old, Ok(primary_only), 1100);
+    assert_eq!(partial.used(1100), None);
+    let secondary_only = usage::parse_codex(&json!({"rateLimits":{
+        "secondary":{"usedPercent":50}
+    }}))
+    .unwrap();
+    let fresh = usage::updated(partial, Ok(secondary_only), 1200);
+    assert_eq!(fresh.used(1200), Some(50.0));
+}
+
+#[test]
+fn replaying_an_older_observation_cannot_clear_a_newer_hard_limit() {
+    let limited = weekly(100.0, Some(2000), 1200);
+    let old_reading = weekly(40.0, Some(2000), 1100).usage;
+    let replayed = usage::updated(limited, Ok(old_reading.clone()), 1100);
+    assert_eq!(replayed.used(1200), None);
+    let replayed_again = usage::updated(replayed, Ok(old_reading.clone()), 1100);
+    assert_eq!(replayed_again.used(1200), None);
+    let newer = usage::updated(replayed_again, Ok(old_reading), 1201);
+    assert_eq!(newer.used(1201), Some(40.0));
+}
+
 #[test]
 fn exhausted_accounts_use_remaining_quota_above_the_soft_threshold() {
     let entries = vec![
@@ -650,4 +761,22 @@ fn duplicate_logins_share_one_fresh_fetch() {
     })
     .unwrap();
     assert_eq!(own.used(1180), Some(43.0));
+
+    usage::cached_mode_with(&store, &a, 1200, true, |_| {
+        Ok(weekly(100.0, Some(2000), 1200).usage)
+    })
+    .unwrap();
+    usage::cached_mode_with(
+        &store,
+        &b,
+        1280,
+        true,
+        |_| Ok(observation(39.0, 1280).usage),
+    )
+    .unwrap();
+    // A sibling's newer partial snapshot cannot replace the known limit.
+    let partial =
+        usage::cached_with(&store, &a, 1380, |_| Ok(observation(39.0, 1380).usage)).unwrap();
+    assert_eq!(partial.fetched_at, 1380);
+    assert_eq!(partial.used(1380), None);
 }
