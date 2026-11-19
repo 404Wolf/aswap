@@ -80,7 +80,7 @@ fn set_clock(path: &Path, at: u64) {
     store::atomic(path, at.to_string().as_bytes()).unwrap();
 }
 
-fn scenario(provider: Provider, recovered: &str, delayed: bool) {
+fn scenario(provider: Provider, recovered: &str, delayed: bool, recovered_usage: f64) {
     let temp = tempfile::tempdir().unwrap();
     let store = Store::open(temp.path().join("data/aswap")).unwrap();
     let base = crate::now();
@@ -266,7 +266,7 @@ fn scenario(provider: Provider, recovered: &str, delayed: bool) {
         let mut cache: usage::Cached = store::json_read(&path).unwrap();
         cache.error = None;
         cache.fetched_at = reset;
-        cache.usage.windows[0].used_percent = 2.0;
+        cache.usage.windows[0].used_percent = recovered_usage;
         cache.usage.windows[0].resets_at = Some(base + 86_400);
         store::json_write(&path, &cache).unwrap();
     }
@@ -295,6 +295,13 @@ fn scenario(provider: Provider, recovered: &str, delayed: bool) {
             trace.contains(&format!("quota available on {provider}:{recovered}")),
             "{trace}"
         );
+        assert_eq!(
+            trace.contains(&format!(
+                "last-resort quota fallback to {provider}:{recovered}"
+            )),
+            recovered_usage >= 90.0,
+            "{trace}"
+        );
     }
     assert_eq!(fs::read_dir(&log).unwrap().count(), 2 * count);
 }
@@ -302,18 +309,27 @@ fn scenario(provider: Provider, recovered: &str, delayed: bool) {
 #[test]
 fn exited_claude_waits_and_many_sessions_resume_on_the_first_reset() {
     for account in ["current", "other"] {
-        scenario(Provider::Claude, account, false);
+        scenario(Provider::Claude, account, false, 2.0);
     }
 }
 #[test]
 fn exited_codex_waits_and_many_sessions_resume_on_the_first_reset() {
     for account in ["current", "other"] {
-        scenario(Provider::Codex, account, false);
+        scenario(Provider::Codex, account, false, 2.0);
     }
 }
 #[test]
 fn delayed_rejections_wait_for_reset_acknowledgements() {
-    scenario(Provider::Claude, "current", true);
+    scenario(Provider::Claude, "current", true, 2.0);
+}
+
+#[test]
+fn verified_resets_resume_above_threshold_and_log_the_last_resort() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        for account in ["current", "other"] {
+            scenario(provider, account, false, 90.0);
+        }
+    }
 }
 
 #[test]

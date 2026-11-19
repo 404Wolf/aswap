@@ -663,7 +663,7 @@ pub fn choose<'a>(
     {
         return None;
     }
-    let eligible = |ceiling: f64, forced: bool| {
+    let eligible = |ceiling: f64, forced: bool, preference: Prefer| {
         entries
             .iter()
             .filter(|(a, c)| {
@@ -672,10 +672,14 @@ pub fn choose<'a>(
                         v < ceiling && (forced || used.is_some_and(|u| u - v >= 10.0))
                     })
             })
-            .min_by(|(_, a), (_, b)| rank(prefer, a, b, at))
+            .min_by(|(_, a), (_, b)| rank(preference, a, b, at))
             .map(|(a, _)| a)
     };
-    eligible(threshold, exhausted).or_else(|| exhausted.then(|| eligible(100.0, true)).flatten())
+    eligible(threshold, exhausted, prefer).or_else(|| {
+        exhausted
+            .then(|| eligible(100.0, true, Prefer::Headroom))
+            .flatten()
+    })
 }
 /// A switch that is not forced by quota: with `WeeklyReset`, a new launch (or
 /// the selection monitor) moves to an eligible account whose weekly window

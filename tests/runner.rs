@@ -1023,3 +1023,35 @@ fn runner_safety_child() {
         );
     }
 }
+#[test]
+fn a_run_in_a_deleted_directory_says_so() {
+    // t1x2, 2026-11-19: its worktree was removed under the shell, and
+    // `aswap run codex --auto -- resume <id>` failed with "cannot resolve
+    // model config directory".
+    let t = tempfile::tempdir().unwrap();
+    let gone = t.path().join("removed-worktree");
+    for auto in [true, false] {
+        fs::create_dir(&gone).unwrap();
+        let script = format!(
+            "cd '{dir}' && rmdir '{dir}' && exec '{aswap}' run codex {flag} -- resume {ID}",
+            dir = gone.display(),
+            aswap = env!("CARGO_BIN_EXE_aswap"),
+            flag = if auto { "--auto" } else { "" },
+        );
+        let out = Command::new("sh")
+            .args(["-c", &script])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", t.path())
+            .env("XDG_DATA_HOME", t.path().join("data"))
+            .env("CODEX_HOME", t.path().join("codex"))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("the current directory no longer exists"),
+            "{stderr}"
+        );
+    }
+}

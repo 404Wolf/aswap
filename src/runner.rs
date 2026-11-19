@@ -28,7 +28,7 @@ use monitor::entries_from_cache;
 pub use monitor::{observations, tick};
 use patience::{COMMIT_PATIENCE, Hiccups, PREPARE_PATIENCE, SUPERVISE_PATIENCE, patiently};
 use quiet::{QUIET_STEP, Quiet};
-use recovery::{Rejected, Restarts, Wake, recovery_target};
+use recovery::{Rejected, Restarts, Wake, quota_fallback, recovery_target, report_quota_fallback};
 use rotation::{access_print, rotated_since, rotation_by};
 pub use via::{PI_BIN, Via, ViaError};
 
@@ -75,6 +75,8 @@ pub struct Launch {
     /// Run another program in front of the provider.
     pub via: Option<Via>,
 }
+/// Why a run can't start in a working directory that no longer exists.
+pub const GONE_CWD: &str = "the current directory no longer exists (was it deleted, e.g. a removed worktree?); cd into an existing directory and run again";
 /// Every run has its own live lease and access-only authentication view.
 /// Auto sessions keep a stable history directory while changing credentials.
 pub fn run(
@@ -102,6 +104,9 @@ pub fn launch(
     args: &[String],
     how: Launch,
 ) -> Result<i32> {
+    // The provider inherits this directory, and Codex's model lookup needs it:
+    // one deleted under the shell (a removed worktree) fails here, plainly.
+    std::env::current_dir().map_err(|_| crate::Error(GONE_CWD))?;
     let auto = how.auto;
     if let Some(via) = how.via {
         via.check(provider)?;
@@ -161,6 +166,7 @@ pub fn launch(
     }
     let mut lease = patiently("reserving the account", || {
         let mut account = account.clone();
+        let mut fallback = None;
         let _lock = store.lock()?;
         if pick {
             let state = store.load()?;
@@ -199,12 +205,18 @@ pub fn launch(
                     .flatten()
             }) {
                 account = best.clone();
+                fallback = quota_fallback(&account, &entries, &settings, now());
             }
         }
         store.account(&store.load()?, provider, Some(&account.label))?;
-        Ok((account.clone(), Arc::new(store.lease_locked(&account)?)))
+        Ok((
+            account.clone(),
+            Arc::new(store.lease_locked(&account)?),
+            fallback,
+        ))
     })
-    .map(|(chosen, lease)| {
+    .map(|(chosen, lease, fallback)| {
+        report_quota_fallback(&chosen, fallback);
         account = chosen;
         lease
     })?;
@@ -375,7 +387,7 @@ pub fn launch(
                     screen_limit |=
                         terminal.pump_child(step.as_millis().max(1) as i32, &mut child.0)?;
                     if terminal.quiet_auth {
-                        quiet.check(tracker.as_ref(), false);
+                        quiet.check();
                     }
                 }
             }
@@ -405,7 +417,7 @@ pub fn launch(
             }
             limited |= limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, false);
             if let Some(terminal) = &mut terminal {
-                quiet.apply(terminal, tracker.as_ref(), false);
+                quiet.apply(terminal, tracker.as_ref());
             }
             if let Some(status) = child.0.try_wait().safe("cannot wait for provider")? {
                 break status;
@@ -542,10 +554,18 @@ pub fn launch(
         hiccups.running = false;
         if let Some(terminal) = &mut terminal {
             let screen_limit = terminal.child_exited()?;
-            limited |= limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, true);
-            // The provider is gone and the tracker will not walk again: look
-            // for a transcript it created in its last moments afresh.
-            quiet.apply(terminal, tracker.as_ref(), true);
+            // Refresh only for Claude limit detection or unresolved held errors.
+            let needs_transcript = (!limited && provider.spec().records_limits())
+                || (terminal.quiet_auth
+                    && !terminal.held_auth.is_empty()
+                    && quiet.transcript.is_none());
+            if needs_transcript && let Some(tracker) = &mut tracker {
+                tracker.transcript_now();
+            }
+            if !limited {
+                limited = limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, true);
+            }
+            quiet.apply(terminal, tracker.as_ref());
         }
         cleanup.synced = hiccups
             .note("saving the provider's view", view.sync(store, &account))
@@ -668,7 +688,7 @@ pub fn launch(
         };
         // A CLI may exit on a limit instead of leaving a dialog open. Keep
         // the supervisor and exact resume argv until any account recovers.
-        let (next, next_lease) = loop {
+        let (next, next_lease, fallback) = loop {
             while quota_wait && (target.is_none() || restarts.capped()) {
                 if wake.due(now()) {
                     let decided = (|| -> Result<Option<Account>> {
@@ -709,26 +729,23 @@ pub fn launch(
             // Eligibility can change after stopping the old provider. A lost
             // target is a normal wait outcome; store failures retain their own
             // retry policy. Neither permits launching a rejected account.
-            let commit = || -> Result<Option<(Account, Arc<crate::live::Lease>)>> {
+            let commit = || {
                 let _lock = store.lock()?;
                 let mut state = store.load()?;
                 let settings = state.auto.get(&provider).cloned().unwrap_or_default();
-                let Some(next) = recovery_target(
+                let entries = rejected.filter(
+                    store,
                     &account.label,
-                    &rejected.filter(
+                    settings.threshold,
+                    models.filter_cached(
                         store,
                         &account.label,
-                        settings.threshold,
-                        models.filter_cached(
-                            store,
-                            &account.label,
-                            entries_from_cache(store, provider)?,
-                        ),
+                        entries_from_cache(store, provider)?,
                     ),
-                    &settings,
-                    now(),
-                )
-                .cloned() else {
+                );
+                let Some(next) =
+                    recovery_target(&account.label, &entries, &settings, now()).cloned()
+                else {
                     return Ok(None);
                 };
                 let next_lease = if next.label == account.label {
@@ -741,7 +758,8 @@ pub fn launch(
                 state.auto.entry(provider).or_default().last_switch = now();
                 store.save(&state)?;
                 rejected.resumed(store, &next, &state.accounts);
-                Ok(Some((next, next_lease)))
+                let fallback = quota_fallback(&next, &entries, &settings, now());
+                Ok(Some((next, next_lease, fallback)))
             };
             // Retried with the store lock released between attempts.
             let committed = store::retry_for(
@@ -766,6 +784,7 @@ pub fn launch(
             target = None;
             wake.retry(now());
         };
+        report_quota_fallback(&next, fallback);
         if quota_wait {
             eprintln!(
                 "aswap: quota available on {provider}:{}; resuming the same session{}",

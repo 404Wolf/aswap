@@ -29,6 +29,21 @@ pub(crate) use handout::hand_out;
 use handout::{carry, view_lock};
 use mcp::{MCP_OAUTH, mcp_record, with_mcp};
 
+/// A mkdir lock (proper-lockfile: a directory named `<file>.lock`), as Claude
+/// Code takes for `.storage-write` and `mcp-refresh-*.lock`. One is never
+/// linked into a view or published from one: through a symlink it can never
+/// be released or broken as stale (rmdir of a link fails with ENOTDIR, and
+/// mkdir over a dangling link fails with EEXIST), so one lock left in the
+/// shared home would block that write in every view for good. It guards a
+/// file in the same directory, and a view's own copy is what its processes
+/// share. Lock *files* (flock on a regular `*.lock`, as Codex's
+/// `session_index.jsonl.lock`) do work through a link and stay shared.
+fn lock_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.ends_with(".lock"))
+        && fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
 fn private(provider: Provider, name: &OsStr) -> bool {
     let name = name.to_string_lossy();
     name == provider.auth_file()
@@ -41,6 +56,10 @@ fn private(provider: Provider, name: &OsStr) -> bool {
                 | "backups"
                 | "remote-settings.json"
                 | "policy-limits.json"
+                // Claude's mkdir lock for writes to its auth file. The auth
+                // file is per view, so its lock is too; through a symlink the
+                // lock can never be removed and every MCP OAuth write fails.
+                | ".storage-write.lock"
         )
         || name.starts_with(".credentials")
         || name.starts_with("auth")
@@ -100,7 +119,7 @@ fn migrate_root(
     }
     let candidates: Vec<_> = entries(source)?
         .into_iter()
-        .filter(|p| !private(provider, p.file_name().unwrap()) && !link(p))
+        .filter(|p| !private(provider, p.file_name().unwrap()) && !link(p) && !lock_dir(p))
         .collect();
     if candidates.is_empty() {
         return Ok(());
@@ -311,7 +330,7 @@ impl View {
             auth_stamp: None,
         };
         for name in names {
-            if private(view.provider, &name) {
+            if private(view.provider, &name) || lock_dir(&view.home.join(&name)) {
                 continue;
             }
             let src = view.home.join(&name);
@@ -473,7 +492,11 @@ impl View {
         }
         for path in entries(&self.path)? {
             let name = path.file_name().unwrap();
-            if private(self.provider, name) || self.managed.contains(name) || link(&path) {
+            if private(self.provider, name)
+                || self.managed.contains(name)
+                || link(&path)
+                || lock_dir(&path)
+            {
                 continue;
             }
             let dest = self.home.join(name);
@@ -513,5 +536,14 @@ impl View {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    #[test]
+    fn auth_file_write_lock_stays_in_its_view() {
+        assert!(private(Provider::Claude, OsStr::new(".storage-write.lock")));
     }
 }

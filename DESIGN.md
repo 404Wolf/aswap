@@ -99,7 +99,10 @@ Clean exits do not restart; forced switches send the configured follow-up unless
 disabled. Restarts are capped at eight per hour (per run, before 2026-11-14:
 a session living for days could exhaust it and then sit at a limit). Limit
 rejections lapse after a doubling hold once a fresh reading is below the
-threshold; login and model rejections last the run. No code changes the caller's cwd.
+threshold, or after a verified window reset with quota remaining. When every
+alternative is at or above the soft threshold, an exhausted session uses the
+least-used eligible account below 100% as a last resort and logs that decision.
+Login and model rejections last the run. No code changes the caller's cwd.
 
 Store trouble (a full disk, EIO, EAGAIN) never ends a provider. Store locks and
 private writes retry with backoff, but under the store lock for at most 1.5
