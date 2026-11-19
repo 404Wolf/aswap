@@ -917,7 +917,8 @@ mod quiet_tests {
         let since_wall = quiet.since_wall;
         let entry = |kind: &str, at| {
             serde_json::json!({"type": kind,
-                "timestamp": chrono::DateTime::<chrono::Utc>::from(since_wall + at)})
+                "timestamp": chrono::DateTime::<chrono::Utc>::from(since_wall + at)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)})
         };
         std::fs::write(&path, format!("{}\n", entry("user", prompt))).unwrap();
         tracker.observe(pid).unwrap();
