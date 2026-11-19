@@ -197,6 +197,18 @@ fn a_codex_slot_without_a_duration_cannot_verify_the_other_slot() {
 }
 
 #[test]
+fn replaying_an_older_observation_cannot_clear_a_newer_hard_limit() {
+    let limited = weekly(100.0, Some(2000), 1200);
+    let old_reading = weekly(40.0, Some(2000), 1100).usage;
+    let replayed = usage::updated(limited, Ok(old_reading.clone()), 1100);
+    assert_eq!(replayed.used(1200), None);
+    let replayed_again = usage::updated(replayed, Ok(old_reading.clone()), 1100);
+    assert_eq!(replayed_again.used(1200), None);
+    let newer = usage::updated(replayed_again, Ok(old_reading), 1201);
+    assert_eq!(newer.used(1201), Some(40.0));
+}
+
+#[test]
 fn exhausted_accounts_use_remaining_quota_above_the_soft_threshold() {
     let entries = vec![
         (account("full"), weekly(100.0, Some(9000), 1000)),

@@ -106,7 +106,12 @@ pub struct Cached {
     pub error: Option<String>,
     /// Previously exhausted windows missing from the latest usable observation.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub unverified_limits: Vec<Window>,
+    pub unverified_limits: Vec<UnverifiedLimit>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnverifiedLimit {
+    window: Window,
+    observed_at: u64,
 }
 impl Cached {
     pub fn diagnostic(&self) -> Option<serde_json::Value> {
@@ -158,22 +163,29 @@ impl Cached {
         self.usage
             .windows
             .iter()
-            .chain(&self.unverified_limits)
+            .chain(self.unverified_limits.iter().map(|limit| &limit.window))
             .filter_map(|window| window.resets_at)
     }
 
     // A successful poll can omit a window. Keep its hard limit separate from
     // the new measurements so neither a partial poll nor time passing clears it.
     pub(crate) fn preserve_limits(&mut self, old: &Self) {
-        for window in old
+        for (window, observed_at) in old
             .unverified_limits
             .iter()
-            .chain(old.usage.windows.iter().filter(|w| w.used_percent >= 100.0))
+            .map(|limit| (&limit.window, limit.observed_at))
+            .chain(
+                old.usage
+                    .windows
+                    .iter()
+                    .filter(|w| w.used_percent >= 100.0)
+                    .map(|window| (window, old.fetched_at)),
+            )
         {
             let current = |w: &&Window| w.resets_at.is_none_or(|r| r > self.fetched_at);
             let matching = |w: &Window| w.name == window.name && w.codex_slot == window.codex_slot;
             let mut windows = self.usage.windows.iter().filter(current);
-            let observed = self.fetched_at >= old.fetched_at
+            let observed = self.fetched_at >= observed_at
                 && if window.name == "quota" {
                     // A durationally anonymous Codex window can be verified in
                     // its own slot or by a fresh reading covering both slots.
@@ -182,8 +194,21 @@ impl Cached {
                 } else {
                     windows.any(matching)
                 };
-            if !observed && !self.unverified_limits.iter().any(matching) {
-                self.unverified_limits.push(window.clone());
+            if observed {
+                continue;
+            }
+            let limit = UnverifiedLimit {
+                window: window.clone(),
+                observed_at,
+            };
+            match self
+                .unverified_limits
+                .iter_mut()
+                .find(|retained| matching(&retained.window))
+            {
+                Some(retained) if retained.observed_at < observed_at => *retained = limit,
+                Some(_) => (),
+                None => self.unverified_limits.push(limit),
             }
         }
     }
