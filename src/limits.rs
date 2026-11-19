@@ -7,10 +7,10 @@
 //!
 //! Only lines appended after the provider launched are parsed, only the three
 //! fields below are looked at, and nothing read is kept or logged.
-use crate::session::Tracker;
+use crate::{session::Tracker, shared::Stamp};
 use serde_json::Value;
 use std::{
-    fs::File,
+    fs::{File, Metadata},
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
     time::{Duration, Instant, SystemTime},
@@ -47,6 +47,8 @@ pub struct Limits {
 /// What has been read of one transcript.
 struct Tail {
     path: PathBuf,
+    /// The version read through its observed end, with no queued bytes.
+    read_stamp: Option<Stamp>,
     offset: u64,
     /// The bytes just before `offset`, as last read.
     anchor: Vec<u8>,
@@ -107,7 +109,8 @@ impl Limits {
             self.scanned = None;
         }
         if let Some(tail) = &mut self.main {
-            self.seen = tail.read(self.launched_wall);
+            self.seen = std::fs::metadata(&tail.path)
+                .is_ok_and(|metadata| tail.read(self.launched_wall, &metadata));
             let dir = tail.path.with_extension("").join("subagents");
             self.seen |= self.subagents_limited(&dir, fresh);
             return self.seen;
@@ -130,12 +133,12 @@ impl Limits {
         let mut files = Vec::new();
         subagent_files(dir, 0, since, &mut files);
         let mut found = false;
-        for path in files {
+        for (path, metadata) in files {
             let tail = self
                 .subagents
                 .entry(path.clone())
                 .or_insert_with(|| Tail::found(path, since));
-            found |= tail.read(since);
+            found |= tail.read(since, &metadata);
         }
         found
     }
@@ -147,7 +150,12 @@ const SCAN: Duration = Duration::from_secs(1);
 /// `.jsonl` files under `dir`, at most two levels down, modified since `since`:
 /// `subagents/agent-*.jsonl` and workflow agents'
 /// `subagents/workflows/wf_*/agent-*.jsonl`.
-fn subagent_files(dir: &std::path::Path, depth: usize, since: SystemTime, out: &mut Vec<PathBuf>) {
+fn subagent_files(
+    dir: &std::path::Path,
+    depth: usize,
+    since: SystemTime,
+    out: &mut Vec<(PathBuf, Metadata)>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -160,12 +168,10 @@ fn subagent_files(dir: &std::path::Path, depth: usize, since: SystemTime, out: &
             subagent_files(&path, depth + 1, since, out);
         } else if kind.is_file()
             && path.extension().is_some_and(|e| e == "jsonl")
-            && entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .is_ok_and(|m| m >= since)
+            && let Ok(metadata) = entry.metadata()
+            && metadata.modified().is_ok_and(|at| at >= since)
         {
-            out.push(path);
+            out.push((path, metadata));
         }
     }
 }
@@ -178,6 +184,7 @@ impl Tail {
             .unwrap_or_default();
         Self {
             path,
+            read_stamp: None,
             offset,
             anchor,
             partial: Vec::new(),
@@ -204,13 +211,18 @@ impl Tail {
 
     /// Read what was appended since the last read; whether it holds a limit
     /// entry stamped at or after `since`.
-    fn read(&mut self, since: SystemTime) -> bool {
+    fn read(&mut self, since: SystemTime, metadata: &Metadata) -> bool {
+        if self.read_stamp.as_ref() == Some(&Stamp::from_metadata(metadata)) {
+            return false;
+        }
+        self.read_stamp = None;
         let Ok(mut file) = File::open(&self.path) else {
             return false;
         };
-        let Ok(len) = file.metadata().map(|m| m.len()) else {
+        let Ok(metadata) = file.metadata() else {
             return false;
         };
+        let len = metadata.len();
         if len < self.offset
             || anchor(&mut file, self.offset).is_none_or(|bytes| bytes != self.anchor)
         {
@@ -221,7 +233,11 @@ impl Tail {
             self.partial.clear();
             self.skipping = false;
         }
-        if len == self.offset || file.seek(SeekFrom::Start(self.offset)).is_err() {
+        if len == self.offset {
+            self.read_stamp = Some(Stamp::from_metadata(&metadata));
+            return false;
+        }
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
             return false;
         }
         let mut chunk = Vec::new();
@@ -229,6 +245,9 @@ impl Tail {
             return false;
         };
         self.offset += n as u64;
+        if self.offset == len {
+            self.read_stamp = Some(Stamp::from_metadata(&metadata));
+        }
         self.anchor
             .extend_from_slice(&chunk[chunk.len().saturating_sub(ANCHOR)..]);
         let excess = self.anchor.len().saturating_sub(ANCHOR);
@@ -429,11 +448,12 @@ mod tests {
         assert!(tracker.transcript().is_none());
         assert!(!limits.check(Some(&tracker), false, true));
 
-        // Once the provider opens the new transcript its own limit counts.
+        // A live screen diagnostic can refresh the pending registry transcript
+        // immediately, without consulting the provider's descriptors.
         let mut current = File::options().append(true).open(new).unwrap();
         writeln!(current, "{}", entry(SystemTime::now(), "rate_limit")).unwrap();
-        tracker.observe(pid).unwrap();
-        assert!(limits.check(Some(&tracker), false, false));
+        tracker.observe_now(pid).unwrap();
+        assert!(limits.check(Some(&tracker), true, false));
     }
 
     #[test]
@@ -460,11 +480,15 @@ mod tests {
         let (_home, path, tracker) = setup(&first);
         let mut limits = Limits::new(Some(&tracker));
         assert!(!limits.check(Some(&tracker), false, false));
-        // Truncated and written again; a live limit of exactly the old length.
+        // The rewrite keeps the old length and mtime.
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(Duration::from_millis(5));
         let live = entry(SystemTime::now(), "rate_limit") + "\n";
         assert_eq!(live.len(), first.len());
-        std::fs::write(&path, &live).unwrap();
+        let mut file = File::create(&path).unwrap();
+        file.write_all(live.as_bytes()).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
         assert!(limits.check(Some(&tracker), false, false));
     }
 

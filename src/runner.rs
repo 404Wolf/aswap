@@ -286,14 +286,16 @@ pub fn run(
                     }
                     // While login errors are held, look at the transcript
                     // every QUIET_STEP to know closely when it changed.
-                    let step = if terminal.quiet_auth {
+                    let check_quiet = terminal.quiet_auth && quiet.needs_check();
+                    let step = if check_quiet {
                         left.min(QUIET_STEP)
                     } else {
                         left
                     };
-                    screen_limit |=
-                        terminal.pump_child(step.as_millis().max(1) as i32, &mut child.0)?;
-                    if terminal.quiet_auth {
+                    // Round up so an idle poll reaches the bookkeeping deadline.
+                    let wait_ms = step.as_nanos().div_ceil(1_000_000) as i32;
+                    screen_limit |= terminal.pump_child(wait_ms, &mut child.0)?;
+                    if check_quiet {
                         quiet.check();
                     }
                 }
@@ -320,7 +322,19 @@ pub fn run(
                 let _ = view.sync(store, &account);
             }
             if let Some(tracker) = &mut tracker {
-                hiccups.note("tracking the conversation", tracker.observe(child.0.id()));
+                // Refresh while the provider still owns its descriptors. A
+                // diagnostic can be followed immediately by provider exit.
+                let fresh = (screen_limit && !limited)
+                    || terminal.as_ref().is_some_and(|t| {
+                        (t.auth_expired && auth_seen.is_none())
+                            || (t.model_unsupported && !unsupported)
+                    });
+                let observed = if fresh {
+                    tracker.observe_now(child.0.id())
+                } else {
+                    tracker.observe(child.0.id())
+                };
+                hiccups.note("tracking the conversation", observed);
             }
             limited |= limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, false);
             if let Some(terminal) = &mut terminal {
@@ -349,11 +363,12 @@ pub fn run(
                     // revocation and its view getting the new token. The
                     // account is fine: resume the conversation on it. Until
                     // the conversation is known, retry on every tick.
-                    match prepare_resume(
+                    match prepare_live_resume(
                         store,
                         provider,
                         auto_args.as_ref().unwrap(),
-                        tracker.as_ref().unwrap(),
+                        tracker.as_mut().unwrap(),
+                        child.0.id(),
                     ) {
                         Ok(args) => {
                             rotated = true;
@@ -421,11 +436,12 @@ pub fn run(
                     wake.retry(now());
                 }
                 if target.is_some() && !restarts.capped() {
-                    match prepare_resume(
+                    match prepare_live_resume(
                         store,
                         provider,
                         auto_args.as_ref().unwrap(),
-                        tracker.as_ref().unwrap(),
+                        tracker.as_mut().unwrap(),
+                        child.0.id(),
                     ) {
                         Ok(args) => {
                             prepared_resume = Some(args);
@@ -844,6 +860,9 @@ impl Quiet {
             transcript,
             recorded: None,
         }
+    }
+    fn needs_check(&self) -> bool {
+        self.recorded.is_none() && self.transcript.is_some()
     }
     /// Check the cached transcript's stamp without walking the history.
     fn check(&mut self) {
@@ -1316,6 +1335,19 @@ impl Restarts {
     fn record(&mut self) {
         self.0.push_back(Instant::now());
     }
+}
+
+fn prepare_live_resume(
+    store: &Store,
+    provider: Provider,
+    args: &crate::session::AutoArgs,
+    tracker: &mut crate::session::Tracker,
+    pid: u32,
+) -> Result<Vec<String>> {
+    if provider == Provider::Codex {
+        tracker.observe_now(pid)?;
+    }
+    prepare_resume(store, provider, args, tracker)
 }
 
 // Build the exact argv before stopping a live provider. Unknown identity or

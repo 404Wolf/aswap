@@ -1,6 +1,6 @@
 //! Pass-through auto-mode argv and session identity tracking. Transcript contents are
 //! never read: only filenames, metadata, /proc descriptors and PID registry JSON.
-use crate::{Error, Result, Safe, provider::Provider, store};
+use crate::{Error, Result, Safe, provider::Provider, shared, store};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -272,10 +272,14 @@ impl AutoArgs {
 }
 const TRANSCRIPT_CHECK: Duration = Duration::from_secs(5);
 const TRANSCRIPT_RETRY_MAX: Duration = Duration::from_secs(60);
+// Resolved Codex sessions poll slowly while idle. Recovery refreshes the
+// identity before resuming a conversation.
+const FD_CHECK: Duration = Duration::from_secs(10);
 
 #[cfg(test)]
 thread_local! {
     static TRANSCRIPT_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FD_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn transcript_depth(provider: Provider) -> usize {
@@ -345,6 +349,8 @@ pub struct Tracker {
     transcript: Option<PathBuf>,
     next_check: Option<Instant>,
     retry_delay: Duration,
+    registry: Option<(u32, shared::Stamp, String)>,
+    last_fd_scan: Option<(u32, Instant)>,
 }
 impl Tracker {
     pub fn new(provider: Provider, home: &Path, id: Option<String>) -> Result<Self> {
@@ -368,9 +374,17 @@ impl Tracker {
                 .map(|_| Instant::now() + TRANSCRIPT_CHECK),
             retry_delay: TRANSCRIPT_CHECK,
             transcript,
+            registry: None,
+            last_fd_scan: None,
         })
     }
     pub fn observe(&mut self, pid: u32) -> Result<()> {
+        self.observe_with(pid, false)
+    }
+    pub(crate) fn observe_now(&mut self, pid: u32) -> Result<()> {
+        self.observe_with(pid, true)
+    }
+    fn observe_with(&mut self, pid: u32, fresh: bool) -> Result<()> {
         // Codex's rollout writer may live in its app-server child. Inspect only
         // this process tree's open descriptors, never another terminal's files.
         fn process_files(pid: u32, depth: usize, out: &mut Vec<PathBuf>) {
@@ -390,8 +404,32 @@ impl Tracker {
                 }
             }
         }
+        let now = Instant::now();
+        if let Some(path) = &self.transcript
+            && self.next_check.is_some_and(|at| at <= now)
+        {
+            if is_transcript_file(path) {
+                self.next_check = Some(now + TRANSCRIPT_CHECK);
+            } else {
+                self.transcript = None;
+            }
+        }
+        if self.provider == Provider::Claude {
+            self.refresh_registry(pid);
+        }
+        let registered = self.registry.as_ref().map(|(_, _, id)| id.as_str());
+        let fd_due = self.provider == Provider::Codex
+            && (fresh
+                || self.last_fd_scan.is_none_or(|(previous, at)| {
+                    previous != pid || now.duration_since(at) >= FD_CHECK
+                }));
         let mut descriptors = Vec::new();
-        process_files(pid, 0, &mut descriptors);
+        if registered.is_none() && (self.transcript.is_none() || fd_due) {
+            self.last_fd_scan = Some((pid, now));
+            #[cfg(test)]
+            FD_SCANS.with(|scans| scans.set(scans.get() + 1));
+            process_files(pid, 0, &mut descriptors);
+        }
         let owned: BTreeSet<_> = descriptors
             .iter()
             .filter(|p| p.starts_with(&self.root))
@@ -399,22 +437,7 @@ impl Tracker {
             .collect();
         // Claude's PID registry identifies the main conversation even while
         // subagents hold other transcripts open or unrelated terminals write.
-        let registered = if self.provider == Provider::Claude {
-            let registry = self.home.join("sessions").join(format!("{pid}.json"));
-            store::json_read::<Value>(&registry).ok().and_then(|v| {
-                (v.get("pid").and_then(Value::as_u64) == Some(pid as u64))
-                    .then(|| {
-                        v.get("sessionId")
-                            .and_then(Value::as_str)
-                            .filter(|s| valid_id(s))
-                            .map(str::to_owned)
-                    })
-                    .flatten()
-            })
-        } else {
-            None
-        };
-        let known = if let Some(id) = registered.as_deref() {
+        let known = if let Some(id) = registered {
             Some(id)
         } else if (self.provider == Provider::Claude && self.known.is_some()) || owned.is_empty() {
             // Shared history activity cannot contradict a known UUID. In
@@ -437,17 +460,8 @@ impl Tracker {
         let Some(id) = self.known.as_deref() else {
             return Ok(());
         };
-        let now = Instant::now();
-        let due = self.next_check.is_none_or(|at| at <= now);
-        if let Some(path) = &self.transcript {
-            if !due {
-                return Ok(());
-            }
-            if is_transcript_file(path) {
-                self.next_check = Some(now + TRANSCRIPT_CHECK);
-                return Ok(());
-            }
-            self.transcript = None;
+        if self.transcript.is_some() {
+            return Ok(());
         }
         // An open descriptor can name the exact file without guessing how
         // Claude encodes project directories, even between history lookups.
@@ -461,10 +475,32 @@ impl Tracker {
         });
         if let Some(path) = direct {
             self.cache_transcript(path, now);
-        } else if due {
+        } else if (registered.is_some() && fresh) || self.next_check.is_none_or(|at| at <= now) {
             self.walk_for_transcript(now)?;
         }
         Ok(())
+    }
+    fn refresh_registry(&mut self, pid: u32) {
+        // One stat per tick detects /clear and atomic replacement. Read the
+        // JSON again only when it changes or the last read did not prove an ID.
+        let path = self.home.join("sessions").join(format!("{pid}.json"));
+        let Some(stamp) = shared::stamp(&path) else {
+            self.registry = None;
+            return;
+        };
+        if self
+            .registry
+            .as_ref()
+            .is_some_and(|(previous, old, _)| *previous == pid && *old == stamp)
+        {
+            return;
+        }
+        self.registry = (|| {
+            let value: Value = store::json_read(&path).ok()?;
+            let id = value.get("sessionId")?.as_str()?;
+            (value.get("pid")?.as_u64()? == u64::from(pid) && valid_id(id))
+                .then(|| (pid, stamp, id.to_owned()))
+        })();
     }
     /// The cached path, if the conversation and its transcript are known.
     pub(crate) fn transcript(&self) -> Option<PathBuf> {
@@ -601,10 +637,20 @@ mod tracker_tests {
         ];
         let pid = std::process::id();
         let registry = home.path().join("sessions").join(format!("{pid}.json"));
+        store::json_write(&registry, &serde_json::json!({"pid":pid,"sessionId":MAIN})).unwrap();
+        let scans = || FD_SCANS.with(std::cell::Cell::get);
+        let before = scans();
+        for _ in 0..3 {
+            tracker.observe(pid).unwrap();
+            assert_eq!(tracker.id().unwrap(), MAIN);
+        }
+        assert_eq!(scans(), before, "a valid registry avoids descriptor scans");
+
         store::json_write(&registry, &serde_json::json!({"pid":pid,"sessionId":OTHER})).unwrap();
         tracker.observe(pid).unwrap();
         assert_eq!(tracker.id().unwrap(), OTHER);
         assert_eq!(tracker.transcript(), Some(other));
+        assert_eq!(scans(), before, "a registry switch also avoids a scan");
     }
 
     #[test]
@@ -742,14 +788,32 @@ mod tracker_tests {
         assert_eq!(tracker.transcript(), Some(other));
         assert_eq!(TRANSCRIPT_WALKS.with(std::cell::Cell::get), before);
         let main = rollout(home.path(), MAIN);
-        let _main_held = fs::File::open(main).unwrap();
+        let main_held = fs::File::open(main).unwrap();
+        let scans = FD_SCANS.with(std::cell::Cell::get);
         tracker.observe(std::process::id()).unwrap();
+        assert_eq!(tracker.id().unwrap(), OTHER);
+        assert_eq!(FD_SCANS.with(std::cell::Cell::get), scans);
+
+        // Recovery rechecks even before the cadence expires.
+        tracker.observe_now(std::process::id()).unwrap();
         assert!(
             tracker.id().is_err(),
             "two owned identities remain ambiguous"
         );
         assert!(tracker.transcript().is_none());
         drop(held);
+        tracker.observe(std::process::id()).unwrap();
+        assert_eq!(
+            tracker.id().unwrap(),
+            MAIN,
+            "retry immediately when unresolved"
+        );
+        drop(main_held);
+        let _held = fs::File::open(rollout(home.path(), OTHER)).unwrap();
+        let pid = std::process::id();
+        tracker.last_fd_scan = Some((pid, Instant::now() - FD_CHECK));
+        tracker.observe(pid).unwrap();
+        assert_eq!(tracker.id().unwrap(), OTHER);
     }
 
     #[test]
