@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::{
     fs::{File, Metadata},
     io::{Read, Seek, SeekFrom},
+    os::unix::fs::MetadataExt,
     path::PathBuf,
     time::{Duration, Instant, SystemTime},
 };
@@ -48,12 +49,26 @@ pub struct Limits {
 struct Tail {
     path: PathBuf,
     /// The version read through its observed end, with no queued bytes.
-    read_stamp: Option<Stamp>,
+    read_stamp: Option<TranscriptVersion>,
     offset: u64,
     /// The bytes just before `offset`, as last read.
     anchor: Vec<u8>,
     partial: Vec<u8>,
     skipping: bool,
+}
+
+#[derive(PartialEq)]
+struct TranscriptVersion(Stamp, i64, i64);
+
+impl TranscriptVersion {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        // ctime catches a same-length rewrite that restores the old mtime.
+        Self(
+            Stamp::from_metadata(metadata),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    }
 }
 
 /// Up to `ANCHOR` bytes of `file` just before `offset`.
@@ -212,7 +227,7 @@ impl Tail {
     /// Read what was appended since the last read; whether it holds a limit
     /// entry stamped at or after `since`.
     fn read(&mut self, since: SystemTime, metadata: &Metadata) -> bool {
-        if self.read_stamp.as_ref() == Some(&Stamp::from_metadata(metadata)) {
+        if self.read_stamp.as_ref() == Some(&TranscriptVersion::from_metadata(metadata)) {
             return false;
         }
         self.read_stamp = None;
@@ -234,7 +249,7 @@ impl Tail {
             self.skipping = false;
         }
         if len == self.offset {
-            self.read_stamp = Some(Stamp::from_metadata(&metadata));
+            self.read_stamp = Some(TranscriptVersion::from_metadata(&metadata));
             return false;
         }
         if file.seek(SeekFrom::Start(self.offset)).is_err() {
@@ -246,7 +261,7 @@ impl Tail {
         };
         self.offset += n as u64;
         if self.offset == len {
-            self.read_stamp = Some(Stamp::from_metadata(&metadata));
+            self.read_stamp = Some(TranscriptVersion::from_metadata(&metadata));
         }
         self.anchor
             .extend_from_slice(&chunk[chunk.len().saturating_sub(ANCHOR)..]);
