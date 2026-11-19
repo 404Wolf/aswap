@@ -5,8 +5,9 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    os::unix::fs::MetadataExt,
+    io::ErrorKind,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 pub fn valid_id(id: &str) -> bool {
     id.len() == 36
@@ -269,47 +270,56 @@ impl AutoArgs {
         Ok(args)
     }
 }
-#[derive(Clone, PartialEq)]
-struct Stamp(u64, u64, i64, i64);
-fn files(provider: Provider, home: &Path) -> Result<BTreeMap<PathBuf, Stamp>> {
+const TRANSCRIPT_CHECK: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+thread_local! {
+    static TRANSCRIPT_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn transcript_depth(provider: Provider) -> usize {
+    match provider {
+        Provider::Claude => 1,
+        Provider::Codex => 5,
+    }
+}
+
+fn find_transcript(provider: Provider, root: &Path, id: &str) -> Result<Option<PathBuf>> {
     fn walk(
         provider: Provider,
         path: &Path,
+        id: &str,
         depth: usize,
-        out: &mut BTreeMap<PathBuf, Stamp>,
+        found: &mut Option<PathBuf>,
     ) -> Result<()> {
-        if depth > 5 || !path.is_dir() {
-            return Ok(());
-        }
-        for e in fs::read_dir(path).safe("cannot inspect session filenames")? {
+        let entries = match fs::read_dir(path) {
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                return Ok(());
+            }
+            entries => entries.safe("cannot inspect session filenames")?,
+        };
+        for e in entries {
             let e = e.safe("cannot inspect session filename")?;
-            let p = e.path();
             let ty = e.file_type().safe("cannot inspect session metadata")?;
-            if ty.is_dir() {
-                if provider == Provider::Codex || depth == 0 {
-                    walk(provider, &p, depth + 1, out)?;
+            if ty.is_dir() && depth < transcript_depth(provider) {
+                walk(provider, &e.path(), id, depth + 1, found)?;
+            } else if ty.is_file() && filename_id(provider, Path::new(&e.file_name())) == Some(id) {
+                let path = e.path();
+                // Match the previous lexicographic lookup if history has copies.
+                if found.as_ref().is_none_or(|previous| path < *previous) {
+                    *found = Some(path);
                 }
-            } else if ty.is_file() && filename_id(provider, &p).is_some() {
-                let m = e.metadata().safe("cannot inspect session timestamp")?;
-                out.insert(p, Stamp(m.ino(), m.len(), m.mtime(), m.mtime_nsec()));
             }
         }
         Ok(())
     }
-    let mut out = BTreeMap::new();
-    walk(
-        provider,
-        &home.join(if provider == Provider::Claude {
-            "projects"
-        } else {
-            "sessions"
-        }),
-        0,
-        &mut out,
-    )?;
-    Ok(out)
+    #[cfg(test)]
+    TRANSCRIPT_WALKS.with(|walks| walks.set(walks.get() + 1));
+    let mut found = None;
+    walk(provider, root, id, 0, &mut found)?;
+    Ok(found)
 }
-fn filename_id(provider: Provider, path: &Path) -> Option<String> {
+fn filename_id(provider: Provider, path: &Path) -> Option<&str> {
     let stem = path.file_stem()?.to_str()?;
     if path.extension()? != "jsonl" {
         return None;
@@ -319,21 +329,40 @@ fn filename_id(provider: Provider, path: &Path) -> Option<String> {
     } else {
         stem
     };
-    valid_id(id).then(|| id.to_owned())
+    valid_id(id).then_some(id)
 }
+
+fn is_transcript_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
 pub struct Tracker {
     provider: Provider,
     home: PathBuf,
+    root: PathBuf,
     known: Option<String>,
-    files: BTreeMap<PathBuf, Stamp>,
+    transcript: Option<PathBuf>,
+    checked: Option<Instant>,
 }
 impl Tracker {
     pub fn new(provider: Provider, home: &Path, id: Option<String>) -> Result<Self> {
+        let root = home.join(match provider {
+            Provider::Claude => "projects",
+            Provider::Codex => "sessions",
+        });
+        // A resume needs the pre-launch transcript as its baseline. If it
+        // doesn't exist yet, give the running provider one immediate probe.
+        let transcript = match id.as_deref() {
+            Some(id) => find_transcript(provider, &root, id)?,
+            None => None,
+        };
         Ok(Self {
             provider,
             home: home.into(),
+            root,
             known: id,
-            files: files(provider, home)?,
+            checked: transcript.as_ref().map(|_| Instant::now()),
+            transcript,
         })
     }
     pub fn observe(&mut self, pid: u32) -> Result<()> {
@@ -358,21 +387,10 @@ impl Tracker {
         }
         let mut descriptors = Vec::new();
         process_files(pid, 0, &mut descriptors);
-        let root = self.home.join(if self.provider == Provider::Claude {
-            "projects"
-        } else {
-            "sessions"
-        });
         let owned: BTreeSet<_> = descriptors
             .iter()
-            .filter(|p| p.starts_with(&root))
+            .filter(|p| p.starts_with(&self.root))
             .filter_map(|p| filename_id(self.provider, p))
-            .collect();
-        let current = files(self.provider, &self.home)?;
-        let changed: BTreeSet<_> = current
-            .iter()
-            .filter(|(p, s)| self.files.get(*p) != Some(*s))
-            .filter_map(|(p, _)| filename_id(self.provider, p))
             .collect();
         // Claude's PID registry identifies the main conversation even while
         // subagents hold other transcripts open or unrelated terminals write.
@@ -391,36 +409,64 @@ impl Tracker {
         } else {
             None
         };
-        if let Some(id) = registered {
-            self.known = Some(id);
-        } else if self.known.is_some() && (self.provider == Provider::Claude || owned.is_empty()) {
+        let known = if let Some(id) = registered.as_deref() {
+            Some(id)
+        } else if (self.provider == Provider::Claude && self.known.is_some()) || owned.is_empty() {
             // Shared history activity cannot contradict a known UUID. In
             // particular, an exited Codex has no descriptors left: another
             // terminal writing then must not strand its exact resume ID.
             // Claude's open files may belong to subagents; Codex can still
             // prove an actual session change with its owned rollout below.
+            self.known.as_deref()
         } else if owned.len() == 1 {
-            self.known = owned.into_iter().next();
-        } else if owned.len() > 1 || changed.iter().any(|s| self.known.as_ref() != Some(s)) {
-            self.known = None;
+            owned.first().copied()
+        } else {
+            None
+        };
+        if known != self.known.as_deref() {
+            self.known = known.map(str::to_owned);
+            self.transcript = None;
+            self.checked = None;
         }
-        self.files = current;
+        let Some(id) = self.known.as_deref() else {
+            return Ok(());
+        };
+        if self
+            .checked
+            .is_some_and(|at| at.elapsed() < TRANSCRIPT_CHECK)
+        {
+            return Ok(());
+        }
+        self.checked = Some(Instant::now());
+        if self.transcript.as_deref().is_some_and(is_transcript_file) {
+            return Ok(());
+        }
+        // An open descriptor can name the exact file without guessing how
+        // Claude encodes project directories. Exclude deeper subagent paths.
+        self.transcript = descriptors.into_iter().find(|path| {
+            path.strip_prefix(&self.root).is_ok_and(|relative| {
+                relative.components().count() <= transcript_depth(self.provider) + 1
+                    && filename_id(self.provider, relative) == Some(id)
+                    && is_transcript_file(path)
+            })
+        });
+        if self.transcript.is_none() {
+            self.transcript = find_transcript(self.provider, &self.root, id)?;
+        }
         Ok(())
     }
-    /// The tracked conversation's transcript, from the last `observe`
-    /// (no walk); None while the identity or the file is unknown.
+    /// The cached path, if the conversation and its transcript are known.
     pub(crate) fn transcript(&self) -> Option<PathBuf> {
-        self.find(self.files.keys())
+        self.transcript.clone()
     }
-    /// The same, from a fresh walk: for when no further `observe` will come.
-    pub(crate) fn transcript_now(&self) -> Option<PathBuf> {
-        self.find(files(self.provider, &self.home).ok()?.keys())
-    }
-    fn find<'a>(&self, mut paths: impl Iterator<Item = &'a PathBuf>) -> Option<PathBuf> {
-        let id = self.known.as_deref()?;
-        paths
-            .find(|path| filename_id(self.provider, path).as_deref() == Some(id))
-            .cloned()
+    /// Refresh the cache after provider exit, when no further `observe` will come.
+    pub(crate) fn transcript_now(&mut self) {
+        if let Some(id) = self.known.as_deref() {
+            self.transcript = find_transcript(self.provider, &self.root, id)
+                .ok()
+                .flatten();
+            self.checked = self.transcript.as_ref().map(|_| Instant::now());
+        }
     }
     pub fn id(&self) -> Result<&str> {
         self.known.as_deref().ok_or(Error(
@@ -515,13 +561,72 @@ mod tracker_tests {
         let other = transcript(home.path(), OTHER);
         let _held = [
             fs::File::open(main).unwrap(),
-            fs::File::open(other).unwrap(),
+            fs::File::open(&other).unwrap(),
         ];
         let pid = std::process::id();
         let registry = home.path().join("sessions").join(format!("{pid}.json"));
         store::json_write(&registry, &serde_json::json!({"pid":pid,"sessionId":OTHER})).unwrap();
         tracker.observe(pid).unwrap();
         assert_eq!(tracker.id().unwrap(), OTHER);
+        assert_eq!(tracker.transcript(), Some(other));
+    }
+
+    #[test]
+    fn steady_state_ticks_do_not_walk_and_a_removed_transcript_is_resolved_again() {
+        let home = tempfile::tempdir().unwrap();
+        let path = transcript(home.path(), MAIN);
+        let walks = || TRANSCRIPT_WALKS.with(std::cell::Cell::get);
+        let before = walks();
+        let mut tracker = Tracker::new(Provider::Claude, home.path(), Some(MAIN.into())).unwrap();
+        let pid = std::process::id();
+        assert_eq!(tracker.transcript().as_ref(), Some(&path));
+        assert_eq!(walks(), before + 1);
+
+        let unrelated = transcript(home.path(), OTHER);
+        for _ in 0..3 {
+            fs::write(&unrelated, "unrelated changes").unwrap();
+            tracker.observe(pid).unwrap();
+            assert_eq!(tracker.transcript().as_ref(), Some(&path));
+        }
+        tracker.checked = Some(Instant::now() - TRANSCRIPT_CHECK);
+        tracker.observe(pid).unwrap();
+        assert_eq!(walks(), before + 1, "revalidation needs only a stat");
+
+        let dir = home.path().join("projects/another-project");
+        fs::create_dir(&dir).unwrap();
+        let moved = dir.join(path.file_name().unwrap());
+        fs::rename(&path, &moved).unwrap();
+        tracker.checked = Some(Instant::now() - TRANSCRIPT_CHECK);
+        tracker.observe(pid).unwrap();
+        assert_eq!(tracker.transcript(), Some(moved));
+        assert_eq!(walks(), before + 2);
+    }
+
+    #[test]
+    fn a_missing_transcript_is_retried_on_interval_and_can_be_found_at_exit() {
+        let home = tempfile::tempdir().unwrap();
+        let mut tracker = Tracker::new(Provider::Claude, home.path(), Some(MAIN.into())).unwrap();
+        let pid = std::process::id();
+        tracker.observe(pid).unwrap();
+        let walks = || TRANSCRIPT_WALKS.with(std::cell::Cell::get);
+        let before = walks();
+        let path = transcript(home.path(), MAIN);
+        tracker.observe(pid).unwrap();
+        assert!(tracker.transcript().is_none());
+        assert_eq!(walks(), before);
+
+        tracker.checked = Some(Instant::now() - TRANSCRIPT_CHECK);
+        tracker.observe(pid).unwrap();
+        assert_eq!(tracker.transcript().as_ref(), Some(&path));
+        assert_eq!(walks(), before + 1);
+
+        fs::remove_file(&path).unwrap();
+        tracker.checked = Some(Instant::now() - TRANSCRIPT_CHECK);
+        tracker.observe(pid).unwrap();
+        assert!(tracker.transcript().is_none());
+        transcript(home.path(), MAIN);
+        tracker.transcript_now();
+        assert_eq!(tracker.transcript(), Some(path));
     }
 
     #[test]
@@ -567,9 +672,12 @@ mod tracker_tests {
         let home = tempfile::tempdir().unwrap();
         let mut tracker = Tracker::new(Provider::Codex, home.path(), Some(MAIN.into())).unwrap();
         let other = rollout(home.path(), OTHER);
-        let held = fs::File::open(other).unwrap();
+        let held = fs::File::open(&other).unwrap();
+        let before = TRANSCRIPT_WALKS.with(std::cell::Cell::get);
         tracker.observe(std::process::id()).unwrap();
         assert_eq!(tracker.id().unwrap(), OTHER);
+        assert_eq!(tracker.transcript(), Some(other));
+        assert_eq!(TRANSCRIPT_WALKS.with(std::cell::Cell::get), before);
         let main = rollout(home.path(), MAIN);
         let _main_held = fs::File::open(main).unwrap();
         tracker.observe(std::process::id()).unwrap();
@@ -577,6 +685,7 @@ mod tracker_tests {
             tracker.id().is_err(),
             "two owned identities remain ambiguous"
         );
+        assert!(tracker.transcript().is_none());
         drop(held);
     }
 

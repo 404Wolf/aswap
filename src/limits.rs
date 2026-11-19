@@ -86,21 +86,15 @@ impl Limits {
     /// Whether this provider has hit a usage limit: its transcript gained a
     /// limit entry since launch, or, while no transcript is known, the screen
     /// (`screen`: shown since the last check) showed one `UNCONFIRMED` or
-    /// more after launch. `fresh` walks the provider home again, for when the
-    /// provider is gone and no further `observe` comes.
+    /// more after launch. `fresh` checks subagents even if they were just
+    /// scanned, for when the provider is gone.
     pub fn check(&mut self, tracker: Option<&Tracker>, screen: bool, fresh: bool) -> bool {
         if self.seen {
             return true;
         }
         // Follow the tracker: a /clear or another conversation picked inside
         // the provider moves its writes, limits included, to a new transcript.
-        let current = tracker.and_then(|t| {
-            if fresh {
-                t.transcript_now()
-            } else {
-                t.transcript()
-            }
-        });
+        let current = tracker.and_then(Tracker::transcript);
         if let Some(path) = current
             && self.main.as_ref().is_none_or(|tail| tail.path != path)
         {

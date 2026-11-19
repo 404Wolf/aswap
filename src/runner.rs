@@ -292,7 +292,7 @@ pub fn run(
                     screen_limit |=
                         terminal.pump_child(step.as_millis().max(1) as i32, &mut child.0)?;
                     if terminal.quiet_auth {
-                        quiet.check(tracker.as_ref(), false);
+                        quiet.check(tracker.as_ref());
                     }
                 }
             }
@@ -322,7 +322,7 @@ pub fn run(
             }
             limited |= limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, false);
             if let Some(terminal) = &mut terminal {
-                quiet.apply(terminal, tracker.as_ref(), false);
+                quiet.apply(terminal, tracker.as_ref());
             }
             if let Some(status) = child.0.try_wait().safe("cannot wait for provider")? {
                 break status;
@@ -459,10 +459,12 @@ pub fn run(
         hiccups.running = false;
         if let Some(terminal) = &mut terminal {
             let screen_limit = terminal.child_exited()?;
+            // Pick up a transcript written after the last observation.
+            if let Some(tracker) = &mut tracker {
+                tracker.transcript_now();
+            }
             limited |= limit_seen(provider, &mut limits, tracker.as_ref(), screen_limit, true);
-            // The provider is gone and the tracker will not walk again: look
-            // for a transcript it created in its last moments afresh.
-            quiet.apply(terminal, tracker.as_ref(), true);
+            quiet.apply(terminal, tracker.as_ref());
         }
         hiccups.note("saving the provider's view", view.sync(store, &account));
         if !auto {
@@ -802,24 +804,17 @@ impl Quiet {
             recorded: None,
         }
     }
-    /// One stat; the path comes from the tracker's last walk, or a new one
-    /// when `fresh`.
-    fn check(&mut self, tracker: Option<&crate::session::Tracker>, fresh: bool) {
+    /// Check the cached transcript's stamp without walking the history.
+    fn check(&mut self, tracker: Option<&crate::session::Tracker>) {
         if self.recorded.is_some() {
             return;
         }
         if self.transcript.is_none() {
-            // Found only now (the tracker learns files once a tick). One
+            // Found only now (the tracker learns files between checks). One
             // unchanged since before launch is the baseline, so finding it is
             // not a change. One written since launch is the resume prompt
             // being recorded: date that by its mtime, since finding it lags.
-            self.transcript = tracker.and_then(|t| {
-                if fresh {
-                    t.transcript_now()
-                } else {
-                    t.transcript()
-                }
-            });
+            self.transcript = tracker.and_then(|t| t.transcript());
             let Some(path) = &self.transcript else {
                 return;
             };
@@ -842,16 +837,11 @@ impl Quiet {
     }
     /// Count held login errors that are live, and stop holding once nothing
     /// read from now on can be part of the redraw.
-    fn apply(
-        &mut self,
-        terminal: &mut Terminal,
-        tracker: Option<&crate::session::Tracker>,
-        fresh: bool,
-    ) {
+    fn apply(&mut self, terminal: &mut Terminal, tracker: Option<&crate::session::Tracker>) {
         if !terminal.quiet_auth {
             return;
         }
-        self.check(tracker, fresh);
+        self.check(tracker);
         if let Some(recorded) = self.recorded {
             let live = recorded + RESUME_LIVE;
             terminal.auth_expired |= terminal.held_auth.iter().any(|at| *at > live);
