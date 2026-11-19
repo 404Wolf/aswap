@@ -571,3 +571,76 @@ fn hand_out_child() {
         assert!(!view.auth_changed(&store, one));
     }
 }
+#[test]
+fn a_stale_lock_directory_in_the_home_never_blocks_a_view() {
+    let t = tempfile::tempdir().unwrap();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "lock_dir_child", "--nocapture"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", t.path())
+        .env("XDG_DATA_HOME", t.path().join("data"))
+        .env("CLAUDE_CONFIG_DIR", t.path().join("claude"))
+        .env("ASWAP_LOCK_DIR_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+#[test]
+fn lock_dir_child() {
+    if std::env::var("ASWAP_LOCK_DIR_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    let store = Store::from_env().unwrap();
+    let home = Provider::Claude.current_home().unwrap();
+    store::json_write(
+        &home.join(".credentials.json"),
+        &json!({"claudeAiOauth":{"accessToken":"synthetic-access"}}),
+    )
+    .unwrap();
+    let a = provider::add(&store, Provider::Claude, "one").unwrap();
+    // Left behind in the shared home by a process that died holding them
+    // (as ~/.claude/.storage-write.lock was on 2026-11-19), beside a lock
+    // *file*, which flock shares correctly through a link.
+    for dir in [
+        ".storage-write.lock",
+        "mcp-refresh-synthetic_0011.lock.lock",
+    ] {
+        fs::create_dir(home.join(dir)).unwrap();
+    }
+    fs::write(home.join("session_index.jsonl.lock"), b"").unwrap();
+    let mut view = View::prepare(&store, &a).unwrap();
+    for dir in [
+        ".storage-write.lock",
+        "mcp-refresh-synthetic_0011.lock.lock",
+    ] {
+        let path = view.path.join(dir);
+        assert!(
+            fs::symlink_metadata(&path).is_err(),
+            "{dir} was linked into the view"
+        );
+        // Claude's proper-lockfile works in the view: take, release, take.
+        fs::create_dir(&path).unwrap();
+        fs::remove_dir(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+    }
+    assert!(
+        fs::symlink_metadata(view.path.join("session_index.jsonl.lock"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "a lock file stays shared"
+    );
+    // A lock the view holds while it syncs is never published to the home,
+    // where it would block every later view.
+    fs::create_dir(view.path.join("held.lock")).unwrap();
+    view.sync(&store, &a).unwrap();
+    assert!(!home.join("held.lock").exists());
+    // The stale locks in the home are left alone.
+    assert!(home.join(".storage-write.lock").is_dir());
+}
