@@ -142,6 +142,7 @@ fn runner_child() {
                         used_percent: pct,
                         resets_at: None,
                         duration_minutes: Some(300),
+                        codex_slot: None,
                     }],
                     ..Default::default()
                 },
@@ -949,6 +950,7 @@ fn runner_safety_child() {
                     used_percent: pct,
                     resets_at: None,
                     duration_minutes: Some(300),
+                    codex_slot: None,
                 }],
                 ..Default::default()
             },

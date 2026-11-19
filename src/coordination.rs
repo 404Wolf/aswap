@@ -404,7 +404,7 @@ fn install_permitted(
     }
     let count = packet.profiles.len();
     let mut changed = false;
-    for p in packet.profiles {
+    for mut p in packet.profiles {
         let path = store.profile(p.account.provider, &p.account.label)?;
         store::private_dir(&path)?;
         let auth = crate::refresh::access_only(p.account.provider, &p.auth);
@@ -419,7 +419,11 @@ fn install_permitted(
                 &crate::shared::account_config(&p.config),
             )?;
         }
-        write_changed(&path.join("usage-cache.json"), &p.cache)?;
+        let cache_path = path.join("usage-cache.json");
+        if let Ok(old) = store::json_read(&cache_path) {
+            p.cache.preserve_limits(&old);
+        }
+        write_changed(&cache_path, &p.cache)?;
         if !state
             .accounts
             .iter()
@@ -1182,6 +1186,7 @@ mod tests {
                     used_percent: 42.0,
                     resets_at: None,
                     duration_minutes: Some(300),
+                    codex_slot: None,
                 }],
                 ..Default::default()
             },
