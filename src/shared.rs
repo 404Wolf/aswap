@@ -86,6 +86,10 @@ fn private(provider: Provider, name: &OsStr) -> bool {
                 | "backups"
                 | "remote-settings.json"
                 | "policy-limits.json"
+                // Claude's mkdir lock for writes to its auth file. The auth
+                // file is per view, so its lock is too; through a symlink the
+                // lock can never be removed and every MCP OAuth write fails.
+                | ".storage-write.lock"
         )
         || name.starts_with(".credentials")
         || name.starts_with("auth")
@@ -909,6 +913,10 @@ impl View {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+    #[test]
+    fn auth_file_write_lock_stays_in_its_view() {
+        assert!(private(Provider::Claude, OsStr::new(".storage-write.lock")));
+    }
     #[test]
     fn snapshot_omits_only_account_and_top_level_process_keys() {
         let config = json!({
