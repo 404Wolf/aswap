@@ -918,6 +918,25 @@ mod quiet_tests {
     };
 
     #[test]
+    fn a_redraw_just_after_the_prompt_stays_quiet() {
+        let mut quiet = Quiet::new(None);
+        let prompt = Instant::now() - 2 * RESUME_LIVE;
+        quiet.recorded = Some(prompt);
+        let mut terminal = Terminal::open().unwrap();
+        terminal.quiet_auth = true;
+        terminal.held_auth.push(prompt + Duration::from_millis(20));
+        quiet.apply(&mut terminal, None);
+        assert!(!terminal.auth_expired);
+
+        terminal.quiet_auth = true;
+        terminal
+            .held_auth
+            .push(prompt + RESUME_LIVE + Duration::from_millis(1));
+        quiet.apply(&mut terminal, None);
+        assert!(terminal.auth_expired);
+    }
+
+    #[test]
     fn chmod_does_not_make_a_redrawn_login_error_live() {
         let home = tempfile::tempdir().unwrap();
         let id = "11111111-2222-4333-8444-555555555555";
