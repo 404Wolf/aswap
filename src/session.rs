@@ -6,6 +6,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::ErrorKind,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -272,9 +273,9 @@ impl AutoArgs {
 }
 const TRANSCRIPT_CHECK: Duration = Duration::from_secs(5);
 const TRANSCRIPT_RETRY_MAX: Duration = Duration::from_secs(60);
-// Check the known rollout descriptor each tick. A full scan on this cadence
-// also catches additional rollouts opened while that descriptor was unchanged.
-const FD_CHECK: Duration = Duration::from_secs(15);
+// Check the known rollout writer each tick, including its access mode. A full
+// scan on this cadence also catches additional rollouts alongside that writer.
+const FD_CHECK: Duration = Duration::from_secs(20);
 
 #[cfg(test)]
 thread_local! {
@@ -341,6 +342,11 @@ fn is_transcript_file(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
+fn writable_proc_fd(path: &Path) -> bool {
+    // Linux gives /proc/<pid>/fd symlinks the access mode of the open fd.
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink() && m.mode() & libc::S_IWUSR != 0)
+}
+
 pub struct Tracker {
     provider: Provider,
     home: PathBuf,
@@ -351,8 +357,7 @@ pub struct Tracker {
     retry_delay: Duration,
     registry: Option<(u32, shared::Stamp, String)>,
     last_fd_scan: Option<(u32, Instant)>,
-    rollout_fd: Option<(PathBuf, PathBuf)>,
-    codex_scan_skipped: bool,
+    rollout_writer: Option<(PathBuf, PathBuf)>,
 }
 impl Tracker {
     pub fn new(provider: Provider, home: &Path, id: Option<String>) -> Result<Self> {
@@ -378,8 +383,7 @@ impl Tracker {
             transcript,
             registry: None,
             last_fd_scan: None,
-            rollout_fd: None,
-            codex_scan_skipped: false,
+            rollout_writer: None,
         })
     }
     pub fn observe(&mut self, pid: u32) -> Result<()> {
@@ -430,10 +434,9 @@ impl Tracker {
                 || self.last_fd_scan.is_none_or(|(previous, at)| {
                     previous != pid || now.duration_since(at) >= FD_CHECK
                 })
-                || self
-                    .rollout_fd
-                    .as_ref()
-                    .is_none_or(|(fd, path)| fs::read_link(fd).ok().as_ref() != Some(path)));
+                || self.rollout_writer.as_ref().is_none_or(|(fd, path)| {
+                    fs::read_link(fd).ok().as_ref() != Some(path) || !writable_proc_fd(fd)
+                }));
         let scan = registered.is_none() && (self.transcript.is_none() || fd_due);
         let mut descriptors = Vec::new();
         if scan {
@@ -446,23 +449,17 @@ impl Tracker {
             .iter()
             .filter_map(|(_, path)| filename_id(self.provider, path))
             .collect();
-        if self.provider == Provider::Codex {
-            if scan {
-                self.rollout_fd = match owned.first().filter(|_| owned.len() == 1) {
-                    Some(id) => descriptors
-                        .iter()
-                        .find(|(_, path)| filename_id(self.provider, path) == Some(*id))
-                        .cloned(),
-                    None => None,
-                };
-                // An empty scan after the writer exits cannot establish which
-                // rollouts were open during the skipped observations.
-                if !owned.is_empty() {
-                    self.codex_scan_skipped = false;
-                }
-            } else {
-                self.codex_scan_skipped = true;
-            }
+        if scan && self.provider == Provider::Codex {
+            // A retained history reader can outlive a switch to another
+            // conversation. Throttle only while an owned writer is present.
+            self.rollout_writer = owned.first().filter(|_| owned.len() == 1).and_then(|id| {
+                descriptors
+                    .iter()
+                    .find(|(fd, path)| {
+                        filename_id(self.provider, path) == Some(*id) && writable_proc_fd(fd)
+                    })
+                    .cloned()
+            });
         }
         // Claude's PID registry identifies the main conversation even while
         // subagents hold other transcripts open or unrelated terminals write.
@@ -568,14 +565,6 @@ impl Tracker {
         self.known.as_deref()
     }
     pub fn id(&self) -> Result<&str> {
-        // One matching descriptor can coexist with a writer for another ID.
-        // The cached ID still serves transcript tracking, but recovery needs
-        // a full scan that saw ownership after the most recent skipped tick.
-        if self.codex_scan_skipped {
-            return Err(Error(
-                "Codex session identity could not be confirmed; refusing an automatic restart",
-            ));
-        }
         self.known_id().ok_or(Error(
             "exact session identity unavailable; refusing an automatic restart",
         ))
@@ -798,6 +787,10 @@ mod tracker_tests {
         path
     }
 
+    fn rollout_writer(path: &Path) -> fs::File {
+        fs::OpenOptions::new().append(true).open(path).unwrap()
+    }
+
     #[test]
     fn explicit_codex_identity_survives_other_sessions_writing_after_child_exit() {
         let home = tempfile::tempdir().unwrap();
@@ -816,14 +809,14 @@ mod tracker_tests {
         let home = tempfile::tempdir().unwrap();
         let mut tracker = Tracker::new(Provider::Codex, home.path(), Some(MAIN.into())).unwrap();
         let other = rollout(home.path(), OTHER);
-        let held = fs::File::open(&other).unwrap();
+        let held = rollout_writer(&other);
         let before = TRANSCRIPT_WALKS.with(std::cell::Cell::get);
         tracker.observe(std::process::id()).unwrap();
         assert_eq!(tracker.id().unwrap(), OTHER);
         assert_eq!(tracker.transcript(), Some(other));
         assert_eq!(TRANSCRIPT_WALKS.with(std::cell::Cell::get), before);
         let main = rollout(home.path(), MAIN);
-        let main_held = fs::File::open(main).unwrap();
+        let main_held = rollout_writer(&main);
         let scans = FD_SCANS.with(std::cell::Cell::get);
         tracker.observe(std::process::id()).unwrap();
         assert_eq!(tracker.known_id(), Some(OTHER));
@@ -843,7 +836,7 @@ mod tracker_tests {
             MAIN,
             "retry immediately when unresolved"
         );
-        let _held = fs::File::open(rollout(home.path(), OTHER)).unwrap();
+        let _held = rollout_writer(&rollout(home.path(), OTHER));
         let pid = std::process::id();
         tracker.last_fd_scan = Some((pid, Instant::now() - FD_CHECK));
         tracker.observe(pid).unwrap();
@@ -855,26 +848,23 @@ mod tracker_tests {
     }
 
     #[test]
-    fn a_codex_switch_is_tracked_and_can_be_confirmed_before_exit() {
+    fn a_codex_switch_before_exit_resumes_the_new_conversation() {
         let home = tempfile::tempdir().unwrap();
         let main = rollout(home.path(), MAIN);
         let other = rollout(home.path(), OTHER);
         let mut tracker = Tracker::new(Provider::Codex, home.path(), None).unwrap();
         let pid = std::process::id();
-        let held_main = fs::File::open(main).unwrap();
+        let held_main = rollout_writer(&main);
         tracker.observe(pid).unwrap();
         assert_eq!(tracker.id().unwrap(), MAIN);
         drop(held_main);
 
-        let held_other = fs::File::open(other).unwrap();
+        let held_other = rollout_writer(&other);
         // /new has switched the writer, but the next periodic scan is far off.
         for _ in 0..3 {
             tracker.observe(pid).unwrap();
         }
         assert_eq!(tracker.known_id(), Some(OTHER));
-        assert!(tracker.id().is_err());
-        // A diagnostic while the provider still owns the fd can confirm it.
-        tracker.observe_now(pid).unwrap();
         drop(held_other);
         tracker.observe_now(pid).unwrap();
         let args = AutoArgs::parse(Provider::Codex, &[]).unwrap();
@@ -882,6 +872,32 @@ mod tracker_tests {
             .resume(Provider::Codex, tracker.id().unwrap(), None)
             .unwrap();
         assert_eq!(resume, ["resume", OTHER]);
+    }
+
+    #[test]
+    fn an_unchanged_codex_writer_can_resume_after_an_idle_exit() {
+        let home = tempfile::tempdir().unwrap();
+        let writer = rollout_writer(&rollout(home.path(), MAIN));
+        let mut tracker = Tracker::new(Provider::Codex, home.path(), None).unwrap();
+        let pid = std::process::id();
+        tracker.observe(pid).unwrap();
+        let scans = FD_SCANS.with(std::cell::Cell::get);
+        for _ in 0..3 {
+            tracker.observe(pid).unwrap();
+        }
+        assert_eq!(
+            FD_SCANS.with(std::cell::Cell::get),
+            scans,
+            "a stable writer stays on the cheap path"
+        );
+
+        drop(writer);
+        tracker.observe_now(pid).unwrap();
+        let args = AutoArgs::parse(Provider::Codex, &[]).unwrap();
+        let resume = args
+            .resume(Provider::Codex, tracker.id().unwrap(), None)
+            .unwrap();
+        assert_eq!(resume, ["resume", MAIN]);
     }
 
     #[test]
@@ -895,12 +911,11 @@ mod tracker_tests {
         tracker.observe(pid).unwrap();
         assert_eq!(tracker.id().unwrap(), MAIN);
 
-        let writer = fs::OpenOptions::new().append(true).open(other).unwrap();
-        let scans = FD_SCANS.with(std::cell::Cell::get);
+        let writer = rollout_writer(&other);
         for _ in 0..3 {
             tracker.observe(pid).unwrap();
         }
-        assert_eq!(FD_SCANS.with(std::cell::Cell::get), scans);
+        assert!(tracker.id().is_err(), "the live scan sees both IDs");
         drop((reader, writer));
 
         // Both descriptors can vanish before the diagnostic forces a scan.
