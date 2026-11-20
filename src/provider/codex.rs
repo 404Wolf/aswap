@@ -195,6 +195,11 @@ impl Spec for Codex {
     fn session_by_writer(&self) -> bool {
         true
     }
+    /// Codex opens state, goals, memories, queue and logs databases under
+    /// `CODEX_SQLITE_HOME` (default `CODEX_HOME`); verified with 0.171.
+    fn database_home_var(&self) -> Option<&'static str> {
+        Some("CODEX_SQLITE_HOME")
+    }
     fn limit_from_stale_login(&self) -> bool {
         true
     }

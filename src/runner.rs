@@ -304,6 +304,7 @@ pub fn launch(
             Some(via) => via.command(provider, &view.path),
             None => provider.command(&view.path),
         };
+        crate::provider::share_databases(provider, &mut cmd, &view.home);
         if let Some(tracker) = &mut tracker
             && provider
                 .spec()
