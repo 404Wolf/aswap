@@ -134,8 +134,9 @@ If Linux denies a read, GC checks the process command line. It keeps the
 view if the command line is unavailable, empty, or mentions the view, Claude,
 Codex, aswap, or Node. The report counts unreadable non-provider processes it
 skipped, once per PID. GC rechecks ambiguous descriptor snapshots against the
-current process state. A descriptor-related keep reason includes the PID and a
-redacted command-line excerpt. Views containing mount points stay in place.
+current process state. It also retries failed working-directory and environment
+reads. When a process still makes liveness uncertain, the reason includes its PID
+and a redacted command-line excerpt. Views containing mount points stay in place.
 
 GC compares the size and SHA-256 of duplicate transcripts. Unique transcripts
 move to the same relative path in the shared provider home. GC keeps unmarked
@@ -156,7 +157,9 @@ data, GC leaves the shared file in place. Conflicting transcripts and any
 view-local private files without a verified identical shared copy go into an
 owner-only archive at `archive/<provider>/<label>/<run>/`. GC always snapshots
 private SQLite databases, including committed WAL data, even when the main file
-matches the shared copy. GC unlinks all-symlink SQLite groups without opening
+matches the shared copy. The snapshot checks I/O pressure between batches of
+pages and times out after a sustained lack of progress. GC prunes
+`logs_*.sqlite` groups as regenerable. GC unlinks all-symlink SQLite groups without opening
 their targets. It also discards regenerable SQLite shared-memory files and
 empty regular `*.lock` files. A linked or unrecognized sidecar that could
 affect private SQLite state keeps the view. The report names the sidecar
@@ -164,7 +167,9 @@ relative to the view. With the main file missing, GC preserves the raw WAL or
 journal under `orphan-sidecars/<sha256>/` in the view's archive. The checksum
 manifest covers those payloads too. If a concurrent restore changes the
 archive displaced during publication, GC keeps both generations and the view.
-GC checks every sealed payload's identity and hash again before removal.
+GC publishes the verified archive before retiring the source. If a later check
+keeps the view, the archive remains available for retry and the report lists
+its path. GC checks every sealed payload's identity and hash again before removal.
 From the archive, run `sha256sum --check SHA256SUMS` to check the compressed
 files before restoring the one you want.
 

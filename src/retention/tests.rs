@@ -85,7 +85,7 @@ impl Fixture {
             at: SystemTime::now() + advance,
             in_use,
             recent_fds: &mut |_, _| Ok(false),
-            fd_blocker: &Cell::new(None),
+            liveness_error: &Cell::new(None),
             mounts,
             pressure: Pressure {
                 read: pressure,
@@ -348,15 +348,121 @@ fn unreadable_processes_use_cmdline_to_distinguish_non_providers_from_ambiguity(
         write(&cmdline, command);
         let mut ignored = Default::default();
         for deny_cwd in [true, false] {
-            assert_eq!(
-                scan(deny_cwd, &mut ignored).unwrap_err().kind(),
-                io::ErrorKind::PermissionDenied
-            );
+            let failure = scan(deny_cwd, &mut ignored).unwrap_err();
+            let field = if deny_cwd { "cwd" } else { "environ" };
+            let diagnostic = failure.blocker.unwrap().to_string();
+            assert!(diagnostic.contains(&format!("{field} PermissionDenied")));
         }
         assert!(ignored.is_empty());
     }
     fs::remove_file(cmdline).unwrap();
     assert!(scan(true, &mut Default::default()).is_err());
+}
+
+#[test]
+fn process_scan_rechecks_a_transient_cwd_error_and_an_exiting_process() {
+    let t = Fixture::new();
+    let view = t.view("codex", "run-cwd");
+    let proc = t._temp.path().join("proc");
+    let pid = proc.join("321");
+    let status = pid.join("status");
+    write(&status, b"State:\tS\nUid:\t1234\t1234\t1234\t1234\n");
+    write(&pid.join("cmdline"), b"");
+    let attempts = Cell::new(0);
+    assert!(
+        process::scan_with_access(
+            &proc,
+            1234,
+            &view,
+            &mut Default::default(),
+            |_| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(ErrorKind::PermissionDenied.into())
+                } else {
+                    Ok(view.join("descendant"))
+                }
+            },
+            |_| unreachable!("cwd already matches"),
+        )
+        .unwrap()
+    );
+    assert_eq!(attempts.get(), 2);
+    assert!(
+        !process::scan_with_access(
+            &proc,
+            1234,
+            &view,
+            &mut Default::default(),
+            |_| Ok(t.home.clone()),
+            |_| {
+                write(&status, b"State:\tZ\nUid:\t1234\t1234\t1234\t1234\n");
+                Err(ErrorKind::NotFound.into())
+            },
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn late_environ_blocker_names_pid_and_preserves_archive_for_retry() {
+    let t = Fixture::new();
+    let view = t.view("codex", "run-environ");
+    let archive = t.root.join("archive/codex/synthetic/run-environ");
+    let proc = t._temp.path().join("proc");
+    let pid = proc.join("322");
+    write(
+        &pid.join("status"),
+        b"State:\tS\nUid:\t1234\t1234\t1234\t1234\n",
+    );
+    write(
+        &pid.join("cmdline"),
+        b"/bin/codex\0synthetic-secret-argument\0",
+    );
+    write(&view.join("history.jsonl"), b"synthetic history");
+    let diagnostic = Cell::new(None);
+    let report = Retention {
+        root: &t.root,
+        at: SystemTime::now() + Duration::from_secs(3 * 86400),
+        in_use: &mut |path| {
+            if !archive.exists() {
+                return Ok(false);
+            }
+            record_liveness(
+                process::scan_with_access(
+                    &proc,
+                    1234,
+                    path,
+                    &mut Default::default(),
+                    |_| Ok(t.home.clone()),
+                    |_| Err(ErrorKind::PermissionDenied.into()),
+                ),
+                &diagnostic,
+            )
+        },
+        liveness_error: &diagnostic,
+        recent_fds: &mut |_, _| Ok(false),
+        mounts: &mut || Ok(mounts::Mounts::default()),
+        pressure: Pressure {
+            read: &mut || Ok(0.0),
+            limit: 30.0,
+            next: Instant::now(),
+            stopped: None,
+        },
+    }
+    .run(t.settings(), Mode::Apply)
+    .unwrap();
+    let text = report.text();
+    assert!(text.contains("cannot establish process liveness (PID 322, cmdline excerpt codex"));
+    assert!(text.contains("environ PermissionDenied"));
+    assert!(!text.contains("synthetic-secret-argument"));
+    assert!(text.contains("Archive retained for retry"));
+    assert_eq!(report.totals.kept, 1);
+    assert!(view.join("history.jsonl").is_file());
+    let manifest = fs::read(archive.join("SHA256SUMS")).unwrap();
+    let retry = t.run(Mode::Apply);
+    assert_eq!(retry.totals.removed, 1, "{}", retry.text());
+    assert_eq!(fs::read(archive.join("SHA256SUMS")).unwrap(), manifest);
 }
 
 #[test]
@@ -1315,8 +1421,13 @@ fn ambiguous_descriptor_snapshot_rechecks_zombies_and_cmdline() {
     let report = Retention {
         root: &t.root,
         at: SystemTime::now() + Duration::from_secs(3 * 86400),
-        in_use: &mut |path| fd_uses_view(&snapshot, path, &mut Default::default(), &diagnostic),
-        fd_blocker: &diagnostic,
+        in_use: &mut |path| {
+            record_liveness(
+                snapshot.uses_view(path, &mut Default::default()),
+                &diagnostic,
+            )
+        },
+        liveness_error: &diagnostic,
         recent_fds: &mut |_, _| Ok(false),
         mounts: &mut || Ok(mounts::Mounts::default()),
         pressure: Pressure {
@@ -1368,7 +1479,7 @@ fn descriptor_opened_after_initial_snapshot_restores_retiring_view() {
                     .uses_view(path, &mut Default::default())
                     .map_err(Error::from)
             },
-            fd_blocker: &Cell::new(None),
+            liveness_error: &Cell::new(None),
             recent_fds: &mut |old, tombstone| {
                 assert!(!old.exists());
                 assert!(tombstone.join(relative).is_file());

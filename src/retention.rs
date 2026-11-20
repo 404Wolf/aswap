@@ -301,7 +301,11 @@ impl Report {
                     },
                 );
                 if let Some(path) = &view.archive {
-                    let _ = writeln!(text, "    Archive {path:?}");
+                    let note = match view.verdict {
+                        Verdict::Kept if !self.dry_run => " retained for retry",
+                        _ => "",
+                    };
+                    let _ = writeln!(text, "    Archive{note} {path:?}");
                 }
                 for backup in &view.codex_index_backups {
                     let _ = writeln!(text, "    Codex index backup {backup:?}");
@@ -331,28 +335,32 @@ pub fn run(mode: Mode, legacy_homes: &[String]) -> Result<Report> {
         process::lower_priority()?;
     }
     let ignored = RefCell::new(Default::default());
-    let fd_blocker = Cell::new(None);
+    let liveness_error = Cell::new(None);
     let runtimes = root.join("runtimes");
     let mut fds = None;
     let mut in_use = |view: &Path| {
         let fds = fds.get_or_insert_with(|| process::Fds::for_paths(&[&runtimes]));
         let fds = fds.as_ref().map_err(|error| Error(error.0))?;
         let mut ignored = ignored.borrow_mut();
-        Ok(fd_uses_view(fds, view, &mut ignored, &fd_blocker)?
-            || process::uses_view(view, &mut ignored)?
-            || live::view_in_use(&root, view)?)
+        Ok(
+            record_liveness(fds.uses_view(view, &mut ignored), &liveness_error)?
+                || record_liveness(process::uses_view(view, &mut ignored), &liveness_error)?
+                || live::view_in_use(&root, view)?,
+        )
     };
     let mut recent_fds = |view: &Path, tombstone: &Path| {
         let fds = process::Fds::for_paths(&[view, tombstone])?;
         let mut ignored = ignored.borrow_mut();
-        Ok(fd_uses_view(&fds, view, &mut ignored, &fd_blocker)?
-            || fd_uses_view(&fds, tombstone, &mut ignored, &fd_blocker)?)
+        Ok(
+            record_liveness(fds.uses_view(view, &mut ignored), &liveness_error)?
+                || record_liveness(fds.uses_view(tombstone, &mut ignored), &liveness_error)?,
+        )
     };
     let mut report = Retention {
         root: &root,
         at: SystemTime::now(),
         in_use: &mut in_use,
-        fd_blocker: &fd_blocker,
+        liveness_error: &liveness_error,
         recent_fds: &mut recent_fds,
         mounts: &mut mounts::read,
         pressure: Pressure {
@@ -367,15 +375,14 @@ pub fn run(mode: Mode, legacy_homes: &[String]) -> Result<Report> {
     Ok(report)
 }
 
-fn fd_uses_view(
-    fds: &process::Fds,
-    view: &Path,
-    ignored: &mut std::collections::HashSet<OsString>,
-    diagnostic: &Cell<Option<process::FdBlocker>>,
+fn record_liveness(
+    result: std::result::Result<bool, process::LivenessError>,
+    diagnostic: &Cell<Option<process::LivenessError>>,
 ) -> Result<bool> {
-    fds.uses_view(view, ignored).map_err(|blocker| {
-        diagnostic.set(Some(blocker));
-        Error(process::FD_LIVENESS_ERROR)
+    result.map_err(|failure| {
+        let error = Error(failure.reason);
+        diagnostic.set(Some(failure));
+        error
     })
 }
 
@@ -383,7 +390,7 @@ struct Retention<'a> {
     root: &'a Path,
     at: SystemTime,
     in_use: &'a mut dyn FnMut(&Path) -> Result<bool>,
-    fd_blocker: &'a Cell<Option<process::FdBlocker>>,
+    liveness_error: &'a Cell<Option<process::LivenessError>>,
     recent_fds: &'a mut dyn FnMut(&Path, &Path) -> Result<bool>,
     mounts: &'a mut dyn FnMut() -> Result<mounts::Mounts>,
     pressure: Pressure<'a>,
@@ -532,11 +539,14 @@ impl Retention<'_> {
                     } else {
                         self.view(candidate, &mut backups, &mut result)
                     };
-                    let blocker = self.fd_blocker.take();
+                    let liveness_error = self.liveness_error.take();
                     if let Err(error) = outcome {
                         if result.reason.is_empty() {
-                            result.reason = match blocker {
-                                Some(blocker) if error.0 == process::FD_LIVENESS_ERROR => {
+                            result.reason = match liveness_error {
+                                Some(process::LivenessError {
+                                    reason,
+                                    blocker: Some(blocker),
+                                }) if error.0 == reason => {
                                     format!("{error} ({blocker})")
                                 }
                                 _ => error.0.into(),

@@ -40,8 +40,11 @@ pub(super) fn parse_pressure(text: &str) -> Result<f64> {
         .ok_or(Error("cannot read I/O pressure avg10"))
 }
 
-pub(super) fn uses_view(view: &Path, ignored: &mut HashSet<OsString>) -> Result<bool> {
-    scan(Path::new("/proc"), own_uid(), view, ignored).safe("cannot establish process liveness")
+pub(super) fn uses_view(
+    view: &Path,
+    ignored: &mut HashSet<OsString>,
+) -> std::result::Result<bool, LivenessError> {
+    scan(Path::new("/proc"), own_uid(), view, ignored)
 }
 
 fn own_uid() -> u32 {
@@ -54,7 +57,7 @@ pub(super) fn scan(
     uid: u32,
     view: &Path,
     ignored: &mut HashSet<OsString>,
-) -> io::Result<bool> {
+) -> std::result::Result<bool, LivenessError> {
     scan_with_access(
         proc_root,
         uid,
@@ -72,23 +75,63 @@ pub(super) fn scan_with_access(
     ignored: &mut HashSet<OsString>,
     cwd: impl Fn(&Path) -> io::Result<PathBuf>,
     environ: impl Fn(&Path) -> io::Result<Vec<u8>>,
-) -> io::Result<bool> {
-    for entry in fs::read_dir(proc_root)? {
-        let entry = entry?;
+) -> std::result::Result<bool, LivenessError> {
+    let scan_error = |_| LivenessError {
+        reason: PROCESS_LIVENESS_ERROR,
+        blocker: None,
+    };
+    for entry in fs::read_dir(proc_root).map_err(scan_error)? {
+        let entry = entry.map_err(scan_error)?;
         let pid = entry.file_name();
         if !pid.as_bytes().iter().all(u8::is_ascii_digit) {
             continue;
         }
         let process = entry.path();
-        match process_uses_view(&process, uid, view, &cwd, &environ) {
+        let inspect = || {
+            process_uses_view(&process, uid, view, &cwd, &environ).or_else(|access| {
+                if access.allows_cmdline_fallback()
+                    && fs::read(process.join("cmdline"))
+                        .is_ok_and(|cmdline| unrelated(&cmdline, view))
+                {
+                    Ok(ViewUse::UnreadableNonProvider)
+                } else {
+                    Err(access)
+                }
+            })
+        };
+        // An exec, exit or UID change can race a process attribute read.
+        // Repeat the whole check before giving up on this view.
+        match inspect().or_else(|_| inspect()) {
             Ok(ViewUse::Active) => return Ok(true),
             Ok(ViewUse::Inactive) => {}
             Ok(ViewUse::UnreadableNonProvider) => {
                 ignored.insert(pid);
             }
-            // A PID can disappear at any point during inspection.
-            Err(_) if gone(&process) => {}
-            Err(error) => return Err(error),
+            Err(access) => {
+                let cmdline = fs::read(process.join("cmdline"));
+                match may_use_store(&process, uid) {
+                    Ok(false) => continue,
+                    Err(_) if gone(&process) => continue,
+                    Ok(true)
+                        if access.allows_cmdline_fallback()
+                            && cmdline
+                                .as_ref()
+                                .is_ok_and(|cmdline| unrelated(cmdline, view)) =>
+                    {
+                        ignored.insert(pid);
+                        continue;
+                    }
+                    _ => {}
+                }
+                return Err(LivenessError {
+                    reason: PROCESS_LIVENESS_ERROR,
+                    blocker: Some(ProcessBlocker {
+                        pid,
+                        excerpt: cmdline_excerpt(&cmdline),
+                        access: Some(access),
+                    }),
+                });
+            }
         }
     }
     Ok(false)
@@ -137,25 +180,16 @@ fn process_uses_view(
     view: &Path,
     cwd: impl Fn(&Path) -> io::Result<PathBuf>,
     environ: impl Fn(&Path) -> io::Result<Vec<u8>>,
-) -> io::Result<ViewUse> {
-    if !may_use_store(process, uid)? {
+) -> std::result::Result<ViewUse, AccessError> {
+    if !may_use_store(process, uid).map_err(|error| AccessError::new("status", error))? {
         return Ok(ViewUse::Inactive);
     }
-    let cwd = match cwd(&process.join("cwd")) {
-        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
-            return inspect_unreadable(process, view, error);
-        }
-        result => result?,
-    };
+    let cwd = cwd(&process.join("cwd")).map_err(|error| AccessError::new("cwd", error))?;
     if cwd.starts_with(view) {
         return Ok(ViewUse::Active);
     }
-    let env = match environ(&process.join("environ")) {
-        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
-            return inspect_unreadable(process, view, error);
-        }
-        result => result?,
-    };
+    let env =
+        environ(&process.join("environ")).map_err(|error| AccessError::new("environ", error))?;
     for value in env.split(|b| *b == 0).filter_map(|var| {
         var.strip_prefix(b"CODEX_HOME=")
             .or_else(|| var.strip_prefix(b"CLAUDE_CONFIG_DIR="))
@@ -170,17 +204,10 @@ fn process_uses_view(
             Ok(path) if path.starts_with(view) => return Ok(ViewUse::Active),
             Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            Err(error) => return Err(AccessError::new("provider home resolution", error)),
         }
     }
     Ok(ViewUse::Inactive)
-}
-
-fn inspect_unreadable(process: &Path, view: &Path, denied: io::Error) -> io::Result<ViewUse> {
-    if fs::read(process.join("cmdline")).is_ok_and(|cmdline| unrelated(&cmdline, view)) {
-        return Ok(ViewUse::UnreadableNonProvider);
-    }
-    Err(denied)
 }
 
 fn unrelated(cmdline: &[u8], view: &Path) -> bool {
@@ -200,28 +227,59 @@ fn provider_marker(cmdline: &[u8]) -> Option<&'static str> {
         })
 }
 
-pub(super) const FD_LIVENESS_ERROR: &str = "cannot establish file descriptor liveness";
+const FD_LIVENESS_ERROR: &str = "cannot establish file descriptor liveness";
+const PROCESS_LIVENESS_ERROR: &str = "cannot establish process liveness";
 
 #[derive(Debug)]
-pub(super) struct FdBlocker {
-    pid: OsString,
-    excerpt: String,
+struct AccessError {
+    field: &'static str,
+    kind: ErrorKind,
 }
 
-impl fmt::Display for FdBlocker {
+impl AccessError {
+    fn new(field: &'static str, error: io::Error) -> Self {
+        Self {
+            field,
+            kind: error.kind(),
+        }
+    }
+
+    fn allows_cmdline_fallback(&self) -> bool {
+        matches!(self.field, "cwd" | "environ") && self.kind == ErrorKind::PermissionDenied
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct LivenessError {
+    pub(super) reason: &'static str,
+    pub(super) blocker: Option<ProcessBlocker>,
+}
+
+#[derive(Debug)]
+pub(super) struct ProcessBlocker {
+    pid: OsString,
+    excerpt: String,
+    access: Option<AccessError>,
+}
+
+impl fmt::Display for ProcessBlocker {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             out,
             "PID {}, cmdline excerpt {}",
             self.pid.to_string_lossy(),
             self.excerpt
-        )
+        )?;
+        if let Some(access) = &self.access {
+            write!(out, ", {} {:?}", access.field, access.kind)?;
+        }
+        Ok(())
     }
 }
 
-impl From<FdBlocker> for Error {
-    fn from(_: FdBlocker) -> Self {
-        Error(FD_LIVENESS_ERROR)
+impl From<LivenessError> for Error {
+    fn from(error: LivenessError) -> Self {
+        Error(error.reason)
     }
 }
 
@@ -362,7 +420,7 @@ impl Fds {
         &self,
         view: &Path,
         ignored: &mut HashSet<OsString>,
-    ) -> std::result::Result<bool, FdBlocker> {
+    ) -> std::result::Result<bool, LivenessError> {
         if self
             .paths
             .range(view.to_owned()..)
@@ -395,9 +453,13 @@ impl Fds {
                     ignored.insert(entry.pid.clone());
                 }
                 Ok(true) | Err(_) => {
-                    return Err(FdBlocker {
-                        pid: entry.pid.clone(),
-                        excerpt: cmdline_excerpt(&cmdline),
+                    return Err(LivenessError {
+                        reason: FD_LIVENESS_ERROR,
+                        blocker: Some(ProcessBlocker {
+                            pid: entry.pid.clone(),
+                            excerpt: cmdline_excerpt(&cmdline),
+                            access: None,
+                        }),
                     });
                 }
             }
