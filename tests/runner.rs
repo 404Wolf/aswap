@@ -68,6 +68,8 @@ if args[:1]==['app-server']:
         print(json.dumps({'id':req['id'],'result':result}),flush=True)
     sys.exit(0)
 assert (p/'projects' if provider=='claude' else p/'sessions').is_symlink()
+# Codex opens its databases in the shared home, never through the view.
+assert provider!='codex' or os.environ.get('CODEX_SQLITE_HOME')==os.environ['ASWAP_EXPECT_CODEX_DB']
 (p/'private-child-file').write_text('synthetic')
 if args==['--test-exit']: time.sleep(.1);sys.exit(7)
 assert os.isatty(0) and os.isatty(1)
@@ -156,6 +158,7 @@ with transcript.open('a') as held:
         )
         .env("ASWAP_TEST_BINARY", env!("CARGO_BIN_EXE_aswap"))
         .env("ASWAP_EXPECT_CWD", &cwd)
+        .env("ASWAP_EXPECT_CODEX_DB", t.path().join("codex"))
         .env("ASWAP_TEST_RESULTS", &results)
         .env("OPENAI_API_KEY", "synthetic-override")
         .env("ANTHROPIC_API_KEY", "synthetic-override")

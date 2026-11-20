@@ -106,6 +106,12 @@ pub trait Spec: Sync {
     fn launch_args(&self) -> &'static [&'static str] {
         &[]
     }
+    /// The variable naming where the provider keeps its SQLite databases.
+    /// A launch sets it to the shared home, so a database is never opened
+    /// (or first created) through the launch view.
+    fn database_home_var(&self) -> Option<&'static str> {
+        None
+    }
 
     // Credentials: the JSON in `auth_file`.
     fn auth_file(&self) -> &'static str;
@@ -303,6 +309,16 @@ fn stamped_since(timestamp: Option<&Value>, since: SystemTime) -> bool {
         .is_some_and(|at| {
             at >= chrono::DateTime::<chrono::Utc>::from(since - std::time::Duration::from_millis(1))
         })
+}
+
+/// Point `cmd`'s databases at `home` (`Spec::database_home_var`), unless the
+/// user already chose a place for them.
+pub(crate) fn share_databases(provider: Provider, cmd: &mut Command, home: &Path) {
+    if let Some(var) = provider.spec().database_home_var()
+        && std::env::var_os(var).is_none()
+    {
+        cmd.env(var, home);
+    }
 }
 
 impl Provider {
@@ -653,6 +669,24 @@ pub fn remove(store: &Store, provider: Provider, name: &str) -> Result<Vec<Strin
 #[cfg(test)]
 mod scrub_tests {
     use super::*;
+
+    #[test]
+    fn a_codex_launch_keeps_its_databases_in_the_shared_home() {
+        if std::env::var_os("CODEX_SQLITE_HOME").is_some() {
+            return; // the user's choice wins; nothing to check here
+        }
+        let home = Path::new("/synthetic/codex-home");
+        let db = |provider: Provider| {
+            let mut cmd = Command::new("true");
+            share_databases(provider, &mut cmd, home);
+            cmd.get_envs()
+                .find(|(key, _)| *key == "CODEX_SQLITE_HOME")
+                .and_then(|(_, value)| value.map(ToOwned::to_owned))
+        };
+        assert_eq!(db(Provider::Codex).as_deref(), Some(home.as_os_str()));
+        assert_eq!(db(Provider::Claude), None);
+        assert_eq!(db(Provider::Pi), None);
+    }
 
     #[test]
     fn a_launch_drops_inherited_claude_oauth_overrides() {
