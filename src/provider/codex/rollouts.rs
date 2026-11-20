@@ -20,8 +20,12 @@ use std::{
 
 /// The history directories a launch view links to the home.
 const LINKED: [&str; 2] = ["sessions", "archived_sessions"];
-/// How long a repair waits for a running Codex to release the database.
+/// How long a run-end repair waits for a running Codex to release the
+/// database.
 const BUSY: Duration = Duration::from_secs(5);
+/// How long the sweep on the launch path waits: a busy database is left to
+/// the next launch rather than delaying this one.
+const SWEEP_BUSY: Duration = Duration::from_millis(250);
 
 /// What can stop a scan or a repair.
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +50,30 @@ impl From<RolloutError> for crate::Error {
     }
 }
 
+/// The spellings of the views root a row may use: as aswap spells it, and
+/// resolved (Codex may canonicalize `CODEX_HOME`, so a symlink above the
+/// store changes the recorded prefix).
+struct Views(Vec<PathBuf>);
+impl Views {
+    fn new(views: &Path) -> Self {
+        let mut spellings = vec![views.to_path_buf()];
+        if let Ok(real) = std::fs::canonicalize(views)
+            && real != views
+        {
+            spellings.push(real);
+        }
+        Self(spellings)
+    }
+}
+/// Whether two spellings name the same launch view.
+fn same_view(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
 /// A `rollout_path` that goes through a launch view under the views root.
 #[derive(Debug, PartialEq, Eq)]
 struct ViewPath {
@@ -57,8 +85,11 @@ struct ViewPath {
 impl ViewPath {
     /// `<views>/<label>/<run>/<sessions|archived_sessions>/<rest>`, with
     /// plain components only.
-    fn parse(views: &Path, home: &Path, path: &Path) -> Option<Self> {
-        let rest = path.strip_prefix(views).ok()?;
+    fn parse(views: &Views, home: &Path, path: &Path) -> Option<Self> {
+        let (views, rest) = views
+            .0
+            .iter()
+            .find_map(|views| Some((views, path.strip_prefix(views).ok()?)))?;
         let mut parts = rest.components();
         let mut next = || match parts.next() {
             Some(Component::Normal(part)) => Some(part),
@@ -117,9 +148,16 @@ fn databases(home: &Path) -> Result<Vec<PathBuf>, RolloutError> {
     Ok(found)
 }
 
-/// The `(id, rollout_path)` rows of a database's thread index; none when the
-/// database has no such table (another Codex version).
-fn rows(db: &Connection) -> Result<Vec<(SessionId, PathBuf)>, RolloutError> {
+/// One thread row: its ID, and its `rollout_path` as stored.
+struct Row {
+    id: SessionId,
+    stored: String,
+    path: PathBuf,
+}
+/// The thread rows of a database's index; none when the database has no
+/// such table (another Codex version). Rows without a valid ID or an
+/// absolute text path are skipped, never fatal.
+fn rows(db: &Connection) -> Result<Vec<Row>, RolloutError> {
     let columns: Vec<String> = db
         .prepare("SELECT name FROM pragma_table_info('threads')")
         .and_then(|mut q| q.query_map([], |row| row.get(0))?.collect())
@@ -133,16 +171,25 @@ fn rows(db: &Connection) -> Result<Vec<(SessionId, PathBuf)>, RolloutError> {
     let mut query = db
         .prepare("SELECT id, rollout_path FROM threads")
         .map_err(RolloutError::Read)?;
+    let text = |value: rusqlite::types::ValueRef| match value {
+        rusqlite::types::ValueRef::Text(bytes) => {
+            std::str::from_utf8(bytes).ok().map(str::to_owned)
+        }
+        _ => None,
+    };
     let rows = query
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
+        .query_map([], |row| Ok((text(row.get_ref(0)?), text(row.get_ref(1)?))))
         .map_err(RolloutError::Read)?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, path) = row.map_err(RolloutError::Read)?;
-        if let Some(id) = SessionId::parse(&id) {
-            out.push((id, PathBuf::from(path)));
+        let (Some(id), Some(stored)) = row.map_err(RolloutError::Read)? else {
+            continue;
+        };
+        let path = PathBuf::from(&stored);
+        if let Some(id) = SessionId::parse(&id)
+            && path.is_absolute()
+        {
+            out.push(Row { id, stored, path });
         }
     }
     Ok(out)
@@ -151,6 +198,7 @@ fn rows(db: &Connection) -> Result<Vec<(SessionId, PathBuf)>, RolloutError> {
 /// Every thread row that names a missing transcript or one through a launch
 /// view under `views`. Opens the databases read-only and changes nothing.
 pub(super) fn scan(home: &Path, views: &Path) -> Result<Vec<Finding>, RolloutError> {
+    let views = Views::new(views);
     let mut findings = Vec::new();
     for database in databases(home)? {
         let db = Connection::open_with_flags(
@@ -159,8 +207,8 @@ pub(super) fn scan(home: &Path, views: &Path) -> Result<Vec<Finding>, RolloutErr
         )
         .map_err(RolloutError::Open)?;
         db.busy_timeout(BUSY).map_err(RolloutError::Open)?;
-        for (id, path) in rows(&db)? {
-            let through = ViewPath::parse(views, home, &path);
+        for Row { id, path, .. } in rows(&db)? {
+            let through = ViewPath::parse(&views, home, &path);
             let problem = if !path.exists() {
                 Problem::Dangling
             } else if through.is_some() {
@@ -187,6 +235,11 @@ pub(super) fn scan(home: &Path, views: &Path) -> Result<Vec<Finding>, RolloutErr
 /// `views` (limited by `scope`) to the same file under `home`. Returns how
 /// many rows changed.
 pub(super) fn repair(home: &Path, views: &Path, scope: Scope) -> Result<usize, RolloutError> {
+    let views = Views::new(views);
+    let busy = match scope {
+        Scope::View(_) => BUSY,
+        Scope::Gone => SWEEP_BUSY,
+    };
     let mut changed = 0;
     for database in databases(home)? {
         let mut db = Connection::open_with_flags(
@@ -194,22 +247,23 @@ pub(super) fn repair(home: &Path, views: &Path, scope: Scope) -> Result<usize, R
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(RolloutError::Open)?;
-        db.busy_timeout(BUSY).map_err(RolloutError::Open)?;
+        db.busy_timeout(busy).map_err(RolloutError::Open)?;
         let fixes: Vec<_> = rows(&db)?
             .into_iter()
-            .filter_map(|(id, path)| {
-                let through = ViewPath::parse(views, home, &path)?;
+            .filter_map(|Row { id, stored, path }| {
+                let through = ViewPath::parse(&views, home, &path)?;
                 let in_scope = match scope {
-                    Scope::View(view) => through.view == view,
+                    Scope::View(view) => same_view(&through.view, view),
                     Scope::Gone => !through.view.exists(),
                 };
                 // While the view exists, its path must still be this file.
+                // (If the home's sessions/ is itself a link, the view holds a
+                // copy instead, nothing matches here, and the transcript is
+                // left to the launch sweep once sync has published it.)
                 let consistent = !path.exists() || same_file(&path, &through.canonical);
-                (in_scope && consistent && names_thread(&through.canonical, &id)).then_some((
-                    id,
-                    path,
-                    through.canonical,
-                ))
+                let new = through.canonical.to_str()?.to_owned();
+                (in_scope && consistent && names_thread(&through.canonical, &id))
+                    .then_some((id, stored, new))
             })
             .collect();
         if fixes.is_empty() {
@@ -219,9 +273,6 @@ pub(super) fn repair(home: &Path, views: &Path, scope: Scope) -> Result<usize, R
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(RolloutError::Write)?;
         for (id, old, new) in &fixes {
-            let (Some(old), Some(new)) = (old.to_str(), new.to_str()) else {
-                continue;
-            };
             // Only the row as read: Codex may have moved it meanwhile.
             changed += tx
                 .execute(
@@ -306,7 +357,7 @@ mod tests {
 
     #[test]
     fn only_paths_through_a_views_linked_history_parse() {
-        let (views, home) = (Path::new("/s/runtimes/codex"), Path::new("/h"));
+        let (views, home) = (&Views(vec!["/s/runtimes/codex".into()]), Path::new("/h"));
         let path = Path::new("/s/runtimes/codex/a/run-x/sessions/2026/r.jsonl");
         assert_eq!(
             ViewPath::parse(views, home, path),
@@ -402,6 +453,55 @@ mod tests {
         f.row(ID, &f.through(&private, ID));
         assert_eq!(repair(&f.home, &f.views, Scope::View(&private)).unwrap(), 0);
         assert_eq!(f.path_of(ID), f.through(&private, ID));
+    }
+
+    #[test]
+    fn a_row_spelled_through_the_resolved_store_is_repaired_too() {
+        // Codex may canonicalize CODEX_HOME: with a symlink above the store,
+        // rows carry the resolved prefix, not aswap's spelling.
+        let f = Fixture::new();
+        let link = f._temp.path().join("linked-data");
+        std::os::unix::fs::symlink(f._temp.path().join("aswap"), &link).unwrap();
+        let views = link.join("runtimes/codex");
+        let view = views.join("work/run-AbC123");
+        f.row(ID, &f.through(&f.view, ID)); // the resolved spelling
+        assert_eq!(repair(&f.home, &views, Scope::View(&view)).unwrap(), 1);
+        assert_eq!(f.path_of(ID), f.through(&f.home, ID));
+        let gone = f.views.join("work/run-Gone00");
+        f.row(OTHER, &f.through(&gone, OTHER));
+        assert_eq!(
+            scan(&f.home, &views).unwrap()[0].canonical,
+            Some(f.through(&f.home, OTHER))
+        );
+        assert_eq!(repair(&f.home, &views, Scope::Gone).unwrap(), 1);
+    }
+
+    #[test]
+    fn malformed_rows_are_skipped_not_fatal() {
+        let f = Fixture::new();
+        let db = Connection::open(f.home.join("state_5.sqlite")).unwrap();
+        // A table without NOT NULL, as another Codex version might have.
+        db.execute_batch("DROP TABLE threads; CREATE TABLE threads (id TEXT, rollout_path TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO threads VALUES (?1, NULL)", [OTHER])
+            .unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES (?1, ?2)",
+            params!["01a1f204-02e0-7023-b4d3-12163ecf38ed", vec![0xffu8, 0xfe]],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES (?1, 'relative/path.jsonl')",
+            [OTHER],
+        )
+        .unwrap();
+        drop(db);
+        let gone = f.views.join("work/run-Gone00");
+        f.row(ID, &f.through(&gone, ID));
+        let findings = scan(&f.home, &f.views).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(repair(&f.home, &f.views, Scope::Gone).unwrap(), 1);
+        assert_eq!(f.path_of(ID), f.through(&f.home, ID));
     }
 
     #[test]

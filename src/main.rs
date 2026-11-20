@@ -426,7 +426,13 @@ fn execute(cli: Cli) -> Result<i32> {
                 .into_iter()
                 .filter(|p| provider.is_none_or(|want| want == *p))
             {
-                let home = aswap::shared::shared_home_of(&store, p)?;
+                // Without a provider named, one whose home can't be found
+                // (not set up here) doesn't stop the others' checks.
+                let home = match aswap::shared::shared_home_of(&store, p) {
+                    Ok(home) => home,
+                    Err(_) if provider.is_none() => continue,
+                    Err(e) => return Err(e),
+                };
                 let views = aswap::shared::views_root(&store, p);
                 findings.extend(
                     p.spec()
@@ -445,7 +451,7 @@ fn execute(cli: Cli) -> Result<i32> {
                 .filter(|(_, f)| f.canonical.is_some())
                 .count();
             let mut pretty = format!(
-                "{dangling} missing, {in_view} through a live launch view, {repairable} with the same transcript in the home"
+                "{dangling} missing, {in_view} through a launch view that still exists (live, or kept after a failed repair), {repairable} with the same transcript in the home"
             );
             for (p, f) in &findings {
                 let problem = match f.problem {
