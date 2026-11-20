@@ -21,7 +21,9 @@
           # (NixOS/nixpkgs 44cddf92c4), which overrides rusqlite's "bundled"
           # feature and links the system SQLite instead.
           nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.sqlite ];
+          buildInputs = [ pkgs.sqlite pkgs.zstd ];
+          # Use the system libzstd on nixpkgs revisions without a zstd-sys hook.
+          ZSTD_SYS_USE_PKG_CONFIG = "1";
           nativeCheckInputs = [ pkgs.python3 ];
           preCheck = ''
             aswapTestRoot=$(mktemp -d)
@@ -50,6 +52,8 @@
       devShells = eachSystem (system: let pkgs = pkgsFor system; in {
         default = pkgs.mkShell {
           packages = with pkgs; [ cargo rustc rustfmt clippy gitleaks pkg-config python3 ];
+          buildInputs = [ pkgs.zstd ];
+          ZSTD_SYS_USE_PKG_CONFIG = "1";
           shellHook = ''
             git config --local core.hooksPath .githooks
             echo "aswap: secret-scanning commit/push hooks installed"
