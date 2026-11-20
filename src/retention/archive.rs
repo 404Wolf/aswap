@@ -1,11 +1,11 @@
 use super::{
     Pressure,
-    files::{ArchiveEntry, Dir, archive_name, digest, sqlite_name, stream},
+    files::{ArchiveEntry, Dir, archive_name, digest, is_sqlite_header, stream},
 };
 use crate::{Error, Result, Safe, shared};
 use rustix::fs::{RenameFlags, renameat_with};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Read, Seek, Write},
@@ -19,24 +19,78 @@ use std::{
 const MANIFEST: &str = "SHA256SUMS";
 type Payloads = BTreeMap<PathBuf, ([u8; 32], u64)>;
 
+#[derive(Eq, PartialEq)]
+struct ArchivedFile {
+    identity: (u64, u64),
+    hash: [u8; 32],
+    bytes: u64,
+}
+
+type ArchivedFiles = BTreeMap<PathBuf, ArchivedFile>;
+
+#[derive(Eq, PartialEq)]
+struct Seal {
+    manifest: [u8; 32],
+    files: ArchivedFiles,
+}
+
 pub(super) struct Receipt {
     path: PathBuf,
     identity: (u64, u64),
-    manifest: [u8; 32],
+    seal: Seal,
     pub(super) bytes_added: u64,
 }
 
 impl Receipt {
     pub(super) fn recheck(&self, pressure: &mut Pressure<'_>) -> Result<()> {
         let dir = Dir::open(&self.path).safe("cannot recheck published archive directory")?;
-        let (manifest, _) = dir
-            .file(OsStr::new(MANIFEST))
-            .safe("cannot recheck published archive manifest")?;
-        if identity(&dir)? != self.identity || digest(manifest, pressure)? != self.manifest {
+        if identity(&dir)? != self.identity {
             return Err(Error("published archive identity or manifest changed"));
+        }
+        if read_seal(&dir, false, pressure)? != self.seal {
+            return Err(Error("published archive payload identity changed"));
         }
         Ok(())
     }
+}
+
+pub(super) fn verify_orphans(
+    path: &Path,
+    orphans: &BTreeSet<PathBuf>,
+    pressure: &mut Pressure<'_>,
+) -> Result<()> {
+    if orphans.is_empty() {
+        return Ok(());
+    }
+    let archive = Dir::open(path).safe("orphan SQLite sidecar has no verified archive snapshot")?;
+    let seal = read_seal(&archive, false, pressure)?;
+    check_orphans(&archive, &seal, orphans)
+}
+
+fn check_orphans(archive: &Dir, seal: &Seal, orphans: &BTreeSet<PathBuf>) -> Result<()> {
+    for database in orphans {
+        let relative = archive_name(database);
+        if !seal.files.contains_key(&relative) {
+            return Err(Error(
+                "orphan SQLite sidecar has no verified archive snapshot",
+            ));
+        }
+        let (file, _) = archive
+            .relative_file(&relative)
+            .safe("cannot open orphan SQLite archive snapshot")?;
+        let mut decoded = zstd::stream::read::Decoder::new(file)
+            .safe("cannot decode orphan SQLite archive snapshot")?;
+        let mut header = [0; 16];
+        decoded
+            .read_exact(&mut header)
+            .safe("cannot read archived SQLite header")?;
+        if !is_sqlite_header(&header) {
+            return Err(Error(
+                "orphan SQLite sidecar has no verified archive snapshot",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Seal verified contents in a private directory before publishing the name.
@@ -45,6 +99,7 @@ pub(super) fn preserve<'a>(
     path: &Path,
     view: &Dir,
     entries: impl Iterator<Item = ArchiveEntry<'a>>,
+    orphans: &BTreeSet<PathBuf>,
     pressure: &mut Pressure<'_>,
 ) -> Result<Receipt> {
     let parent_path = path.parent().ok_or(Error("missing archive parent"))?;
@@ -64,14 +119,24 @@ pub(super) fn preserve<'a>(
         Err(_) => return Err(Error("unsafe or unreadable existing archive")),
     };
     let mut payloads = Payloads::new();
-    let (archive, bytes_added) = if let Some(archive) = existing {
+    let (archive, bytes_added, seal) = if let Some(archive) = existing {
         for entry in entries {
             let file = payload(&entry, view, &parent, pressure)?;
             let length = file.metadata().safe("cannot inspect archive source")?.len();
-            payloads.insert(archive_name(entry.file), (digest(file, pressure)?, length));
+            payloads.insert(
+                archive_name(&entry.file.path),
+                (digest(file, pressure)?, length),
+            );
         }
-        (archive, 0)
+        let seal = verify(&archive, &payloads, pressure)?;
+        check_orphans(&archive, &seal, orphans)?;
+        (archive, 0, seal)
     } else {
+        if !orphans.is_empty() {
+            return Err(Error(
+                "orphan SQLite sidecar has no verified archive snapshot",
+            ));
+        }
         let temp = tempfile::Builder::new()
             .prefix(".aswap-archive-")
             .permissions(fs::Permissions::from_mode(0o700))
@@ -83,7 +148,7 @@ pub(super) fn preserve<'a>(
             .ok_or(Error("missing staged archive name"))?;
         let staging = parent.child(temp_name).safe("cannot open staged archive")?;
         for entry in entries {
-            let relative = archive_name(entry.file);
+            let relative = archive_name(&entry.file.path);
             let (dir, name) = staging
                 .parent(&relative, true)
                 .safe("cannot create archive payload directory")?;
@@ -101,13 +166,15 @@ pub(super) fn preserve<'a>(
                 .safe("cannot sync archived file")?;
             payloads.insert(relative, (original, length));
         }
-        let (manifest, bytes) = manifest_for(&staging, pressure)?;
+        let files = archived_files(&staging, false, pressure)?;
+        let bytes: u64 = files.values().map(|file| file.bytes).sum();
+        let manifest = manifest_for(&files);
         let mut file = private_file(&staging.path().join(MANIFEST))?;
         file.write_all(&manifest)
             .safe("cannot write archive checksum manifest")?;
         file.sync_all()
             .safe("cannot sync archive checksum manifest")?;
-        verify(&staging, &payloads, pressure)?;
+        let seal = verify(&staging, &payloads, pressure)?;
         renameat_with(
             &parent.0,
             temp_name,
@@ -117,17 +184,9 @@ pub(super) fn preserve<'a>(
         )
         .safe("archive appeared or could not be published")?;
         let _ = temp.keep();
-        (staging, bytes + manifest.len() as u64)
+        (staging, bytes + manifest.len() as u64, seal)
     };
 
-    let manifest = if bytes_added == 0 {
-        verify(&archive, &payloads, pressure)?
-    } else {
-        let (manifest, _) = archive
-            .file(OsStr::new(MANIFEST))
-            .safe("cannot read archive checksum manifest")?;
-        digest(manifest, pressure)?
-    };
     // Retry this even when the archive already exists. A prior rename may
     // have succeeded before its parent fsync failed.
     archive.0.sync_all().safe("cannot sync archive directory")?;
@@ -139,10 +198,13 @@ pub(super) fn preserve<'a>(
     let receipt = Receipt {
         path: path.to_owned(),
         identity: identity(&archive)?,
-        manifest,
+        seal,
         bytes_added,
     };
-    receipt.recheck(pressure)?;
+    let current = Dir::open(path).safe("cannot reopen published archive")?;
+    if identity(&current)? != receipt.identity {
+        return Err(Error("published archive identity or manifest changed"));
+    }
     Ok(receipt)
 }
 
@@ -163,15 +225,8 @@ fn payload(
     parent: &Dir,
     pressure: &mut Pressure<'_>,
 ) -> Result<File> {
-    let mut source = entry.file.open(view)?;
-    let mut header = [0; 16];
-    if entry.file.size() >= header.len() as u64 {
-        source
-            .read_exact(&mut header)
-            .safe("cannot inspect archive source")?;
-        source.rewind().safe("cannot rewind archive source")?;
-    }
-    if header != *b"SQLite format 3\0" && !sqlite_name(entry.file.path.as_os_str().as_bytes()) {
+    let source = entry.file.open(view)?;
+    if !entry.sqlite {
         return Ok(source);
     }
 
@@ -222,22 +277,25 @@ fn identity(dir: &Dir) -> Result<(u64, u64)> {
     Ok((m.dev(), m.ino()))
 }
 
-fn manifest_for(dir: &Dir, pressure: &mut Pressure<'_>) -> Result<(Vec<u8>, u64)> {
-    let mut sums = BTreeMap::new();
-    let mut bytes = 0;
-    inventory(dir, Path::new(""), &mut sums, &mut bytes, pressure)?;
+fn manifest_for(files: &ArchivedFiles) -> Vec<u8> {
     let mut manifest = Vec::new();
-    for (path, hash) in sums {
-        append_sum(&mut manifest, &path, hash);
+    for (path, file) in files {
+        append_sum(&mut manifest, path, file.hash);
     }
-    Ok((manifest, bytes))
+    manifest
+}
+
+fn archived_files(dir: &Dir, sync: bool, pressure: &mut Pressure<'_>) -> Result<ArchivedFiles> {
+    let mut files = BTreeMap::new();
+    inventory(dir, Path::new(""), &mut files, sync, pressure)?;
+    Ok(files)
 }
 
 fn inventory(
     dir: &Dir,
     relative: &Path,
-    sums: &mut BTreeMap<PathBuf, [u8; 32]>,
-    bytes: &mut u64,
+    files: &mut ArchivedFiles,
+    sync: bool,
     pressure: &mut Pressure<'_>,
 ) -> Result<()> {
     if relative.components().count() > 128
@@ -263,22 +321,55 @@ fn inventory(
             let child = dir
                 .contained_child(&name)
                 .safe("cannot open archive directory")?;
-            inventory(&child, &path, sums, bytes, pressure)?;
+            let before = files.len();
+            inventory(&child, &path, files, sync, pressure)?;
+            if before == files.len() {
+                return Err(Error("unexpected empty archive directory"));
+            }
         } else {
             let (file, m) = dir.file(&name).safe("cannot read archived file")?;
             if m.mode() & 0o777 != 0o600 || path.extension() != Some(OsStr::new("zst")) {
                 return Err(Error("unsafe archive file"));
             }
-            sums.insert(path, digest(&file, pressure)?);
-            file.sync_all().safe("cannot sync archived file")?;
-            *bytes += m.len();
+            let hash = digest(&file, pressure)?;
+            let after = file.metadata().safe("cannot recheck archived file")?;
+            if (
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            ) != (
+                after.len(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec(),
+            ) {
+                return Err(Error("archived file changed during verification"));
+            }
+            files.insert(
+                path,
+                ArchivedFile {
+                    identity: (m.dev(), m.ino()),
+                    hash,
+                    bytes: m.len(),
+                },
+            );
+            if sync {
+                file.sync_all().safe("cannot sync archived file")?;
+            }
         }
     }
-    dir.0.sync_all().safe("cannot sync archive directory")
+    if sync {
+        dir.0.sync_all().safe("cannot sync archive directory")?;
+    }
+    Ok(())
 }
 
-fn verify(archive: &Dir, payloads: &Payloads, pressure: &mut Pressure<'_>) -> Result<[u8; 32]> {
-    let (expected, _) = manifest_for(archive, pressure)?;
+fn read_seal(archive: &Dir, sync: bool, pressure: &mut Pressure<'_>) -> Result<Seal> {
+    let files = archived_files(archive, sync, pressure)?;
+    let expected = manifest_for(&files);
     let (manifest, m) = archive
         .file(OsStr::new(MANIFEST))
         .safe("cannot read archive checksum manifest")?;
@@ -290,9 +381,19 @@ fn verify(archive: &Dir, payloads: &Payloads, pressure: &mut Pressure<'_>) -> Re
     if m.mode() & 0o777 != 0o600 || recorded != expected {
         return Err(Error("archive checksum manifest did not verify"));
     }
-    manifest
-        .sync_all()
-        .safe("cannot sync archive checksum manifest")?;
+    if sync {
+        manifest
+            .sync_all()
+            .safe("cannot sync archive checksum manifest")?;
+    }
+    Ok(Seal {
+        manifest: digest(recorded.as_slice(), pressure)?,
+        files,
+    })
+}
+
+fn verify(archive: &Dir, payloads: &Payloads, pressure: &mut Pressure<'_>) -> Result<Seal> {
+    let seal = read_seal(archive, true, pressure)?;
     for (relative, (original, length)) in payloads {
         let (file, _) = archive
             .relative_file(relative)
@@ -302,7 +403,7 @@ fn verify(archive: &Dir, payloads: &Payloads, pressure: &mut Pressure<'_>) -> Re
             return Err(Error("archived file differs from original"));
         }
     }
-    digest(recorded.as_slice(), pressure)
+    Ok(seal)
 }
 
 fn append_sum(manifest: &mut Vec<u8>, path: &Path, digest: [u8; 32]) {

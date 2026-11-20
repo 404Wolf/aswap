@@ -84,6 +84,7 @@ impl Fixture {
             root: &self.root,
             at: SystemTime::now() + advance,
             in_use,
+            recent_fds: &mut |_, _| Ok(false),
             mounts,
             pressure: Pressure {
                 read: pressure,
@@ -802,7 +803,7 @@ fn descriptor_snapshot_and_nested_provider_home_keep_old_views() {
     );
     let mut ignored = Default::default();
     assert!(process::scan(&proc, 1234, &view, &mut ignored).unwrap());
-    let fds = process::Fds::read(&proc, 1234, &t.root.join("runtimes"), None).unwrap();
+    let fds = process::Fds::read(&proc, 1234, &[&t.root.join("runtimes")], None).unwrap();
     fs::remove_file(pid.join("fd/4")).unwrap();
     let report = t.run_with(
         Mode::Apply,
@@ -812,7 +813,7 @@ fn descriptor_snapshot_and_nested_provider_home_keep_old_views() {
     );
     assert!(report.text().contains("used by a live process"));
     assert!(view.join(relative).exists());
-    let fds = process::Fds::read(&proc, 1234, &t.root.join("runtimes"), None).unwrap();
+    let fds = process::Fds::read(&proc, 1234, &[&t.root.join("runtimes")], None).unwrap();
     assert!(!fds.uses_view(&view, &mut ignored).unwrap());
 }
 
@@ -917,4 +918,270 @@ fn pressure_stop_during_bounded_deletion_restores_partial_view_and_reports_incom
     assert!(view.exists());
     assert!(report.totals.bytes_reclaimed > 0 && report.totals.bytes_reclaimed < 80);
     assert_eq!(t.run(Mode::Apply).totals.removed, 1);
+}
+
+#[test]
+fn identical_sqlite_main_files_with_different_effective_state_are_archived() {
+    let t = Fixture::new();
+    let view = t.view("claude", "run-checkpoint");
+    let database = "state_5.sqlite";
+    let shared = t.home.join(database);
+    {
+        let db = rusqlite::Connection::open(&shared).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE history (message TEXT); INSERT INTO history VALUES ('checkpoint');").unwrap();
+    }
+    fs::copy(&shared, view.join(database)).unwrap();
+    let writer = rusqlite::Connection::open(&shared).unwrap();
+    writer
+        .execute_batch("PRAGMA wal_autocheckpoint=0; DELETE FROM history;")
+        .unwrap();
+    assert_eq!(
+        fs::read(&shared).unwrap(),
+        fs::read(view.join(database)).unwrap()
+    );
+    assert!(t.home.join("state_5.sqlite-wal").exists());
+    assert!(!view.join("state_5.sqlite-wal").exists());
+
+    let report = t.run(Mode::Apply);
+    assert_eq!(report.totals.removed, 1, "{}", report.text());
+    let archive = t
+        .root
+        .join("archive/claude/synthetic/run-checkpoint/state_5.sqlite.zst");
+    let snapshot = zstd::stream::decode_all(File::open(archive).unwrap()).unwrap();
+    let restored = t._temp.path().join("restored.sqlite");
+    write(&restored, &snapshot);
+    let restored = rusqlite::Connection::open(restored).unwrap();
+    let value: String = restored
+        .query_row("SELECT message FROM history", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(value, "checkpoint");
+    let shared_count: u32 = writer
+        .query_row("SELECT count(*) FROM history", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(shared_count, 0);
+}
+
+#[test]
+fn linked_and_unknown_sidecars_keep_private_sqlite_groups() {
+    let t = Fixture::new();
+    let linked = t.view("claude", "run-linked-db");
+    let unknown = t.view("claude", "run-unknown-sidecar");
+    let unknown_link = t.view("claude", "run-unknown-link");
+    for view in [&linked, &unknown] {
+        let db = rusqlite::Connection::open(view.join("private.sqlite")).unwrap();
+        db.execute("CREATE TABLE history (message TEXT)", [])
+            .unwrap();
+    }
+    let outside = t._temp.path().join("outside");
+    write(&outside, b"synthetic");
+    symlink(&outside, linked.join("private.sqlite-wal")).unwrap();
+    symlink(
+        &outside,
+        unknown_link.join("private.sqlite-synthetic-sidecar"),
+    )
+    .unwrap();
+    write(
+        &unknown.join("private.sqlite-synthetic-sidecar"),
+        b"synthetic",
+    );
+
+    let report = t.run(Mode::Apply);
+    assert_eq!(report.totals.kept, 3);
+    assert!(report.incomplete());
+    assert!(report.text().contains("linked or non-regular sidecar"));
+    assert!(
+        report
+            .text()
+            .contains("unrecognized private SQLite sidecar")
+    );
+    assert!(linked.join("private.sqlite").is_file());
+    assert!(unknown.join("private.sqlite").is_file());
+    assert!(unknown_link.is_dir());
+    assert_eq!(fs::read(outside).unwrap(), b"synthetic");
+}
+
+#[test]
+fn orphan_sidecar_requires_a_verified_archived_database() {
+    let t = Fixture::new();
+    let view = t.view("claude", "run-orphan");
+    let db = rusqlite::Connection::open(view.join("private.sqlite")).unwrap();
+    db.execute("CREATE TABLE history (message TEXT)", [])
+        .unwrap();
+    drop(db);
+    let archive = t.root.join("archive/claude/synthetic/run-orphan");
+    let first = t.run_with(
+        Mode::Apply,
+        Duration::from_secs(3 * 86400),
+        &mut |_| Ok(archive.exists()),
+        &mut || Ok(0.0),
+    );
+    assert!(first.incomplete());
+    assert!(archive.join("private.sqlite.zst").exists());
+    fs::remove_file(view.join("private.sqlite")).unwrap();
+    write(&view.join("private.sqlite-wal"), b"synthetic orphan");
+
+    let no_archive = t.view("claude", "run-no-snapshot");
+    write(
+        &no_archive.join("private.sqlite-journal"),
+        b"synthetic orphan",
+    );
+    let preview = t.run(Mode::Preview);
+    assert_eq!(preview.totals.finished, 1, "{}", preview.text());
+    assert!(
+        preview
+            .text()
+            .contains("orphan SQLite sidecar has no verified archive snapshot")
+    );
+    let retry = t.run(Mode::Apply);
+    assert_eq!(retry.totals.removed, 1, "{}", retry.text());
+    assert!(view.metadata().is_err());
+    assert!(archive.join("private.sqlite.zst").exists());
+    assert!(no_archive.join("private.sqlite-journal").exists());
+}
+
+#[test]
+fn descriptor_opened_after_initial_snapshot_restores_retiring_view() {
+    for use_old_name in [true, false] {
+        let t = Fixture::new();
+        let view = t.view("codex", "run-late-fd");
+        let relative = "sessions/rollout-synthetic.jsonl";
+        write(&view.join(relative), b"synthetic transcript");
+        let proc = t._temp.path().join("proc");
+        let pid = proc.join("321");
+        write(
+            &pid.join("status"),
+            b"State:\tS\nUid:\t1234\t1234\t1234\t1234\n",
+        );
+        fs::create_dir_all(pid.join("fd")).unwrap();
+        let initial = process::Fds::read(&proc, 1234, &[&t.root.join("runtimes")], None).unwrap();
+        let mut opened = false;
+        let report = Retention {
+            root: &t.root,
+            at: SystemTime::now() + Duration::from_secs(3 * 86400),
+            in_use: &mut |path| initial.uses_view(path, &mut Default::default()),
+            recent_fds: &mut |old, tombstone| {
+                assert!(!old.exists());
+                assert!(tombstone.join(relative).is_file());
+                let opened_path = if use_old_name { old } else { tombstone };
+                symlink(opened_path.join(relative), pid.join("fd/4")).unwrap();
+                opened = true;
+                let fresh = process::Fds::read(&proc, 1234, &[old, tombstone], None).unwrap();
+                let mut ignored = Default::default();
+                Ok(fresh.uses_view(old, &mut ignored)?
+                    || fresh.uses_view(tombstone, &mut ignored)?)
+            },
+            mounts: &mut || Ok(mounts::Mounts::default()),
+            pressure: Pressure {
+                read: &mut || Ok(0.0),
+                limit: 30.0,
+                next: Instant::now(),
+                stopped: None,
+            },
+        }
+        .run(t.settings(), Mode::Apply)
+        .unwrap();
+        assert!(opened);
+        assert!(report.incomplete());
+        assert!(
+            report
+                .text()
+                .contains("open file descriptor refers to the retiring view")
+        );
+        assert!(view.join(relative).exists());
+        assert!(!view.with_file_name(".retiring-run-late-fd").exists());
+    }
+}
+
+#[test]
+fn removing_or_replacing_only_a_sealed_payload_keeps_original_data() {
+    for remove in [true, false] {
+        let t = Fixture::new();
+        let view = t.view("claude", "run-payload");
+        let archive = t.root.join("archive/claude/synthetic/run-payload");
+        let payload = archive.join("history.jsonl.zst");
+        let manifest = archive.join("SHA256SUMS");
+        let original = b"synthetic history";
+        write(&view.join("history.jsonl"), original);
+        let report = t.run_with(
+            Mode::Apply,
+            Duration::from_secs(3 * 86400),
+            &mut |path| {
+                if path.ends_with(".retiring-run-payload") {
+                    assert!(manifest.is_file());
+                    if remove {
+                        fs::remove_file(&payload).unwrap();
+                    } else {
+                        let mut substitute = tempfile::NamedTempFile::new_in(&archive).unwrap();
+                        std::io::Write::write_all(&mut substitute, &fs::read(&payload).unwrap())
+                            .unwrap();
+                        substitute.persist(&payload).unwrap();
+                    }
+                    assert!(manifest.is_file());
+                }
+                Ok(false)
+            },
+            &mut || Ok(0.0),
+        );
+        assert!(report.incomplete());
+        assert_eq!(report.totals.removed, 0);
+        let reason = if remove {
+            "archive checksum manifest did not verify"
+        } else {
+            "published archive payload identity changed"
+        };
+        assert!(report.text().contains(reason), "{}", report.text());
+        assert_eq!(fs::read(view.join("history.jsonl")).unwrap(), original);
+    }
+}
+
+#[test]
+fn tombstone_identity_mismatch_leaves_inventoried_and_replacement_directories_intact() {
+    let t = Fixture::new();
+    let view = t.view("claude", "run-swap");
+    write(&view.join("original"), b"synthetic");
+    let inventoried = Dir::open(&view).unwrap();
+    let parent = Dir::open(view.parent().unwrap()).unwrap();
+    let saved = view.with_file_name("original-view");
+    fs::rename(&view, &saved).unwrap();
+    write(&view.join("replacement"), b"synthetic replacement");
+    let mut pressure = Pressure {
+        read: &mut || Ok(0.0),
+        limit: 30.0,
+        next: Instant::now(),
+        stopped: None,
+    };
+    let mut reclaimed = 0;
+    let error = retire::remove(
+        &parent,
+        &view,
+        &inventoried,
+        |_, _| panic!("replacement must never be verified or deleted"),
+        &mut pressure,
+        &mut reclaimed,
+    )
+    .unwrap_err();
+    assert_eq!(error.0, "retiring directory differs from inventoried view");
+    assert_eq!(reclaimed, 0);
+    assert!(saved.join("original").exists());
+    assert!(
+        view.with_file_name(".retiring-run-swap")
+            .join("replacement")
+            .exists()
+    );
+}
+
+#[test]
+fn operational_failure_before_publication_makes_apply_incomplete() {
+    let t = Fixture::new();
+    let view = t.view("claude", "run-healthy");
+    write(&view.with_file_name("run-unreadable"), b"not a directory");
+    let preview = t.run(Mode::Preview);
+    assert!(!preview.incomplete());
+    let applied = t.run(Mode::Apply);
+    assert!(applied.incomplete());
+    assert!(
+        applied
+            .text()
+            .contains("unsafe or unreadable view directory")
+    );
 }

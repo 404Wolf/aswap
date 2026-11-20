@@ -129,6 +129,7 @@ I/O pressure exceeds the configured limit or the pressure reading is unavailable
 It keeps young views, views with a held lock, and views referenced by a live
 aswap supervisor or a local process under the store's Unix user. The process
 check uses open file descriptors, provider home variables, and working directories.
+GC takes a fresh descriptor scan after hiding each view's original name.
 If Linux denies a read, GC checks the process command line. It keeps the
 view if the command line is unavailable, empty, or mentions the view, Claude,
 Codex, aswap, or Node. The report counts unreadable non-provider processes it
@@ -151,8 +152,11 @@ transcripts remain at `projects/<slug>/<id>.jsonl` and can be opened with
 `claude --resume <id>` from the matching project. If both paths had different
 data, GC leaves the shared file in place. Conflicting transcripts and any
 view-local private files without a verified identical shared copy go into an
-owner-only archive at `archive/<provider>/<label>/<run>/`. SQLite archives hold
-verified online snapshots with committed WAL data. From the archive, run
+owner-only archive at `archive/<provider>/<label>/<run>/`. GC always snapshots
+private SQLite databases, including committed WAL data, even when the main file
+matches the shared copy. A linked or unrecognized private SQLite sidecar keeps
+the view. GC checks every sealed payload's identity and hash again before
+removal. From the archive, run
 `sha256sum --check SHA256SUMS` to check the compressed files before restoring
 the one you want.
 
@@ -162,7 +166,9 @@ reference keeps the view. Apply reports the verified SQLite backup path when
 it first rewrites a shared index. Before deletion, GC renames the view and takes
 a Codex index write transaction to check for references to both names. A native
 Codex process holding an old path in memory can still republish it after that
-transaction. Apply restores an interrupted retirement to its original path
+transaction. Replacing the shared Codex home directory while GC is updating
+the index can also race with opening that database. Apply restores an
+interrupted retirement to its original path
 when it can do so safely. Reclaim counts include newly written index backups.
 
 ## Development

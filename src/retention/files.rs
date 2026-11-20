@@ -2,7 +2,7 @@ use super::Pressure;
 use crate::{Error, Result, Safe, provider::Provider, shared};
 use ring::digest::{Context, SHA256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs::{self, File, Metadata, OpenOptions},
     io::{self, ErrorKind, Read, Write},
@@ -10,7 +10,7 @@ use std::{
         fd::AsRawFd,
         unix::{
             ffi::OsStrExt,
-            fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+            fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt},
         },
     },
     path::{Component, Path, PathBuf},
@@ -53,7 +53,7 @@ impl Dir {
         let fd = openat2(
             &self.0,
             name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
             ResolveFlags::NO_XDEV | ResolveFlags::NO_SYMLINKS,
         )?;
@@ -164,6 +164,7 @@ pub(super) struct Inventory {
     pub(super) files: Vec<SavedFile>,
     pub(super) bytes: u64,
     pub(super) shared_links: Vec<(OsString, PathBuf)>,
+    nonregular: Vec<PathBuf>,
     directories: Vec<(PathBuf, Version)>,
 }
 
@@ -177,6 +178,7 @@ impl Inventory {
             files: Vec::new(),
             bytes: 0,
             shared_links: Vec::new(),
+            nonregular: Vec::new(),
             directories: Vec::new(),
         };
         let version = Version::from(&view.0.metadata().safe("cannot inspect view")?);
@@ -205,10 +207,14 @@ impl Inventory {
         for name in dir.names().safe("cannot list view directory")? {
             pressure.check(false)?;
             let path = dir.path().join(&name);
+            let entry = relative.join(&name);
             let metadata = fs::symlink_metadata(&path).safe("cannot inspect view entry")?;
             let protected = transcript_dir || (top && TRANSCRIPTS.iter().any(|root| name == *root));
             if metadata.dev() != device {
                 return Err(Error("view contains a mounted filesystem"));
+            }
+            if !metadata.is_file() && !regenerable(&entry, &name) {
+                self.nonregular.push(entry.clone());
             }
             if metadata.is_dir() {
                 let child = dir
@@ -219,19 +225,12 @@ impl Inventory {
                 {
                     return Err(Error("view directory changed"));
                 }
-                self.visit(
-                    &child,
-                    &relative.join(&name),
-                    Version::from(&metadata),
-                    provider,
-                    pressure,
-                )?;
+                self.visit(&child, &entry, Version::from(&metadata), provider, pressure)?;
             } else if metadata.is_file() {
                 self.bytes = self.bytes.saturating_add(metadata.len());
-                let path = relative.join(&name);
-                if !regenerable(&path, &name) {
+                if !regenerable(&entry, &name) {
                     self.files.push(SavedFile {
-                        path,
+                        path: entry,
                         source: Version::from(&metadata),
                         transcript: transcript_dir && !shared::private(provider, &name),
                     });
@@ -347,23 +346,86 @@ fn regenerable(path: &Path, name: &OsStr) -> bool {
                 | b"models_cache.json"
                 | b".aswap-active"
         )
-    }) || (name.strip_suffix(b"-shm").is_some_and(sqlite_name))
-        || (name.starts_with(b"logs_")
-            && (name.ends_with(b".sqlite") || name.ends_with(b".sqlite-wal")))
+    }) || (name.starts_with(b"logs_")
+        && (name.ends_with(b".sqlite")
+            || name
+                .windows(b".sqlite-".len())
+                .any(|part| part == b".sqlite-")))
 }
 
-pub(super) fn sqlite_name(name: &[u8]) -> bool {
+fn sqlite_name(name: &[u8]) -> bool {
     [b".sqlite".as_slice(), b".sqlite3", b".db"]
         .iter()
         .any(|suffix| name.ends_with(suffix))
 }
 
-fn database_for_sidecar(path: &Path) -> Option<PathBuf> {
-    let name = path.file_name()?.as_bytes();
-    let base = [b"-wal".as_slice(), b"-journal"]
-        .iter()
-        .find_map(|suffix| name.strip_suffix(*suffix))?;
-    sqlite_name(base).then(|| path.with_file_name(OsStr::from_bytes(base)))
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+pub(super) fn is_sqlite_header(header: &[u8; 16]) -> bool {
+    header == SQLITE_HEADER
+}
+
+fn looks_like_sqlite(view: &Dir, file: &SavedFile) -> Result<bool> {
+    if sqlite_name(file.path.as_os_str().as_bytes()) {
+        return Ok(true);
+    }
+    let mut header = [0; 16];
+    if file.size() < header.len() as u64 {
+        return Ok(false);
+    }
+    file.open(view)?
+        .read_exact_at(&mut header, 0)
+        .safe("cannot inspect view file for SQLite header")?;
+    Ok(is_sqlite_header(&header))
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Sidecar {
+    Wal,
+    Journal,
+    Shm,
+    Unknown,
+}
+
+fn sqlite_sidecar(name: &OsStr, is_database: impl Fn(&OsStr) -> bool) -> Option<(&OsStr, Sidecar)> {
+    let bytes = name.as_bytes();
+    for (index, &byte) in bytes.iter().enumerate().rev() {
+        if byte != b'-' {
+            continue;
+        }
+        let base = OsStr::from_bytes(&bytes[..index]);
+        if sqlite_name(base.as_bytes()) || is_database(base) {
+            let kind = match &bytes[index..] {
+                b"-wal" => Sidecar::Wal,
+                b"-journal" => Sidecar::Journal,
+                b"-shm" => Sidecar::Shm,
+                _ => Sidecar::Unknown,
+            };
+            return Some((base, kind));
+        }
+    }
+    None
+}
+
+pub(super) fn named_sqlite_sidecar(name: &OsStr) -> Option<&OsStr> {
+    sqlite_sidecar(name, |_| false).map(|(base, _)| base)
+}
+
+pub(super) fn sqlite_sidecar_sort_base(name: &OsStr) -> Option<&OsStr> {
+    [b"-wal".as_slice(), b"-journal", b"-shm"]
+        .into_iter()
+        .find_map(|suffix| name.as_bytes().strip_suffix(suffix).map(OsStr::from_bytes))
+        .or_else(|| named_sqlite_sidecar(name))
+}
+
+fn database_for_sidecar(
+    path: &Path,
+    databases: &BTreeMap<&Path, usize>,
+) -> Option<(PathBuf, Sidecar)> {
+    let (name, sidecar) = sqlite_sidecar(path.file_name()?, |base| {
+        databases.contains_key(path.with_file_name(base).as_path())
+    })?;
+    Some((path.with_file_name(name), sidecar))
 }
 
 struct Witness {
@@ -404,6 +466,7 @@ fn compare(
 
 pub(super) struct ArchiveEntry<'a> {
     pub(super) file: &'a SavedFile,
+    pub(super) sqlite: bool,
     pub(super) sidecars: Vec<&'a SavedFile>,
 }
 
@@ -413,7 +476,8 @@ pub(super) struct Plan {
     unique: Vec<usize>,
     conflicts: Vec<usize>,
     shared_files: Vec<Witness>,
-    sidecars: BTreeMap<usize, Vec<usize>>,
+    sqlite_inputs: BTreeMap<usize, Vec<usize>>,
+    pub(super) orphan_databases: BTreeSet<PathBuf>,
 }
 
 impl Plan {
@@ -424,69 +488,87 @@ impl Plan {
         pressure: &mut Pressure<'_>,
     ) -> Result<Self> {
         let files = &inventory.files;
-        let positions: BTreeMap<_, _> = files
-            .iter()
-            .enumerate()
-            .map(|(index, file)| (file.path.as_path(), index))
-            .collect();
-        let mut sidecars = BTreeMap::<_, Vec<_>>::new();
+        let mut databases = BTreeMap::new();
         for (index, file) in files.iter().enumerate() {
-            if let Some(database) = database_for_sidecar(&file.path) {
-                let base = positions
-                    .get(database.as_path())
-                    .ok_or(Error("SQLite sidecar has no view-local database"))?;
-                sidecars.entry(*base).or_default().push(index);
+            pressure.check(false)?;
+            if file
+                .path
+                .file_name()
+                .and_then(named_sqlite_sidecar)
+                .is_none()
+                && looks_like_sqlite(view, file)?
+            {
+                databases.insert(file.path.as_path(), index);
+            }
+        }
+        for path in &inventory.nonregular {
+            if let Some((base, sidecar)) = database_for_sidecar(path, &databases) {
+                if sidecar == Sidecar::Unknown {
+                    return Err(Error("unrecognized private SQLite sidecar"));
+                }
+                if databases.contains_key(base.as_path()) {
+                    return Err(Error(
+                        "private SQLite database has a linked or non-regular sidecar",
+                    ));
+                }
+            }
+        }
+
+        let mut sqlite_inputs: BTreeMap<_, Vec<_>> = databases
+            .values()
+            .map(|&index| (index, Vec::new()))
+            .collect();
+        let mut sidecar_indexes = BTreeSet::new();
+        let mut orphan_databases = BTreeSet::new();
+        let mut sqlite_bytes = 0;
+        for (index, file) in files.iter().enumerate() {
+            let Some((database, sidecar)) = database_for_sidecar(&file.path, &databases) else {
+                continue;
+            };
+            if sidecar == Sidecar::Unknown {
+                return Err(Error("unrecognized private SQLite sidecar"));
+            }
+            sidecar_indexes.insert(index);
+            if let Some(base) = databases.get(database.as_path()) {
+                sqlite_bytes += file.size();
+                if sidecar != Sidecar::Shm {
+                    sqlite_inputs.get_mut(base).unwrap().push(index);
+                }
+            } else {
+                orphan_databases.insert(database);
             }
         }
         let mut plan = Self {
             move_bytes: 0,
-            archive_bytes: 0,
+            archive_bytes: sqlite_bytes,
             unique: Vec::new(),
             conflicts: Vec::new(),
             shared_files: Vec::new(),
-            sidecars,
+            sqlite_inputs,
+            orphan_databases,
         };
         for (index, file) in files.iter().enumerate() {
             pressure.check(false)?;
-            if database_for_sidecar(&file.path).is_some() {
+            if sidecar_indexes.contains(&index) {
                 continue;
             }
-            let comparison = compare(file, view, home, pressure)?;
-            let members = plan
-                .sidecars
-                .get(&index)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            if let Comparison::Equivalent(version) = &comparison {
-                let mut witnesses = vec![Witness {
-                    index,
-                    version: version.clone(),
-                }];
-                for &sidecar in members {
-                    if let Comparison::Equivalent(version) =
-                        compare(&files[sidecar], view, home, pressure)?
-                    {
-                        witnesses.push(Witness {
-                            index: sidecar,
-                            version,
-                        });
+            // Identical main files can expose different data through their
+            // WALs. Preserve every private SQLite database as a snapshot.
+            if !plan.sqlite_inputs.contains_key(&index) {
+                match compare(file, view, home, pressure)? {
+                    Comparison::Equivalent(version) => {
+                        plan.shared_files.push(Witness { index, version });
+                        continue;
                     }
-                }
-                if witnesses.len() == members.len() + 1 {
-                    plan.shared_files.extend(witnesses);
-                    continue;
+                    Comparison::Missing if file.transcript => {
+                        plan.move_bytes += file.size();
+                        plan.unique.push(index);
+                        continue;
+                    }
+                    Comparison::Missing | Comparison::Different => {}
                 }
             }
-            if matches!(comparison, Comparison::Missing)
-                && file.transcript
-                && !sqlite_name(file.path.as_os_str().as_bytes())
-            {
-                plan.move_bytes += file.size();
-                plan.unique.push(index);
-                continue;
-            }
-            plan.archive_bytes +=
-                file.size() + members.iter().map(|&i| files[i].size()).sum::<u64>();
+            plan.archive_bytes += file.size();
             plan.conflicts.push(index);
         }
         Ok(plan)
@@ -498,8 +580,9 @@ impl Plan {
     ) -> impl Iterator<Item = ArchiveEntry<'a>> + Clone {
         self.conflicts.iter().map(|&index| ArchiveEntry {
             file: &inventory.files[index],
+            sqlite: self.sqlite_inputs.contains_key(&index),
             sidecars: self
-                .sidecars
+                .sqlite_inputs
                 .get(&index)
                 .into_iter()
                 .flatten()
@@ -509,7 +592,7 @@ impl Plan {
     }
 
     pub(super) fn has_conflicts(&self) -> bool {
-        !self.conflicts.is_empty()
+        !self.conflicts.is_empty() || !self.orphan_databases.is_empty()
     }
 
     pub(super) fn publish(
@@ -631,8 +714,8 @@ pub(super) fn digest(source: impl Read, pressure: &mut Pressure<'_>) -> Result<[
     Ok(hash.0.finish().as_ref().try_into().expect("SHA-256 length"))
 }
 
-pub(super) fn archive_name(transcript: &SavedFile) -> PathBuf {
-    let mut name = transcript.path.as_os_str().to_owned();
+pub(super) fn archive_name(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
     name.push(".zst");
     PathBuf::from(name)
 }

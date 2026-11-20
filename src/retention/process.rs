@@ -202,11 +202,11 @@ pub(super) struct Fds {
 }
 
 impl Fds {
-    pub(super) fn for_runtimes(runtimes: &Path) -> Result<Self> {
+    pub(super) fn for_paths(roots: &[&Path]) -> Result<Self> {
         Self::read(
             Path::new("/proc"),
             own_uid(),
-            runtimes,
+            roots,
             Some(std::process::id()),
         )
         .safe("cannot scan process file descriptors")
@@ -215,7 +215,7 @@ impl Fds {
     pub(super) fn read(
         proc_root: &Path,
         uid: u32,
-        runtimes: &Path,
+        roots: &[&Path],
         skip_pid: Option<u32>,
     ) -> io::Result<Self> {
         let mut fds = Self::default();
@@ -234,7 +234,7 @@ impl Fds {
                 Err(_) if gone(&process) => continue,
                 Err(error) => return Err(error),
             }
-            match fds.read_process(&process, runtimes) {
+            match fds.read_process(&process, roots) {
                 Ok(()) => {}
                 Err(_) if gone(&process) => {}
                 Err(error) if error.kind() == ErrorKind::PermissionDenied => {
@@ -247,7 +247,7 @@ impl Fds {
         Ok(fds)
     }
 
-    fn read_process(&mut self, process: &Path, runtimes: &Path) -> io::Result<()> {
+    fn read_process(&mut self, process: &Path, roots: &[&Path]) -> io::Result<()> {
         for fd in fs::read_dir(process.join("fd"))? {
             let path = match fs::read_link(fd?.path()) {
                 Ok(path) => path,
@@ -258,7 +258,7 @@ impl Fds {
             let actual = Path::new(OsStr::from_bytes(
                 bytes.strip_suffix(b" (deleted)").unwrap_or(bytes),
             ));
-            if actual.starts_with(runtimes) {
+            if roots.iter().any(|root| actual.starts_with(root)) {
                 self.paths.insert(actual.to_owned());
             }
         }

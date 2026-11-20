@@ -15,6 +15,7 @@ use crate::{
 use files::{Dir, Home, Inventory, Plan};
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt::Write as _,
@@ -329,20 +330,27 @@ pub fn run(mode: Mode, legacy_homes: &[String]) -> Result<Report> {
     if settings.enabled && Dir::open(&root.join("runtimes")).is_ok() {
         process::lower_priority()?;
     }
-    let mut ignored = Default::default();
+    let ignored = RefCell::new(Default::default());
     let runtimes = root.join("runtimes");
     let mut fds = None;
     let mut in_use = |view: &Path| {
-        let fds = fds.get_or_insert_with(|| process::Fds::for_runtimes(&runtimes));
+        let fds = fds.get_or_insert_with(|| process::Fds::for_paths(&[&runtimes]));
         let fds = fds.as_ref().map_err(|error| Error(error.0))?;
+        let mut ignored = ignored.borrow_mut();
         Ok(fds.uses_view(view, &mut ignored)?
             || process::uses_view(view, &mut ignored)?
             || live::view_in_use(&root, view)?)
+    };
+    let mut recent_fds = |view: &Path, tombstone: &Path| {
+        let fds = process::Fds::for_paths(&[view, tombstone])?;
+        let mut ignored = ignored.borrow_mut();
+        Ok(fds.uses_view(view, &mut ignored)? || fds.uses_view(tombstone, &mut ignored)?)
     };
     let mut report = Retention {
         root: &root,
         at: SystemTime::now(),
         in_use: &mut in_use,
+        recent_fds: &mut recent_fds,
         mounts: &mut mounts::read,
         pressure: Pressure {
             read: &mut process::io_pressure,
@@ -352,7 +360,7 @@ pub fn run(mode: Mode, legacy_homes: &[String]) -> Result<Report> {
         },
     }
     .run(settings, mode)?;
-    report.unreadable_non_provider_processes_ignored = ignored.len();
+    report.unreadable_non_provider_processes_ignored = ignored.into_inner().len();
     Ok(report)
 }
 
@@ -360,6 +368,7 @@ struct Retention<'a> {
     root: &'a Path,
     at: SystemTime,
     in_use: &'a mut dyn FnMut(&Path) -> Result<bool>,
+    recent_fds: &'a mut dyn FnMut(&Path, &Path) -> Result<bool>,
     mounts: &'a mut dyn FnMut() -> Result<mounts::Mounts>,
     pressure: Pressure<'a>,
 }
@@ -509,6 +518,7 @@ impl Retention<'_> {
                     };
                     if let Err(error) = outcome {
                         result.reason = error.0;
+                        result.incomplete |= !dry_run && !expected_keep(&error);
                     }
                     group.totals.add(&result);
                     report.totals.add(&result);
@@ -553,7 +563,7 @@ impl Retention<'_> {
         if (self.in_use)(&path)? || (self.in_use)(candidate.path)? {
             return Err(Error("retiring view is in use"));
         }
-        retire::restore(candidate.label_dir, entry, candidate.run)?;
+        retire::restore(candidate.label_dir, entry, candidate.run, &dir)?;
         Err(Error(
             "restored interrupted retirement to the original view path",
         ))
@@ -616,6 +626,7 @@ impl Retention<'_> {
             .has_conflicts()
             .then(|| archive.to_string_lossy().into_owned());
         if dry_run {
+            archive::verify_orphans(archive, &plan.orphan_databases, &mut self.pressure)?;
             if provider == Provider::Codex {
                 codex_index::check(
                     &home,
@@ -653,6 +664,7 @@ impl Retention<'_> {
                 archive,
                 &view,
                 plan.conflicts(&inventory),
+                &plan.orphan_databases,
                 &mut self.pressure,
             )?;
             result.bytes_reclaimed -= i128::from(receipt.bytes_added);
@@ -694,9 +706,11 @@ impl Retention<'_> {
         }
         let mounts = &mut self.mounts;
         let in_use = &mut self.in_use;
+        let recent_fds = &mut self.recent_fds;
         retire::remove(
             label_dir,
             path,
+            &view,
             |tombstone, pressure| {
                 if in_use(tombstone)? || in_use(path)? {
                     return Err(Error("used by a live process or supervisor"));
@@ -716,13 +730,17 @@ impl Retention<'_> {
                     return Err(Error("shared provider home changed"));
                 }
                 plan.verify_shared(&inventory, &home.dir, pressure)?;
+                inventory.verify(&view, true, pressure)?;
                 if let Some(receipt) = &archive {
                     receipt.recheck(pressure)?;
                 }
-                inventory.verify(&view, true, pressure)?;
                 let mounts = mounts()?;
                 mounts.check(path)?;
-                mounts.check(tombstone)
+                mounts.check(tombstone)?;
+                if recent_fds(path, tombstone)? {
+                    return Err(Error("open file descriptor refers to the retiring view"));
+                }
+                Ok(())
             },
             &mut self.pressure,
             &mut result.bytes_reclaimed,
@@ -788,6 +806,17 @@ struct Candidate<'a> {
     archive_root: &'a Path,
     min_age: Duration,
     dry_run: bool,
+}
+
+fn expected_keep(error: &Error) -> bool {
+    matches!(
+        error.0,
+        "younger than minimum age"
+            | "view lock held"
+            | "used by a live process or supervisor"
+            | "view contains a mount point"
+            | "legacy view without a verified home"
+    )
 }
 
 fn try_lock(dir: &Dir, name: &OsStr) -> Result<Option<File>> {
