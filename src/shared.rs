@@ -28,10 +28,12 @@ use config::{merge_missing, read_config, shared_config};
 pub use files::merge_new;
 pub(crate) use files::sqlite_snapshot_from;
 pub(crate) use files::{Stamp, stamp};
-use files::{dir, entries, exists, link, snapshot};
+use files::{WAL_SIDECARS, dir, entries, exists, link, snapshot, sqlite_database};
+mod sqlite;
 use handout::{carry, view_lock};
 pub(crate) use handout::{hand_out, view_lock_path};
 use mcp::{MCP_OAUTH, mcp_record, with_mcp};
+pub use sqlite::{SqliteRisk, ViewRisk, sqlite_risks};
 
 /// A mkdir lock (proper-lockfile: a directory named `<file>.lock`), as Claude
 /// Code takes for `.storage-write` and `mcp-refresh-*.lock`. One is never
@@ -374,6 +376,23 @@ impl View {
                     .safe("cannot secure shared history")?;
             }
             names.insert(name.into());
+        }
+        // SQLite opens a linked database's -wal and -shm beside the real
+        // file, so Codex's own SQLite never uses the view's spelling. A client
+        // that did would create them privately, beside a shared database:
+        // two WALs for one database. Link them before they exist, so every
+        // spelling reaches the home's.
+        let databases: Vec<OsString> = names
+            .iter()
+            .filter(|name| sqlite_database(&home, name))
+            .cloned()
+            .collect();
+        for database in databases {
+            for suffix in WAL_SIDECARS {
+                let mut sidecar = database.clone();
+                sidecar.push(suffix);
+                names.insert(sidecar);
+            }
         }
         drop(lock);
         let mut view = Self {

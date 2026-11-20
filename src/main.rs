@@ -45,7 +45,9 @@ enum Action {
     /// Show the actual account used by each locally running session.
     Sessions { provider: Option<Provider> },
     /// Report provider index entries that name a missing transcript or one
-    /// inside a launch view; changes nothing. Exits 1 when one is missing.
+    /// inside a launch view, and launch views whose SQLite databases aren't
+    /// shared safely with the home; changes nothing. Exits 1 when a
+    /// transcript is missing or a view can lose or corrupt data.
     Check { provider: Option<Provider> },
     /// Capture the current file-based login under a private label.
     Add { provider: Provider, label: String },
@@ -422,6 +424,7 @@ fn execute(cli: Cli) -> Result<i32> {
         }
         Action::Check { provider } => {
             let mut findings = Vec::new();
+            let mut risks = Vec::new();
             for p in Provider::ALL
                 .into_iter()
                 .filter(|p| provider.is_none_or(|want| want == *p))
@@ -434,6 +437,11 @@ fn execute(cli: Cli) -> Result<i32> {
                     Err(e) => return Err(e),
                 };
                 let views = aswap::shared::views_root(&store, p);
+                risks.extend(
+                    aswap::shared::sqlite_risks(&store, p, &home)?
+                        .into_iter()
+                        .map(|risk| (p, risk)),
+                );
                 findings.extend(
                     p.spec()
                         .check_index(&home, &views)?
@@ -463,16 +471,39 @@ fn execute(cli: Cli) -> Result<i32> {
                     pretty.push_str(&format!("\n  home copy: {}", canonical.display()));
                 }
             }
+            let at_risk = risks.iter().filter(|(_, r)| r.risk.dangerous()).count();
+            pretty.push_str(&format!(
+                "\n{at_risk} launch view files at risk, {} SQLite sidecars not linked (safe)",
+                risks.len() - at_risk
+            ));
+            for (p, r) in risks.iter().filter(|(_, r)| r.risk.dangerous()) {
+                let risk = match r.risk {
+                    aswap::shared::SqliteRisk::PrivateCopy => "private database copy",
+                    _ => "private SQLite sidecar",
+                };
+                pretty.push_str(&format!("\n{p} {risk}: {}", r.file.display()));
+            }
             let rows: Vec<_> = findings
                 .iter()
                 .map(|(p, f)| json!({"provider": p.as_str(), "entry": f}))
                 .collect();
+            let views: Vec<_> = risks
+                .iter()
+                .map(|(p, r)| json!({"provider": p.as_str(), "view": r}))
+                .collect();
             output(
-                &json!({"dangling": dangling, "in_view": in_view, "repairable": repairable, "entries": rows}),
+                &json!({
+                    "dangling": dangling,
+                    "in_view": in_view,
+                    "repairable": repairable,
+                    "entries": rows,
+                    "sqlite_at_risk": at_risk,
+                    "sqlite_views": views,
+                }),
                 cli.json,
                 pretty,
             )?;
-            if dangling > 0 {
+            if dangling > 0 || at_risk > 0 {
                 return Ok(1);
             }
         }

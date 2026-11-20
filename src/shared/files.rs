@@ -42,6 +42,23 @@ pub(super) fn dir(path: &Path) -> Result<bool> {
         .safe("cannot create shared provider directory")?;
     Ok(true)
 }
+/// The files SQLite keeps beside a database in WAL mode, named by suffix.
+pub(super) const WAL_SIDECARS: [&str; 2] = ["-wal", "-shm"];
+/// Whether `name` is spelled like a SQLite database.
+pub(super) fn sqlite_name(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        [".sqlite", ".sqlite3", ".db"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+    })
+}
+/// A regular SQLite database file in `dir` named `name`.
+pub(super) fn sqlite_database(dir: &Path, name: &OsStr) -> bool {
+    let path = dir.join(name);
+    sqlite_name(name)
+        && fs::symlink_metadata(&path).is_ok_and(|m| m.is_file())
+        && sqlite_file(&path)
+}
 /// SQLite sidecars are transient and belong to the connection's database path.
 pub(super) fn sqlite_sidecar(path: &Path) -> bool {
     path.file_name()
