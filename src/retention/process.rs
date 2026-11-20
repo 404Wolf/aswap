@@ -1,6 +1,6 @@
 use crate::{Error, Result, Safe};
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     ffi::{OsStr, OsString},
     fs,
     io::{self, ErrorKind},
@@ -41,9 +41,12 @@ pub(super) fn parse_pressure(text: &str) -> Result<f64> {
 }
 
 pub(super) fn uses_view(view: &Path, ignored: &mut HashSet<OsString>) -> Result<bool> {
+    scan(Path::new("/proc"), own_uid(), view, ignored).safe("cannot establish process liveness")
+}
+
+fn own_uid() -> u32 {
     // SAFETY: geteuid takes no arguments and does not access memory.
-    let uid = unsafe { libc::geteuid() };
-    scan(Path::new("/proc"), uid, view, ignored).safe("cannot establish process liveness")
+    unsafe { libc::geteuid() }
 }
 
 pub(super) fn scan(
@@ -84,8 +87,7 @@ pub(super) fn scan_with_access(
                 ignored.insert(pid);
             }
             // A PID can disappear at any point during inspection.
-            Err(_) if matches!(fs::metadata(&process), Err(e) if e.kind() == ErrorKind::NotFound) =>
-                {}
+            Err(_) if gone(&process) => {}
             Err(error) => return Err(error),
         }
     }
@@ -98,13 +100,11 @@ enum ViewUse {
     UnreadableNonProvider,
 }
 
-fn process_uses_view(
-    process: &Path,
-    uid: u32,
-    view: &Path,
-    cwd: impl Fn(&Path) -> io::Result<PathBuf>,
-    environ: impl Fn(&Path) -> io::Result<Vec<u8>>,
-) -> io::Result<ViewUse> {
+fn gone(process: &Path) -> bool {
+    matches!(fs::metadata(process), Err(e) if e.kind() == ErrorKind::NotFound)
+}
+
+fn may_use_store(process: &Path, uid: u32) -> io::Result<bool> {
     let status = fs::read(process.join("status"))?;
     let field = |prefix: &[u8]| {
         status
@@ -123,13 +123,22 @@ fn process_uses_view(
         .ok_or_else(|| io::Error::other("invalid process UIDs"))?;
     // Runtimes are private to this Unix user. Other users' process state
     // is ordinarily unreadable. UID transitions involving this user count.
-    if !uids.contains(&uid)
-        || matches!(
+    Ok(uids.contains(&uid)
+        && !matches!(
             field(b"State:\t").and_then(|s| s.first()),
             Some(b'Z' | b'X')
         )
-        || field(b"Kthread:\t") == Some(b"1")
-    {
+        && field(b"Kthread:\t") != Some(b"1"))
+}
+
+fn process_uses_view(
+    process: &Path,
+    uid: u32,
+    view: &Path,
+    cwd: impl Fn(&Path) -> io::Result<PathBuf>,
+    environ: impl Fn(&Path) -> io::Result<Vec<u8>>,
+) -> io::Result<ViewUse> {
+    if !may_use_store(process, uid)? {
         return Ok(ViewUse::Inactive);
     }
     let cwd = match cwd(&process.join("cwd")) {
@@ -153,12 +162,12 @@ fn process_uses_view(
             .filter(|path| !path.is_empty())
     }) {
         let path = cwd.join(OsStr::from_bytes(value));
-        if path == view {
+        if path.starts_with(view) {
             return Ok(ViewUse::Active);
         }
         // Also recognize a provider home spelled via an alias or .. component.
         match path.canonicalize() {
-            Ok(path) if path == view => return Ok(ViewUse::Active),
+            Ok(path) if path.starts_with(view) => return Ok(ViewUse::Active),
             Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -168,20 +177,112 @@ fn process_uses_view(
 }
 
 fn inspect_unreadable(process: &Path, view: &Path, denied: io::Error) -> io::Result<ViewUse> {
-    let Ok(cmdline) = fs::read(process.join("cmdline")) else {
-        return Err(denied);
-    };
+    if fs::read(process.join("cmdline")).is_ok_and(|cmdline| unrelated(&cmdline, view)) {
+        return Ok(ViewUse::UnreadableNonProvider);
+    }
+    Err(denied)
+}
+
+fn unrelated(cmdline: &[u8], view: &Path) -> bool {
     let names: &[&[u8]] = &[b"claude", b"codex", b"aswap", b"node"];
     let view = view.as_os_str().as_bytes();
-    if cmdline.iter().all(|&b| b == 0)
+    !(cmdline.iter().all(|&b| b == 0)
         || names.iter().any(|name| {
             cmdline
                 .windows(name.len())
                 .any(|part| part.eq_ignore_ascii_case(name))
         })
-        || (!view.is_empty() && cmdline.windows(view.len()).any(|part| part == view))
-    {
-        return Err(denied);
+        || (!view.is_empty() && cmdline.windows(view.len()).any(|part| part == view)))
+}
+
+#[derive(Default)]
+pub(super) struct Fds {
+    paths: BTreeSet<PathBuf>,
+    unreadable: Vec<(OsString, Option<Vec<u8>>)>,
+}
+
+impl Fds {
+    pub(super) fn for_runtimes(runtimes: &Path) -> Result<Self> {
+        Self::read(
+            Path::new("/proc"),
+            own_uid(),
+            runtimes,
+            Some(std::process::id()),
+        )
+        .safe("cannot scan process file descriptors")
     }
-    Ok(ViewUse::UnreadableNonProvider)
+
+    pub(super) fn read(
+        proc_root: &Path,
+        uid: u32,
+        runtimes: &Path,
+        skip_pid: Option<u32>,
+    ) -> io::Result<Self> {
+        let mut fds = Self::default();
+        let skip_pid = skip_pid.map(|pid| pid.to_string());
+        for entry in fs::read_dir(proc_root)? {
+            let entry = entry?;
+            let pid = entry.file_name();
+            if !pid.as_bytes().iter().all(u8::is_ascii_digit) || pid.to_str() == skip_pid.as_deref()
+            {
+                continue;
+            }
+            let process = entry.path();
+            match may_use_store(&process, uid) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) if gone(&process) => continue,
+                Err(error) => return Err(error),
+            }
+            match fds.read_process(&process, runtimes) {
+                Ok(()) => {}
+                Err(_) if gone(&process) => {}
+                Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+                    fds.unreadable
+                        .push((pid, fs::read(process.join("cmdline")).ok()));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(fds)
+    }
+
+    fn read_process(&mut self, process: &Path, runtimes: &Path) -> io::Result<()> {
+        for fd in fs::read_dir(process.join("fd"))? {
+            let path = match fs::read_link(fd?.path()) {
+                Ok(path) => path,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let bytes = path.as_os_str().as_bytes();
+            let actual = Path::new(OsStr::from_bytes(
+                bytes.strip_suffix(b" (deleted)").unwrap_or(bytes),
+            ));
+            if actual.starts_with(runtimes) {
+                self.paths.insert(actual.to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn uses_view(&self, view: &Path, ignored: &mut HashSet<OsString>) -> Result<bool> {
+        if self
+            .paths
+            .range(view.to_owned()..)
+            .next()
+            .is_some_and(|path| path.starts_with(view))
+        {
+            return Ok(true);
+        }
+        for (pid, cmdline) in &self.unreadable {
+            if !cmdline
+                .as_deref()
+                .is_some_and(|cmdline| unrelated(cmdline, view))
+            {
+                return Err(Error("cannot establish file descriptor liveness"));
+            }
+            ignored.insert(pid.clone());
+        }
+        Ok(false)
+    }
 }

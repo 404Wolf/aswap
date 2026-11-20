@@ -156,15 +156,25 @@ pub(crate) fn sqlite_snapshot(source: &Path, dest: &Path) -> Result<()> {
     let source =
         rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .safe("cannot open SQLite snapshot source")?;
+    sqlite_snapshot_from(&source, dest, || Ok(()))
+}
+
+pub(crate) fn sqlite_snapshot_from(
+    source: &rusqlite::Connection,
+    dest: &Path,
+    mut check_pressure: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    check_pressure()?;
     source
         .busy_timeout(std::time::Duration::from_secs(5))
         .safe("cannot set SQLite timeout")?;
     let mut target =
         rusqlite::Connection::open(dest).safe("cannot open SQLite snapshot destination")?;
-    let backup = rusqlite::backup::Backup::new(&source, &mut target)
+    let backup = rusqlite::backup::Backup::new(source, &mut target)
         .safe("cannot prepare SQLite snapshot")?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
+        check_pressure()?;
         if matches!(
             backup.step(128).safe("cannot snapshot SQLite database")?,
             rusqlite::backup::StepResult::Done
@@ -177,6 +187,7 @@ pub(crate) fn sqlite_snapshot(source: &Path, dest: &Path) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     drop(backup);
+    check_pressure()?;
     let check: String = target
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
         .safe("cannot validate SQLite snapshot")?;
@@ -185,7 +196,7 @@ pub(crate) fn sqlite_snapshot(source: &Path, dest: &Path) -> Result<()> {
             "SQLite snapshot source is corrupt; original retained",
         ));
     }
-    Ok(())
+    check_pressure()
 }
 /// Stream into a private temporary file, then publish without replacing anything.
 fn new_file(source: &Path, dest: &Path) -> Result<()> {

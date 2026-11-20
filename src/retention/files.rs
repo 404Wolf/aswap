@@ -2,12 +2,16 @@ use super::Pressure;
 use crate::{Error, Result, Safe, provider::Provider, shared};
 use ring::digest::{Context, SHA256};
 use std::{
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     fs::{self, File, Metadata, OpenOptions},
     io::{self, ErrorKind, Read, Write},
     os::{
         fd::AsRawFd,
-        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        unix::{
+            ffi::OsStrExt,
+            fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        },
     },
     path::{Component, Path, PathBuf},
 };
@@ -42,6 +46,18 @@ impl Dir {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(self.path().join(name))
             .map(Self)
+    }
+
+    pub(super) fn contained_child(&self, name: &OsStr) -> io::Result<Self> {
+        use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+        let fd = openat2(
+            &self.0,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_XDEV | ResolveFlags::NO_SYMLINKS,
+        )?;
+        Ok(Self(fd.into()))
     }
 
     pub(super) fn descend(&self, path: &Path, create: bool) -> io::Result<Self> {
@@ -123,11 +139,12 @@ impl From<&Metadata> for Version {
     }
 }
 
-pub(super) struct Transcript {
+pub(super) struct SavedFile {
     pub(super) path: PathBuf,
     source: Version,
+    transcript: bool,
 }
-impl Transcript {
+impl SavedFile {
     pub(super) fn size(&self) -> u64 {
         self.source.size
     }
@@ -135,16 +152,16 @@ impl Transcript {
     pub(super) fn open(&self, view: &Dir) -> Result<File> {
         let (file, metadata) = view
             .relative_file(&self.path)
-            .safe("cannot read view transcript")?;
+            .safe("cannot read view file")?;
         if Version::from(&metadata) != self.source {
-            return Err(Error("view transcript changed"));
+            return Err(Error("view file changed"));
         }
         Ok(file)
     }
 }
 
 pub(super) struct Inventory {
-    pub(super) transcripts: Vec<Transcript>,
+    pub(super) files: Vec<SavedFile>,
     pub(super) bytes: u64,
     pub(super) shared_links: Vec<(OsString, PathBuf)>,
     directories: Vec<(PathBuf, Version)>,
@@ -157,7 +174,7 @@ impl Inventory {
         pressure: &mut Pressure<'_>,
     ) -> Result<Self> {
         let mut inventory = Self {
-            transcripts: Vec::new(),
+            files: Vec::new(),
             bytes: 0,
             shared_links: Vec::new(),
             directories: Vec::new(),
@@ -194,7 +211,9 @@ impl Inventory {
                 return Err(Error("view contains a mounted filesystem"));
             }
             if metadata.is_dir() {
-                let child = dir.child(&name).safe("cannot open view directory")?;
+                let child = dir
+                    .contained_child(&name)
+                    .safe("cannot enter view directory without crossing a mount")?;
                 if Version::from(&child.0.metadata().safe("cannot inspect view directory")?)
                     != Version::from(&metadata)
                 {
@@ -209,15 +228,12 @@ impl Inventory {
                 )?;
             } else if metadata.is_file() {
                 self.bytes = self.bytes.saturating_add(metadata.len());
-                if protected {
-                    if top || shared::private(provider, &name) {
-                        return Err(Error(
-                            "unexpected private or non-directory transcript entry",
-                        ));
-                    }
-                    self.transcripts.push(Transcript {
-                        path: relative.join(name),
+                let path = relative.join(&name);
+                if !regenerable(&path, &name) {
+                    self.files.push(SavedFile {
+                        path,
                         source: Version::from(&metadata),
+                        transcript: transcript_dir && !shared::private(provider, &name),
                     });
                 }
             } else if protected {
@@ -239,17 +255,28 @@ impl Inventory {
         Ok(())
     }
 
-    pub(super) fn verify(&self, view: &Dir, pressure: &mut Pressure<'_>) -> Result<()> {
+    pub(super) fn verify(
+        &self,
+        view: &Dir,
+        renamed: bool,
+        pressure: &mut Pressure<'_>,
+    ) -> Result<()> {
         for (relative, version) in &self.directories {
             pressure.check(false)?;
             let dir = view
                 .descend(relative, false)
                 .safe("cannot recheck view directory")?;
-            if Version::from(&dir.0.metadata().safe("cannot inspect view directory")?) != *version {
+            let mut current =
+                Version::from(&dir.0.metadata().safe("cannot inspect view directory")?);
+            if renamed && relative.as_os_str().is_empty() {
+                // Renaming the view advances the directory's ctime.
+                current.changed = version.changed;
+            }
+            if current != *version {
                 return Err(Error("view directory changed"));
             }
         }
-        for transcript in &self.transcripts {
+        for transcript in &self.files {
             pressure.check(false)?;
             transcript.open(view)?;
         }
@@ -267,7 +294,10 @@ impl Inventory {
         pressure: &mut Pressure<'_>,
     ) -> Result<()> {
         const UNSAFE: Error = Error("Codex index rollout cannot be safely mapped to shared home");
-        let source = self.transcripts.iter().find(|file| file.path == relative);
+        let source = self
+            .files
+            .iter()
+            .find(|file| file.transcript && file.path == relative);
         let (canonical, metadata) = match home.dir.relative_file(relative) {
             Ok(file) => file,
             Err(error) if preview && source.is_some() && error.kind() == ErrorKind::NotFound => {
@@ -300,9 +330,81 @@ impl Inventory {
     }
 }
 
+fn regenerable(path: &Path, name: &OsStr) -> bool {
+    let name = name.as_bytes();
+    let top = path
+        .components()
+        .next()
+        .map(|part| part.as_os_str().as_bytes());
+    top.is_some_and(|top| {
+        matches!(
+            top,
+            b"tmp"
+                | b"log"
+                | b"logs"
+                | b"cache"
+                | b".tmp"
+                | b"models_cache.json"
+                | b".aswap-active"
+        )
+    }) || (name.strip_suffix(b"-shm").is_some_and(sqlite_name))
+        || (name.starts_with(b"logs_")
+            && (name.ends_with(b".sqlite") || name.ends_with(b".sqlite-wal")))
+}
+
+pub(super) fn sqlite_name(name: &[u8]) -> bool {
+    [b".sqlite".as_slice(), b".sqlite3", b".db"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+fn database_for_sidecar(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.as_bytes();
+    let base = [b"-wal".as_slice(), b"-journal"]
+        .iter()
+        .find_map(|suffix| name.strip_suffix(*suffix))?;
+    sqlite_name(base).then(|| path.with_file_name(OsStr::from_bytes(base)))
+}
+
 struct Witness {
     index: usize,
     version: Version,
+}
+
+enum Comparison {
+    Equivalent(Version),
+    Missing,
+    Different,
+}
+
+fn compare(
+    file: &SavedFile,
+    view: &Dir,
+    home: &Dir,
+    pressure: &mut Pressure<'_>,
+) -> Result<Comparison> {
+    match home.relative_file(&file.path) {
+        Ok((shared, metadata)) => {
+            let version = Version::from(&metadata);
+            if metadata.len() != file.size()
+                || digest(file.open(view)?, pressure)? != digest(&shared, pressure)?
+            {
+                return Ok(Comparison::Different);
+            }
+            if Version::from(&shared.metadata().safe("cannot inspect shared file")?) != version {
+                return Err(Error("shared file changed"));
+            }
+            Ok(Comparison::Equivalent(version))
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(Comparison::Missing),
+        Err(_) if !file.transcript => Ok(Comparison::Different),
+        Err(_) => Err(Error("unsafe or unreadable shared transcript path")),
+    }
+}
+
+pub(super) struct ArchiveEntry<'a> {
+    pub(super) file: &'a SavedFile,
+    pub(super) sidecars: Vec<&'a SavedFile>,
 }
 
 pub(super) struct Plan {
@@ -311,49 +413,81 @@ pub(super) struct Plan {
     unique: Vec<usize>,
     conflicts: Vec<usize>,
     shared_files: Vec<Witness>,
+    sidecars: BTreeMap<usize, Vec<usize>>,
 }
 
 impl Plan {
     pub(super) fn classify(
         inventory: &Inventory,
         view: &Dir,
-        home: Option<&Dir>,
+        home: &Dir,
         pressure: &mut Pressure<'_>,
     ) -> Result<Self> {
+        let files = &inventory.files;
+        let positions: BTreeMap<_, _> = files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| (file.path.as_path(), index))
+            .collect();
+        let mut sidecars = BTreeMap::<_, Vec<_>>::new();
+        for (index, file) in files.iter().enumerate() {
+            if let Some(database) = database_for_sidecar(&file.path) {
+                let base = positions
+                    .get(database.as_path())
+                    .ok_or(Error("SQLite sidecar has no view-local database"))?;
+                sidecars.entry(*base).or_default().push(index);
+            }
+        }
         let mut plan = Self {
             move_bytes: 0,
             archive_bytes: 0,
             unique: Vec::new(),
             conflicts: Vec::new(),
             shared_files: Vec::new(),
+            sidecars,
         };
-        for (index, transcript) in inventory.transcripts.iter().enumerate() {
+        for (index, file) in files.iter().enumerate() {
             pressure.check(false)?;
-            let home = home.ok_or(Error("shared home is unavailable"))?;
-            match home.relative_file(&transcript.path) {
-                Ok((shared, metadata)) => {
-                    let version = Version::from(&metadata);
-                    if metadata.len() == transcript.size()
-                        && digest(transcript.open(view)?, pressure)? == digest(&shared, pressure)?
+            if database_for_sidecar(&file.path).is_some() {
+                continue;
+            }
+            let comparison = compare(file, view, home, pressure)?;
+            let members = plan
+                .sidecars
+                .get(&index)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if let Comparison::Equivalent(version) = &comparison {
+                let mut witnesses = vec![Witness {
+                    index,
+                    version: version.clone(),
+                }];
+                for &sidecar in members {
+                    if let Comparison::Equivalent(version) =
+                        compare(&files[sidecar], view, home, pressure)?
                     {
-                        if Version::from(
-                            &shared.metadata().safe("cannot inspect shared transcript")?,
-                        ) != version
-                        {
-                            return Err(Error("shared transcript changed"));
-                        }
-                        plan.shared_files.push(Witness { index, version });
-                    } else {
-                        plan.archive_bytes += transcript.size();
-                        plan.conflicts.push(index);
+                        witnesses.push(Witness {
+                            index: sidecar,
+                            version,
+                        });
                     }
                 }
-                Err(error) if error.kind() == ErrorKind::NotFound => {
-                    plan.move_bytes += transcript.size();
-                    plan.unique.push(index);
+                if witnesses.len() == members.len() + 1 {
+                    plan.shared_files.extend(witnesses);
+                    continue;
                 }
-                Err(_) => return Err(Error("unsafe or unreadable shared transcript path")),
             }
+            if matches!(comparison, Comparison::Missing)
+                && file.transcript
+                && !sqlite_name(file.path.as_os_str().as_bytes())
+            {
+                plan.move_bytes += file.size();
+                plan.unique.push(index);
+                continue;
+            }
+            plan.archive_bytes +=
+                file.size() + members.iter().map(|&i| files[i].size()).sum::<u64>();
+            plan.conflicts.push(index);
         }
         Ok(plan)
     }
@@ -361,8 +495,17 @@ impl Plan {
     pub(super) fn conflicts<'a>(
         &'a self,
         inventory: &'a Inventory,
-    ) -> impl Iterator<Item = &'a Transcript> + Clone {
-        self.conflicts.iter().map(|&i| &inventory.transcripts[i])
+    ) -> impl Iterator<Item = ArchiveEntry<'a>> + Clone {
+        self.conflicts.iter().map(|&index| ArchiveEntry {
+            file: &inventory.files[index],
+            sidecars: self
+                .sidecars
+                .get(&index)
+                .into_iter()
+                .flatten()
+                .map(|&i| &inventory.files[i])
+                .collect(),
+        })
     }
 
     pub(super) fn has_conflicts(&self) -> bool {
@@ -379,7 +522,7 @@ impl Plan {
     ) -> Result<()> {
         for &index in &self.unique {
             pressure.check(false)?;
-            let transcript = &inventory.transcripts[index];
+            let transcript = &inventory.files[index];
             let (parent, name) = home
                 .parent(&transcript.path, true)
                 .safe("cannot create shared transcript directory")?;
@@ -391,6 +534,14 @@ impl Plan {
                     != transcript.source
             {
                 return Err(Error("view transcript changed"));
+            }
+            let mut readback = temporary
+                .reopen()
+                .safe("cannot read staged shared transcript")?;
+            if digest(transcript.open(view)?, pressure)? != digest(&mut readback, pressure)? {
+                return Err(Error(
+                    "staged shared transcript failed SHA-256 verification",
+                ));
             }
             temporary
                 .as_file()
@@ -424,7 +575,7 @@ impl Plan {
     ) -> Result<()> {
         for witness in &self.shared_files {
             pressure.check(false)?;
-            let transcript = &inventory.transcripts[witness.index];
+            let transcript = &inventory.files[witness.index];
             let (parent, name) = home
                 .parent(&transcript.path, false)
                 .safe("cannot recheck shared transcript directory")?;
@@ -480,7 +631,7 @@ pub(super) fn digest(source: impl Read, pressure: &mut Pressure<'_>) -> Result<[
     Ok(hash.0.finish().as_ref().try_into().expect("SHA-256 length"))
 }
 
-pub(super) fn archive_name(transcript: &Transcript) -> PathBuf {
+pub(super) fn archive_name(transcript: &SavedFile) -> PathBuf {
     let mut name = transcript.path.as_os_str().to_owned();
     name.push(".zst");
     PathBuf::from(name)

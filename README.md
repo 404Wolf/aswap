@@ -107,7 +107,7 @@ io_pressure_limit = 30    # Linux /proc/pressure/io some avg10, in percent
 ```
 
 With the Home Manager module, set `programs.aswap.retention.enable = true`.
-Its `minAge`, `dryRun`, `ioPressureLimit`, and `archiveDir` options configure
+Its `minAge`, `dryRun`, `ioPressureLimit`, `archiveDir`, and `legacyHomes` options configure
 the same settings. The default archive is `archive/` inside the aswap data
 directory (`~/.local/share/aswap/` by default).
 
@@ -118,39 +118,52 @@ aswap gc --dry-run --json
 ```
 
 The report goes to standard output with a verdict, reason, and byte counts
-for each view, followed by totals. Preview estimates count regular-file
-bytes and exclude the bytes to move or archive. Apply counts net bytes after
-files moved to the shared home and newly written compressed archives.
+for each view, followed by totals. Preview estimates count logical file bytes
+and exclude bytes to move or archive. Apply counts net logical bytes after
+files moved to the shared home and newly written compressed archives. An apply
+that stops early or leaves an operation incomplete exits with a nonzero status.
 Actual filesystem space varies with compression, sparse files, and hard links.
 
 GC processes one view at a time at idle I/O priority and nice 19. It stops if
 I/O pressure exceeds the configured limit or the pressure reading is unavailable.
 It keeps young views, views with a held lock, and views referenced by a live
 aswap supervisor or a local process under the store's Unix user. The process
-check uses the provider home environment variables and the working directory.
-If Linux denies either read, GC checks the process command line. It keeps the
+check uses open file descriptors, provider home variables, and working directories.
+If Linux denies a read, GC checks the process command line. It keeps the
 view if the command line is unavailable, empty, or mentions the view, Claude,
 Codex, aswap, or Node. The report counts unreadable non-provider processes it
-skipped, once per PID.
+skipped, once per PID. Views containing mount points stay in place.
 
 GC compares the size and SHA-256 of duplicate transcripts. Unique transcripts
-move to the same relative path in the shared provider home. For legacy views
-that lack a recorded home or shared links, use the provider home settings from
-the original launch (`CODEX_HOME` or `CLAUDE_CONFIG_DIR` if customized).
+move to the same relative path in the shared provider home. GC keeps unmarked
+legacy views until you confirm the original home for that label. Supply the
+same mapping in preview and apply, using repeatable `--legacy-home` flags or
+the `[retention.legacy_homes]` TOML table. Only map a label whose original home
+you have verified.
+
+```sh
+aswap gc --dry-run --legacy-home 'codex:old-label=/absolute/path/to/codex'
+```
+
 Codex rollouts remain under `sessions/YYYY/MM/DD/rollout-*.jsonl` or
 `archived_sessions/` and can be opened with `codex resume <id>`. Claude
 transcripts remain at `projects/<slug>/<id>.jsonl` and can be opened with
 `claude --resume <id>` from the matching project. If both paths had different
-data, GC leaves the shared file in place and reports the view's archive at
-`archive/<provider>/<label>/<run>/`. From that directory, run
+data, GC leaves the shared file in place. Conflicting transcripts and any
+view-local private files without a verified identical shared copy go into an
+owner-only archive at `archive/<provider>/<label>/<run>/`. SQLite archives hold
+verified online snapshots with committed WAL data. From the archive, run
 `sha256sum --check SHA256SUMS` to check the compressed files before restoring
 the one you want.
 
 When Codex's shared thread index points into a view, GC verifies the shared
 rollout and updates the index before removing the view. An ambiguous index
 reference keeps the view. Apply reports the verified SQLite backup path when
-it first rewrites a shared index. Actual reclaim counts include newly written
-index backups.
+it first rewrites a shared index. Before deletion, GC renames the view and takes
+a Codex index write transaction to check for references to both names. A native
+Codex process holding an old path in memory can still republish it after that
+transaction. Apply restores an interrupted retirement to its original path
+when it can do so safely. Reclaim counts include newly written index backups.
 
 ## Development
 

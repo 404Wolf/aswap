@@ -127,7 +127,12 @@ in {
       archiveDir = mkOption {
         type = types.nullOr types.str;
         default = null;
-        description = "Absolute path for conflicting transcripts. Null uses the archive directory in the aswap data store.";
+        description = "Absolute path for retained private state and conflicting transcripts. Null uses the archive directory in the aswap data store.";
+      };
+      legacyHomes = mkOption {
+        type = types.attrsOf types.str;
+        default = {};
+        description = "Verified original homes for old runtime views, keyed by provider:label.";
       };
       dryRun = mkOption {
         type = types.bool;
@@ -197,6 +202,8 @@ in {
           io_pressure_limit = cfg.retention.ioPressureLimit;
         } // lib.optionalAttrs (cfg.retention.archiveDir != null) {
           archive_dir = cfg.retention.archiveDir;
+        } // lib.optionalAttrs (cfg.retention.legacyHomes != {}) {
+          legacy_homes = cfg.retention.legacyHomes;
         };
       };
     };

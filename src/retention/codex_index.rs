@@ -8,7 +8,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use std::{
     collections::HashSet,
     ffi::OsStr,
-    fs::File,
+    fs::{self, File},
     io::ErrorKind,
     os::unix::{
         ffi::OsStrExt,
@@ -31,18 +31,8 @@ pub(super) fn check(
     let mut apply = apply;
     let mut rewritten = 0;
     let mut backup_bytes = 0;
-    for name in home
-        .dir
-        .names()
-        .safe("cannot list shared Codex index databases")?
-    {
-        let Some(name) = name.to_str().filter(|name| {
-            name.strip_prefix("state_")
-                .and_then(|n| n.strip_suffix(".sqlite"))
-                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-        }) else {
-            continue;
-        };
+    for name in databases(home)? {
+        let name = name.as_str();
         pressure.check(false)?;
         let (file, metadata) = home
             .dir
@@ -76,10 +66,11 @@ pub(super) fn check(
         .safe("cannot open shared Codex index")?;
         db.busy_timeout(Duration::from_secs(5))
             .safe("cannot set Codex index busy timeout")?;
-        let before = rows(&db, view)?;
-        for (id, stored) in &before {
+        let before = rows(&db, view, None)?;
+        for (id, _, relative) in &before {
             pressure.check(false)?;
-            verify(relative_rollout(view, id, stored)?, pressure)?;
+            validate_rollout(id, relative)?;
+            verify(relative, pressure)?;
         }
         if idle_wal
             && (sidecars(&home.dir, name)? != (false, false)
@@ -103,32 +94,33 @@ pub(super) fn check(
         drop(db);
         let key = (metadata.dev(), metadata.ino());
         if !backups.0.contains(&key) {
-            let (backup, bytes) = backup_index(&file_path, name, archive)?;
+            let db = open_index(&file_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .safe("cannot open checked Codex index for backup")?;
+            ensure_identity(home, name, key)?;
+            let (backup, bytes) = backup_index(&db, name, archive, pressure)?;
+            ensure_identity(home, name, key)?;
             reported.push(backup.to_string_lossy().into_owned());
             backup_bytes += bytes;
             backups.0.insert(key);
         }
 
         pressure.check(false)?;
-        let (_, current) = home
-            .dir
-            .file(OsStr::new(name))
-            .safe("cannot recheck shared Codex index")?;
-        if (current.dev(), current.ino()) != key {
-            return Err(Error("shared Codex index was replaced during backup"));
-        }
+        ensure_identity(home, name, key)?;
         let mut db = open_index(&file_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .safe("cannot open shared Codex index for repair")?;
         db.busy_timeout(Duration::from_secs(5))
             .safe("cannot set Codex index busy timeout")?;
+        ensure_identity(home, name, key)?;
+        db.pragma_update(None, "synchronous", "FULL")
+            .safe("cannot require durable Codex index commits")?;
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .safe("cannot lock shared Codex index for repair")?;
-        if rows(&tx, view)? != before {
+        if rows(&tx, view, None)? != before {
             return Err(Error("Codex index references changed during repair"));
         }
-        for (id, old) in &before {
-            let replacement = home.path.join(relative_rollout(view, id, old)?);
+        for (id, old, relative) in &before {
+            let replacement = home.path.join(relative);
             let replacement = replacement
                 .to_str()
                 .ok_or(Error("shared Codex rollout path is not UTF-8"))?;
@@ -165,7 +157,60 @@ fn sidecars(home: &Dir, database: &str) -> Result<(bool, bool)> {
     Ok((present("-wal")?, present("-shm")?))
 }
 
-fn rows(db: &Connection, view: &Path) -> Result<Vec<(String, String)>> {
+fn databases(home: &Home) -> Result<Vec<String>> {
+    Ok(home
+        .dir
+        .names()
+        .safe("cannot list shared Codex index databases")?
+        .into_iter()
+        .filter_map(|name| name.into_string().ok())
+        .filter(|name| {
+            name.strip_prefix("state_")
+                .and_then(|n| n.strip_suffix(".sqlite"))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect())
+}
+
+fn ensure_identity(home: &Home, name: &str, key: (u64, u64)) -> Result<()> {
+    let (_, current) = home
+        .dir
+        .file(OsStr::new(name))
+        .safe("cannot recheck shared Codex index")?;
+    if (current.dev(), current.ino()) != key {
+        return Err(Error("shared Codex index was replaced during repair"));
+    }
+    Ok(())
+}
+
+pub(super) fn verify_retired(
+    home: &Home,
+    view: &Path,
+    retired: &Path,
+    pressure: &mut Pressure<'_>,
+) -> Result<()> {
+    for name in databases(home)? {
+        pressure.check(false)?;
+        sidecars(&home.dir, &name)?;
+        let mut db = open_index(&home.path.join(&name), OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .safe("cannot open shared Codex index during retirement")?;
+        db.busy_timeout(Duration::from_secs(5))
+            .safe("cannot set Codex index busy timeout")?;
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .safe("cannot lock shared Codex index during retirement")?;
+        if !rows(&tx, view, Some(retired))?.is_empty() {
+            return Err(Error("Codex index still references the retiring view"));
+        }
+        tx.commit()
+            .safe("cannot finish Codex index retirement check")?;
+    }
+    Ok(())
+}
+
+type Row = (String, String, PathBuf);
+
+fn rows(db: &Connection, view: &Path, retired: Option<&Path>) -> Result<Vec<Row>> {
     let mut columns = db
         .prepare("SELECT name FROM pragma_table_info('threads')")
         .safe("cannot inspect Codex index schema")?;
@@ -182,29 +227,87 @@ fn rows(db: &Connection, view: &Path) -> Result<Vec<(String, String)>> {
     {
         return Err(Error("unrecognized Codex index schema"));
     }
-    let view = view.as_os_str().as_bytes();
-    let mut prefix = view.to_vec();
-    prefix.push(b'/');
+    let name = view
+        .file_name()
+        .ok_or(Error("missing view name for Codex index lookup"))?;
     let mut query = db
         .prepare(
             "SELECT id, rollout_path FROM threads
-         WHERE substr(CAST(rollout_path AS BLOB), 1, length(?1)) = ?1
-            OR CAST(rollout_path AS BLOB) = ?2
+         WHERE instr(CAST(rollout_path AS BLOB), ?1) > 0
          ORDER BY id, rollout_path",
         )
         .safe("cannot prepare Codex index query")?;
-    query
-        .query_map(params![prefix, view], |row| Ok((row.get(0)?, row.get(1)?)))
-        .and_then(Iterator::collect)
-        .safe("cannot read a Codex index row for this view")
+    let mut result = Vec::new();
+    let mut query = query
+        .query(params![name.as_bytes()])
+        .safe("cannot query Codex index")?;
+    while let Some(row) = query
+        .next()
+        .safe("cannot read a Codex index row for this view")?
+    {
+        use rusqlite::types::ValueRef;
+        let raw = match row.get_ref(1).safe("cannot read Codex rollout path")? {
+            ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes,
+            _ => return Err(Error("malformed Codex rollout path")),
+        };
+        if let Some(relative) = resolve_candidate(Path::new(OsStr::from_bytes(raw)), view, retired)?
+        {
+            let id = row
+                .get(0)
+                .safe("cannot read a Codex index row for this view")?;
+            let stored = row
+                .get(1)
+                .safe("cannot read a Codex index row for this view")?;
+            result.push((id, stored, relative));
+        }
+    }
+    Ok(result)
 }
 
-fn relative_rollout<'a>(view: &Path, id: &str, stored: &'a str) -> Result<&'a Path> {
+fn resolve_candidate(
+    stored: &Path,
+    view: &Path,
+    retired: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    let parent = view
+        .parent()
+        .ok_or(Error("missing view parent for Codex index lookup"))?;
+    let name = view.file_name();
+    let tombstone = retired.and_then(Path::file_name);
+    let mut prefix = PathBuf::new();
+    let mut parts = stored.components();
+    while let Some(part) = parts.next() {
+        if matches!(part, Component::Normal(_))
+            && (Some(part.as_os_str()) == name || Some(part.as_os_str()) == tombstone)
+        {
+            if !prefix.is_absolute() {
+                return Err(Error("cannot resolve possible Codex index reference"));
+            }
+            // Resolve only the containing label, never a transcript link.
+            // This covers alternate spellings even after the view is renamed.
+            let same_parent = if prefix == parent {
+                true
+            } else {
+                let left =
+                    fs::metadata(&prefix).safe("cannot resolve possible Codex index reference")?;
+                let right = fs::metadata(parent)
+                    .safe("cannot identify view parent for Codex index lookup")?;
+                (left.dev(), left.ino()) == (right.dev(), right.ino())
+            };
+            if same_parent {
+                return Ok(Some(parts.as_path().to_owned()));
+            }
+        }
+        prefix.push(part);
+    }
+    Ok(None)
+}
+
+fn validate_rollout(id: &str, path: &Path) -> Result<()> {
     const MALFORMED: Error = Error("malformed Codex index row for this view");
     if !valid_id(id) {
         return Err(MALFORMED);
     }
-    let path = Path::new(stored).strip_prefix(view).safe(MALFORMED.0)?;
     let mut parts = path.components();
     if !matches!(parts.next(), Some(Component::Normal(root)) if root == "sessions" || root == "archived_sessions")
         || !parts.all(|part| matches!(part, Component::Normal(_)))
@@ -215,10 +318,15 @@ fn relative_rollout<'a>(view: &Path, id: &str, stored: &'a str) -> Result<&'a Pa
     {
         return Err(MALFORMED);
     }
-    Ok(path)
+    Ok(())
 }
 
-fn backup_index(source: &Path, name: &str, archive: &Path) -> Result<(PathBuf, u64)> {
+fn backup_index(
+    source: &Connection,
+    name: &str,
+    archive: &Path,
+    pressure: &mut Pressure<'_>,
+) -> Result<(PathBuf, u64)> {
     let folder = archive.join("codex/index-backups");
     let root = Dir::open(Path::new("/")).safe("cannot open backup filesystem")?;
     let dir = root
@@ -231,7 +339,7 @@ fn backup_index(source: &Path, name: &str, archive: &Path) -> Result<(PathBuf, u
         .prefix(".pending-")
         .tempfile_in(dir.path())
         .safe("cannot stage Codex index backup")?;
-    shared::sqlite_snapshot(source, temp.path())?;
+    shared::sqlite_snapshot_from(source, temp.path(), || pressure.check(false))?;
     let backup = File::open(temp.path()).safe("cannot open Codex index backup")?;
     backup.sync_all().safe("cannot sync Codex index backup")?;
     let bytes = backup

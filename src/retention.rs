@@ -2,7 +2,9 @@
 mod archive;
 mod codex_index;
 mod files;
+mod mounts;
 mod process;
+mod retire;
 
 use crate::{
     Error, Result, Safe, live,
@@ -13,9 +15,10 @@ use crate::{
 use files::{Dir, Home, Inventory, Plan};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt::Write as _,
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io::{ErrorKind, Read},
     os::unix::{
         ffi::OsStringExt,
@@ -39,6 +42,7 @@ struct Settings {
     archive_dir: Option<PathBuf>,
     dry_run: bool,
     io_pressure_limit: f64,
+    legacy_homes: BTreeMap<String, PathBuf>,
 }
 
 impl Default for Settings {
@@ -49,11 +53,46 @@ impl Default for Settings {
             archive_dir: None,
             dry_run: true,
             io_pressure_limit: 30.0,
+            legacy_homes: BTreeMap::new(),
         }
     }
 }
 
 impl Settings {
+    fn set_legacy_homes(&mut self, options: &[String]) -> Result<()> {
+        let mut explicit = BTreeMap::new();
+        for entry in options {
+            let (key, path) = entry.split_once('=').ok_or(Error(
+                "expected --legacy-home provider:label=/absolute/path",
+            ))?;
+            if explicit
+                .insert(key.to_owned(), PathBuf::from(path))
+                .is_some()
+            {
+                return Err(Error("duplicate --legacy-home label"));
+            }
+        }
+        self.legacy_homes.extend(explicit);
+        for (key, path) in &self.legacy_homes {
+            let (provider, label) = key
+                .split_once(':')
+                .ok_or(Error("expected a provider:label legacy home key"))?;
+            if !matches!(provider, "claude" | "codex") || store::label(label).is_err() {
+                return Err(Error("invalid provider:label legacy home key"));
+            }
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir)
+            {
+                return Err(Error(
+                    "legacy home must be an absolute path without parent traversal",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn load(path: &Path) -> Result<Self> {
         // Home Manager may install this declarative file as a symlink.
         let file = match OpenOptions::new()
@@ -126,6 +165,7 @@ pub struct Report {
     stopped: Option<&'static str>,
     unreadable_non_provider_processes_ignored: usize,
     warnings: Vec<String>,
+    incomplete: bool,
     totals: Totals,
     groups: Vec<Group>,
 }
@@ -160,6 +200,7 @@ struct ViewResult {
     archive: Option<String>,
     codex_index_rows_rewritten: u64,
     codex_index_backups: Vec<String>,
+    incomplete: bool,
 }
 
 #[derive(Serialize)]
@@ -185,7 +226,7 @@ impl Totals {
 
     fn text(&self, dry_run: bool) -> String {
         format!(
-            "{} examined, {} kept, {} finished, {} removed, {:.3} GB ({} bytes) {}, {} bytes {}, {} bytes {}",
+            "{} examined, {} kept, {} finished, {} removed, {:.3} GB ({} logical bytes) {}, {} bytes {}, {} bytes {}",
             self.examined,
             self.kept,
             self.finished,
@@ -202,6 +243,10 @@ impl Totals {
 }
 
 impl Report {
+    pub fn incomplete(&self) -> bool {
+        self.incomplete
+    }
+
     pub fn text(&self) -> String {
         if !self.enabled {
             return "Runtime retention is disabled".into();
@@ -236,7 +281,7 @@ impl Report {
                 };
                 let _ = writeln!(
                     text,
-                    "  {:?} — {verdict} ({}), {} bytes {}, {} {}, {} {}",
+                    "  {:?} — {verdict} ({}), {} logical bytes {}, {} {}, {} {}",
                     view.path,
                     view.reason,
                     view.bytes_reclaimed,
@@ -277,22 +322,28 @@ impl Report {
     }
 }
 
-pub fn run(mode: Mode) -> Result<Report> {
-    let settings = Settings::load(&Store::config_dir()?.join("config.toml"))?;
+pub fn run(mode: Mode, legacy_homes: &[String]) -> Result<Report> {
+    let mut settings = Settings::load(&Store::config_dir()?.join("config.toml"))?;
+    settings.set_legacy_homes(legacy_homes)?;
     let root = Store::root_from_env()?;
     if settings.enabled && Dir::open(&root.join("runtimes")).is_ok() {
         process::lower_priority()?;
     }
-    let home = |provider: Provider| shared::shared_home(&root, provider, provider.current_home()?);
     let mut ignored = Default::default();
+    let runtimes = root.join("runtimes");
+    let mut fds = None;
     let mut in_use = |view: &Path| {
-        Ok(process::uses_view(view, &mut ignored)? || live::view_in_use(&root, view)?)
+        let fds = fds.get_or_insert_with(|| process::Fds::for_runtimes(&runtimes));
+        let fds = fds.as_ref().map_err(|error| Error(error.0))?;
+        Ok(fds.uses_view(view, &mut ignored)?
+            || process::uses_view(view, &mut ignored)?
+            || live::view_in_use(&root, view)?)
     };
     let mut report = Retention {
         root: &root,
         at: SystemTime::now(),
-        home: &home,
         in_use: &mut in_use,
+        mounts: &mut mounts::read,
         pressure: Pressure {
             read: &mut process::io_pressure,
             limit: settings.io_pressure_limit,
@@ -308,8 +359,8 @@ pub fn run(mode: Mode) -> Result<Report> {
 struct Retention<'a> {
     root: &'a Path,
     at: SystemTime,
-    home: &'a dyn Fn(Provider) -> Result<PathBuf>,
     in_use: &'a mut dyn FnMut(&Path) -> Result<bool>,
+    mounts: &'a mut dyn FnMut() -> Result<mounts::Mounts>,
     pressure: Pressure<'a>,
 }
 
@@ -326,6 +377,7 @@ impl Retention<'_> {
             stopped: None,
             unreadable_non_provider_processes_ignored: 0,
             warnings: Vec::new(),
+            incomplete: false,
             totals: Totals::default(),
             groups: Vec::new(),
         };
@@ -364,6 +416,7 @@ impl Retention<'_> {
         // Flocking the existing directory leaves dry-run entirely read-only.
         fs2::FileExt::try_lock_exclusive(&root.0)
             .map_err(|_| Error("cannot lock runtimes directory (another GC may be active)"))?;
+        let mounts = (self.mounts)()?;
         let mut backups = codex_index::Backups::default();
         'providers: for provider in [Provider::Claude, Provider::Codex] {
             let provider_name = OsStr::new(provider.as_str());
@@ -406,7 +459,12 @@ impl Retention<'_> {
                     totals: Totals::default(),
                     views: Vec::new(),
                 };
-                for run in runs {
+                let legacy_home = settings.legacy_homes.get(&format!("{provider}:{label}"));
+                for entry in runs {
+                    let retiring = entry
+                        .to_str()
+                        .and_then(|name| name.strip_prefix(retire::PREFIX));
+                    let run = retiring.map(OsStr::new).unwrap_or(&entry);
                     if !run
                         .to_str()
                         .and_then(|s| s.strip_prefix("run-"))
@@ -417,7 +475,7 @@ impl Retention<'_> {
                     if self.pressure.check(true).is_err() {
                         break;
                     }
-                    let path = runtimes.join(provider_name).join(label).join(&run);
+                    let path = runtimes.join(provider_name).join(label).join(run);
                     let mut result = ViewResult {
                         path: path.to_string_lossy().into(),
                         verdict: Verdict::Kept,
@@ -428,18 +486,28 @@ impl Retention<'_> {
                         archive: None,
                         codex_index_rows_rewritten: 0,
                         codex_index_backups: Vec::new(),
+                        incomplete: false,
                     };
                     let candidate = Candidate {
                         path: &path,
+                        legacy_home: legacy_home.map(PathBuf::as_path),
+                        mounts: &mounts,
                         provider,
                         label_dir: &label_dir,
-                        run: &run,
-                        archive: &archive.join(provider_name).join(label).join(&run),
+                        run,
+                        archive: &archive.join(provider_name).join(label).join(run),
                         archive_root: &archive,
                         min_age: Duration::from_secs(settings.min_age),
                         dry_run,
                     };
-                    if let Err(error) = self.view(candidate, &mut backups, &mut result) {
+                    let outcome = if retiring.is_some() {
+                        result.path = path.with_file_name(&entry).to_string_lossy().into();
+                        result.incomplete = !dry_run;
+                        self.recover_retirement(&candidate, &entry)
+                    } else {
+                        self.view(candidate, &mut backups, &mut result)
+                    };
+                    if let Err(error) = outcome {
                         result.reason = error.0;
                     }
                     group.totals.add(&result);
@@ -458,7 +526,37 @@ impl Retention<'_> {
             }
         }
         report.stopped = self.pressure.stopped;
+        report.incomplete = !dry_run
+            && (report.stopped.is_some()
+                || !report.warnings.is_empty()
+                || report
+                    .groups
+                    .iter()
+                    .flat_map(|group| &group.views)
+                    .any(|view| view.incomplete));
         Ok(report)
+    }
+
+    fn recover_retirement(&mut self, candidate: &Candidate<'_>, entry: &OsStr) -> Result<()> {
+        if candidate.dry_run {
+            return Err(Error("retiring view needs recovery"));
+        }
+        let path = candidate.path.with_file_name(entry);
+        candidate.mounts.check(&path)?;
+        let dir = candidate
+            .label_dir
+            .contained_child(entry)
+            .safe("cannot safely open retiring view")?;
+        let sibling = shared::view_lock_path(Path::new(candidate.run));
+        let _auth = try_lock(candidate.label_dir, sibling.as_os_str())?;
+        let _lifetime = try_lock(&dir, OsStr::new(shared::VIEW_LIFETIME_LOCK))?;
+        if (self.in_use)(&path)? || (self.in_use)(candidate.path)? {
+            return Err(Error("retiring view is in use"));
+        }
+        retire::restore(candidate.label_dir, entry, candidate.run)?;
+        Err(Error(
+            "restored interrupted retirement to the original view path",
+        ))
     }
 
     fn view(
@@ -469,6 +567,8 @@ impl Retention<'_> {
     ) -> Result<()> {
         let Candidate {
             path,
+            legacy_home,
+            mounts,
             provider,
             label_dir,
             run,
@@ -477,8 +577,9 @@ impl Retention<'_> {
             min_age,
             dry_run,
         } = candidate;
+        mounts.check(path)?;
         let view = label_dir
-            .child(run)
+            .contained_child(run)
             .safe("unsafe or unreadable view directory")?;
         let metadata = view.0.metadata().safe("cannot inspect view directory")?;
         let modified = metadata
@@ -509,26 +610,19 @@ impl Retention<'_> {
         }
 
         let inventory = Inventory::scan(&view, provider, &mut self.pressure)?;
-        let home = self.shared_home(provider, &inventory, lifetime.as_ref())?;
-        let mut plan = Plan::classify(
-            &inventory,
-            &view,
-            home.as_ref().map(|home| &home.dir),
-            &mut self.pressure,
-        )?;
+        let home = self.shared_home(&inventory, lifetime.as_ref(), legacy_home)?;
+        let mut plan = Plan::classify(&inventory, &view, &home.dir, &mut self.pressure)?;
         let archive_path = plan
             .has_conflicts()
             .then(|| archive.to_string_lossy().into_owned());
         if dry_run {
-            if provider == Provider::Codex
-                && let Some(home) = &home
-            {
+            if provider == Provider::Codex {
                 codex_index::check(
-                    home,
+                    &home,
                     path,
                     None,
                     |relative, pressure| {
-                        inventory.verify_rollout(relative, &view, home, true, pressure)
+                        inventory.verify_rollout(relative, &view, &home, true, pressure)
                     },
                     &mut self.pressure,
                 )?;
@@ -544,38 +638,38 @@ impl Retention<'_> {
             return Ok(());
         }
 
-        if let Some(home) = &home {
-            let published = plan.publish(
-                &inventory,
-                &view,
-                &home.dir,
-                &mut result.bytes_moved,
-                &mut self.pressure,
-            );
-            result.bytes_reclaimed -= i128::from(result.bytes_moved);
-            published?;
-        }
-        if plan.has_conflicts() {
-            let archive_added = archive::preserve(
+        result.incomplete = true;
+        let published = plan.publish(
+            &inventory,
+            &view,
+            &home.dir,
+            &mut result.bytes_moved,
+            &mut self.pressure,
+        );
+        result.bytes_reclaimed -= i128::from(result.bytes_moved);
+        published?;
+        let archive = if plan.has_conflicts() {
+            let receipt = archive::preserve(
                 archive,
                 &view,
                 plan.conflicts(&inventory),
                 &mut self.pressure,
             )?;
-            result.bytes_reclaimed -= i128::from(archive_added);
+            result.bytes_reclaimed -= i128::from(receipt.bytes_added);
             result.bytes_archived = plan.archive_bytes;
             result.archive = archive_path;
-        }
+            Some(receipt)
+        } else {
+            None
+        };
 
-        if provider == Provider::Codex
-            && let Some(home) = &home
-        {
+        if provider == Provider::Codex {
             let (rows, bytes) = codex_index::check(
-                home,
+                &home,
                 path,
                 Some((backups, archive_root, &mut result.codex_index_backups)),
                 |relative, pressure| {
-                    inventory.verify_rollout(relative, &view, home, false, pressure)
+                    inventory.verify_rollout(relative, &view, &home, false, pressure)
                 },
                 &mut self.pressure,
             )?;
@@ -583,30 +677,14 @@ impl Retention<'_> {
             result.bytes_reclaimed -= i128::from(bytes);
         }
 
-        // Recheck both the sources and published copies before deleting anything.
-        if let Some(home) = &home {
-            plan.verify_shared(&inventory, &home.dir, &mut self.pressure)?;
-            let current = Dir::open(&home.path)
-                .safe("cannot recheck shared provider home")?
-                .0
-                .metadata()
-                .safe("cannot inspect shared provider home")?;
-            let opened = home
-                .dir
-                .0
-                .metadata()
-                .safe("cannot inspect shared provider home")?;
-            if (current.dev(), current.ino()) != (opened.dev(), opened.ino()) {
-                return Err(Error("shared provider home changed"));
-            }
-        }
+        // Recheck the sources before hiding the original name.
         if (self.in_use)(path)? {
             return Err(Error("used by a live process or supervisor"));
         }
-        inventory.verify(&view, &mut self.pressure)?;
+        inventory.verify(&view, false, &mut self.pressure)?;
         self.pressure.check(true)?;
         let current = label_dir
-            .child(run)
+            .contained_child(run)
             .safe("cannot recheck view directory")?
             .0
             .metadata()
@@ -614,21 +692,53 @@ impl Retention<'_> {
         if (current.dev(), current.ino()) != (metadata.dev(), metadata.ino()) {
             return Err(Error("view directory changed"));
         }
-        // Linux remove_dir_all uses descriptor-relative traversal and unlinks
-        // symlinks without entering their targets.
-        fs::remove_dir_all(label_dir.path().join(run)).safe("cannot remove view directory")?;
+        let mounts = &mut self.mounts;
+        let in_use = &mut self.in_use;
+        retire::remove(
+            label_dir,
+            path,
+            |tombstone, pressure| {
+                if in_use(tombstone)? || in_use(path)? {
+                    return Err(Error("used by a live process or supervisor"));
+                }
+                if provider == Provider::Codex {
+                    codex_index::verify_retired(&home, path, tombstone, pressure)?;
+                }
+                let current = Dir::open(&home.path)
+                    .and_then(|dir| dir.0.metadata())
+                    .safe("cannot recheck shared provider home")?;
+                let opened = home
+                    .dir
+                    .0
+                    .metadata()
+                    .safe("cannot inspect shared provider home")?;
+                if (current.dev(), current.ino()) != (opened.dev(), opened.ino()) {
+                    return Err(Error("shared provider home changed"));
+                }
+                plan.verify_shared(&inventory, &home.dir, pressure)?;
+                if let Some(receipt) = &archive {
+                    receipt.recheck(pressure)?;
+                }
+                inventory.verify(&view, true, pressure)?;
+                let mounts = mounts()?;
+                mounts.check(path)?;
+                mounts.check(tombstone)
+            },
+            &mut self.pressure,
+            &mut result.bytes_reclaimed,
+        )?;
         result.verdict = Verdict::Removed;
-        result.reason = "finished and transcripts preserved";
-        result.bytes_reclaimed += i128::from(inventory.bytes);
+        result.reason = "finished and private data preserved";
+        result.incomplete = false;
         Ok(())
     }
 
     fn shared_home(
         &self,
-        provider: Provider,
         inventory: &Inventory,
         lifetime: Option<&File>,
-    ) -> Result<Option<Home>> {
+        legacy_home: Option<&Path>,
+    ) -> Result<Home> {
         let recorded = lifetime
             .map(|file| {
                 let mut bytes = Vec::new();
@@ -654,32 +764,23 @@ impl Retention<'_> {
         {
             return Err(Error("cannot establish view's shared home"));
         }
-        if inventory.transcripts.is_empty() && provider != Provider::Codex {
-            return Ok(None);
-        }
-        let home = match recorded.or_else(|| hinted.map(Path::to_owned)) {
-            Some(home) => home,
-            None => (self.home)(provider)?,
-        };
+        let home = recorded
+            .or_else(|| hinted.or(legacy_home).map(Path::to_owned))
+            .ok_or(Error("legacy view without a verified home"))?;
         if home.starts_with(self.root) || home.ancestors().any(|p| p.join(".git").exists()) {
             return Err(Error(
                 "shared home must be outside the store and Git checkouts",
             ));
         }
-        match Dir::open(&home) {
-            Ok(dir) => Ok(Some(Home { path: home, dir })),
-            Err(error)
-                if inventory.transcripts.is_empty() && error.kind() == ErrorKind::NotFound =>
-            {
-                Ok(None)
-            }
-            Err(_) => Err(Error("cannot safely open shared provider home")),
-        }
+        let dir = Dir::open(&home).safe("cannot safely open shared provider home")?;
+        Ok(Home { path: home, dir })
     }
 }
 
 struct Candidate<'a> {
     path: &'a Path,
+    legacy_home: Option<&'a Path>,
+    mounts: &'a mounts::Mounts,
     provider: Provider,
     label_dir: &'a Dir,
     run: &'a OsStr,

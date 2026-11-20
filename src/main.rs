@@ -38,6 +38,9 @@ enum Action {
         /// Preview even if the configuration enables automatic application.
         #[arg(long)]
         dry_run: bool,
+        /// Verify an old label's original home (provider:label=/absolute/path).
+        #[arg(long, value_name = "PROVIDER:LABEL=PATH")]
+        legacy_home: Vec<String>,
     },
     /// Show the actual account used by each locally running session.
     Sessions { provider: Option<Provider> },
@@ -321,17 +324,22 @@ fn waybar(value: &Value) -> Value {
     json!({"text":if text.is_empty(){"aswap: no accounts"}else{&text},"tooltip":rows_text(value),"class":"aswap"})
 }
 fn execute(cli: Cli) -> Result<i32> {
-    if let Action::Gc { apply, dry_run } = cli.command {
+    if let Action::Gc {
+        apply,
+        dry_run,
+        legacy_home,
+    } = cli.command
+    {
         use aswap::retention::{self, Mode};
         let mode = match (apply, dry_run) {
             (true, _) => Mode::Apply,
             (_, true) => Mode::Preview,
             _ => Mode::Configured,
         };
-        let report = retention::run(mode)?;
+        let report = retention::run(mode, &legacy_home)?;
         let value = serde_json::to_value(&report).safe("cannot encode retention report")?;
         output(&value, cli.json, report.text())?;
-        return Ok(0);
+        return Ok(i32::from(report.incomplete()));
     }
     let store = Store::from_env()?;
     match cli.command {

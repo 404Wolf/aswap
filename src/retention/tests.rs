@@ -1,5 +1,8 @@
 use super::*;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::{
+    fs,
+    os::unix::fs::{PermissionsExt, symlink},
+};
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -47,15 +50,41 @@ impl Fixture {
         in_use: &mut dyn FnMut(&Path) -> Result<bool>,
         pressure: &mut dyn FnMut() -> Result<f64>,
     ) -> Report {
-        let settings = Settings {
+        self.run_with_settings(
+            mode,
+            advance,
+            in_use,
+            pressure,
+            &mut || Ok(mounts::Mounts::default()),
+            self.settings(),
+        )
+    }
+
+    fn settings(&self) -> Settings {
+        Settings {
             enabled: true,
+            legacy_homes: ["claude:synthetic", "codex:synthetic"]
+                .into_iter()
+                .map(|label| (label.into(), self.home.clone()))
+                .collect(),
             ..Settings::default()
-        };
+        }
+    }
+
+    fn run_with_settings(
+        &self,
+        mode: Mode,
+        advance: Duration,
+        in_use: &mut dyn FnMut(&Path) -> Result<bool>,
+        pressure: &mut dyn FnMut() -> Result<f64>,
+        mounts: &mut dyn FnMut() -> Result<mounts::Mounts>,
+        settings: Settings,
+    ) -> Report {
         Retention {
             root: &self.root,
             at: SystemTime::now() + advance,
-            home: &|_| Ok(self.home.clone()),
             in_use,
+            mounts,
             pressure: Pressure {
                 read: pressure,
                 limit: settings.io_pressure_limit,
@@ -87,6 +116,7 @@ fn preview_and_apply_account_for_duplicates_moves_and_regenerable_entries() {
     write(&v.join("tmp/output"), b"cache");
     write(&v.join("logs_2.sqlite"), b"database");
     write(&v.join("auth.json"), b"synthetic-private");
+    write(&t.home.join("auth.json"), b"synthetic-private");
     let saved = t._temp.path().join("external");
     write(&saved, b"keep this");
     symlink(&saved, v.join("external")).unwrap();
@@ -107,7 +137,7 @@ fn preview_and_apply_account_for_duplicates_moves_and_regenerable_entries() {
     assert!(
         report
             .text()
-            .contains(&format!("{bytes_reclaimed} bytes to reclaim"))
+            .contains(&format!("{bytes_reclaimed} logical bytes to reclaim"))
     );
     assert!(!report.text().contains("synthetic-private"));
 
@@ -129,7 +159,10 @@ fn preview_and_apply_account_for_duplicates_moves_and_regenerable_entries() {
     );
     assert!(!v.exists());
     assert_eq!(fs::read(saved).unwrap(), b"keep this");
-    assert!(!t.home.join("auth.json").exists());
+    assert_eq!(
+        fs::read(t.home.join("auth.json")).unwrap(),
+        b"synthetic-private"
+    );
 }
 
 #[test]
@@ -556,4 +589,332 @@ fn malformed_or_conflicting_codex_index_keeps_view_and_original_row() {
         assert!(malformed.join(&second).exists());
     }
     assert!(!t.root.join("archive/codex/index-backups").exists());
+}
+
+#[test]
+fn private_files_and_committed_wal_are_restorable_from_owner_only_archive() {
+    let t = Fixture::new();
+    let view = t.view("claude", "run-private");
+    let history = b"synthetic history";
+    let credential = b"synthetic private credential";
+    write(&view.join("history.jsonl"), history);
+    write(&t.home.join("history.jsonl"), b"another history");
+    write(&view.join(".credentials.json"), credential);
+    write(&view.join("settings.json"), b"shared");
+    write(&t.home.join("settings.json"), b"shared");
+    write(&view.join("models_cache.json"), b"discard");
+    write(&view.join("logs_2.sqlite-wal"), b"discard");
+    let db = rusqlite::Connection::open(view.join("state_5.sqlite")).unwrap();
+    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE local_data (value TEXT); INSERT INTO local_data VALUES ('synthetic WAL');").unwrap();
+    assert!(view.join("state_5.sqlite-wal").exists());
+
+    let report = t.run(Mode::Apply);
+    assert_eq!(report.totals.removed, 1, "{}", report.text());
+    assert!(!report.text().contains("synthetic private credential"));
+    let archive = t.root.join("archive/claude/synthetic/run-private");
+    assert_eq!(
+        archive.metadata().unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let restore = |name: &str| {
+        let path = archive.join(format!("{name}.zst"));
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        zstd::stream::decode_all(fs::File::open(path).unwrap()).unwrap()
+    };
+    assert_eq!(restore("history.jsonl"), history);
+    assert_eq!(restore(".credentials.json"), credential);
+    assert_eq!(
+        fs::read(t.home.join("history.jsonl")).unwrap(),
+        b"another history"
+    );
+    assert!(!t.home.join(".credentials.json").exists());
+    for name in [
+        "state_5.sqlite-wal",
+        "state_5.sqlite-shm",
+        "settings.json",
+        "models_cache.json",
+        "logs_2.sqlite-wal",
+    ] {
+        assert!(!archive.join(format!("{name}.zst")).exists());
+    }
+    let restored = t._temp.path().join("restored.sqlite");
+    write(&restored, &restore("state_5.sqlite"));
+    let restored = rusqlite::Connection::open(&restored).unwrap();
+    let value: String = restored
+        .query_row("SELECT value FROM local_data", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(value, "synthetic WAL");
+}
+
+#[test]
+fn unmarked_legacy_views_require_an_explicit_label_mapping() {
+    let t = Fixture::new();
+    let view = t.view("codex", "run-legacy");
+    let other = view
+        .parent()
+        .unwrap()
+        .with_file_name("different")
+        .join("run-legacy");
+    let relative = "sessions/rollout-synthetic.jsonl";
+    write(&view.join(relative), b"synthetic");
+    write(&other.join(relative), b"unmapped");
+    let mut settings = t.settings();
+    settings.legacy_homes.clear();
+    let run = |settings| {
+        t.run_with_settings(
+            Mode::Apply,
+            Duration::from_secs(3 * 86400),
+            &mut |_| Ok(false),
+            &mut || Ok(0.0),
+            &mut || Ok(mounts::Mounts::default()),
+            settings,
+        )
+    };
+    let preview = run(settings);
+    assert_eq!(preview.totals.kept, 2);
+    assert!(
+        preview
+            .text()
+            .contains("legacy view without a verified home")
+    );
+    assert!(!t.home.join(relative).exists());
+
+    let mapped = t._temp.path().join("legacy-home");
+    fs::create_dir(&mapped).unwrap();
+    let mut settings = Settings {
+        enabled: true,
+        ..Settings::default()
+    };
+    settings
+        .set_legacy_homes(&[format!("codex:synthetic={}", mapped.display())])
+        .unwrap();
+    let applied = run(settings);
+    assert_eq!(applied.totals.removed, 1, "{}", applied.text());
+    assert_eq!(fs::read(mapped.join(relative)).unwrap(), b"synthetic");
+    assert!(other.join(relative).exists());
+    assert!(!t.home.join(relative).exists());
+}
+
+#[test]
+fn alternate_codex_index_spellings_are_repaired_or_reported_as_uncertain() {
+    let t = Fixture::new();
+    let view = t.view("codex", "run-spelling");
+    let uncertain = t.view("codex", "run-unresolved");
+    let first = format!("sessions/rollout-synthetic-{CODEX_ID}.jsonl");
+    let second = format!("sessions/rollout-synthetic-{SECOND_ID}.jsonl");
+    write(&view.join(&first), b"synthetic");
+    write(&uncertain.join(&second), b"do not lose this");
+    let stored = PathBuf::from(format!(
+        "{}/.//run-spelling/{first}",
+        view.parent().unwrap().display()
+    ));
+    let unresolved = t
+        ._temp
+        .path()
+        .join("nonexistent/run-unresolved")
+        .join(&second);
+    let index = codex_index(&t, &[(CODEX_ID, &stored), (SECOND_ID, &unresolved)]);
+    let applied = t.run(Mode::Apply);
+    assert_eq!(applied.totals.removed, 1, "{}", applied.text());
+    assert!(
+        applied
+            .text()
+            .contains("cannot resolve possible Codex index reference")
+    );
+    assert_eq!(indexed_rollout(&index, CODEX_ID), t.home.join(&first));
+    assert!(uncertain.join(&second).exists());
+}
+
+#[test]
+fn index_row_inserted_during_retirement_restores_the_view() {
+    let t = Fixture::new();
+    let view = t.view("codex", "run-retirement");
+    let relative = format!("sessions/rollout-synthetic-{CODEX_ID}.jsonl");
+    write(&view.join(&relative), b"synthetic");
+    let db = codex_index(&t, &[]);
+    let tombstone = view.with_file_name(".retiring-run-retirement");
+    let mut inserted = false;
+    let applied = t.run_with(
+        Mode::Apply,
+        Duration::from_secs(3 * 86400),
+        &mut |path| {
+            if path == tombstone {
+                assert!(!view.exists());
+                assert!(tombstone.is_dir());
+                let db = rusqlite::Connection::open(&db).unwrap();
+                db.execute(
+                    "INSERT INTO threads VALUES (?1, ?2)",
+                    rusqlite::params![CODEX_ID, view.join(&relative).to_str()],
+                )
+                .unwrap();
+                inserted = true;
+            }
+            Ok(false)
+        },
+        &mut || Ok(0.0),
+    );
+    assert!(inserted);
+    assert!(applied.incomplete());
+    assert!(
+        applied
+            .text()
+            .contains("Codex index still references the retiring view")
+    );
+    assert_eq!(applied.totals.removed, 0);
+    assert_eq!(fs::read(view.join(relative)).unwrap(), b"synthetic");
+    assert!(!tombstone.exists());
+}
+
+#[test]
+fn interrupted_retirement_is_restored_only_on_apply() {
+    let t = Fixture::new();
+    let view = t.view("codex", "run-interrupted");
+    let tombstone = view.with_file_name(".retiring-run-interrupted");
+    write(&view.join("sessions/test.jsonl"), b"synthetic");
+    fs::rename(&view, &tombstone).unwrap();
+    assert!(t.run(Mode::Preview).text().contains("needs recovery"));
+    assert!(!view.exists());
+    let report = t.run(Mode::Apply);
+    assert!(report.incomplete());
+    assert!(report.text().contains("restored interrupted retirement"));
+    assert!(view.join("sessions/test.jsonl").exists());
+    assert!(!tombstone.exists());
+}
+
+#[test]
+fn descriptor_snapshot_and_nested_provider_home_keep_old_views() {
+    let t = Fixture::new();
+    let view = t.view("codex", "run-descriptor");
+    let relative = "sessions/rollout-synthetic.jsonl";
+    write(&view.join(relative), b"synthetic");
+    let proc = t._temp.path().join("proc");
+    let pid = proc.join("123");
+    write(
+        &pid.join("status"),
+        b"State:\tS\nUid:\t1234\t1234\t1234\t1234\n",
+    );
+    fs::create_dir_all(pid.join("fd")).unwrap();
+    symlink(view.join(relative), pid.join("fd/4")).unwrap();
+    symlink(&t.home, pid.join("cwd")).unwrap();
+    write(
+        &pid.join("environ"),
+        format!("CODEX_HOME={}\0", view.join("nested").display()).as_bytes(),
+    );
+    let mut ignored = Default::default();
+    assert!(process::scan(&proc, 1234, &view, &mut ignored).unwrap());
+    let fds = process::Fds::read(&proc, 1234, &t.root.join("runtimes"), None).unwrap();
+    fs::remove_file(pid.join("fd/4")).unwrap();
+    let report = t.run_with(
+        Mode::Apply,
+        Duration::from_secs(3 * 86400),
+        &mut |path| fds.uses_view(path, &mut ignored),
+        &mut || Ok(0.0),
+    );
+    assert!(report.text().contains("used by a live process"));
+    assert!(view.join(relative).exists());
+    let fds = process::Fds::read(&proc, 1234, &t.root.join("runtimes"), None).unwrap();
+    assert!(!fds.uses_view(&view, &mut ignored).unwrap());
+}
+
+fn synthetic_mount(path: &Path) -> Result<mounts::Mounts> {
+    let escaped = path.to_string_lossy().replace(' ', "\\040");
+    mounts::Mounts::parse(format!("42 1 0:7 / {escaped} rw - ext4 synthetic rw\n").as_bytes())
+}
+
+#[test]
+fn mount_checks_include_run_root_descendants_and_new_mounts_before_deletion() {
+    let t = Fixture::new();
+    let view = t.view("codex", "run-mounted");
+    write(&view.join("tmp/mount space/file"), b"synthetic");
+    let tombstone = view.with_file_name(".retiring-run-mounted");
+    let run = |mounts: &mut dyn FnMut() -> Result<mounts::Mounts>| {
+        t.run_with_settings(
+            Mode::Apply,
+            Duration::from_secs(3 * 86400),
+            &mut |_| Ok(false),
+            &mut || Ok(0.0),
+            mounts,
+            t.settings(),
+        )
+    };
+    for mount in [&view, &view.join("tmp/mount space")] {
+        let report = run(&mut || synthetic_mount(mount));
+        assert!(report.text().contains("view contains a mount point"));
+        assert!(view.join("tmp/mount space/file").exists());
+    }
+    let report = run(&mut || {
+        if tombstone.exists() {
+            synthetic_mount(&tombstone.join("tmp/mount space"))
+        } else {
+            Ok(mounts::Mounts::default())
+        }
+    });
+    assert!(report.incomplete());
+    assert!(report.text().contains("view contains a mount point"));
+    assert!(view.join("tmp/mount space/file").exists());
+    assert!(!tombstone.exists());
+}
+
+#[test]
+fn published_archive_identity_is_rechecked_and_retries_validate_surviving_subset() {
+    let t = Fixture::new();
+    let view = t.view("claude", "run-archive");
+    let archive = t.root.join("archive/claude/synthetic/run-archive");
+    let moved_archive = archive.with_file_name("previous");
+    let tombstone = view.with_file_name(".retiring-run-archive");
+    write(&view.join("unknown-a"), b"keep a");
+    write(&view.join("unknown-b"), b"keep b");
+    let report = t.run_with(
+        Mode::Apply,
+        Duration::from_secs(3 * 86400),
+        &mut |path| {
+            if path == tombstone {
+                fs::rename(&archive, &moved_archive).unwrap();
+                fs::create_dir(&archive).unwrap();
+                fs::copy(moved_archive.join("SHA256SUMS"), archive.join("SHA256SUMS")).unwrap();
+            }
+            Ok(false)
+        },
+        &mut || Ok(0.0),
+    );
+    assert!(report.incomplete());
+    assert!(
+        report
+            .text()
+            .contains("published archive identity or manifest changed")
+    );
+    assert!(view.join("unknown-a").exists());
+    fs::remove_file(archive.join("SHA256SUMS")).unwrap();
+    fs::remove_dir(&archive).unwrap();
+    fs::rename(&moved_archive, &archive).unwrap();
+    fs::remove_file(view.join("unknown-a")).unwrap();
+    let retried = t.run(Mode::Apply);
+    assert_eq!(retried.totals.removed, 1, "{}", retried.text());
+    assert!(archive.join("unknown-a.zst").exists());
+    assert!(archive.join("unknown-b.zst").exists());
+}
+
+#[test]
+fn pressure_stop_during_bounded_deletion_restores_partial_view_and_reports_incomplete() {
+    let t = Fixture::new();
+    let view = t.view("claude", "run-delete");
+    for index in 0..80 {
+        write(&view.join(format!("tmp/{index:02}")), b"X");
+    }
+    let mut samples = 0;
+    let report = t.run_with(
+        Mode::Apply,
+        Duration::from_secs(3 * 86400),
+        &mut |_| Ok(false),
+        &mut || {
+            samples += 1;
+            Ok(if samples >= 3 { 31.0 } else { 0.0 })
+        },
+    );
+    assert!(report.incomplete());
+    assert!(report.stopped.is_some());
+    assert_eq!(report.totals.removed, 0);
+    assert!(view.exists());
+    assert!(report.totals.bytes_reclaimed > 0 && report.totals.bytes_reclaimed < 80);
+    assert_eq!(t.run(Mode::Apply).totals.removed, 1);
 }
