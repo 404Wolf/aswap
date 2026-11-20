@@ -2255,7 +2255,7 @@ mod tests {
                 let mut command = Command::new("sh");
                 command.args([
                     "-c",
-                    "printf 'aswap: sync: version-mismatch\\n' >&2; exit 1",
+                    "IFS= read -r request || exit 2; printf 'aswap: sync: version-mismatch\\n' >&2; exit 1",
                 ]);
                 Ok(command)
             },

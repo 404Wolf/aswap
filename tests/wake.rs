@@ -6,11 +6,12 @@ use aswap::{
 use serde_json::json;
 use std::{
     fs,
-    io::Read,
     os::unix::fs::PermissionsExt,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
+
+const LOST_ELIGIBILITY: &str = "lost eligibility before commit; waiting";
 
 struct Children(Vec<Child>);
 impl Drop for Children {
@@ -102,6 +103,8 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
     )
     .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    let stderr_path = |index| temp.path().join(format!("supervisor-{index}.stderr"));
+    let read_stderr = |index| fs::read_to_string(stderr_path(index)).unwrap();
     let mut children = Children(Vec::new());
     for index in 0..count {
         let id = format!("11111111-2222-4333-8444-{index:012}");
@@ -141,14 +144,20 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
                     Stdio::null()
                 })
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stderr(fs::File::create(stderr_path(index)).unwrap())
                 .spawn()
                 .unwrap(),
         );
     }
     let deadline = Instant::now() + Duration::from_secs(100);
     let mut sent = false;
-    while aswap::now() < reset {
+    // In the revocation case, publish quota only once the supervisor is waiting
+    // and the provider has acknowledged the limit with its signal handler armed.
+    while aswap::now() < reset
+        || (mode == "race"
+            && (fs::read_dir(&log).unwrap().count() != count
+                || !(0..count).all(|index| read_stderr(index).contains("watching all accounts"))))
+    {
         assert!(Instant::now() < deadline);
         if exited
             && !sent
@@ -175,10 +184,9 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
         std::thread::sleep(Duration::from_millis(20));
     }
     if fs::read_dir(&log).unwrap().count() != count {
-        for child in &mut children.0 {
+        for (index, child) in children.0.iter_mut().enumerate() {
             if let Some(status) = child.try_wait().unwrap() {
-                let mut stderr = String::new();
-                std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+                let stderr = read_stderr(index);
                 let mut stdout = String::new();
                 std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
                 panic!("provider exited before barrier: {status}: {stderr} {stdout}");
@@ -207,26 +215,23 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
         while if mode == "model" {
             aswap::now() < model_reset
         } else {
+            // Wait for both the fixture's revocation and the supervisor's
+            // commit-time rejection before making quota available again.
             !log.join("revoked").exists()
+                || !(0..count).all(|index| read_stderr(index).contains(LOST_ELIGIBILITY))
         } {
             assert!(Instant::now() < deadline, "review barrier timed out");
-            for child in &mut children.0 {
+            for (index, child) in children.0.iter_mut().enumerate() {
                 if let Some(status) = child.try_wait().unwrap() {
-                    let mut stderr = String::new();
-                    std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr)
-                        .unwrap();
+                    let stderr = read_stderr(index);
                     panic!("supervisor abandoned quota recovery: {status}: {stderr}");
                 }
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        if mode == "race" {
-            std::thread::sleep(Duration::from_millis(750));
-        }
-        for child in &mut children.0 {
+        for (index, child) in children.0.iter_mut().enumerate() {
             if let Some(status) = child.try_wait().unwrap() {
-                let mut stderr = String::new();
-                std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+                let stderr = read_stderr(index);
                 panic!("supervisor launched without verified quota: {status}: {stderr}");
             }
         }
@@ -242,7 +247,7 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
         cache.usage.windows[0].resets_at = Some(reset + 3600);
         store::json_write(&path, &cache).unwrap();
     }
-    for child in &mut children.0 {
+    for (index, child) in children.0.iter_mut().enumerate() {
         while child.try_wait().unwrap().is_none() {
             if Instant::now() >= deadline {
                 let cache: Cached = store::json_read(
@@ -256,20 +261,12 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
                     format!("supervisor never woke after reset; cache={cache:?}\n");
                 let _ = child.kill();
                 let _ = child.wait();
-                let mut stderr = String::new();
-                child
-                    .stderr
-                    .as_mut()
-                    .unwrap()
-                    .read_to_string(&mut stderr)
-                    .unwrap();
-                diagnostics.push_str(&stderr);
+                diagnostics.push_str(&read_stderr(index));
                 panic!("{diagnostics}");
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        let mut stderr = String::new();
-        std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+        let stderr = read_stderr(index);
         let status = child.wait().unwrap();
         if interrupted {
             assert!(!status.success());
@@ -282,10 +279,6 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
             panic!("{stderr}\n{stdout}");
         }
         if mode == "race" {
-            assert!(
-                stderr.contains("lost eligibility before commit; waiting"),
-                "{stderr}"
-            );
             assert!(!stderr.contains("resuming on claude:current"), "{stderr}");
         }
         assert!(stderr.contains("watching all accounts"), "{stderr}");
