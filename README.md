@@ -133,7 +133,9 @@ GC takes a fresh descriptor scan after hiding each view's original name.
 If Linux denies a read, GC checks the process command line. It keeps the
 view if the command line is unavailable, empty, or mentions the view, Claude,
 Codex, aswap, or Node. The report counts unreadable non-provider processes it
-skipped, once per PID. Views containing mount points stay in place.
+skipped, once per PID. GC rechecks ambiguous descriptor snapshots against the
+current process state. A descriptor-related keep reason includes the PID and a
+redacted command-line excerpt. Views containing mount points stay in place.
 
 GC compares the size and SHA-256 of duplicate transcripts. Unique transcripts
 move to the same relative path in the shared provider home. GC keeps unmarked
@@ -155,7 +157,9 @@ view-local private files without a verified identical shared copy go into an
 owner-only archive at `archive/<provider>/<label>/<run>/`. GC always snapshots
 private SQLite databases, including committed WAL data, even when the main file
 matches the shared copy. A linked or unrecognized private SQLite sidecar keeps
-the view. GC checks every sealed payload's identity and hash again before
+the view. With the main file missing, GC preserves the raw sidecar under
+`orphan-sidecars/<sha256>/` in the view's archive. The checksum manifest covers
+those payloads too. GC checks every sealed payload's identity and hash again before
 removal. From the archive, run
 `sha256sum --check SHA256SUMS` to check the compressed files before restoring
 the one you want.
@@ -168,8 +172,11 @@ a Codex index write transaction to check for references to both names. A native
 Codex process holding an old path in memory can still republish it after that
 transaction. Replacing the shared Codex home directory while GC is updating
 the index can also race with opening that database. Apply restores an
-interrupted retirement to its original path
-when it can do so safely. Reclaim counts include newly written index backups.
+interrupted retirement to its original path when it can do so safely. If I/O
+pressure interrupts SQLite cleanup after the WAL has been removed, a retry can
+keep the partial view because its remaining main file differs from the archived
+snapshot. The verified archive retains the committed data. Reclaim counts
+include newly written index backups.
 
 ## Development
 

@@ -2,7 +2,7 @@ use crate::{Error, Result, Safe};
 use std::{
     collections::{BTreeSet, HashSet},
     ffi::{OsStr, OsString},
-    fs,
+    fmt, fs,
     io::{self, ErrorKind},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -184,21 +184,91 @@ fn inspect_unreadable(process: &Path, view: &Path, denied: io::Error) -> io::Res
 }
 
 fn unrelated(cmdline: &[u8], view: &Path) -> bool {
-    let names: &[&[u8]] = &[b"claude", b"codex", b"aswap", b"node"];
     let view = view.as_os_str().as_bytes();
     !(cmdline.iter().all(|&b| b == 0)
-        || names.iter().any(|name| {
-            cmdline
-                .windows(name.len())
-                .any(|part| part.eq_ignore_ascii_case(name))
-        })
+        || provider_marker(cmdline).is_some()
         || (!view.is_empty() && cmdline.windows(view.len()).any(|part| part == view)))
 }
 
-#[derive(Default)]
+fn provider_marker(cmdline: &[u8]) -> Option<&'static str> {
+    ["claude", "codex", "aswap", "node"]
+        .into_iter()
+        .find(|name| {
+            cmdline
+                .windows(name.len())
+                .any(|part| part.eq_ignore_ascii_case(name.as_bytes()))
+        })
+}
+
+pub(super) const FD_LIVENESS_ERROR: &str = "cannot establish file descriptor liveness";
+
+#[derive(Debug)]
+pub(super) struct FdBlocker {
+    pid: OsString,
+    excerpt: String,
+}
+
+impl fmt::Display for FdBlocker {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            out,
+            "PID {}, cmdline excerpt {}",
+            self.pid.to_string_lossy(),
+            self.excerpt
+        )
+    }
+}
+
+impl From<FdBlocker> for Error {
+    fn from(_: FdBlocker) -> Self {
+        Error(FD_LIVENESS_ERROR)
+    }
+}
+
+fn cmdline_excerpt(cmdline: &io::Result<Vec<u8>>) -> String {
+    let data = match cmdline {
+        Ok(data) if data.iter().any(|&b| b != 0) => data,
+        Ok(_) => return "<empty>".into(),
+        Err(error) => return format!("<unreadable: {:?}>", error.kind()),
+    };
+    // Arguments and unfamiliar executable names can contain credentials.
+    // Only a recognized basename and fixed provider markers are reportable.
+    let argv0 = data
+        .split(|&b| matches!(b, 0 | b':' | b' '))
+        .next()
+        .unwrap_or_default();
+    let basename = argv0.rsplit(|&b| b == b'/').next().unwrap_or_default();
+    let name = [
+        "sshd",
+        "sshd-session",
+        "ssh-agent",
+        "sftp-server",
+        "systemd",
+        "(sd-pam)",
+        "claude",
+        "codex",
+        "aswap",
+        "node",
+    ]
+    .into_iter()
+    .find(|name| basename.eq_ignore_ascii_case(name.as_bytes()))
+    .unwrap_or("<argv0 redacted>");
+    match provider_marker(data) {
+        Some(marker) => format!("{name} (marker {marker})"),
+        None => name.into(),
+    }
+}
+
+struct UnreadableFds {
+    pid: OsString,
+    path: PathBuf,
+    cmdline: io::Result<Vec<u8>>,
+}
+
 pub(super) struct Fds {
     paths: BTreeSet<PathBuf>,
-    unreadable: Vec<(OsString, Option<Vec<u8>>)>,
+    unreadable: Vec<UnreadableFds>,
+    uid: u32,
 }
 
 impl Fds {
@@ -218,7 +288,21 @@ impl Fds {
         roots: &[&Path],
         skip_pid: Option<u32>,
     ) -> io::Result<Self> {
-        let mut fds = Self::default();
+        Self::read_with_links(proc_root, uid, roots, skip_pid, |path| fs::read_link(path))
+    }
+
+    pub(super) fn read_with_links(
+        proc_root: &Path,
+        uid: u32,
+        roots: &[&Path],
+        skip_pid: Option<u32>,
+        mut read_link: impl FnMut(&Path) -> io::Result<PathBuf>,
+    ) -> io::Result<Self> {
+        let mut fds = Self {
+            paths: BTreeSet::new(),
+            unreadable: Vec::new(),
+            uid,
+        };
         let skip_pid = skip_pid.map(|pid| pid.to_string());
         for entry in fs::read_dir(proc_root)? {
             let entry = entry?;
@@ -234,12 +318,16 @@ impl Fds {
                 Err(_) if gone(&process) => continue,
                 Err(error) => return Err(error),
             }
-            match fds.read_process(&process, roots) {
+            match fds.read_process(&process, roots, &mut read_link) {
                 Ok(()) => {}
                 Err(_) if gone(&process) => {}
                 Err(error) if error.kind() == ErrorKind::PermissionDenied => {
-                    fds.unreadable
-                        .push((pid, fs::read(process.join("cmdline")).ok()));
+                    let cmdline = fs::read(process.join("cmdline"));
+                    fds.unreadable.push(UnreadableFds {
+                        pid,
+                        path: process,
+                        cmdline,
+                    });
                 }
                 Err(error) => return Err(error),
             }
@@ -247,9 +335,14 @@ impl Fds {
         Ok(fds)
     }
 
-    fn read_process(&mut self, process: &Path, roots: &[&Path]) -> io::Result<()> {
+    fn read_process(
+        &mut self,
+        process: &Path,
+        roots: &[&Path],
+        mut read_link: impl FnMut(&Path) -> io::Result<PathBuf>,
+    ) -> io::Result<()> {
         for fd in fs::read_dir(process.join("fd"))? {
-            let path = match fs::read_link(fd?.path()) {
+            let path = match read_link(&fd?.path()) {
                 Ok(path) => path,
                 Err(error) if error.kind() == ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
@@ -265,7 +358,11 @@ impl Fds {
         Ok(())
     }
 
-    pub(super) fn uses_view(&self, view: &Path, ignored: &mut HashSet<OsString>) -> Result<bool> {
+    pub(super) fn uses_view(
+        &self,
+        view: &Path,
+        ignored: &mut HashSet<OsString>,
+    ) -> std::result::Result<bool, FdBlocker> {
         if self
             .paths
             .range(view.to_owned()..)
@@ -274,14 +371,36 @@ impl Fds {
         {
             return Ok(true);
         }
-        for (pid, cmdline) in &self.unreadable {
-            if !cmdline
-                .as_deref()
-                .is_some_and(|cmdline| unrelated(cmdline, view))
+        for entry in &self.unreadable {
+            if entry
+                .cmdline
+                .as_ref()
+                .is_ok_and(|cmdline| unrelated(cmdline, view))
             {
-                return Err(Error("cannot establish file descriptor liveness"));
+                ignored.insert(entry.pid.clone());
+                continue;
             }
-            ignored.insert(pid.clone());
+            // A process can exit or exec between inspecting status, reading
+            // its descriptors and reading cmdline. Do not let an ambiguous
+            // observation stay in the batch-wide snapshot indefinitely.
+            let cmdline = fs::read(entry.path.join("cmdline"));
+            match may_use_store(&entry.path, self.uid) {
+                Ok(false) => continue,
+                Err(_) if gone(&entry.path) => continue,
+                Ok(true)
+                    if cmdline
+                        .as_ref()
+                        .is_ok_and(|cmdline| unrelated(cmdline, view)) =>
+                {
+                    ignored.insert(entry.pid.clone());
+                }
+                Ok(true) | Err(_) => {
+                    return Err(FdBlocker {
+                        pid: entry.pid.clone(),
+                        excerpt: cmdline_excerpt(&cmdline),
+                    });
+                }
+            }
         }
         Ok(false)
     }

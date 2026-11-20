@@ -85,6 +85,7 @@ impl Fixture {
             at: SystemTime::now() + advance,
             in_use,
             recent_fds: &mut |_, _| Ok(false),
+            fd_blocker: &Cell::new(None),
             mounts,
             pressure: Pressure {
                 read: pressure,
@@ -808,7 +809,7 @@ fn descriptor_snapshot_and_nested_provider_home_keep_old_views() {
     let report = t.run_with(
         Mode::Apply,
         Duration::from_secs(3 * 86400),
-        &mut |path| fds.uses_view(path, &mut ignored),
+        &mut |path| fds.uses_view(path, &mut ignored).map_err(Error::from),
         &mut || Ok(0.0),
     );
     assert!(report.text().contains("used by a live process"));
@@ -1001,13 +1002,14 @@ fn linked_and_unknown_sidecars_keep_private_sqlite_groups() {
 }
 
 #[test]
-fn orphan_sidecar_requires_a_verified_archived_database() {
+fn orphan_wal_keeps_later_commits_absent_from_an_older_archive() {
     let t = Fixture::new();
     let view = t.view("claude", "run-orphan");
-    let db = rusqlite::Connection::open(view.join("private.sqlite")).unwrap();
-    db.execute("CREATE TABLE history (message TEXT)", [])
-        .unwrap();
-    drop(db);
+    let main = view.join("private.sqlite");
+    {
+        let db = rusqlite::Connection::open(&main).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE history (message TEXT); INSERT INTO history VALUES ('earlier checkpoint');").unwrap();
+    }
     let archive = t.root.join("archive/claude/synthetic/run-orphan");
     let first = t.run_with(
         Mode::Apply,
@@ -1016,27 +1018,134 @@ fn orphan_sidecar_requires_a_verified_archived_database() {
         &mut || Ok(0.0),
     );
     assert!(first.incomplete());
-    assert!(archive.join("private.sqlite.zst").exists());
-    fs::remove_file(view.join("private.sqlite")).unwrap();
-    write(&view.join("private.sqlite-wal"), b"synthetic orphan");
+    let earlier = fs::read(archive.join("private.sqlite.zst")).unwrap();
+
+    let later = rusqlite::Connection::open(&main).unwrap();
+    later
+        .execute_batch("PRAGMA wal_autocheckpoint=0; INSERT INTO history VALUES ('later commit');")
+        .unwrap();
+    let raw_wal = fs::read(view.join("private.sqlite-wal")).unwrap();
+    let recovery = t._temp.path().join("recovery/private.sqlite");
+    write(&recovery, &fs::read(&main).unwrap());
+    fs::remove_file(main).unwrap();
 
     let no_archive = t.view("claude", "run-no-snapshot");
     write(
         &no_archive.join("private.sqlite-journal"),
-        b"synthetic orphan",
+        b"synthetic orphan journal",
     );
     let preview = t.run(Mode::Preview);
-    assert_eq!(preview.totals.finished, 1, "{}", preview.text());
-    assert!(
-        preview
-            .text()
-            .contains("orphan SQLite sidecar has no verified archive snapshot")
-    );
+    assert_eq!(preview.totals.finished, 2, "{}", preview.text());
+    assert!(preview.totals.bytes_archived >= raw_wal.len() as u64);
+    assert!(!archive.join("orphan-sidecars").exists());
     let retry = t.run(Mode::Apply);
-    assert_eq!(retry.totals.removed, 1, "{}", retry.text());
-    assert!(view.metadata().is_err());
-    assert!(archive.join("private.sqlite.zst").exists());
-    assert!(no_archive.join("private.sqlite-journal").exists());
+    assert_eq!(retry.totals.removed, 2, "{}", retry.text());
+    assert!(!view.exists());
+    assert!(!no_archive.exists());
+    drop(later);
+    assert_eq!(
+        fs::read(archive.join("private.sqlite.zst")).unwrap(),
+        earlier
+    );
+    let supplement = archive.join("orphan-sidecars");
+    let versions: Vec<_> = fs::read_dir(&supplement)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    let compressed = versions
+        .iter()
+        .map(|dir| dir.join("private.sqlite-wal.zst"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let decoded = zstd::stream::decode_all(File::open(compressed).unwrap()).unwrap();
+    assert_eq!(decoded, raw_wal);
+    write(&recovery.with_file_name("private.sqlite-wal"), &decoded);
+    let recovered = rusqlite::Connection::open(&recovery).unwrap();
+    let recovered_rows: u32 = recovered
+        .query_row("SELECT count(*) FROM history", [], |row| row.get(0))
+        .unwrap();
+    let earlier_path = t._temp.path().join("earlier.sqlite");
+    write(
+        &earlier_path,
+        &zstd::stream::decode_all(&earlier[..]).unwrap(),
+    );
+    let earlier_db = rusqlite::Connection::open(earlier_path).unwrap();
+    let earlier_rows: u32 = earlier_db
+        .query_row("SELECT count(*) FROM history", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!((earlier_rows, recovered_rows), (1, 2));
+
+    let manifest = fs::read(archive.join("SHA256SUMS")).unwrap();
+    assert!(String::from_utf8_lossy(&manifest).contains("private.sqlite-wal.zst"));
+    write(&view.join("private.sqlite-wal"), &raw_wal);
+    let identical = t.run(Mode::Apply);
+    assert_eq!(identical.totals.removed, 1, "{}", identical.text());
+    assert_eq!(manifest, fs::read(archive.join("SHA256SUMS")).unwrap());
+    assert_eq!(fs::read_dir(supplement).unwrap().count(), versions.len());
+}
+
+#[test]
+fn ambiguous_descriptor_snapshot_rechecks_zombies_and_cmdline() {
+    let t = Fixture::new();
+    let view = t.view("codex", "run-fd-recheck");
+    let proc = t._temp.path().join("proc");
+    let exiting = proc.join("321");
+    let helper = proc.join("322");
+    let provider = proc.join("323");
+    for pid in [&exiting, &helper, &provider] {
+        write(
+            &pid.join("status"),
+            b"State:\tS\nUid:\t1234\t1234\t1234\t1234\n",
+        );
+        write(&pid.join("fd/4"), b"synthetic");
+    }
+    write(&exiting.join("cmdline"), b"");
+    write(
+        &provider.join("cmdline"),
+        b"/bin/node\0synthetic-secret-argument\0",
+    );
+    let snapshot = process::Fds::read_with_links(&proc, 1234, &[&view], None, |_| {
+        Err(ErrorKind::PermissionDenied.into())
+    })
+    .unwrap();
+    write(
+        &exiting.join("status"),
+        b"State:\tZ\nUid:\t1234\t1234\t1234\t1234\n",
+    );
+    write(&helper.join("cmdline"), b"sshd-session: synthetic\0");
+
+    let diagnostic = Cell::new(None);
+    let settings = t.settings();
+    let report = Retention {
+        root: &t.root,
+        at: SystemTime::now() + Duration::from_secs(3 * 86400),
+        in_use: &mut |path| fd_uses_view(&snapshot, path, &mut Default::default(), &diagnostic),
+        fd_blocker: &diagnostic,
+        recent_fds: &mut |_, _| Ok(false),
+        mounts: &mut || Ok(mounts::Mounts::default()),
+        pressure: Pressure {
+            read: &mut || Ok(0.0),
+            limit: 30.0,
+            next: Instant::now(),
+            stopped: None,
+        },
+    }
+    .run(settings, Mode::Preview)
+    .unwrap();
+    let reason = &report.groups[0].views[0].reason;
+    assert!(reason.contains("PID 323, cmdline excerpt node"), "{reason}");
+    assert!(!reason.contains("synthetic-secret-argument"));
+
+    write(
+        &provider.join("status"),
+        b"State:\tX\nUid:\t1234\t1234\t1234\t1234\n",
+    );
+    let mut ignored = Default::default();
+    assert!(!snapshot.uses_view(&view, &mut ignored).unwrap());
+    assert_eq!(
+        ignored.into_iter().collect::<Vec<_>>(),
+        [OsString::from("322")]
+    );
 }
 
 #[test]
@@ -1058,7 +1167,12 @@ fn descriptor_opened_after_initial_snapshot_restores_retiring_view() {
         let report = Retention {
             root: &t.root,
             at: SystemTime::now() + Duration::from_secs(3 * 86400),
-            in_use: &mut |path| initial.uses_view(path, &mut Default::default()),
+            in_use: &mut |path| {
+                initial
+                    .uses_view(path, &mut Default::default())
+                    .map_err(Error::from)
+            },
+            fd_blocker: &Cell::new(None),
             recent_fds: &mut |old, tombstone| {
                 assert!(!old.exists());
                 assert!(tombstone.join(relative).is_file());

@@ -361,7 +361,7 @@ fn sqlite_name(name: &[u8]) -> bool {
 
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
-pub(super) fn is_sqlite_header(header: &[u8; 16]) -> bool {
+fn is_sqlite_header(header: &[u8; 16]) -> bool {
     header == SQLITE_HEADER
 }
 
@@ -467,6 +467,7 @@ fn compare(
 pub(super) struct ArchiveEntry<'a> {
     pub(super) file: &'a SavedFile,
     pub(super) sqlite: bool,
+    pub(super) orphan_sidecar: bool,
     pub(super) sidecars: Vec<&'a SavedFile>,
 }
 
@@ -477,7 +478,7 @@ pub(super) struct Plan {
     conflicts: Vec<usize>,
     shared_files: Vec<Witness>,
     sqlite_inputs: BTreeMap<usize, Vec<usize>>,
-    pub(super) orphan_databases: BTreeSet<PathBuf>,
+    orphan_sidecars: BTreeSet<usize>,
 }
 
 impl Plan {
@@ -519,7 +520,7 @@ impl Plan {
             .map(|&index| (index, Vec::new()))
             .collect();
         let mut sidecar_indexes = BTreeSet::new();
-        let mut orphan_databases = BTreeSet::new();
+        let mut orphan_sidecars = BTreeSet::new();
         let mut sqlite_bytes = 0;
         for (index, file) in files.iter().enumerate() {
             let Some((database, sidecar)) = database_for_sidecar(&file.path, &databases) else {
@@ -528,14 +529,14 @@ impl Plan {
             if sidecar == Sidecar::Unknown {
                 return Err(Error("unrecognized private SQLite sidecar"));
             }
-            sidecar_indexes.insert(index);
             if let Some(base) = databases.get(database.as_path()) {
+                sidecar_indexes.insert(index);
                 sqlite_bytes += file.size();
                 if sidecar != Sidecar::Shm {
                     sqlite_inputs.get_mut(base).unwrap().push(index);
                 }
             } else {
-                orphan_databases.insert(database);
+                orphan_sidecars.insert(index);
             }
         }
         let mut plan = Self {
@@ -545,7 +546,7 @@ impl Plan {
             conflicts: Vec::new(),
             shared_files: Vec::new(),
             sqlite_inputs,
-            orphan_databases,
+            orphan_sidecars,
         };
         for (index, file) in files.iter().enumerate() {
             pressure.check(false)?;
@@ -554,7 +555,7 @@ impl Plan {
             }
             // Identical main files can expose different data through their
             // WALs. Preserve every private SQLite database as a snapshot.
-            if !plan.sqlite_inputs.contains_key(&index) {
+            if !plan.sqlite_inputs.contains_key(&index) && !plan.orphan_sidecars.contains(&index) {
                 match compare(file, view, home, pressure)? {
                     Comparison::Equivalent(version) => {
                         plan.shared_files.push(Witness { index, version });
@@ -581,6 +582,7 @@ impl Plan {
         self.conflicts.iter().map(|&index| ArchiveEntry {
             file: &inventory.files[index],
             sqlite: self.sqlite_inputs.contains_key(&index),
+            orphan_sidecar: self.orphan_sidecars.contains(&index),
             sidecars: self
                 .sqlite_inputs
                 .get(&index)
@@ -592,7 +594,7 @@ impl Plan {
     }
 
     pub(super) fn has_conflicts(&self) -> bool {
-        !self.conflicts.is_empty() || !self.orphan_databases.is_empty()
+        !self.conflicts.is_empty()
     }
 
     pub(super) fn publish(

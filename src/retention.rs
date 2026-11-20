@@ -1,4 +1,4 @@
-//! Retention of finished private launch views. Reports contain paths and counts only.
+//! Retention of finished private launch views. Process diagnostics redact command arguments.
 mod archive;
 mod codex_index;
 mod files;
@@ -15,7 +15,7 @@ use crate::{
 use files::{Dir, Home, Inventory, Plan};
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt::Write as _,
@@ -194,7 +194,7 @@ struct Totals {
 struct ViewResult {
     path: String,
     verdict: Verdict,
-    reason: &'static str,
+    reason: String,
     bytes_reclaimed: i128,
     bytes_moved: u64,
     bytes_archived: u64,
@@ -331,25 +331,28 @@ pub fn run(mode: Mode, legacy_homes: &[String]) -> Result<Report> {
         process::lower_priority()?;
     }
     let ignored = RefCell::new(Default::default());
+    let fd_blocker = Cell::new(None);
     let runtimes = root.join("runtimes");
     let mut fds = None;
     let mut in_use = |view: &Path| {
         let fds = fds.get_or_insert_with(|| process::Fds::for_paths(&[&runtimes]));
         let fds = fds.as_ref().map_err(|error| Error(error.0))?;
         let mut ignored = ignored.borrow_mut();
-        Ok(fds.uses_view(view, &mut ignored)?
+        Ok(fd_uses_view(fds, view, &mut ignored, &fd_blocker)?
             || process::uses_view(view, &mut ignored)?
             || live::view_in_use(&root, view)?)
     };
     let mut recent_fds = |view: &Path, tombstone: &Path| {
         let fds = process::Fds::for_paths(&[view, tombstone])?;
         let mut ignored = ignored.borrow_mut();
-        Ok(fds.uses_view(view, &mut ignored)? || fds.uses_view(tombstone, &mut ignored)?)
+        Ok(fd_uses_view(&fds, view, &mut ignored, &fd_blocker)?
+            || fd_uses_view(&fds, tombstone, &mut ignored, &fd_blocker)?)
     };
     let mut report = Retention {
         root: &root,
         at: SystemTime::now(),
         in_use: &mut in_use,
+        fd_blocker: &fd_blocker,
         recent_fds: &mut recent_fds,
         mounts: &mut mounts::read,
         pressure: Pressure {
@@ -364,10 +367,23 @@ pub fn run(mode: Mode, legacy_homes: &[String]) -> Result<Report> {
     Ok(report)
 }
 
+fn fd_uses_view(
+    fds: &process::Fds,
+    view: &Path,
+    ignored: &mut std::collections::HashSet<OsString>,
+    diagnostic: &Cell<Option<process::FdBlocker>>,
+) -> Result<bool> {
+    fds.uses_view(view, ignored).map_err(|blocker| {
+        diagnostic.set(Some(blocker));
+        Error(process::FD_LIVENESS_ERROR)
+    })
+}
+
 struct Retention<'a> {
     root: &'a Path,
     at: SystemTime,
     in_use: &'a mut dyn FnMut(&Path) -> Result<bool>,
+    fd_blocker: &'a Cell<Option<process::FdBlocker>>,
     recent_fds: &'a mut dyn FnMut(&Path, &Path) -> Result<bool>,
     mounts: &'a mut dyn FnMut() -> Result<mounts::Mounts>,
     pressure: Pressure<'a>,
@@ -488,7 +504,7 @@ impl Retention<'_> {
                     let mut result = ViewResult {
                         path: path.to_string_lossy().into(),
                         verdict: Verdict::Kept,
-                        reason: "eligibility uncertain",
+                        reason: "eligibility uncertain".into(),
                         bytes_reclaimed: 0,
                         bytes_moved: 0,
                         bytes_archived: 0,
@@ -516,8 +532,14 @@ impl Retention<'_> {
                     } else {
                         self.view(candidate, &mut backups, &mut result)
                     };
+                    let blocker = self.fd_blocker.take();
                     if let Err(error) = outcome {
-                        result.reason = error.0;
+                        result.reason = match blocker {
+                            Some(blocker) if error.0 == process::FD_LIVENESS_ERROR => {
+                                format!("{error} ({blocker})")
+                            }
+                            _ => error.0.into(),
+                        };
                         result.incomplete |= !dry_run && !expected_keep(&error);
                     }
                     group.totals.add(&result);
@@ -626,7 +648,6 @@ impl Retention<'_> {
             .has_conflicts()
             .then(|| archive.to_string_lossy().into_owned());
         if dry_run {
-            archive::verify_orphans(archive, &plan.orphan_databases, &mut self.pressure)?;
             if provider == Provider::Codex {
                 codex_index::check(
                     &home,
@@ -639,7 +660,7 @@ impl Retention<'_> {
                 )?;
             }
             result.verdict = Verdict::Finished;
-            result.reason = "eligible for removal";
+            result.reason = "eligible for removal".into();
             result.bytes_reclaimed = i128::from(inventory.bytes)
                 - i128::from(plan.move_bytes)
                 - i128::from(plan.archive_bytes);
@@ -664,7 +685,6 @@ impl Retention<'_> {
                 archive,
                 &view,
                 plan.conflicts(&inventory),
-                &plan.orphan_databases,
                 &mut self.pressure,
             )?;
             result.bytes_reclaimed -= i128::from(receipt.bytes_added);
@@ -746,7 +766,7 @@ impl Retention<'_> {
             &mut result.bytes_reclaimed,
         )?;
         result.verdict = Verdict::Removed;
-        result.reason = "finished and private data preserved";
+        result.reason = "finished and private data preserved".into();
         result.incomplete = false;
         Ok(())
     }
