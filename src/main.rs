@@ -30,6 +30,15 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Preview retention of finished runtime views.
+    Gc {
+        /// Remove eligible views and preserve their transcripts.
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
+        /// Preview even if the configuration enables automatic application.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show the actual account used by each locally running session.
     Sessions { provider: Option<Provider> },
     /// Capture the current file-based login under a private label.
@@ -304,8 +313,21 @@ fn waybar(value: &Value) -> Value {
     json!({"text":if text.is_empty(){"aswap: no accounts"}else{&text},"tooltip":rows_text(value),"class":"aswap"})
 }
 fn execute(cli: Cli) -> Result<i32> {
+    if let Action::Gc { apply, dry_run } = cli.command {
+        use aswap::retention::{self, Mode};
+        let mode = match (apply, dry_run) {
+            (true, _) => Mode::Apply,
+            (_, true) => Mode::Preview,
+            _ => Mode::Configured,
+        };
+        let report = retention::run(mode)?;
+        let value = serde_json::to_value(&report).safe("cannot encode retention report")?;
+        output(&value, cli.json, report.text())?;
+        return Ok(0);
+    }
     let store = Store::from_env()?;
     match cli.command {
+        Action::Gc { .. } => unreachable!(),
         Action::Sessions { provider } => {
             let rows: Vec<_> = aswap::live::sessions(&store)?
                 .into_iter()

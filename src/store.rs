@@ -291,12 +291,22 @@ pub fn json_write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     )
 }
 impl Store {
-    pub fn from_env() -> Result<Self> {
+    pub(crate) fn root_from_env() -> Result<PathBuf> {
         let base = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
             .unwrap_or(crate::provider::home()?.join(".local/share"));
-        Self::open(base.join("aswap"))
+        Ok(base.join("aswap"))
+    }
+    pub(crate) fn config_dir() -> Result<PathBuf> {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or(crate::provider::home()?.join(".config"));
+        Ok(base.join("aswap"))
+    }
+    pub fn from_env() -> Result<Self> {
+        Self::open(Self::root_from_env()?)
     }
     pub fn open(root: PathBuf) -> Result<Self> {
         no_links(&root)?;
@@ -305,13 +315,9 @@ impl Store {
             return Err(Error("account stores must live outside a Git checkout"));
         }
         private_dir(&root)?;
-        let config = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .unwrap_or(crate::provider::home()?.join(".config"));
         Ok(Self {
             root,
-            sync_policy_path: config.join("aswap/sync-policy.json"),
+            sync_policy_path: Self::config_dir()?.join("sync-policy.json"),
         })
     }
     pub fn lock(&self) -> Result<Guard> {

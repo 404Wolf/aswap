@@ -190,6 +190,56 @@ pub(crate) fn views(store: &Store, a: &Account) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Include legacy supervisors between children, even after an account switch.
+/// This read-only check never collects stale records or takes the store lock.
+pub(crate) fn view_in_use(root: &Path, view: &Path) -> Result<bool> {
+    fn dirs(path: &Path) -> Result<Vec<PathBuf>> {
+        store::no_links(path)?;
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => return Err(Error("cannot inspect live session directory")),
+        };
+        entries
+            .map(|entry| {
+                entry
+                    .map(|e| e.path())
+                    .safe("cannot inspect live session entry")
+            })
+            .collect()
+    }
+    let current_boot = boot()?;
+    for provider in [
+        crate::provider::Provider::Claude,
+        crate::provider::Provider::Codex,
+    ] {
+        for label in dirs(&root.join("live").join(provider.as_str()))? {
+            for path in dirs(&label)? {
+                if path.extension().is_none_or(|extension| extension != "json") {
+                    continue;
+                }
+                let record: Record = match store::json_read(&path) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        if matches!(fs::symlink_metadata(&path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+                        {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                };
+                if record.view.as_deref() == Some(view)
+                    && record.boot == current_boot
+                    && (alive(&record.parent) || record.child.as_ref().is_some_and(alive))
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Local live sessions, including the actual credential profile after failover.
 pub fn sessions(store: &Store) -> Result<Vec<serde_json::Value>> {
     let _lock = store.lock()?;

@@ -50,6 +50,28 @@ impl Sandbox {
     }
 }
 #[test]
+fn gc_is_disabled_by_default_and_reads_declarative_config() {
+    let sandbox = Sandbox::new();
+    let report = sandbox.ok(&["gc", "--apply", "--json"]);
+    assert_eq!(report["enabled"], false);
+    assert!(!sandbox.root().join("data/aswap").exists());
+
+    let config = sandbox.root().join("config/aswap");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "[retention]\nenabled = true\n").unwrap();
+    let report = sandbox.ok(&["gc", "--json"]);
+    assert_eq!(report["enabled"], true);
+    assert_eq!(report["dry_run"], true);
+    assert_eq!(report["totals"]["examined"], 0);
+    assert!(!sandbox.root().join("data/aswap").exists());
+    assert!(
+        !sandbox
+            .invoke(&["gc", "--dry-run", "--apply"])
+            .status
+            .success()
+    );
+}
+#[test]
 fn cli_lifecycle_json_and_waybar_schema() {
     let t = Sandbox::new();
     t.seed();

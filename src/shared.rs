@@ -11,7 +11,10 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},
     io::{Read, Write},
-    os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
+    },
     path::{Path, PathBuf},
 };
 
@@ -74,7 +77,7 @@ fn shared_config(config: &Value) -> Value {
             .collect(),
     )
 }
-fn private(provider: Provider, name: &OsStr) -> bool {
+pub(crate) fn private(provider: Provider, name: &OsStr) -> bool {
     let name = name.to_string_lossy();
     name == provider.auth_file()
         || matches!(
@@ -86,6 +89,7 @@ fn private(provider: Provider, name: &OsStr) -> bool {
                 | "backups"
                 | "remote-settings.json"
                 | "policy-limits.json"
+                | VIEW_LIFETIME_LOCK
         )
         || name.starts_with(".credentials")
         || name.starts_with("auth")
@@ -148,7 +152,7 @@ fn sqlite_file(path: &Path) -> bool {
         && &header == b"SQLite format 3\0"
 }
 /// Copy committed pages through SQLite so live WAL writes cannot tear snapshots.
-fn sqlite_snapshot(source: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn sqlite_snapshot(source: &Path, dest: &Path) -> Result<()> {
     let source =
         rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .safe("cannot open SQLite snapshot source")?;
@@ -365,10 +369,13 @@ pub(crate) fn stamp(path: &Path) -> Option<Stamp> {
 /// provider home. It holds the label of the account whose credentials the view
 /// carries, so a hand-out never gives one account's token to a view that has
 /// switched to another. Closing the file releases the lock.
-fn view_lock(view: &Path, create: bool) -> Result<File> {
+pub(crate) fn view_lock_path(view: &Path) -> PathBuf {
     let mut name = view.as_os_str().to_owned();
     name.push(".lock");
-    let path = PathBuf::from(name);
+    PathBuf::from(name)
+}
+fn view_lock(view: &Path, create: bool) -> Result<File> {
+    let path = view_lock_path(view);
     store::no_links(&path)?;
     let file = fs::OpenOptions::new()
         .read(true)
@@ -559,8 +566,8 @@ fn shared_names(provider: Provider) -> &'static [&'static str] {
 /// as home would snapshot every shared entry (each is a symlink there),
 /// copying the whole session history into the new view. Follow the view's
 /// links back to the home it shares instead.
-fn shared_home(store: &Store, provider: Provider, mut home: PathBuf) -> Result<PathBuf> {
-    let runtimes = store.root.join("runtimes");
+pub(crate) fn shared_home(root: &Path, provider: Provider, mut home: PathBuf) -> Result<PathBuf> {
+    let runtimes = root.join("runtimes");
     for _ in 0..8 {
         if !home.starts_with(&runtimes) {
             return Ok(home);
@@ -603,14 +610,20 @@ pub struct View {
     /// The canonical profile auth this view last copied; a different stamp
     /// means the owner rotated or a follower installed a new token.
     auth_stamp: Option<Stamp>,
+    _lifetime: File,
 }
+pub(crate) const VIEW_LIFETIME_LOCK: &str = ".aswap-active";
 impl View {
     /// The global store lock covers migration, shared-home creation and the
     /// credential/MCP writes in `select_locked`. Linking and snapshotting into
     /// the new run directory, which no other process knows about, happen
     /// outside it: a large managed entry must never stall other launches.
     pub fn prepare(store: &Store, account: &Account) -> Result<Self> {
-        let home = shared_home(store, account.provider, account.provider.current_home()?)?;
+        let home = shared_home(
+            &store.root,
+            account.provider,
+            account.provider.current_home()?,
+        )?;
         if home.ancestors().any(|p| p.join(".git").exists()) {
             return Err(Error("provider state must live outside a Git checkout"));
         }
@@ -671,11 +684,42 @@ impl View {
             .join(account.provider.as_str())
             .join(&account.label);
         store::private_dir(&parent)?;
-        let path = tempfile::Builder::new()
-            .prefix("run-")
+        let pending = tempfile::Builder::new()
+            .prefix(".preparing-")
             .tempdir_in(parent)
-            .safe("cannot create private launch view")?
-            .keep();
+            .safe("cannot create private launch view")?;
+        // Credential hand-outs use a separate lock. This one spans setup,
+        // child restarts and final sync, and pins the view's shared home for GC.
+        let mut lifetime = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(pending.path().join(VIEW_LIFETIME_LOCK))
+            .safe("cannot open launch view lifetime lock")?;
+        fs2::FileExt::lock_exclusive(&lifetime).safe("cannot hold launch view lifetime lock")?;
+        lifetime
+            .write_all(home.as_os_str().as_bytes())
+            .safe("cannot record launch view home")?;
+        let mut run = OsString::from("run-");
+        run.push(OsStr::from_bytes(
+            pending
+                .path()
+                .file_name()
+                .unwrap()
+                .as_bytes()
+                .strip_prefix(b".preparing-")
+                .unwrap(),
+        ));
+        let path = pending.path().with_file_name(run);
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            pending.path(),
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .safe("cannot publish private launch view")?;
+        let _ = pending.keep();
         let mut names: BTreeSet<OsString> = entries(&home)?
             .into_iter()
             .map(|p| p.file_name().unwrap().to_owned())
@@ -710,6 +754,7 @@ impl View {
             managed: BTreeSet::new(),
             stamps: BTreeMap::new(),
             auth_stamp: None,
+            _lifetime: lifetime,
         };
         for name in names {
             if private(view.provider, &name) {

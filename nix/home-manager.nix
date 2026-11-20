@@ -117,6 +117,29 @@ in {
       claude = mkOption { type = types.submodule providerOptions; default = {}; };
       codex = mkOption { type = types.submodule providerOptions; default = {}; };
     };
+    retention = {
+      enable = mkEnableOption "retention of finished aswap runtime views";
+      minAge = mkOption {
+        type = types.ints.unsigned;
+        default = 172800;
+        description = "Minimum age in seconds before a runtime view is eligible for garbage collection.";
+      };
+      archiveDir = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Absolute path for conflicting transcripts. Null uses the archive directory in the aswap data store.";
+      };
+      dryRun = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Preview changes by default when invoking aswap gc.";
+      };
+      ioPressureLimit = mkOption {
+        type = types.addCheck types.number (n: n >= 0 && n <= 100);
+        default = 30;
+        description = "Stop GC when Linux I/O pressure some avg10 exceeds this percentage.";
+      };
+    };
     refreshOwner = mkOption {
       type = types.nullOr types.bool;
       default = null;
@@ -164,6 +187,18 @@ in {
     home.packages = [ cfg.package ];
     xdg.configFile."aswap/sync-policy.json" = mkIf (cfg.syncProfiles != null) {
       text = builtins.toJSON cfg.syncProfiles;
+    };
+    xdg.configFile."aswap/config.toml" = mkIf cfg.retention.enable {
+      source = (pkgs.formats.toml {}).generate "aswap-config.toml" {
+        retention = {
+          enabled = true;
+          min_age = cfg.retention.minAge;
+          dry_run = cfg.retention.dryRun;
+          io_pressure_limit = cfg.retention.ioPressureLimit;
+        } // lib.optionalAttrs (cfg.retention.archiveDir != null) {
+          archive_dir = cfg.retention.archiveDir;
+        };
+      };
     };
     systemd.user.services = lib.mapAttrs' (provider: settings:
       lib.nameValuePair "aswap-${provider}" (serviceFor provider settings)

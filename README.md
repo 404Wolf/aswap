@@ -86,6 +86,63 @@ Arguments after `--` go to the provider unchanged.
 
 [DESIGN.md](DESIGN.md) has the details.
 
+## Runtime retention
+
+Runtime retention is off by default. Enable it in
+`$XDG_CONFIG_HOME/aswap/config.toml` (usually `~/.config/aswap/config.toml`):
+
+```toml
+[retention]
+enabled = true
+min_age = 172800          # seconds, two days
+dry_run = true
+io_pressure_limit = 30    # Linux /proc/pressure/io some avg10, in percent
+# archive_dir = "/absolute/path/to/private/archive"
+```
+
+With the Home Manager module, set `programs.aswap.retention.enable = true`.
+Its `minAge`, `dryRun`, `ioPressureLimit`, and `archiveDir` options configure
+the same settings. The default archive is `archive/` inside the aswap data
+directory (`~/.local/share/aswap/` by default).
+
+```sh
+aswap gc --dry-run
+aswap gc --apply
+aswap gc --dry-run --json
+```
+
+The report goes to standard output with a verdict, reason, and byte counts
+for each view, followed by totals. Preview estimates count regular-file
+bytes and exclude the bytes to move or archive. Apply counts net bytes after
+files moved to the shared home and newly written compressed archives.
+Actual filesystem space varies with compression, sparse files, and hard links.
+
+GC processes one view at a time at idle I/O priority and nice 19. It stops if
+I/O pressure exceeds the configured limit or the pressure reading is unavailable.
+It keeps young views, views with a held lock, and views referenced by a live
+aswap supervisor or a local process under the store's Unix user. The process
+check uses the provider home environment variables and the working directory.
+Unreadable or ambiguous views are kept and reported.
+
+GC compares the size and SHA-256 of duplicate transcripts. Unique transcripts
+move to the same relative path in the shared provider home. For legacy views
+that lack a recorded home or shared links, use the provider home settings from
+the original launch (`CODEX_HOME` or `CLAUDE_CONFIG_DIR` if customized).
+Codex rollouts remain under `sessions/YYYY/MM/DD/rollout-*.jsonl` or
+`archived_sessions/` and can be opened with `codex resume <id>`. Claude
+transcripts remain at `projects/<slug>/<id>.jsonl` and can be opened with
+`claude --resume <id>` from the matching project. If both paths had different
+data, GC leaves the shared file in place and reports the view's archive at
+`archive/<provider>/<label>/<run>/`. From that directory, run
+`sha256sum --check SHA256SUMS` to check the compressed files before restoring
+the one you want.
+
+When Codex's shared thread index points into a view, GC verifies the shared
+rollout and updates the index before removing the view. An ambiguous index
+reference keeps the view. Apply reports the verified SQLite backup path when
+it first rewrites a shared index. Actual reclaim counts include newly written
+index backups.
+
 ## Development
 
 ```sh
