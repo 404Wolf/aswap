@@ -4,6 +4,7 @@
 //! `provider/<name>.rs`; the rest of aswap only asks `provider.spec()`.
 mod claude;
 mod codex;
+pub mod index;
 mod pi;
 
 use crate::{
@@ -178,6 +179,17 @@ pub trait Spec: Sync {
     }
 
     // The shared home.
+    /// Rewrite the provider's own index entries that name a transcript
+    /// through a launch view under `views` to the same file under `home`,
+    /// limited by `scope` (see [`index`]). Returns how many entries changed.
+    fn repair_index(&self, _home: &Path, _views: &Path, _scope: index::Scope) -> Result<usize> {
+        Ok(0)
+    }
+    /// Index entries that name a missing transcript, or one only reachable
+    /// through a launch view under `views`. Reads only.
+    fn check_index(&self, _home: &Path, _views: &Path) -> Result<Vec<index::Finding>> {
+        Ok(Vec::new())
+    }
     /// Directories a launch view always links, created in the home if missing.
     fn shared_dirs(&self) -> &'static [&'static str];
     /// A history file a launch view always links, created if missing.

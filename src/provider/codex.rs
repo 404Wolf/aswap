@@ -14,8 +14,18 @@ use std::path::Path;
 pub const CLIENT: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub(super) const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
+mod rollouts;
+
 pub struct Codex;
 impl Spec for Codex {
+    /// Codex's state database records each thread's rollout as spelled
+    /// under `CODEX_HOME`: in a launch view, through the view.
+    fn repair_index(&self, home: &Path, views: &Path, scope: super::index::Scope) -> Result<usize> {
+        Ok(rollouts::repair(home, views, scope)?)
+    }
+    fn check_index(&self, home: &Path, views: &Path) -> Result<Vec<super::index::Finding>> {
+        Ok(rollouts::scan(home, views)?)
+    }
     fn name(&self) -> &'static str {
         "codex"
     }
