@@ -179,12 +179,18 @@ fn shared_home(store: &Store, provider: Provider, mut home: PathBuf) -> Result<P
 /// failed is kept, so nothing written there is lost.
 pub struct ViewCleanup {
     path: PathBuf,
+    home: PathBuf,
+    views: PathBuf,
+    provider: Provider,
     pub synced: bool,
 }
 impl ViewCleanup {
-    pub fn new(view: &View) -> Self {
+    pub fn new(store: &Store, view: &View) -> Self {
         Self {
             path: view.path.clone(),
+            home: view.home.clone(),
+            views: views_root(store, view.provider),
+            provider: view.provider,
             synced: false,
         }
     }
@@ -192,6 +198,16 @@ impl ViewCleanup {
 impl Drop for ViewCleanup {
     fn drop(&mut self) {
         if !self.synced {
+            return;
+        }
+        // The provider's index must not keep naming files through the view.
+        let scope = crate::provider::index::Scope::View(&self.path);
+        if let Err(err) = self
+            .provider
+            .spec()
+            .repair_index(&self.home, &self.views, scope)
+        {
+            eprintln!("aswap: {err}; keeping the launch view so its transcripts stay reachable");
             return;
         }
         // remove_dir_all never follows the view's links into shared state.
@@ -202,6 +218,14 @@ impl Drop for ViewCleanup {
             let _ = fs::remove_file(PathBuf::from(name));
         }
     }
+}
+/// Where `provider`'s launch views live: `<store>/runtimes/<provider>`.
+pub fn views_root(store: &Store, provider: Provider) -> PathBuf {
+    store.root.join("runtimes").join(provider.as_str())
+}
+/// The home a launch view of `provider` shares, as `View::prepare` finds it.
+pub fn shared_home_of(store: &Store, provider: Provider) -> Result<PathBuf> {
+    shared_home(store, provider, provider.current_home()?)
 }
 /// A private auth/config view; actual history lives in the caller's home.
 pub struct View {
@@ -281,11 +305,7 @@ impl View {
                 }
             }
         }
-        let parent = store
-            .root
-            .join("runtimes")
-            .join(account.provider.as_str())
-            .join(&account.label);
+        let parent = views_root(store, account.provider).join(&account.label);
         store::private_dir(&parent)?;
         let path = tempfile::Builder::new()
             .prefix("run-")
@@ -350,6 +370,12 @@ impl View {
             view.baseline = shared_config(&read_config(&view.config_path)?);
         }
         view.select_locked(store, account)?;
+        drop(_lock);
+        // Index entries left through views that earlier runs never cleaned
+        // up (or an older aswap removed): best effort, never a launch failure.
+        let views = views_root(store, view.provider);
+        let scope = crate::provider::index::Scope::Gone;
+        let _ = view.provider.spec().repair_index(&view.home, &views, scope);
         Ok(view)
     }
     fn select_locked(&mut self, store: &Store, account: &Account) -> Result<()> {

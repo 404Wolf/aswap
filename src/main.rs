@@ -32,6 +32,9 @@ struct Cli {
 enum Action {
     /// Show the actual account used by each locally running session.
     Sessions { provider: Option<Provider> },
+    /// Report provider index entries that name a missing transcript or one
+    /// inside a launch view; changes nothing. Exits 1 when one is missing.
+    Check { provider: Option<Provider> },
     /// Capture the current file-based login under a private label.
     Add { provider: Provider, label: String },
     /// List profiles, local identity hints and cached quota; no network requests.
@@ -344,6 +347,56 @@ fn execute(cli: Cli) -> Result<i32> {
                     .join("\n")
             };
             output(&json!({"sessions": rows}), cli.json, pretty)?;
+        }
+        Action::Check { provider } => {
+            let mut findings = Vec::new();
+            for p in Provider::ALL
+                .into_iter()
+                .filter(|p| provider.is_none_or(|want| want == *p))
+            {
+                let home = aswap::shared::shared_home_of(&store, p)?;
+                let views = aswap::shared::views_root(&store, p);
+                findings.extend(
+                    p.spec()
+                        .check_index(&home, &views)?
+                        .into_iter()
+                        .map(|finding| (p, finding)),
+                );
+            }
+            let dangling = findings
+                .iter()
+                .filter(|(_, f)| f.problem == provider::index::Problem::Dangling)
+                .count();
+            let in_view = findings.len() - dangling;
+            let repairable = findings
+                .iter()
+                .filter(|(_, f)| f.canonical.is_some())
+                .count();
+            let mut pretty = format!(
+                "{dangling} missing, {in_view} through a live launch view, {repairable} with the same transcript in the home"
+            );
+            for (p, f) in &findings {
+                let problem = match f.problem {
+                    provider::index::Problem::Dangling => "missing",
+                    provider::index::Problem::InView => "in view",
+                };
+                pretty.push_str(&format!("\n{p} {} {problem}: {}", f.id, f.path.display()));
+                if let Some(canonical) = &f.canonical {
+                    pretty.push_str(&format!("\n  home copy: {}", canonical.display()));
+                }
+            }
+            let rows: Vec<_> = findings
+                .iter()
+                .map(|(p, f)| json!({"provider": p.as_str(), "entry": f}))
+                .collect();
+            output(
+                &json!({"dangling": dangling, "in_view": in_view, "repairable": repairable, "entries": rows}),
+                cli.json,
+                pretty,
+            )?;
+            if dangling > 0 {
+                return Ok(1);
+            }
         }
         Action::Add { provider, label } => {
             let a = provider::add(&store, provider, &label)?;
