@@ -124,6 +124,7 @@ pub struct Report {
     enabled: bool,
     dry_run: bool,
     stopped: Option<&'static str>,
+    unreadable_non_provider_processes_ignored: usize,
     warnings: Vec<String>,
     totals: Totals,
     groups: Vec<Group>,
@@ -212,6 +213,13 @@ impl Report {
         for warning in &self.warnings {
             let _ = writeln!(text, "Warning — {warning}");
         }
+        if self.unreadable_non_provider_processes_ignored != 0 {
+            let _ = writeln!(
+                text,
+                "{} unreadable non-provider processes ignored",
+                self.unreadable_non_provider_processes_ignored
+            );
+        }
         for group in &self.groups {
             let _ = writeln!(
                 text,
@@ -276,8 +284,11 @@ pub fn run(mode: Mode) -> Result<Report> {
         process::lower_priority()?;
     }
     let home = |provider: Provider| shared::shared_home(&root, provider, provider.current_home()?);
-    let mut in_use = |view: &Path| Ok(process::uses_view(view)? || live::view_in_use(&root, view)?);
-    Retention {
+    let mut ignored = Default::default();
+    let mut in_use = |view: &Path| {
+        Ok(process::uses_view(view, &mut ignored)? || live::view_in_use(&root, view)?)
+    };
+    let mut report = Retention {
         root: &root,
         at: SystemTime::now(),
         home: &home,
@@ -289,7 +300,9 @@ pub fn run(mode: Mode) -> Result<Report> {
             stopped: None,
         },
     }
-    .run(settings, mode)
+    .run(settings, mode)?;
+    report.unreadable_non_provider_processes_ignored = ignored.len();
+    Ok(report)
 }
 
 struct Retention<'a> {
@@ -311,6 +324,7 @@ impl Retention<'_> {
             enabled: settings.enabled,
             dry_run,
             stopped: None,
+            unreadable_non_provider_processes_ignored: 0,
             warnings: Vec::new(),
             totals: Totals::default(),
             groups: Vec::new(),

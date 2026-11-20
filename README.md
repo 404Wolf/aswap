@@ -128,7 +128,10 @@ I/O pressure exceeds the configured limit or the pressure reading is unavailable
 It keeps young views, views with a held lock, and views referenced by a live
 aswap supervisor or a local process under the store's Unix user. The process
 check uses the provider home environment variables and the working directory.
-Unreadable or ambiguous views are kept and reported.
+If Linux denies either read, GC checks the process command line. It keeps the
+view if the command line is unavailable, empty, or mentions the view, Claude,
+Codex, aswap, or Node. The report counts unreadable non-provider processes it
+skipped, once per PID.
 
 GC compares the size and SHA-256 of duplicate transcripts. Unique transcripts
 move to the same relative path in the shared provider home. For legacy views

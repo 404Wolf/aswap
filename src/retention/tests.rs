@@ -235,6 +235,7 @@ fn process_scan_checks_both_provider_variables_and_descendant_cwd() {
     let v = t.view("codex", "run-live");
     let proc = t._temp.path().join("proc");
     let pid = proc.join("123");
+    let mut ignored = Default::default();
     write(
         &pid.join("status"),
         b"Name:\tsynthetic\nState:\tS\nUid:\t1234\t1234\t1234\t1234\n",
@@ -245,18 +246,82 @@ fn process_scan_checks_both_provider_variables_and_descendant_cwd() {
             &pid.join("environ"),
             format!("EXAMPLE=synthetic\0{var}={}\0", v.display()).as_bytes(),
         );
-        assert!(process::scan(&proc, 1234, &v).unwrap());
-        assert!(!process::scan(&proc, 1235, &v).unwrap());
+        assert!(process::scan(&proc, 1234, &v, &mut ignored).unwrap());
+        assert!(!process::scan(&proc, 1235, &v, &mut ignored).unwrap());
     }
     write(
         &pid.join("environ"),
         b"CODEX_HOME=/synthetic-path-that-does-not-exist\0",
     );
-    assert!(!process::scan(&proc, 1234, &v).unwrap());
+    assert!(!process::scan(&proc, 1234, &v, &mut ignored).unwrap());
     fs::remove_file(pid.join("cwd")).unwrap();
-    assert!(process::scan(&proc, 1234, &v).is_err());
+    assert!(process::scan(&proc, 1234, &v, &mut ignored).is_err());
     symlink(v.join("tmp"), pid.join("cwd")).unwrap();
-    assert!(process::scan(&proc, 1234, &v).unwrap());
+    assert!(process::scan(&proc, 1234, &v, &mut ignored).unwrap());
+    assert!(ignored.is_empty());
+}
+
+#[test]
+fn unreadable_processes_use_cmdline_to_distinguish_non_providers_from_ambiguity() {
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
+
+    let t = Fixture::new();
+    let v = Path::new("/synthetic-runtimes/run-example");
+    let proc = t._temp.path().join("proc");
+    let pid = proc.join("123");
+    write(
+        &pid.join("status"),
+        b"State:\tS\nUid:\t1234\t1234\t1234\t1234\n",
+    );
+    symlink(&t.home, pid.join("cwd")).unwrap();
+    let cmdline = pid.join("cmdline");
+    let scan = |deny_cwd, ignored: &mut _| {
+        process::scan_with_access(
+            &proc,
+            1234,
+            v,
+            ignored,
+            |path| {
+                if deny_cwd {
+                    Err(io::ErrorKind::PermissionDenied.into())
+                } else {
+                    fs::read_link(path)
+                }
+            },
+            |_| Err(io::ErrorKind::PermissionDenied.into()),
+        )
+    };
+
+    let mut ignored = Default::default();
+    write(&cmdline, b"sshd-session\0synthetic\0");
+    assert!(!scan(true, &mut ignored).unwrap());
+    assert!(!scan(false, &mut ignored).unwrap());
+    assert_eq!(ignored.len(), 1, "repeated scans count one PID once");
+
+    let mut view_cmdline = b"shell\0".to_vec();
+    view_cmdline.extend_from_slice(v.as_os_str().as_bytes());
+    for command in [
+        b"".as_slice(),
+        b"\0",
+        b"Claude\0",
+        b"codex\0",
+        b"aswap\0",
+        b"shell\0/usr/bin/node\0",
+        &view_cmdline,
+    ] {
+        write(&cmdline, command);
+        let mut ignored = Default::default();
+        for deny_cwd in [true, false] {
+            assert_eq!(
+                scan(deny_cwd, &mut ignored).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        assert!(ignored.is_empty());
+    }
+    fs::remove_file(cmdline).unwrap();
+    assert!(scan(true, &mut Default::default()).is_err());
 }
 
 #[test]

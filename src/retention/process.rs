@@ -1,10 +1,11 @@
 use crate::{Error, Result, Safe};
 use std::{
-    ffi::OsStr,
+    collections::HashSet,
+    ffi::{OsStr, OsString},
     fs,
     io::{self, ErrorKind},
     os::unix::ffi::OsStrExt,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 pub(super) fn lower_priority() -> Result<()> {
@@ -39,13 +40,36 @@ pub(super) fn parse_pressure(text: &str) -> Result<f64> {
         .ok_or(Error("cannot read I/O pressure avg10"))
 }
 
-pub(super) fn uses_view(view: &Path) -> Result<bool> {
+pub(super) fn uses_view(view: &Path, ignored: &mut HashSet<OsString>) -> Result<bool> {
     // SAFETY: geteuid takes no arguments and does not access memory.
     let uid = unsafe { libc::geteuid() };
-    scan(Path::new("/proc"), uid, view).safe("cannot establish process liveness")
+    scan(Path::new("/proc"), uid, view, ignored).safe("cannot establish process liveness")
 }
 
-pub(super) fn scan(proc_root: &Path, uid: u32, view: &Path) -> io::Result<bool> {
+pub(super) fn scan(
+    proc_root: &Path,
+    uid: u32,
+    view: &Path,
+    ignored: &mut HashSet<OsString>,
+) -> io::Result<bool> {
+    scan_with_access(
+        proc_root,
+        uid,
+        view,
+        ignored,
+        |p| fs::read_link(p),
+        |p| fs::read(p),
+    )
+}
+
+pub(super) fn scan_with_access(
+    proc_root: &Path,
+    uid: u32,
+    view: &Path,
+    ignored: &mut HashSet<OsString>,
+    cwd: impl Fn(&Path) -> io::Result<PathBuf>,
+    environ: impl Fn(&Path) -> io::Result<Vec<u8>>,
+) -> io::Result<bool> {
     for entry in fs::read_dir(proc_root)? {
         let entry = entry?;
         let pid = entry.file_name();
@@ -53,9 +77,12 @@ pub(super) fn scan(proc_root: &Path, uid: u32, view: &Path) -> io::Result<bool> 
             continue;
         }
         let process = entry.path();
-        match process_uses_view(&process, uid, view) {
-            Ok(true) => return Ok(true),
-            Ok(false) => {}
+        match process_uses_view(&process, uid, view, &cwd, &environ) {
+            Ok(ViewUse::Active) => return Ok(true),
+            Ok(ViewUse::Inactive) => {}
+            Ok(ViewUse::UnreadableNonProvider) => {
+                ignored.insert(pid);
+            }
             // A PID can disappear at any point during inspection.
             Err(_) if matches!(fs::metadata(&process), Err(e) if e.kind() == ErrorKind::NotFound) =>
                 {}
@@ -65,7 +92,19 @@ pub(super) fn scan(proc_root: &Path, uid: u32, view: &Path) -> io::Result<bool> 
     Ok(false)
 }
 
-fn process_uses_view(process: &Path, uid: u32, view: &Path) -> io::Result<bool> {
+enum ViewUse {
+    Active,
+    Inactive,
+    UnreadableNonProvider,
+}
+
+fn process_uses_view(
+    process: &Path,
+    uid: u32,
+    view: &Path,
+    cwd: impl Fn(&Path) -> io::Result<PathBuf>,
+    environ: impl Fn(&Path) -> io::Result<Vec<u8>>,
+) -> io::Result<ViewUse> {
     let status = fs::read(process.join("status"))?;
     let field = |prefix: &[u8]| {
         status
@@ -91,13 +130,23 @@ fn process_uses_view(process: &Path, uid: u32, view: &Path) -> io::Result<bool> 
         )
         || field(b"Kthread:\t") == Some(b"1")
     {
-        return Ok(false);
+        return Ok(ViewUse::Inactive);
     }
-    let cwd = fs::read_link(process.join("cwd"))?;
+    let cwd = match cwd(&process.join("cwd")) {
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+            return inspect_unreadable(process, view, error);
+        }
+        result => result?,
+    };
     if cwd.starts_with(view) {
-        return Ok(true);
+        return Ok(ViewUse::Active);
     }
-    let env = fs::read(process.join("environ"))?;
+    let env = match environ(&process.join("environ")) {
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+            return inspect_unreadable(process, view, error);
+        }
+        result => result?,
+    };
     for value in env.split(|b| *b == 0).filter_map(|var| {
         var.strip_prefix(b"CODEX_HOME=")
             .or_else(|| var.strip_prefix(b"CLAUDE_CONFIG_DIR="))
@@ -105,15 +154,34 @@ fn process_uses_view(process: &Path, uid: u32, view: &Path) -> io::Result<bool> 
     }) {
         let path = cwd.join(OsStr::from_bytes(value));
         if path == view {
-            return Ok(true);
+            return Ok(ViewUse::Active);
         }
         // Also recognize a provider home spelled via an alias or .. component.
         match path.canonicalize() {
-            Ok(path) if path == view => return Ok(true),
+            Ok(path) if path == view => return Ok(ViewUse::Active),
             Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
     }
-    Ok(false)
+    Ok(ViewUse::Inactive)
+}
+
+fn inspect_unreadable(process: &Path, view: &Path, denied: io::Error) -> io::Result<ViewUse> {
+    let Ok(cmdline) = fs::read(process.join("cmdline")) else {
+        return Err(denied);
+    };
+    let names: &[&[u8]] = &[b"claude", b"codex", b"aswap", b"node"];
+    let view = view.as_os_str().as_bytes();
+    if cmdline.iter().all(|&b| b == 0)
+        || names.iter().any(|name| {
+            cmdline
+                .windows(name.len())
+                .any(|part| part.eq_ignore_ascii_case(name))
+        })
+        || (!view.is_empty() && cmdline.windows(view.len()).any(|part| part == view))
+    {
+        return Err(denied);
+    }
+    Ok(ViewUse::UnreadableNonProvider)
 }
