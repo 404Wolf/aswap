@@ -19,6 +19,15 @@ use std::{
 const MANIFEST: &str = "SHA256SUMS";
 type Payloads = BTreeMap<PathBuf, ([u8; 32], u64)>;
 
+#[cfg(test)]
+type ExchangeHook = Box<dyn FnOnce()>;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static BEFORE_EXCHANGE: std::cell::Cell<Option<ExchangeHook>> =
+        const { std::cell::Cell::new(None) };
+}
+
 #[derive(Eq, PartialEq)]
 struct ArchivedFile {
     identity: (u64, u64),
@@ -73,7 +82,7 @@ pub(super) fn preserve<'a>(
             true,
         )
         .safe("cannot create archive directory")?;
-    let existing = match parent.child(name) {
+    let mut existing = match parent.child(name) {
         Ok(dir) => {
             let seal = read_seal(&dir, true, pressure)?;
             Some((dir, seal))
@@ -124,7 +133,7 @@ pub(super) fn preserve<'a>(
 
     let (archive, seal, bytes_added, old_generation) = match staging {
         None => {
-            let (dir, seal) = existing.ok_or(Error("archive has no payloads"))?;
+            let (dir, seal) = existing.take().ok_or(Error("archive has no payloads"))?;
             (dir, seal, 0, None)
         }
         Some(stage) => stage.publish(&parent, name, existing.as_ref(), pressure)?,
@@ -143,6 +152,30 @@ pub(super) fn preserve<'a>(
         let archive_identity = identity(&archive)?;
         if identity(&current)? != archive_identity {
             return Err(Error("published archive identity or manifest changed"));
+        }
+        // The exchange can displace a concurrent restore instead of the
+        // generation whose files were copied into the new archive.
+        if let Some(displaced) = &old_generation
+            && let Some((previous, old)) = &existing
+        {
+            let name = displaced
+                .path()
+                .file_name()
+                .ok_or(Error("missing displaced archive name"))?;
+            let reopen = || {
+                parent
+                    .contained_child(name)
+                    .safe("cannot reopen displaced archive after exchange")
+            };
+            let dir = reopen()?;
+            let expected = identity(previous)?;
+            if identity(&dir)? != expected
+                || read_seal(&dir, false, pressure).safe("cannot verify displaced archive seal")?
+                    != *old
+                || identity(&reopen()?)? != expected
+            {
+                return Err(Error("displaced archive changed during exchange"));
+            }
         }
         Ok(Receipt {
             path: path.to_owned(),
@@ -272,6 +305,12 @@ impl Staging {
         } else {
             (RenameFlags::NOREPLACE, bytes)
         };
+        #[cfg(test)]
+        if flags == RenameFlags::EXCHANGE
+            && let Some(hook) = BEFORE_EXCHANGE.take()
+        {
+            hook();
+        }
         renameat_with(&parent.0, temp_name, &parent.0, name, flags)
             .safe("archive appeared or could not be published")?;
         let old_generation = if existing.is_some() {

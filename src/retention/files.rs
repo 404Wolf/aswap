@@ -164,7 +164,7 @@ pub(super) struct Inventory {
     pub(super) files: Vec<SavedFile>,
     pub(super) bytes: u64,
     pub(super) shared_links: Vec<(OsString, PathBuf)>,
-    nonregular: Vec<PathBuf>,
+    nonregular: Vec<(PathBuf, fs::FileType)>,
     directories: Vec<(PathBuf, Version)>,
 }
 
@@ -214,7 +214,7 @@ impl Inventory {
                 return Err(Error("view contains a mounted filesystem"));
             }
             if !metadata.is_file() && !regenerable(&entry, &name) {
-                self.nonregular.push(entry.clone());
+                self.nonregular.push((entry.clone(), metadata.file_type()));
             }
             if metadata.is_dir() {
                 let child = dir
@@ -433,6 +433,17 @@ struct Witness {
     version: Version,
 }
 
+pub(super) enum ClassificationError {
+    Other(Error),
+    Sidecar(Error, PathBuf),
+}
+
+impl From<Error> for ClassificationError {
+    fn from(error: Error) -> Self {
+        Self::Other(error)
+    }
+}
+
 enum Comparison {
     Equivalent(Version),
     Missing,
@@ -487,11 +498,18 @@ impl Plan {
         view: &Dir,
         home: &Dir,
         pressure: &mut Pressure<'_>,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, ClassificationError> {
         let files = &inventory.files;
         let mut databases = BTreeMap::new();
+        let mut excluded = BTreeSet::new();
         for (index, file) in files.iter().enumerate() {
             pressure.check(false)?;
+            if file.size() == 0 && file.path.extension() == Some(OsStr::new("lock")) {
+                // Keep its inventory witness so a lock that gains contents
+                // before retirement prevents removal.
+                excluded.insert(index);
+                continue;
+            }
             if file
                 .path
                 .file_name()
@@ -502,42 +520,58 @@ impl Plan {
                 databases.insert(file.path.as_path(), index);
             }
         }
-        for path in &inventory.nonregular {
-            if let Some((base, sidecar)) = database_for_sidecar(path, &databases) {
-                if sidecar == Sidecar::Unknown {
-                    return Err(Error("unrecognized private SQLite sidecar"));
-                }
-                if databases.contains_key(base.as_path()) {
-                    return Err(Error(
-                        "private SQLite database has a linked or non-regular sidecar",
-                    ));
-                }
-            }
-        }
-
         let mut sqlite_inputs: BTreeMap<_, Vec<_>> = databases
             .values()
             .map(|&index| (index, Vec::new()))
             .collect();
-        let mut sidecar_indexes = BTreeSet::new();
+        let mut private_sidecar_bases = BTreeSet::new();
         let mut orphan_sidecars = BTreeSet::new();
         let mut sqlite_bytes = 0;
         for (index, file) in files.iter().enumerate() {
+            pressure.check(false)?;
+            if excluded.contains(&index) {
+                continue;
+            }
             let Some((database, sidecar)) = database_for_sidecar(&file.path, &databases) else {
                 continue;
             };
             if sidecar == Sidecar::Unknown {
-                return Err(Error("unrecognized private SQLite sidecar"));
+                return Err(ClassificationError::Sidecar(
+                    Error("unrecognized private SQLite sidecar"),
+                    file.path.clone(),
+                ));
             }
-            if let Some(base) = databases.get(database.as_path()) {
-                sidecar_indexes.insert(index);
+            if sidecar == Sidecar::Shm {
+                excluded.insert(index);
+            } else if let Some(base) = databases.get(database.as_path()) {
+                excluded.insert(index);
                 sqlite_bytes += file.size();
-                if sidecar != Sidecar::Shm {
-                    sqlite_inputs.get_mut(base).unwrap().push(index);
-                }
+                sqlite_inputs.get_mut(base).unwrap().push(index);
             } else {
                 orphan_sidecars.insert(index);
+                private_sidecar_bases.insert(database);
             }
+        }
+        for (path, file_type) in &inventory.nonregular {
+            pressure.check(false)?;
+            let Some((base, sidecar)) = database_for_sidecar(path, &databases) else {
+                continue;
+            };
+            // All-link groups have no private SQLite input. Shared-memory
+            // links can also be discarded beside a private database.
+            if file_type.is_symlink()
+                && (sidecar == Sidecar::Shm
+                    || (!databases.contains_key(base.as_path())
+                        && !private_sidecar_bases.contains(&base)))
+            {
+                continue;
+            }
+            let error = if sidecar == Sidecar::Unknown {
+                Error("unrecognized private SQLite sidecar")
+            } else {
+                Error("private SQLite database has a linked or non-regular sidecar")
+            };
+            return Err(ClassificationError::Sidecar(error, path.clone()));
         }
         let mut plan = Self {
             move_bytes: 0,
@@ -550,7 +584,7 @@ impl Plan {
         };
         for (index, file) in files.iter().enumerate() {
             pressure.check(false)?;
-            if sidecar_indexes.contains(&index) {
+            if excluded.contains(&index) {
                 continue;
             }
             // Identical main files can expose different data through their

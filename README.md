@@ -156,13 +156,17 @@ data, GC leaves the shared file in place. Conflicting transcripts and any
 view-local private files without a verified identical shared copy go into an
 owner-only archive at `archive/<provider>/<label>/<run>/`. GC always snapshots
 private SQLite databases, including committed WAL data, even when the main file
-matches the shared copy. A linked or unrecognized private SQLite sidecar keeps
-the view. With the main file missing, GC preserves the raw sidecar under
-`orphan-sidecars/<sha256>/` in the view's archive. The checksum manifest covers
-those payloads too. GC checks every sealed payload's identity and hash again before
-removal. From the archive, run
-`sha256sum --check SHA256SUMS` to check the compressed files before restoring
-the one you want.
+matches the shared copy. GC unlinks all-symlink SQLite groups without opening
+their targets. It also discards regenerable SQLite shared-memory files and
+empty regular `*.lock` files. A linked or unrecognized sidecar that could
+affect private SQLite state keeps the view. The report names the sidecar
+relative to the view. With the main file missing, GC preserves the raw WAL or
+journal under `orphan-sidecars/<sha256>/` in the view's archive. The checksum
+manifest covers those payloads too. If a concurrent restore changes the
+archive displaced during publication, GC keeps both generations and the view.
+GC checks every sealed payload's identity and hash again before removal.
+From the archive, run `sha256sum --check SHA256SUMS` to check the compressed
+files before restoring the one you want.
 
 When Codex's shared thread index points into a view, GC verifies the shared
 rollout and updates the index before removing the view. An ambiguous index

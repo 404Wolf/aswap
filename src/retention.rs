@@ -504,7 +504,7 @@ impl Retention<'_> {
                     let mut result = ViewResult {
                         path: path.to_string_lossy().into(),
                         verdict: Verdict::Kept,
-                        reason: "eligibility uncertain".into(),
+                        reason: String::new(),
                         bytes_reclaimed: 0,
                         bytes_moved: 0,
                         bytes_archived: 0,
@@ -534,12 +534,14 @@ impl Retention<'_> {
                     };
                     let blocker = self.fd_blocker.take();
                     if let Err(error) = outcome {
-                        result.reason = match blocker {
-                            Some(blocker) if error.0 == process::FD_LIVENESS_ERROR => {
-                                format!("{error} ({blocker})")
-                            }
-                            _ => error.0.into(),
-                        };
+                        if result.reason.is_empty() {
+                            result.reason = match blocker {
+                                Some(blocker) if error.0 == process::FD_LIVENESS_ERROR => {
+                                    format!("{error} ({blocker})")
+                                }
+                                _ => error.0.into(),
+                            };
+                        }
                         result.incomplete |= !dry_run && !expected_keep(&error);
                     }
                     group.totals.add(&result);
@@ -643,7 +645,15 @@ impl Retention<'_> {
 
         let inventory = Inventory::scan(&view, provider, &mut self.pressure)?;
         let home = self.shared_home(&inventory, lifetime.as_ref(), legacy_home)?;
-        let mut plan = Plan::classify(&inventory, &view, &home.dir, &mut self.pressure)?;
+        let mut plan = Plan::classify(&inventory, &view, &home.dir, &mut self.pressure).map_err(
+            |failure| match failure {
+                files::ClassificationError::Other(error) => error,
+                files::ClassificationError::Sidecar(error, path) => {
+                    result.reason = format!("{error} at {path:?}");
+                    error
+                }
+            },
+        )?;
         let archive_path = plan
             .has_conflicts()
             .then(|| archive.to_string_lossy().into_owned());

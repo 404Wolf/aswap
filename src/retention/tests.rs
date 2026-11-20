@@ -968,7 +968,7 @@ fn linked_and_unknown_sidecars_keep_private_sqlite_groups() {
     let linked = t.view("claude", "run-linked-db");
     let unknown = t.view("claude", "run-unknown-sidecar");
     let unknown_link = t.view("claude", "run-unknown-link");
-    for view in [&linked, &unknown] {
+    for view in [&linked, &unknown, &unknown_link] {
         let db = rusqlite::Connection::open(view.join("private.sqlite")).unwrap();
         db.execute("CREATE TABLE history (message TEXT)", [])
             .unwrap();
@@ -989,16 +989,126 @@ fn linked_and_unknown_sidecars_keep_private_sqlite_groups() {
     let report = t.run(Mode::Apply);
     assert_eq!(report.totals.kept, 3);
     assert!(report.incomplete());
-    assert!(report.text().contains("linked or non-regular sidecar"));
     assert!(
         report
             .text()
-            .contains("unrecognized private SQLite sidecar")
+            .contains("linked or non-regular sidecar at \"private.sqlite-wal\"")
+    );
+    assert!(
+        report.text().contains(
+            "unrecognized private SQLite sidecar at \"private.sqlite-synthetic-sidecar\""
+        )
     );
     assert!(linked.join("private.sqlite").is_file());
     assert!(unknown.join("private.sqlite").is_file());
     assert!(unknown_link.is_dir());
     assert_eq!(fs::read(outside).unwrap(), b"synthetic");
+}
+
+#[test]
+fn codex_sqlite_groups_with_only_links_are_unlinked_without_reading_targets() {
+    let t = Fixture::new();
+    let view = t.view("codex", "run-linked-sqlite");
+    for name in [
+        "queue_1.sqlite",
+        "queue_1.sqlite-wal",
+        "queue_1.sqlite-shm",
+        "queue_1.sqlite-other",
+        ".sqlite-maintenance.lock",
+    ] {
+        let target = t.home.join(name);
+        write(&target, b"synthetic shared data");
+        symlink(&target, view.join(name)).unwrap();
+    }
+    let preview = t.run(Mode::Preview);
+    assert_eq!(preview.totals.finished, 1, "{}", preview.text());
+    assert_eq!(preview.totals.bytes_archived, 0);
+    let apply = t.run(Mode::Apply);
+    assert_eq!(apply.totals.removed, 1, "{}", apply.text());
+    assert!(!view.exists());
+    assert!(!t.root.join("archive").exists());
+    assert_eq!(fs::read_dir(&t.home).unwrap().count(), 5);
+    for entry in fs::read_dir(&t.home).unwrap() {
+        assert_eq!(
+            fs::read(entry.unwrap().path()).unwrap(),
+            b"synthetic shared data"
+        );
+    }
+}
+
+#[test]
+fn codex_full_copy_snapshots_main_and_wal_and_prunes_shared_memory() {
+    let t = Fixture::new();
+    let view = t.view("codex", "run-private-sqlite");
+    let standalone = ["goals_1.sqlite", "memories_1.sqlite", "state_5.sqlite"];
+    let create = "CREATE TABLE history (message TEXT); INSERT INTO history VALUES ('synthetic');";
+    for name in standalone {
+        let db = rusqlite::Connection::open(view.join(name)).unwrap();
+        db.execute_batch(create).unwrap();
+    }
+    let queue = view.join("queue_1.sqlite");
+    let db = rusqlite::Connection::open(&queue).unwrap();
+    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    db.execute_batch(create).unwrap();
+    assert!(view.join("queue_1.sqlite-shm").is_file());
+    write(&view.join("orphan.sqlite-shm"), b"synthetic unused SHM");
+    let linked_shm = t.home.join("state_5.sqlite-shm");
+    write(&linked_shm, b"synthetic shared SHM");
+    symlink(&linked_shm, view.join("state_5.sqlite-shm")).unwrap();
+    write(&view.join(".sqlite-maintenance.lock"), b"");
+    for name in ["logs_2.sqlite", "logs_2.sqlite-wal", "logs_2.sqlite-shm"] {
+        write(&view.join(name), b"synthetic logs");
+    }
+
+    let expected_bytes: u64 = standalone
+        .into_iter()
+        .chain(["queue_1.sqlite", "queue_1.sqlite-wal"])
+        .map(|name| fs::metadata(view.join(name)).unwrap().len())
+        .sum();
+    let preview = t.run(Mode::Preview);
+    assert_eq!(preview.totals.finished, 1, "{}", preview.text());
+    assert_eq!(preview.totals.bytes_archived, expected_bytes);
+    let apply = t.run(Mode::Apply);
+    assert_eq!(apply.totals.removed, 1, "{}", apply.text());
+    drop(db);
+    assert!(!view.exists());
+    assert_eq!(fs::read(linked_shm).unwrap(), b"synthetic shared SHM");
+    let archive = t.root.join("archive/codex/synthetic/run-private-sqlite");
+    assert_eq!(fs::read_dir(&archive).unwrap().count(), 5);
+    for name in standalone.into_iter().chain(["queue_1.sqlite"]) {
+        let payload = File::open(archive.join(format!("{name}.zst"))).unwrap();
+        let restored = t._temp.path().join(name);
+        write(&restored, &zstd::stream::decode_all(payload).unwrap());
+        let value: String = rusqlite::Connection::open(restored)
+            .unwrap()
+            .query_row("SELECT message FROM history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "synthetic");
+    }
+}
+
+#[test]
+fn nonempty_sqlite_maintenance_lock_keeps_view_and_reports_relative_path() {
+    let t = Fixture::new();
+    let view = t.view("codex", "run-lock");
+    let relative = "nested/.sqlite-maintenance.lock";
+    write(&view.join(relative), b"synthetic nonempty lock");
+    let apply = t.run(Mode::Apply);
+    assert!(apply.incomplete());
+    assert_eq!(apply.totals.kept, 1, "{}", apply.text());
+    assert_eq!(
+        apply.groups[0].views[0].reason,
+        format!("unrecognized private SQLite sidecar at {relative:?}")
+    );
+    assert_eq!(
+        fs::read(view.join(relative)).unwrap(),
+        b"synthetic nonempty lock"
+    );
+    write(&view.join(relative), b"");
+    let retry = t.run(Mode::Apply);
+    assert_eq!(retry.totals.removed, 1, "{}", retry.text());
+    assert!(!t.root.join("archive").exists());
 }
 
 #[test]
@@ -1047,6 +1157,17 @@ fn orphan_wal_keeps_later_commits_absent_from_an_older_archive() {
         fs::read(archive.join("private.sqlite.zst")).unwrap(),
         earlier
     );
+    assert!(
+        fs::read_dir(archive.parent().unwrap())
+            .unwrap()
+            .all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b".aswap-archive-")
+            })
+    );
     let supplement = archive.join("orphan-sidecars");
     let versions: Vec<_> = fs::read_dir(&supplement)
         .unwrap()
@@ -1082,6 +1203,81 @@ fn orphan_wal_keeps_later_commits_absent_from_an_older_archive() {
     assert_eq!(identical.totals.removed, 1, "{}", identical.text());
     assert_eq!(manifest, fs::read(archive.join("SHA256SUMS")).unwrap());
     assert_eq!(fs::read_dir(supplement).unwrap().count(), versions.len());
+}
+
+#[test]
+fn changing_the_archive_during_exchange_keeps_both_generations_and_the_view() {
+    for replace_directory in [true, false] {
+        let t = Fixture::new();
+        let view = t.view("claude", "run-supplement");
+        let restored_view = t.view("claude", "run-restored");
+        let archives = t.root.join("archive/claude/synthetic");
+        let archive = archives.join("run-supplement");
+        let restored = archives.join("run-restored");
+        let original = b"synthetic original archive";
+        let restored_data = b"synthetic restored archive";
+        write(&view.join("original.jsonl"), original);
+        write(&restored_view.join("restored.jsonl"), restored_data);
+        let setup = t.run_with(
+            Mode::Apply,
+            Duration::from_secs(3 * 86400),
+            &mut |candidate| Ok(candidate == view && archive.exists()),
+            &mut || Ok(0.0),
+        );
+        assert_eq!(setup.totals.removed, 1, "{}", setup.text());
+        let orphan = view.join("private.sqlite-wal");
+        write(&orphan, b"synthetic orphan WAL");
+        let saved = archives.join("saved");
+        let canonical = archive.clone();
+        let original_name = saved.clone();
+        archive::BEFORE_EXCHANGE.set(Some(Box::new(move || {
+            if replace_directory {
+                fs::rename(&canonical, original_name).unwrap();
+                fs::rename(restored, &canonical).unwrap();
+            } else {
+                fs::remove_file(canonical.join("original.jsonl.zst")).unwrap();
+                fs::copy(
+                    restored.join("restored.jsonl.zst"),
+                    canonical.join("restored.jsonl.zst"),
+                )
+                .unwrap();
+                fs::copy(restored.join("SHA256SUMS"), canonical.join("SHA256SUMS")).unwrap();
+            }
+        })));
+
+        let report = t.run(Mode::Apply);
+        assert!(report.incomplete());
+        assert_eq!(report.totals.removed, 0, "{}", report.text());
+        assert!(
+            report
+                .text()
+                .contains("displaced archive changed during exchange")
+        );
+        assert_eq!(fs::read(&orphan).unwrap(), b"synthetic orphan WAL");
+        assert_eq!(fs::read(view.join("original.jsonl")).unwrap(), original);
+        let decode = |path| zstd::stream::decode_all(File::open(path).unwrap()).unwrap();
+        assert_eq!(decode(archive.join("original.jsonl.zst")), original);
+        assert!(archive.join("orphan-sidecars").is_dir());
+        let displaced: Vec<_> = fs::read_dir(&archives)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b".aswap-archive-")
+            })
+            .collect();
+        assert_eq!(displaced.len(), 1);
+        assert_eq!(
+            decode(displaced[0].path().join("restored.jsonl.zst")),
+            restored_data
+        );
+        assert!(displaced[0].path().join("SHA256SUMS").is_file());
+        if replace_directory {
+            assert_eq!(decode(saved.join("original.jsonl.zst")), original);
+        }
+    }
 }
 
 #[test]
