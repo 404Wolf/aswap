@@ -54,6 +54,7 @@ aswap add claude work
 aswap add codex personal
 aswap list               # saved accounts
 aswap status             # accounts with quota
+aswap check codex        # report index entries naming a missing or in-view transcript (read-only)
 ```
 
 ### Switch and run
