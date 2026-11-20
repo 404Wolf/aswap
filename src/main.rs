@@ -458,13 +458,22 @@ fn execute(cli: Cli) -> Result<i32> {
                 .iter()
                 .filter(|(_, f)| f.canonical.is_some())
                 .count();
+            // Missing with no copy in the home: nothing to repoint it to.
+            let lost = findings
+                .iter()
+                .filter(|(_, f)| {
+                    f.problem == provider::index::Problem::Dangling && f.canonical.is_none()
+                })
+                .count();
             let mut pretty = format!(
-                "{dangling} missing, {in_view} through a launch view that still exists (live, or kept after a failed repair), {repairable} with the same transcript in the home"
+                "{dangling} missing ({lost} lost: no copy in the home; {} fixable by the next launch), {in_view} through a launch view that still exists (live, or kept after a failed repair)",
+                dangling - lost
             );
             for (p, f) in &findings {
-                let problem = match f.problem {
-                    provider::index::Problem::Dangling => "missing",
-                    provider::index::Problem::InView => "in view",
+                let problem = match (f.problem, &f.canonical) {
+                    (provider::index::Problem::Dangling, None) => "lost",
+                    (provider::index::Problem::Dangling, Some(_)) => "fixable",
+                    (provider::index::Problem::InView, _) => "in view",
                 };
                 pretty.push_str(&format!("\n{p} {} {problem}: {}", f.id, f.path.display()));
                 if let Some(canonical) = &f.canonical {
@@ -496,6 +505,7 @@ fn execute(cli: Cli) -> Result<i32> {
                     "dangling": dangling,
                     "in_view": in_view,
                     "repairable": repairable,
+                    "lost": lost,
                     "entries": rows,
                     "sqlite_at_risk": at_risk,
                     "sqlite_views": views,

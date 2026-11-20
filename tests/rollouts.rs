@@ -13,6 +13,7 @@ use std::{path::Path, process::Command};
 
 const ID: &str = "01a1f1fe-7601-7603-9212-031af3c72201";
 const GONE: &str = "01a1f204-ef0a-7792-9e77-0cb931110bd3";
+const LOST: &str = "01a1b433-2d30-7563-b417-813f2aa8817d";
 const DAY: &str = "sessions/2026/11/19";
 
 fn rollout(id: &str) -> String {
@@ -81,6 +82,15 @@ fn rollout_child() {
             params![GONE, gone.to_str().unwrap()],
         )
         .unwrap();
+    // A row whose transcript is gone everywhere: lost, never rewritten.
+    let lost = home.join(DAY).join(rollout(LOST));
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "INSERT INTO threads VALUES (?1, ?2)",
+            params![LOST, lost.to_str().unwrap()],
+        )
+        .unwrap();
     // The report-only check finds it, says where the transcript is, and
     // changes nothing.
     let check = Command::new(env!("CARGO_BIN_EXE_aswap"))
@@ -89,9 +99,23 @@ fn rollout_child() {
         .unwrap();
     assert_eq!(check.status.code(), Some(1), "{check:?}");
     let report: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
-    assert_eq!(report["dangling"], 1);
+    assert_eq!(report["dangling"], 2);
     assert_eq!(
-        report["entries"][0]["entry"]["canonical"],
+        report["lost"], 1,
+        "only the row with no transcript anywhere"
+    );
+    let entry = |id: &str| {
+        report["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["entry"]["id"] == id)
+            .unwrap()["entry"]
+            .clone()
+    };
+    assert!(entry(LOST)["canonical"].is_null());
+    assert_eq!(
+        entry(GONE)["canonical"],
         home.join(DAY).join(rollout(GONE)).to_str().unwrap()
     );
     assert_eq!(path_of(&db, GONE), gone.to_str().unwrap());
@@ -125,8 +149,11 @@ fn rollout_child() {
         .args(["--json", "check", "codex"])
         .output()
         .unwrap();
-    assert_eq!(check.status.code(), Some(0), "{check:?}");
+    // Only the lost row is left, and it still fails the check.
+    assert_eq!(check.status.code(), Some(1), "{check:?}");
     let report: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
-    assert_eq!(report["dangling"], 0);
+    assert_eq!(report["dangling"], 1);
+    assert_eq!(report["lost"], 1);
+    assert_eq!(path_of(&db, LOST), lost.to_str().unwrap());
     assert_eq!(report["in_view"], 0);
 }
