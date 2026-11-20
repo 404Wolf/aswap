@@ -78,7 +78,7 @@ enum Action {
         #[arg(value_enum)]
         action: AutoAction,
         #[arg(
-            help = "Percentage for threshold; text or off for resume-prompt; headroom or weekly-reset for prefer"
+            help = "Percentage for threshold; text or off for resume-prompt; headroom or weekly-reset for prefer; account label for reserve or unreserve"
         )]
         value: Option<String>,
         #[arg(
@@ -130,6 +130,10 @@ enum AutoAction {
     Off,
     Threshold,
     Prefer,
+    /// Keep this account available for runs pinned to it.
+    Reserve,
+    /// Make this account available to automatic selection again.
+    Unreserve,
     Once,
     Watch,
 }
@@ -167,7 +171,10 @@ fn snapshot(store: &Store, filter: Option<Provider>, refresh: bool) -> Result<Va
             }
         };
         let duplicates = duplicate_labels(store, &a)?;
-        rows.push(json!({"provider":a.provider,"label":a.label,"active":active.get(&a.provider)==Some(&a.label),"remaining_percent":c.used(now()).map(|u|100.0-u),"usage":c.usage,"fetched_at":c.fetched_at,"next_poll_at":c.next_poll_at,"duplicates":duplicates,"usage_error":c.diagnostic(),"http_status":c.http_status,"retry_after_seconds":c.retry_after,"last_attempt":c.last_attempt,"usage_status":if c.used(now()).is_some(){"ok"}else if c.error.is_some(){"backoff"}else{"unknown"}}));
+        let reserved = settings
+            .get(&a.provider)
+            .is_some_and(|s| !s.allows(&a.label, None));
+        rows.push(json!({"provider":a.provider,"label":a.label,"active":active.get(&a.provider)==Some(&a.label),"reserved":reserved,"remaining_percent":c.used(now()).map(|u|100.0-u),"usage":c.usage,"fetched_at":c.fetched_at,"next_poll_at":c.next_poll_at,"duplicates":duplicates,"usage_error":c.diagnostic(),"http_status":c.http_status,"retry_after_seconds":c.retry_after,"last_attempt":c.last_attempt,"usage_status":if c.used(now()).is_some(){"ok"}else if c.error.is_some(){"backoff"}else{"unknown"}}));
     }
     let coordination = aswap::coordination::settings(store)?;
     Ok(
@@ -228,6 +235,7 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
             provider: r["provider"].as_str().unwrap(),
             label: r["label"].as_str().unwrap(),
             active: r["active"] == true,
+            reserved: r["reserved"] == true,
             identity: &identities[i],
             cached: &caches[i],
             duplicates: &duplicates[i],
@@ -473,14 +481,37 @@ fn execute(cli: Cli) -> Result<i32> {
         } => {
             if matches!(
                 action,
-                AutoAction::Threshold | AutoAction::ResumePrompt | AutoAction::Prefer
+                AutoAction::Threshold
+                    | AutoAction::ResumePrompt
+                    | AutoAction::Prefer
+                    | AutoAction::Reserve
+                    | AutoAction::Unreserve
             ) != value.is_some()
             {
                 return Err(Error(
-                    "threshold requires a percentage; resume-prompt requires text or off; prefer requires headroom or weekly-reset; other actions take no value",
+                    "threshold requires a percentage; resume-prompt requires text or off; prefer requires headroom or weekly-reset; reserve and unreserve require an account label; other actions take no value",
                 ));
             }
             match action {
+                AutoAction::Reserve | AutoAction::Unreserve => {
+                    let label = value.unwrap();
+                    let _lock = store.lock()?;
+                    let mut state = store.load()?;
+                    store.account(&state, provider, Some(&label))?;
+                    let settings = state.auto.entry(provider).or_default();
+                    let reserved = matches!(action, AutoAction::Reserve);
+                    if reserved {
+                        if settings.allows(&label, None) {
+                            settings.reserved.push(label.clone());
+                        }
+                    } else {
+                        settings.reserved.retain(|item| item != &label);
+                    }
+                    let v = json!({"provider":provider,"label":label,"reserved":reserved,"auto":settings});
+                    store.save(&state)?;
+                    let action = if reserved { "Reserved" } else { "Unreserved" };
+                    output(&v, cli.json, format!("{action} {provider}:{label}"))?;
+                }
                 AutoAction::On
                 | AutoAction::Off
                 | AutoAction::Threshold

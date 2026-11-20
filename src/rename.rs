@@ -84,9 +84,15 @@ fn finish(store: &Store, tx: Transaction) -> Result<()> {
     if let Some(index) = old_index {
         state.accounts[index].label.clone_from(&tx.new);
         if state.active.get(&tx.provider) == Some(&tx.old) {
-            state.active.insert(tx.provider, tx.new);
+            state.active.insert(tx.provider, tx.new.clone());
         }
-        // Auto policy is provider-wide; preserve its threshold, cooldown and prompt.
+        if let Some(settings) = state.auto.get_mut(&tx.provider) {
+            for label in &mut settings.reserved {
+                if *label == tx.old {
+                    label.clone_from(&tx.new);
+                }
+            }
+        }
         // Usage cache and provider-native histories live inside the moved profile.
         store.save(&state)?;
     }

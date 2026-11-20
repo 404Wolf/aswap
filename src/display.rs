@@ -8,6 +8,7 @@ pub struct Row<'a> {
     pub provider: &'a str,
     pub label: &'a str,
     pub active: bool,
+    pub reserved: bool,
     pub identity: &'a Identity,
     pub duplicates: &'a [String],
     pub cached: &'a Cached,
@@ -365,6 +366,9 @@ fn render_row(
     let marker = if row.active { "●" } else { "○" };
     let label = format!("{:<label_width$}", clean(row.label));
     let mut facts = Vec::new();
+    if row.reserved {
+        facts.push("reserved".into());
+    }
     match (&row.identity.email, &row.identity.plan) {
         (Some(e), Some(p)) => facts.push(format!("{} · {}", clean(e), clean(p))),
         (Some(e), None) => facts.push(clean(e)),

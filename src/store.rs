@@ -24,6 +24,8 @@ pub struct Auto {
     pub last_switch: u64,
     #[serde(default)]
     pub prefer: Prefer,
+    #[serde(default)]
+    pub reserved: Vec<String>,
 }
 /// How auto selection ranks eligible accounts.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
@@ -48,7 +50,13 @@ impl Default for Auto {
             threshold: 90.0,
             last_switch: 0,
             prefer: Prefer::Headroom,
+            reserved: Vec::new(),
         }
+    }
+}
+impl Auto {
+    pub fn allows(&self, label: &str, pinned: Option<&str>) -> bool {
+        pinned == Some(label) || !self.reserved.iter().any(|reserved| reserved == label)
     }
 }
 #[derive(Default, Serialize, Deserialize)]
@@ -367,6 +375,9 @@ impl Store {
         }
         for a in state.auto.values() {
             threshold(a.threshold)?;
+            for reserved in &a.reserved {
+                label(reserved)?;
+            }
         }
         Ok(state)
     }

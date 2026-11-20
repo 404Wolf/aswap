@@ -68,6 +68,12 @@ aswap auto claude threshold 90          # when --auto switches
 
 Arguments after `--` go to the provider unchanged.
 
+Use `aswap auto claude reserve work` to keep that account out of automatic
+selection. A run started with `aswap run claude --account work --auto` can
+use it and fall back to other accounts when it runs out of quota. Reservations
+appear in `aswap list` and `aswap status`. Use `aswap auto claude unreserve work`
+to return it to the automatic pool.
+
 ## How it works
 
 - Each account's login is stored privately under `~/.local/share/aswap/`

@@ -11,7 +11,9 @@ use crate::{
     usage,
 };
 use std::{
+    collections::hash_map::RandomState,
     fs::File,
+    hash::BuildHasher,
     io::{IsTerminal, Read, Seek, SeekFrom, Write},
     os::unix::process::CommandExt,
     path::Path,
@@ -60,6 +62,7 @@ pub fn run(
     args: &[String],
     auto: bool,
 ) -> Result<i32> {
+    let pinned = name;
     // Nothing runs yet: wait out a full disk or a busy store rather than exit.
     store::set_patience(PREPARE_PATIENCE);
     let mut auto_args = if auto {
@@ -72,7 +75,7 @@ pub fn run(
     // follower with no usable profile yet waits for the owner.
     let synced = {
         let _lock = store.lock()?;
-        store.account(&store.load()?, provider, name).is_ok()
+        launch_seed(store, &store.load()?, provider, pinned, auto).is_ok()
     };
     if synced {
         drop(background_poll(store));
@@ -84,7 +87,7 @@ pub fn run(
     crate::coordination::spawn_sync(store);
     let mut account = {
         let _lock = store.lock()?;
-        store.account(&store.load()?, provider, name)?
+        launch_seed(store, &store.load()?, provider, pinned, auto)?
     };
     let mut models = if auto {
         crate::models::Gate::new(provider, args)?
@@ -93,42 +96,44 @@ pub fn run(
     };
     if auto {
         models.resolve(store, &account)?;
-        let (entries, _) = patiently("reading usage", || observations(store, provider))?;
+        let (mut entries, settings) = patiently("reading usage", || observations(store, provider))?;
+        entries.retain(|(a, _)| settings.allows(&a.label, pinned));
         let _ = models.filter(store, &account.label, entries);
     }
     let mut lease = patiently("reserving the account", || {
         let mut account = account.clone();
         let mut fallback = None;
         let _lock = store.lock()?;
+        let state = store.load()?;
         if auto {
-            let state = store.load()?;
             let settings = state.auto.get(&provider).cloned().unwrap_or_default();
             let entries =
                 models.filter_cached(store, &account.label, entries_from_cache(store, provider)?);
             trace_candidates("launch", &entries, settings.threshold, now(), None);
-            if let Some(best) = usage::choose(
-                &account.label,
-                &entries,
-                settings.threshold,
-                settings.prefer,
-                settings.last_switch,
-                now(),
-                false,
-            )
-            .or_else(|| {
-                usage::prefer_at_launch(
-                    &account.label,
-                    &entries,
-                    settings.threshold,
-                    settings.prefer,
-                    now(),
-                )
-            }) {
+            let current = state
+                .active
+                .get(&provider)
+                .filter(|label| pinned.is_none() && !settings.allows(label, None))
+                .map_or(account.label.as_str(), String::as_str);
+            let at = now();
+            let best =
+                usage::choose(current, &entries, &settings, at, false, pinned).or_else(|| {
+                    pinned
+                        .is_none()
+                        .then(|| usage::prefer_at_launch(current, &entries, &settings, at))
+                        .flatten()
+                });
+            if let Some(best) = best {
                 account = best.clone();
-                fallback = quota_fallback(&account, &entries, &settings, now());
+                fallback = quota_fallback(&account, &entries, &settings, at, pinned);
+            }
+            if !settings.allows(&account.label, pinned) {
+                return Err(crate::Error(
+                    "no unreserved account available for automatic launch",
+                ));
             }
         }
-        store.account(&store.load()?, provider, Some(&account.label))?;
+        store.account(&state, provider, Some(&account.label))?;
         Ok((
             account.clone(),
             Arc::new(store.lease_locked(&account)?),
@@ -189,6 +194,7 @@ pub fn run(
     let mut next_sync = 0;
     let mut syncing: Option<std::thread::JoinHandle<bool>> = None;
     let mut auth_restarts = 0;
+    let wake_seed = RandomState::new().hash_one(std::process::id());
     // A follower learns of a rotation from the owner, a moment after the old
     // token stopped working: give it this long to arrive before deciding
     // that a login error means the account itself has expired.
@@ -271,7 +277,7 @@ pub fn run(
         let mut auth_seen: Option<Instant> = None;
         let mut rotated = false;
         let mut reported_resume = false;
-        let mut wake = Wake::new(u64::from(std::process::id()));
+        let mut wake = Wake::new(wake_seed);
         let status = loop {
             // Whether the screen showed a limit this tick; for Claude, its
             // transcript decides whether that is live (see `limit_seen`).
@@ -453,7 +459,10 @@ pub fn run(
                     );
                     let entries =
                         rejected.filter(store, &account.label, settings.threshold, entries);
-                    Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
+                    Ok(
+                        recovery_target(&account.label, &entries, &settings, now(), pinned)
+                            .cloned(),
+                    )
                 })();
                 // An unreadable store leaves the decision to the next tick.
                 let decided = hiccups.note("choosing another account", decided);
@@ -560,7 +569,16 @@ pub fn run(
         {
             rotated = true;
         }
-        if rotated {
+        if rotated
+            && patiently("checking account reservation", || {
+                let _lock = store.lock()?;
+                let state = store.load()?;
+                Ok(state
+                    .auto
+                    .get(&provider)
+                    .is_none_or(|settings| settings.allows(&account.label, pinned)))
+            })?
+        {
             store::set_patience(PREPARE_PATIENCE);
             let resume_args = match prepared_resume.take() {
                 Some(args) => args,
@@ -636,7 +654,10 @@ pub fn run(
                     );
                     let entries =
                         rejected.filter(store, &account.label, settings.threshold, entries);
-                    Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
+                    Ok(
+                        recovery_target(&account.label, &entries, &settings, now(), pinned)
+                            .cloned(),
+                    )
                 })();
                 // Keep the decision that stopped the provider if this one fails.
                 if let Some(choice) = hiccups.note("choosing another account", decided) {
@@ -688,7 +709,10 @@ pub fn run(
                         );
                         let entries =
                             rejected.filter(store, &account.label, settings.threshold, entries);
-                        Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
+                        Ok(
+                            recovery_target(&account.label, &entries, &settings, now(), pinned)
+                                .cloned(),
+                        )
                     })();
                     if let Some(choice) = hiccups.note("waiting for usable quota", decided) {
                         target = choice;
@@ -733,7 +757,8 @@ pub fn run(
                 );
                 let entries =
                     rejected.filter_at(store, &account.label, settings.threshold, entries, at);
-                let Some(next) = recovery_target(&account.label, &entries, &settings, at).cloned()
+                let Some(next) =
+                    recovery_target(&account.label, &entries, &settings, at, pinned).cloned()
                 else {
                     return Ok(None);
                 };
@@ -747,7 +772,7 @@ pub fn run(
                 state.auto.entry(provider).or_default().last_switch = at;
                 store.save(&state)?;
                 rejected.resumed(store, &next, &state.accounts);
-                let fallback = quota_fallback(&next, &entries, &settings, at);
+                let fallback = quota_fallback(&next, &entries, &settings, at, pinned);
                 Ok(Some((next, next_lease, fallback)))
             };
             // Retried with the store lock released between attempts.
@@ -798,6 +823,30 @@ pub fn run(
         switches += 1;
         restarts.record();
     }
+}
+
+fn launch_seed(
+    store: &Store,
+    state: &store::State,
+    provider: Provider,
+    pinned: Option<&str>,
+    auto: bool,
+) -> Result<Account> {
+    let selected = store.account(state, provider, pinned)?;
+    let Some(settings) = state.auto.get(&provider) else {
+        return Ok(selected);
+    };
+    if !auto || settings.allows(&selected.label, pinned) {
+        return Ok(selected);
+    }
+    state
+        .accounts
+        .iter()
+        .find(|account| account.provider == provider && settings.allows(&account.label, pinned))
+        .cloned()
+        .ok_or(crate::Error(
+            "no unreserved account available for automatic launch",
+        ))
 }
 /// How long store I/O retries while no provider runs (preparing a launch or a
 /// restart), and while one does (then its bookkeeping retries next tick).
@@ -1248,7 +1297,11 @@ fn quota_fallback(
     entries: &[(Account, usage::Cached)],
     settings: &store::Auto,
     at: u64,
+    pinned: Option<&str>,
 ) -> Option<(f64, f64)> {
+    if !settings.allows(&account.label, pinned) {
+        return None;
+    }
     let used = entries
         .iter()
         .find(|(a, _)| a.provider == account.provider && a.label == account.label)?
@@ -1275,22 +1328,20 @@ fn recovery_target<'a>(
     entries: &'a [(Account, usage::Cached)],
     settings: &store::Auto,
     at: u64,
+    pinned: Option<&str>,
 ) -> Option<&'a Account> {
-    usage::choose(
-        current,
-        entries,
-        settings.threshold,
-        settings.prefer,
-        settings.last_switch,
-        at,
-        true,
-    )
-    .or_else(|| {
+    let usable = |label| {
         entries.iter().find_map(|(account, cache)| {
-            (account.label == current && cache.used(at).is_some_and(|used| used < 100.0))
-                .then_some(account)
+            (account.label == label
+                && settings.allows(&account.label, pinned)
+                && cache.used(at).is_some_and(|used| used < 100.0))
+            .then_some(account)
         })
-    })
+    };
+    pinned
+        .and_then(usable)
+        .or_else(|| usage::choose(current, entries, settings, at, true, pinned))
+        .or_else(|| usable(current))
 }
 
 /// Pure wall-clock schedule, also used with synthetic time in tests. Shared
@@ -1305,7 +1356,7 @@ impl Wake {
     fn new(seed: u64) -> Self {
         Self {
             next: 0,
-            stagger: 1 + seed % 5,
+            stagger: 1 + seed % 30,
             reported: None,
         }
     }
@@ -1328,7 +1379,7 @@ impl Wake {
         self.next = next.saturating_add(self.stagger);
     }
     fn retry(&mut self, at: u64) {
-        self.next = at.saturating_add(5 + self.stagger);
+        self.next = at.saturating_add(6 + self.stagger % 5);
     }
     fn report(&mut self, provider: Provider, current: &str, at: u64) {
         if self.reported != Some(self.next) {
@@ -1651,24 +1702,10 @@ pub fn tick(store: &Store, provider: Provider, activate_live: bool) -> Result<Op
     let Some(current) = state.active.get(&provider) else {
         return Ok(None);
     };
-    let Some(account) = usage::choose(
-        current,
-        &entries,
-        settings.threshold,
-        settings.prefer,
-        settings.last_switch,
-        now(),
-        false,
-    )
-    .or_else(|| {
-        usage::prefer_at_launch(
-            current,
-            &entries,
-            settings.threshold,
-            settings.prefer,
-            now(),
-        )
-    }) else {
+    let at = now();
+    let Some(account) = usage::choose(current, &entries, &settings, at, false, None)
+        .or_else(|| usage::prefer_at_launch(current, &entries, &settings, at))
+    else {
         return Ok(None);
     };
     if activate_live {
@@ -1886,6 +1923,34 @@ mod wake_tests {
     }
 
     #[test]
+    fn recovery_only_uses_a_reserved_label_for_its_pin() {
+        let mut entries = [
+            entry(Provider::Claude, "held", 95.0, Some(AT + 1000), AT),
+            entry(Provider::Claude, "other", 100.0, Some(AT + 1800), AT),
+        ];
+        let settings = store::Auto {
+            reserved: vec!["held".into()],
+            ..Default::default()
+        };
+        assert!(recovery_target("held", &entries, &settings, AT, None).is_none());
+        assert!(quota_fallback(&entries[0].0, &entries, &settings, AT, None).is_none());
+        for current in ["held", "other"] {
+            assert_eq!(
+                recovery_target(current, &entries, &settings, AT, Some("held"))
+                    .map(|a| a.label.as_str()),
+                Some("held")
+            );
+        }
+        entries[0].1.usage.windows[0].used_percent = 100.0;
+        entries[1].1.usage.windows[0].used_percent = 95.0;
+        assert_eq!(
+            recovery_target("held", &entries, &settings, AT, Some("held"))
+                .map(|a| a.label.as_str()),
+            Some("other")
+        );
+    }
+
+    #[test]
     fn recovery_rechecks_weekly_quota_from_the_locked_cache_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("store")).unwrap();
@@ -1925,7 +1990,7 @@ mod wake_tests {
             let _lock = store.lock().unwrap();
             let entries = entries_from_cache(&store, Provider::Claude).unwrap();
             let entries = rejected.filter_at(&store, "current", settings.threshold, entries, AT);
-            recovery_target("current", &entries, &settings, AT).map(|a| a.label.clone())
+            recovery_target("current", &entries, &settings, AT, None).map(|a| a.label.clone())
         };
         let rejected = Rejected::default();
         let usable = usage::updated(usage::Cached::default(), Ok(full(80.0)), AT - 120);
@@ -1978,9 +2043,9 @@ mod wake_tests {
             });
             let mut wake = Wake::new(17);
             wake.schedule(&entries, None, AT);
-            assert!((AT + 30..=AT + 35).contains(&wake.next));
+            assert!((AT + 31..=AT + 60).contains(&wake.next));
             assert!(!wake.due(AT + 29));
-            assert!(wake.due(AT + 35));
+            assert!(wake.due(AT + 60));
         }
     }
 
@@ -1991,11 +2056,11 @@ mod wake_tests {
             let mut entries = vec![entry(Provider::Claude, "current", 100.0, reset, AT - 600)];
             entries[0].1.next_poll_at = AT - 1;
             wake.schedule(&entries, None, AT);
-            assert!((AT + 300..=AT + 305).contains(&wake.next));
+            assert!((AT + 301..=AT + 330).contains(&wake.next));
             assert!(!wake.due(AT + 1));
         }
         wake.schedule(&[], Some(AT + 20), AT);
-        assert!((AT + 20..=AT + 25).contains(&wake.next));
+        assert!((AT + 21..=AT + 50).contains(&wake.next));
     }
 
     #[test]
@@ -2005,11 +2070,11 @@ mod wake_tests {
             .map(|seed| {
                 let mut wake = Wake::new(seed);
                 wake.schedule(&entries, None, AT);
-                assert!((AT + usage::TTL..=AT + usage::TTL + 5).contains(&wake.next));
+                assert!((AT + usage::TTL + 1..=AT + usage::TTL + 30).contains(&wake.next));
                 wake.next
             })
             .collect::<std::collections::BTreeSet<_>>();
-        assert!(times.len() > 1);
+        assert_eq!(times.len(), 30);
     }
 
     #[test]
@@ -2049,8 +2114,14 @@ mod wake_tests {
                     });
                     let entries = rejected.filter_at(&store, "current", 90.0, entries, AT + 30);
                     assert_eq!(
-                        recovery_target("current", &entries, &store::Auto::default(), AT + 30)
-                            .map(|a| a.label.as_str()),
+                        recovery_target(
+                            "current",
+                            &entries,
+                            &store::Auto::default(),
+                            AT + 30,
+                            None
+                        )
+                        .map(|a| a.label.as_str()),
                         Some(recovered),
                         "{provider} {recovered} at {used}%"
                     );
@@ -2109,6 +2180,7 @@ mod wake_tests {
                         &rejected.filter_at(&store, "current", 90.0, entries, at),
                         &store::Auto::default(),
                         at,
+                        None,
                     )
                     .map(|a| a.label.clone())
                 };
@@ -2143,7 +2215,7 @@ mod wake_tests {
                 vec![entry(Provider::Codex, "current", 5.0, None, at)],
                 at,
             );
-            recovery_target("current", &entries, &store::Auto::default(), at)
+            recovery_target("current", &entries, &store::Auto::default(), at, None)
                 .map(|a| a.label.clone())
         };
         assert_eq!(choose(&rejected, AT + 10), None);

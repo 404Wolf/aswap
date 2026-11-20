@@ -17,7 +17,11 @@ impl Sandbox {
         self.temp.path()
     }
     fn invoke(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_aswap"))
+        self.command(args).output().unwrap()
+    }
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aswap"));
+        command
             .args(args)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap())
@@ -25,9 +29,8 @@ impl Sandbox {
             .env("XDG_DATA_HOME", self.root().join("data"))
             .env("XDG_CONFIG_HOME", self.root().join("config"))
             .env("CLAUDE_CONFIG_DIR", self.root().join("claude"))
-            .env("CODEX_HOME", self.root().join("codex"))
-            .output()
-            .unwrap()
+            .env("CODEX_HOME", self.root().join("codex"));
+        command
     }
     fn ok(&self, args: &[&str]) -> Value {
         let out = self.invoke(args);
@@ -48,6 +51,102 @@ impl Sandbox {
         )
         .unwrap();
     }
+}
+
+#[test]
+fn reserve_round_trips_and_auto_launch_and_monitor_skip_the_label() {
+    let t = Sandbox::new();
+    t.seed();
+    let at = aswap::now();
+    for (label, used, reset) in [("work", 20, at + 3600), ("held", 1, at + 1200)] {
+        fs::write(
+            t.root().join("claude/.credentials.json"),
+            json!({"claudeAiOauth":{"accessToken":format!("synthetic-{label}")}}).to_string(),
+        )
+        .unwrap();
+        t.ok(&["add", "claude", label, "--json"]);
+        fs::write(
+            t.root().join(format!(
+                "data/aswap/profiles/claude/{label}/usage-cache.json"
+            )),
+            json!({
+                "usage":{"windows":[{"name":"seven_day","used_percent":used,"resets_at":reset,"duration_minutes":10080}]},
+                "fetched_at":at,"next_poll_at":at+180
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    t.ok(&["add", "codex", "held", "--json"]);
+    t.ok(&["auto", "claude", "prefer", "weekly-reset", "--json"]);
+    t.ok(&["auto", "claude", "on", "--json"]);
+    for _ in 0..2 {
+        let v = t.ok(&["auto", "claude", "reserve", "held", "--json"]);
+        assert_eq!(v["reserved"], true);
+        assert_eq!(v["auto"]["reserved"], json!(["held"]));
+    }
+    for action in ["list", "status"] {
+        let v = t.ok(&[action, "claude", "--json"]);
+        let rows = v["accounts"].as_array().unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r["label"] == "held").unwrap()["reserved"],
+            true
+        );
+        assert_eq!(
+            rows.iter().find(|r| r["label"] == "work").unwrap()["reserved"],
+            false
+        );
+        let out = t.invoke(&[action, "claude"]);
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|line| { line.contains("held") && line.contains("reserved") })
+        );
+    }
+    assert_eq!(
+        t.ok(&["list", "codex", "--json"])["accounts"][0]["reserved"],
+        false
+    );
+    assert_eq!(
+        t.ok(&["auto", "claude", "once", "--json"])["selected"],
+        Value::Null
+    );
+
+    let fake = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("true"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let launch = |label: Option<&str>| {
+        let mut cmd = t.command(&["run", "claude", "--auto"]);
+        if let Some(label) = label {
+            cmd.args(["--account", label]);
+        }
+        cmd.env("ASWAP_CLAUDE_BIN", &fake).output().unwrap()
+    };
+    t.ok(&["switch", "claude", "held", "--json"]);
+    for (pin, chosen) in [(None, "work"), (Some("held"), "held")] {
+        let out = launch(pin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        assert!(
+            stderr.contains(&format!("using claude:{chosen} ")),
+            "{stderr}"
+        );
+    }
+    t.ok(&["auto", "claude", "reserve", "work", "--json"]);
+    let refused = launch(None);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("no unreserved account"));
+    t.ok(&["auto", "claude", "unreserve", "work", "--json"]);
+    t.ok(&["switch", "claude", "work", "--json"]);
+    let v = t.ok(&["auto", "claude", "unreserve", "held", "--json"]);
+    assert_eq!(v["reserved"], false);
+    assert_eq!(v["auto"]["reserved"], json!([]));
+    assert_eq!(
+        t.ok(&["auto", "claude", "once", "--json"])["selected"],
+        "held"
+    );
 }
 #[test]
 fn gc_is_disabled_by_default_and_reads_declarative_config() {

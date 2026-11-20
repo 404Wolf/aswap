@@ -36,6 +36,9 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
     let log = temp.path().join("launches");
     fs::create_dir(&log).unwrap();
     let reset = aswap::now() + 4;
+    // Leave enough time for every staggered probe to reject the other model
+    // before publishing the current account's post-reset observation.
+    let model_reset = reset + 35;
     let mut state = store.load().unwrap();
     for (label, used) in [("current", 20.0), ("other", 100.0)] {
         let profile = store.profile(provider, label).unwrap();
@@ -61,7 +64,7 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
                             reset
                         } else {
                             if mode == "model" {
-                                reset + 10
+                                model_reset
                             } else {
                                 reset + 60
                             }
@@ -143,7 +146,7 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
                 .unwrap(),
         );
     }
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(100);
     let mut sent = false;
     while aswap::now() < reset {
         assert!(Instant::now() < deadline);
@@ -202,7 +205,7 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
     }
     if mode == "model" || mode == "race" {
         while if mode == "model" {
-            aswap::now() < reset + 10
+            aswap::now() < model_reset
         } else {
             !log.join("revoked").exists()
         } {

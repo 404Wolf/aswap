@@ -760,18 +760,21 @@ fn rank(prefer: Prefer, a: &Cached, b: &Cached, at: u64) -> std::cmp::Ordering {
 pub fn choose<'a>(
     current: &str,
     entries: &'a [(Account, Cached)],
-    threshold: f64,
-    prefer: Prefer,
-    last_switch: u64,
+    settings: &store::Auto,
     at: u64,
     limited: bool,
+    pinned: Option<&str>,
 ) -> Option<&'a Account> {
+    let threshold = settings.threshold;
     let (_, current_cache) = entries.iter().find(|(a, _)| a.label == current)?;
     let used = current_cache.used(at);
-    let exhausted =
-        limited || !current_cache.unverified_limits.is_empty() || used.is_some_and(|v| v >= 100.0);
+    let exhausted = limited
+        || !settings.allows(current, pinned)
+        || !current_cache.unverified_limits.is_empty()
+        || used.is_some_and(|v| v >= 100.0);
     if !exhausted
-        && used.is_none_or(|v| v < threshold || (v < 100.0 && at.saturating_sub(last_switch) < 300))
+        && (pinned == Some(current)
+            || used.is_none_or(|v| v < threshold || at.saturating_sub(settings.last_switch) < 300))
     {
         return None;
     }
@@ -780,6 +783,7 @@ pub fn choose<'a>(
             .iter()
             .filter(|(a, c)| {
                 a.label != current
+                    && settings.allows(&a.label, pinned)
                     && c.used(at).is_some_and(|v| {
                         v < ceiling && (forced || used.is_some_and(|u| u - v >= 10.0))
                     })
@@ -787,7 +791,7 @@ pub fn choose<'a>(
             .min_by(|(_, a), (_, b)| rank(preference, a, b, at))
             .map(|(a, _)| a)
     };
-    eligible(threshold, exhausted, prefer).or_else(|| {
+    eligible(threshold, exhausted, settings.prefer).or_else(|| {
         exhausted
             .then(|| eligible(100.0, true, Prefer::Headroom))
             .flatten()
@@ -800,17 +804,19 @@ pub fn choose<'a>(
 pub fn prefer_at_launch<'a>(
     current: &str,
     entries: &'a [(Account, Cached)],
-    threshold: f64,
-    prefer: Prefer,
+    settings: &store::Auto,
     at: u64,
 ) -> Option<&'a Account> {
+    let prefer = settings.prefer;
     if prefer != Prefer::WeeklyReset {
         return None;
     }
     let (_, mine) = entries.iter().find(|(a, _)| a.label == current)?;
     let best = entries
         .iter()
-        .filter(|(_, c)| c.used(at).is_some_and(|v| v < threshold))
+        .filter(|(a, c)| {
+            settings.allows(&a.label, None) && c.used(at).is_some_and(|v| v < settings.threshold)
+        })
         .min_by(|(_, a), (_, b)| rank(prefer, a, b, at))?;
     let sooner = match (best.1.usage.weekly_reset(at), mine.usage.weekly_reset(at)) {
         (Some(x), Some(y)) => x < y,

@@ -370,6 +370,9 @@ pub fn remove(store: &Store, provider: Provider, name: &str) -> Result<Vec<Strin
     if state.active.get(&provider).is_some_and(|s| s == name) {
         state.active.remove(&provider);
     }
+    if let Some(settings) = state.auto.get_mut(&provider) {
+        settings.reserved.retain(|label| label != name);
+    }
     store.save(&state)?;
     if profile.exists() {
         std::fs::remove_dir_all(profile).safe("cannot remove private profile")?;
