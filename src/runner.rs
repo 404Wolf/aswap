@@ -144,7 +144,7 @@ pub fn launch(
     // follower with no usable profile yet waits for the owner.
     let synced = {
         let _lock = store.lock()?;
-        launch_seed(store, &store.load()?, provider, pinned, auto).is_ok()
+        launch_seed(store, &store.load()?, provider, pinned, pick).is_ok()
     };
     if synced {
         drop(background_poll(store));
@@ -156,7 +156,7 @@ pub fn launch(
     crate::coordination::spawn_sync(store);
     let mut account = {
         let _lock = store.lock()?;
-        launch_seed(store, &store.load()?, provider, pinned, auto)?
+        launch_seed(store, &store.load()?, provider, pinned, pick)?
     };
     let mut models = if auto {
         crate::models::Gate::new(provider, args)?
@@ -961,13 +961,15 @@ fn launch_seed(
     state: &store::State,
     provider: Provider,
     pinned: Option<&str>,
-    auto: bool,
+    by_quota: bool,
 ) -> Result<Account> {
     let selected = store.account(state, provider, pinned)?;
     let Some(settings) = state.auto.get(&provider) else {
         return Ok(selected);
     };
-    if !auto || settings.allows(&selected.label, pinned) {
+    // A launch that picks by quota (--auto, --pick) never starts from a
+    // reserved account it wasn't asked for.
+    if !by_quota || settings.allows(&selected.label, pinned) {
         return Ok(selected);
     }
     state

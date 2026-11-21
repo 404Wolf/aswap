@@ -191,9 +191,15 @@ fn process_uses_view(
     }
     let env =
         environ(&process.join("environ")).map_err(|error| AccessError::new("environ", error))?;
+    // Every provider's home variable: CODEX_HOME, CLAUDE_CONFIG_DIR and
+    // pi's PI_CODING_AGENT_DIR.
     for value in env.split(|b| *b == 0).filter_map(|var| {
-        var.strip_prefix(b"CODEX_HOME=")
-            .or_else(|| var.strip_prefix(b"CLAUDE_CONFIG_DIR="))
+        crate::provider::Provider::ALL
+            .iter()
+            .find_map(|provider| {
+                var.strip_prefix(provider.env_var().as_bytes())?
+                    .strip_prefix(b"=")
+            })
             .filter(|path| !path.is_empty())
     }) {
         let path = cwd.join(OsStr::from_bytes(value));

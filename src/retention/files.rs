@@ -356,6 +356,7 @@ fn regenerable(path: &Path, name: &OsStr) -> bool {
                 | b".tmp"
                 | b"models_cache.json"
                 | b".aswap-active"
+                | b".aswap-session.json"
         )
     }) || (name.starts_with(b"logs_")
         && (name.ends_with(b".sqlite")

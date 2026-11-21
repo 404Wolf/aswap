@@ -340,3 +340,23 @@ fn concurrent_picks_each_run_and_leave_no_launch_view() {
         assert_eq!(left, 0, "{label} kept a lease");
     }
 }
+
+#[test]
+fn pick_never_starts_from_a_reserved_default() {
+    let t = Sandbox::new();
+    // The default is reserved and no account has a usable reading: a pick
+    // must fall to an unreserved account rather than fail.
+    assert!(t.aswap(&["auto", "claude", "reserve", "one"], None).status.success());
+    for label in ["one", "two"] {
+        let path = t
+            .store()
+            .profile(Provider::Claude, label)
+            .unwrap()
+            .join("usage-cache.json");
+        let _ = std::fs::remove_file(path);
+    }
+    let out = t.aswap(&["run", "claude", "--pick", "--", "-p"], Some("hi\n"));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let answers = lines(&String::from_utf8(out.stdout).unwrap());
+    assert_eq!(answers[0]["token"], "synthetic-two");
+}

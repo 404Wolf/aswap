@@ -463,8 +463,6 @@ impl View {
             .profile(account.provider, &account.label)
             .is_ok_and(|p| stamp(&p.join(account.provider.auth_file())) != self.auth_stamp)
     }
-    /// Where the provider reports its current session: beside the view, never
-    /// inside the provider home, like the view's lock.
     /// Where the provider reports its current session
     /// (`Spec::report_session`): inside the view, private, so retention
     /// retires it with the view.

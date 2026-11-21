@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased (wolf/pi-support)
+
+### Added
+- **pi as a third provider.** `aswap add pi` stores pi's ChatGPT login; launches get access-only views with shared settings, sessions and extensions. `run pi --auto` resumes the same pi session on another account at a usage limit. pi shows in list, status, usage, waybar and sessions, and has the Home Manager option `autoswitch.pi`.
+- **`run claude --pick`** chooses the account by quota with plain stdio, for `claude -p` pipes. **`run claude --via pi`** runs pi in front of Claude Code, either on one account or with one account picked per call.
+- Provider facts now live behind one `provider::Spec` trait (Claude, Codex, pi). `runner`, `shared` and `coordination` are split into modules.
+
+### Changed
+- **Launch views are kept after a run**, as on main, for runtime retention (`aswap gc`) to retire. Only the one-shot views of `run --pick` are removed when the call ends. Retention is off by default. Enable it (Home Manager `programs.aswap.retention.enable`, then `aswap gc`), or views and their access-only logins pile up. pi users of earlier builds of this branch had them removed at run end.
+- Retention covers pi views. Its liveness check also follows `PI_CODING_AGENT_DIR`.
+
 ## 0.2.1 (2026-11-21)
 
 ### Added
