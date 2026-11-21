@@ -114,10 +114,12 @@ spaces grants: the account commit and launch after a grant take their own
 time, and a grant whose commit finds no eligible account is spent. Waiters
 queue first come, first served in `switch-gate.json`, read and rewritten only
 under an exclusive `flock` on `switch-gate.lock` next to `state.json`. The
-clock is read under the lock, the lock is never held across a sleep, the wait
-for it is bounded (1.5 s), and the state is written once without the store's
-retries; a gate that can't be locked, read or written lets the restart
-through with a warning. Each waiter refreshes its ticket's heartbeat (the head
+clock is read under the lock, the lock is never held across a sleep, each try
+for it lasts at most 250 ms, and the state is written once without the store's
+retries. A busy lock (its holder stalled on a slow disk) is retried between
+terminal pumps for up to 30 s or two intervals, whichever is longer, so a
+short stall still spaces the herd; past that, or when the gate can't be
+opened, read or written, the restart goes through with a warning. Each waiter refreshes its ticket's heartbeat (the head
 on every poll); a ticket silent for two intervals plus slack (18 s at 4 s) is
 dropped, so a killed or stopped waiter holds up those behind it for at most
 that long, and a waiter that stops waiting removes its own. The recorded

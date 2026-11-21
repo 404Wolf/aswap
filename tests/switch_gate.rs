@@ -1,9 +1,9 @@
 //! The machine-wide switch gate over real lock and state files in a temp
 //! directory: racing threads with their own file handles, racing processes,
 //! a waiter process killed while it holds a place in line, and a lock held
-//! too long.
+//! for a moment or for good.
 use aswap::switch_gate::{
-    Clock, FileShelf, LOCK_WAIT, Shared, Shelf, SwitchGate, SystemClock, Turn, ttl,
+    Clock, FileShelf, LOCK_WAIT, Shared, Shelf, SwitchGate, SystemClock, Turn, busy_limit, ttl,
 };
 use fs2::FileExt;
 use std::{
@@ -11,7 +11,10 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Barrier},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -257,12 +260,9 @@ fn killed_waiter_helper() {
     let _ = SystemClock.now_ms();
 }
 
-#[test]
-fn a_lock_held_too_long_lets_the_switch_through_without_waiting_forever() {
-    let (_guard, dir) = temp();
-    hold_slot(&dir);
-    // A holder stuck inside its read-modify-write (stopped, or on a stalled
-    // disk) keeps the lock.
+/// Holds the gate lock from another open file description, as a holder
+/// stalled inside its read-modify-write would.
+fn stuck_holder(dir: &Path) -> fs::File {
     let stuck = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -270,17 +270,60 @@ fn a_lock_held_too_long_lets_the_switch_through_without_waiting_forever() {
         .open(dir.join("switch-gate.lock"))
         .unwrap();
     stuck.lock_exclusive().unwrap();
-    let started = Instant::now();
-    let mut gate = SwitchGate::new(FileShelf::new(&dir), SystemClock, "a".into());
-    assert!(gate.poll(INTERVAL).is_err());
-    gate.acquire(INTERVAL, |_| panic!("no wait while the gate is unusable"))
+    stuck
+}
+
+#[test]
+fn a_lock_stuck_for_a_moment_is_waited_out_and_the_switch_still_gated() {
+    let (_guard, dir) = temp();
+    // A switch was just granted; then its holder stalls for a second.
+    FileShelf::new(&dir)
+        .update(|shared| {
+            shared.last_switch_at = SystemClock.now_ms();
+            ((), true)
+        })
         .unwrap();
-    let elapsed = started.elapsed();
-    assert!(elapsed >= LOCK_WAIT * 2, "{elapsed:?}");
-    assert!(
-        elapsed < LOCK_WAIT * 2 + Duration::from_secs(2),
-        "{elapsed:?}"
-    );
+    let started = Instant::now();
+    let asked = SystemClock.now_ms();
+    let stuck = stuck_holder(&dir);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(1));
+        drop(stuck);
+    });
+    let mut gate = SwitchGate::new(FileShelf::new(&dir), SystemClock, "a".into());
+    gate.acquire(INTERVAL, sleep).unwrap();
+    release.join().unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert!(started.elapsed() < busy_limit(INTERVAL));
+    let granted = read_shared(&dir).last_switch_at;
+    assert!(granted >= asked + 1_000, "granted only after the stall");
+}
+
+/// Wall time that moves on only when a waiter sleeps, ten seconds a time.
+struct Jumping(Arc<AtomicU64>);
+impl Clock for Jumping {
+    fn now_ms(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+#[test]
+fn a_lock_stuck_for_good_lets_the_switch_through_after_the_limit() {
+    let (_guard, dir) = temp();
+    let stuck = stuck_holder(&dir);
+    let at = Arc::new(AtomicU64::new(SystemClock.now_ms()));
+    let start = at.load(Ordering::SeqCst);
+    let mut gate = SwitchGate::new(FileShelf::new(&dir), Jumping(Arc::clone(&at)), "a".into());
+    let mut waits = 0;
+    gate.acquire(INTERVAL, |pause| {
+        assert_eq!(pause, LOCK_WAIT);
+        waits += 1;
+        at.fetch_add(10_000, Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(waits, 3, "retried until 30 s had passed");
+    assert!(at.load(Ordering::SeqCst) - start >= busy_limit(INTERVAL).as_millis() as u64);
     drop(stuck);
     assert!(read_shared(&dir).queue.is_empty(), "nothing was written");
 }

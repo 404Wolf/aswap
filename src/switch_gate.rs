@@ -13,10 +13,12 @@
 //! killed head holds everyone behind it that long), and a waiter that stops
 //! waiting removes its ticket.
 //!
-//! Every lock wait and write is bounded: the lock is tried for at most
-//! [`LOCK_WAIT`] and the state is written once, without the store's retries.
-//! Either failing lets the switch through (logged), since a stranded session
-//! is worse than one early switch.
+//! Every lock wait and write is bounded: each attempt at the lock lasts at
+//! most [`LOCK_WAIT`], and the state is written once, without the store's
+//! retries. A busy lock (a holder stalled on its disk) is retried between
+//! terminal pumps for up to [`busy_limit`], so a short stall still spaces the
+//! herd; past that, or on any other gate failure, the switch goes through
+//! (logged), since a stranded session is worse than one early switch.
 //!
 //! The gate is per account store (`$XDG_DATA_HOME/aswap`): it spaces *grants*;
 //! the account commit and launch that follow each grant take their own time.
@@ -41,9 +43,18 @@ pub const DEFAULT_INTERVAL_SECONDS: u64 = 4;
 /// How long past two intervals a silent waiter keeps its place, at most
 /// (short intervals get four intervals of slack).
 const SLACK_MS: u64 = 10_000;
-/// The longest wait for the gate lock, which others hold only for one
-/// read-modify-write; past it the gate counts as unusable.
-pub const LOCK_WAIT: Duration = Duration::from_millis(1_500);
+/// The longest single wait for the gate lock, which others hold only for one
+/// read-modify-write; past it the attempt reports [`LOCK_BUSY`].
+pub const LOCK_WAIT: Duration = Duration::from_millis(250);
+/// The error of an attempt that found the lock held for all of [`LOCK_WAIT`].
+pub const LOCK_BUSY: &str = "the switch gate lock is busy";
+/// The shortest total time a waiter keeps retrying a busy lock.
+const BUSY_MIN: Duration = Duration::from_secs(30);
+/// How long a waiter keeps retrying a busy gate lock before switching anyway:
+/// 30 s, or two intervals if that is longer.
+pub fn busy_limit(interval: Duration) -> Duration {
+    BUSY_MIN.max(interval.saturating_mul(2))
+}
 /// Bounds on how often a waiter behind the head re-reads the queue.
 const RECHECK_MIN_MS: u64 = 50;
 const RECHECK_MAX_MS: u64 = 1_000;
@@ -149,9 +160,11 @@ pub fn decide(shared: &mut Shared, id: &str, now: u64, interval_ms: u64) -> (Tur
         Turn::Go
     } else {
         let until_free = free_at.saturating_sub(now);
-        // The head sleeps until its slot; the rest re-read the queue.
+        // The head sleeps until its slot, but never past half a TTL: after a
+        // backward clock step its slot can be further away than the TTL, and
+        // the others would drop it as dead. The rest re-read the queue.
         let recheck = if position == 0 {
-            until_free
+            until_free.min(ttl / 2)
         } else {
             (interval_ms / 4).clamp(RECHECK_MIN_MS, RECHECK_MAX_MS)
         };
@@ -228,7 +241,7 @@ impl FileShelf {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(err) if err.raw_os_error() == contended => {
-                    return Err(crate::Error("the switch gate lock is held too long"));
+                    return Err(crate::Error(LOCK_BUSY));
                 }
                 Err(_) => return Err(crate::Error("cannot lock the switch gate")),
             }
@@ -321,8 +334,9 @@ impl<S: Shelf, C: Clock> SwitchGate<S, C> {
     }
     /// Wait for the slot, calling `wait` to sleep between checks (it may
     /// pump a terminal; its error ends the wait and gives up the place).
-    /// Logs one line when the switch is delayed. A gate that cannot be read
-    /// or written lets the switch through rather than strand a session.
+    /// Logs one line when the switch is delayed. A busy lock is retried for
+    /// up to [`busy_limit`]; past that, or when the gate cannot be read or
+    /// written, the switch goes through rather than strand a session.
     pub fn acquire(
         &mut self,
         interval: Duration,
@@ -333,8 +347,31 @@ impl<S: Shelf, C: Clock> SwitchGate<S, C> {
             return Ok(());
         }
         let mut reported: Option<usize> = None;
+        let busy_ms = u64::try_from(busy_limit(interval).as_millis()).unwrap_or(u64::MAX);
+        let mut busy_since: Option<u64> = None;
         loop {
-            match self.poll(interval) {
+            let polled = self.poll(interval);
+            match &polled {
+                Err(err) if err.0 == LOCK_BUSY => {
+                    let now = self.clock.now_ms();
+                    let since = *busy_since.get_or_insert_with(|| {
+                        eprintln!(
+                            "aswap: the global switch gate is busy; waiting up to {}s for it",
+                            busy_ms.div_ceil(1000)
+                        );
+                        now
+                    });
+                    if now.saturating_sub(since) < busy_ms {
+                        if let Err(err) = wait(LOCK_WAIT) {
+                            self.leave();
+                            return Err(err);
+                        }
+                        continue;
+                    }
+                }
+                _ => busy_since = None,
+            }
+            match polled {
                 Ok(Turn::Go) => return Ok(()),
                 Ok(Turn::Wait {
                     position,
@@ -639,6 +676,93 @@ mod tests {
         broken.set(true);
         gate.acquire(Duration::from_millis(I), |_| panic!("no wait"))
             .unwrap();
+    }
+
+    /// A shelf whose lock is busy for the next `.1` attempts.
+    struct Busy(Rc<RefCell<Shared>>, Rc<Cell<u32>>);
+    impl Shelf for Busy {
+        fn update<R>(&self, change: impl FnOnce(&mut Shared) -> (R, bool)) -> Result<R> {
+            if self.1.get() > 0 {
+                self.1.set(self.1.get() - 1);
+                return Err(crate::Error(LOCK_BUSY));
+            }
+            Ok(change(&mut self.0.borrow_mut()).0)
+        }
+    }
+
+    #[test]
+    fn a_lock_busy_for_a_while_is_waited_out_and_then_gated_as_usual() {
+        let shared = Rc::new(RefCell::new(Shared {
+            last_switch_at: 100_000,
+            queue: Vec::new(),
+        }));
+        let clock = Rc::new(Cell::new(100_500));
+        let mut gate = SwitchGate::new(
+            Busy(shared.clone(), Rc::new(Cell::new(3))),
+            Fake(clock.clone()),
+            "a".into(),
+        );
+        let mut slept = Vec::new();
+        gate.acquire(Duration::from_millis(I), |d| {
+            slept.push(d.as_millis() as u64);
+            clock.set(clock.get() + d.as_millis() as u64);
+            Ok(())
+        })
+        .unwrap();
+        // Three busy retries, then the usual wait for the interval.
+        assert_eq!(slept, [250, 250, 250, 2_750]);
+        assert_eq!(shared.borrow().last_switch_at, 104_000);
+    }
+
+    #[test]
+    fn a_lock_that_stays_busy_lets_the_switch_through_after_the_limit() {
+        let shared = Rc::new(RefCell::new(Shared::default()));
+        let clock = Rc::new(Cell::new(100_000));
+        let mut gate = SwitchGate::new(
+            Busy(shared.clone(), Rc::new(Cell::new(u32::MAX))),
+            Fake(clock.clone()),
+            "a".into(),
+        );
+        let interval = Duration::from_millis(I);
+        gate.acquire(interval, |d| {
+            clock.set(clock.get() + d.as_millis() as u64);
+            Ok(())
+        })
+        .unwrap();
+        let limit = busy_limit(interval).as_millis() as u64;
+        assert_eq!(limit, 30_000);
+        assert_eq!(clock.get(), 100_000 + limit);
+        assert_eq!(*shared.borrow(), Shared::default());
+        // A long interval waits two of them.
+        assert_eq!(
+            busy_limit(Duration::from_secs(60)),
+            Duration::from_secs(120)
+        );
+        // An interrupted wait ends it too.
+        let mut gate = SwitchGate::new(
+            Busy(shared.clone(), Rc::new(Cell::new(u32::MAX))),
+            Fake(clock.clone()),
+            "b".into(),
+        );
+        assert!(
+            gate.acquire(interval, |_| Err(crate::Error("interrupted")))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_head_never_sleeps_past_half_a_ttl() {
+        // After a backward clock step a recorded switch up to a TTL ahead
+        // stands, so the head's slot can be further away than the TTL.
+        let mut s = Shared {
+            last_switch_at: 100_000 + ttl(I),
+            queue: Vec::new(),
+        };
+        let Turn::Wait { recheck, eta, .. } = decide(&mut s, "a", 100_000, I).0 else {
+            panic!()
+        };
+        assert_eq!(eta, Duration::from_millis(ttl(I) + I));
+        assert_eq!(recheck, Duration::from_millis(ttl(I) / 2));
     }
 
     /// A shelf whose lock takes `delay` to get, on a shared fake clock.
