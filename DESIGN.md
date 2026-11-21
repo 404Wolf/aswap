@@ -472,10 +472,50 @@ the original decimal precision. Hide unknown reload settings and zero/unknown
 available reset counts in terminal output.
 The [reset credits summary](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/typescript/v2/RateLimitResetCreditsSummary.ts)
 provides availableCount separately from balance. Only bounded decimal balance,
-boolean flags and numeric reset count enter normalized usage; account IDs,
-credit detail rows and backend banners are discarded. Older caches remain
+boolean flags, numeric reset count and bounded reset-credit rows (below) enter
+normalized usage; account IDs and backend banners are discarded. Older caches remain
 readable with missing optional metadata. Live diagnostics may inspect these
 field names/types and coarse numeric magnitudes only, never log the RPC payload.
+
+## Codex usage-limit resets
+
+Codex 0.167.1 calls these rate-limit reset credits ("Redeem reset" under
+`/usage`). `account/rateLimits/read` lists them under
+`rateLimitResetCredits.credits` (id, resetType, status, expiresAt, title,
+description). aswap keeps at most 16 rows with an id of 1-128 safe characters,
+known status/type values (others become `unknown`) and title/description
+stripped of control characters and cut at 200 characters.
+
+Redeeming is the TUI's own request, `account/rateLimitResetCredit/consume`
+`{idempotencyKey, creditId}`, sent through the same bounded app-server
+transport as usage reads, from a temporary home holding only the account's
+access token. The outcome is `reset`, `alreadyRedeemed`, `nothingToReset` or
+`noCredit`. One redemption resets the account's eligible windows, 5-hour and
+weekly together, and spends one earned, expiring credit.
+
+`src/reset.rs` separates the rule from I/O. `decide` is pure: off, non-Codex,
+halted or cooling down means no decision; any Codex account (reserved ones
+included) with unknown, stale or failed usage, or without a future weekly
+reset, means none; any with weekly usage under 100% means none. Otherwise the
+candidate is the unreserved account with a positive available count and an
+available, unexpired `codexRateLimits` credit whose weekly window resets
+farthest away; ties go to the soonest credit expiry, then the label. Any such
+credit whose text mentions money refuses the whole decision.
+
+`step` runs one decision against a `Port` (forced usage read, redeem, save,
+key). Dry-run records the decision once per account and window, uses only the
+shared cached readings and never redeems. `on` re-reads the chosen account, decides again on that
+reading, persists the pending redemption with a fresh UUID key before the
+request, counts the attempt before sending, and records the usage before and
+after. Errors and unknown outcomes keep the key for a retry after 15 and 30
+minutes; the third failure, `nothingToReset` and `noCredit` skip that account
+until its weekly reset. A pending key is retried only while every account is
+still exhausted; if one has room again the earlier request may have worked,
+so it is recorded as unconfirmed. Anything that may have spent a credit starts
+a one-hour cooldown. Money wording in a credit or a response halts redemption
+until `reset off`. Followers never redeem; a second process skips the tick
+while another holds `codex-reset.lock`. The log (`codex-resets.json`) keeps 50
+records; status output omits keys and credit ids.
 
 ## SSH sync failure classes and role drift
 

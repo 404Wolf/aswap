@@ -74,6 +74,69 @@ use it and fall back to other accounts when it runs out of quota. Reservations
 appear in `aswap list` and `aswap status`. Use `aswap auto claude unreserve work`
 to return it to the automatic pool.
 
+### Pick the account whose quota expires first
+
+```sh
+aswap auto codex prefer weekly-reset    # or: aswap auto claude prefer weekly-reset
+```
+
+With `weekly-reset`, when several accounts have room, aswap uses the one whose
+weekly window resets soonest, so quota that would expire unused goes first.
+New launches and the monitor also move to such an account. The 5-hour session
+window does not affect this ranking: it renews every 5 hours whatever you do.
+Past the switch threshold, aswap's last-resort fallback ranks by the most
+headroom instead, to keep the session running as long as possible.
+
+## Codex usage-limit resets (opt-in)
+
+Codex accounts can hold a few **usage-limit reset credits** (in Codex, `/usage`
+→ Redeem reset). aswap can redeem one for you when every Codex account is out
+of weekly usage, so supervised sessions don't sit blocked for days.
+
+Read this before you enable it:
+
+- **One redemption resets the account's 5-hour and weekly windows together**,
+  and **spends one earned credit**. Credits are limited and expire; a spent
+  credit can't be returned.
+- aswap redeems only when **every** Codex account is known to be out of weekly
+  usage. It never redeems for an account that still has weekly usage left, or
+  while any Codex account has, or while any account's usage is unknown or stale.
+- It redeems on the unreserved account whose weekly window resets **farthest**
+  away (the one that would stay blocked longest). Ties go to the account whose
+  credit expires soonest, then to the label.
+- At most one credit per decision, then an hour's cooldown. A failed request is
+  retried twice with backoff, reusing its idempotency key so a retry can't
+  spend a second credit, then not again before that account's weekly reset.
+- It uses only credits Codex lists as available. If a credit's title or
+  description, or Codex's answer, mentions payment, purchase, billing,
+  upgrades, credits or extra usage, aswap refuses and stops redeeming until you
+  run `aswap auto codex reset off`.
+- Only the monitor (`aswap auto codex watch`, the `aswap-codex` service) on
+  the refresh owner redeems; sync followers never do.
+
+Try the dry run first. It logs `would reset codex:LABEL (weekly resets in …)`
+to the monitor's output and to the reset log, and spends nothing:
+
+```sh
+aswap auto codex reset dry-run   # log what it would redeem
+aswap list --json | jq .codex_usage_resets
+aswap auto codex reset on        # redeem for real
+aswap auto codex reset off       # the default; also clears a halt
+```
+
+With the Home Manager module, set
+`programs.aswap.autoswitch.codex.autoReset = "dry-run";` (or `"on"`; default
+`"off"`).
+
+aswap redeems with the same `account/rateLimitResetCredit/consume` request the
+Codex TUI sends through `codex app-server`, using the account's own login. It
+records each attempt, with the account's usage before and after, in
+`codex-resets.json` in the aswap data directory (the last 50 entries).
+
+`aswap sessions --json` shows, for each running session, whether its account
+is held by a usage limit (`limit_blocked`) and, when Codex or Claude said,
+when it frees up (`blocked_until`, Unix seconds).
+
 ## How it works
 
 - Each account's login is stored privately under `~/.local/share/aswap/`

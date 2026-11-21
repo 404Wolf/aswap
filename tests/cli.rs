@@ -373,3 +373,143 @@ fn remove_names_the_duplicate_and_json_contains_only_labels() {
             .contains("Removed claude:another (duplicate login of first)")
     );
 }
+
+fn seed_codex(t: &Sandbox, label: &str, weekly: f64, reset: u64, credits: Value) {
+    fs::write(
+        t.root().join("codex/auth.json"),
+        json!({"tokens":{"access_token":format!("synthetic-{label}")}}).to_string(),
+    )
+    .unwrap();
+    t.ok(&["add", "codex", label, "--json"]);
+    write_codex_cache(t, label, weekly, reset, credits);
+}
+fn write_codex_cache(t: &Sandbox, label: &str, weekly: f64, reset: u64, credits: Value) {
+    let at = aswap::now();
+    let count = credits.as_array().map_or(0, Vec::len);
+    fs::write(
+        t.root()
+            .join(format!("data/aswap/profiles/codex/{label}/usage-cache.json")),
+        json!({
+            "usage":{
+                "windows":[
+                    {"name":"session","used_percent":10,"resets_at":at+3600,"duration_minutes":300,"codex_slot":0},
+                    {"name":"weekly","used_percent":weekly,"resets_at":reset,"duration_minutes":10080,"codex_slot":1}
+                ],
+                "available_usage_resets":count,
+                "reset_credits":credits
+            },
+            "fetched_at":at,"next_poll_at":at+180,"last_attempt":at
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn codex_reset_mode_is_opt_in_shown_and_codex_only() {
+    let t = Sandbox::new();
+    t.seed();
+    t.ok(&["add", "codex", "one", "--json"]);
+    // Default off, including state written before the field existed.
+    let state = t.root().join("data/aswap/state.json");
+    let mut v: Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    v["auto"] = json!({"codex":{"enabled":true,"threshold":90.0,"last_switch":0}});
+    fs::write(&state, v.to_string()).unwrap();
+    let listed = t.ok(&["list", "--json"]);
+    assert_eq!(listed["auto"]["codex"]["auto_reset"], "off");
+    assert_eq!(listed["codex_usage_resets"]["halted"], Value::Null);
+    let text = String::from_utf8_lossy(&t.invoke(&["list"]).stdout).into_owned();
+    assert!(!text.contains("usage reset"), "{text}");
+    for mode in ["dry-run", "on", "off", "dry-run"] {
+        assert_eq!(
+            t.ok(&["auto", "codex", "reset", mode, "--json"])["auto"]["auto_reset"],
+            mode
+        );
+    }
+    for action in ["list", "status"] {
+        assert_eq!(
+            t.ok(&[action, "--json"])["auto"]["codex"]["auto_reset"],
+            "dry-run"
+        );
+        let out = t.command(&[action]).env("COLUMNS", "200").output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("usage reset dry-run"), "{text}");
+    }
+    for bad in [
+        &["auto", "claude", "reset", "on"][..],
+        &["auto", "claude", "reset", "dry-run"],
+        &["auto", "codex", "reset", "yes"],
+        &["auto", "codex", "reset"],
+    ] {
+        assert!(!t.invoke(bad).status.success(), "{bad:?}");
+    }
+    t.ok(&["auto", "claude", "reset", "off", "--json"]);
+}
+
+#[test]
+fn codex_monitor_prefers_soonest_reset_and_dry_run_only_logs_the_farthest() {
+    let t = Sandbox::new();
+    t.seed();
+    let at = aswap::now();
+    let credit = |id: &str| json!([{"id":id,"status":"available","reset_type":"codexRateLimits","title":"Full reset (Weekly + 5 hr)","description":"Ready to redeem"}]);
+    seed_codex(&t, "late", 30.0, at + 6 * 86_400, credit("synthetic-late"));
+    seed_codex(&t, "soon", 50.0, at + 2 * 86_400, credit("synthetic-soon"));
+    t.ok(&["switch", "codex", "late", "--json"]);
+    t.ok(&["auto", "codex", "prefer", "weekly-reset", "--json"]);
+    t.ok(&["auto", "codex", "on", "--json"]);
+    // Both have room: the monitor moves to the account whose week ends first.
+    let v = t.ok(&["auto", "codex", "once", "--json"]);
+    assert_eq!(v["selected"], "soon");
+    assert!(v.get("usage_reset").is_none());
+    // Both out of weekly usage, dry-run: report the farthest reset, spend nothing.
+    write_codex_cache(&t, "late", 100.0, at + 6 * 86_400, credit("synthetic-late"));
+    write_codex_cache(&t, "soon", 100.0, at + 2 * 86_400, credit("synthetic-soon"));
+    t.ok(&["auto", "codex", "reset", "dry-run", "--json"]);
+    // A codex binary that fails if anything starts it.
+    let bin = t.root().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let marker = t.root().join("codex-started");
+    let fake = bin.join("codex");
+    fs::write(
+        &fake,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    let out = t
+        .command(&["auto", "codex", "once", "--json"])
+        .env("ASWAP_CODEX_BIN", &fake)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["usage_reset"]["step"], "would-reset");
+    assert_eq!(v["usage_reset"]["decision"]["label"], "late");
+    assert!(v["usage_reset"]["decision"].get("credit_id").is_none());
+    assert!(
+        stderr.contains("dry-run: would reset codex:late (weekly resets in 6d"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("synthetic-late"));
+    assert!(!marker.exists(), "dry-run must not start codex");
+    let history = &t.ok(&["list", "--json"])["codex_usage_resets"]["history"];
+    assert_eq!(history[0]["outcome"], "dry-run");
+    assert_eq!(history[0]["label"], "late");
+    // The same decision is not logged again on the next tick.
+    let out = t
+        .command(&["auto", "codex", "once", "--json"])
+        .env("ASWAP_CODEX_BIN", &fake)
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("would reset"));
+    assert!(!marker.exists());
+    // Off reads nothing and reports nothing.
+    t.ok(&["auto", "codex", "reset", "off", "--json"]);
+    assert!(
+        t.ok(&["auto", "codex", "once", "--json"])
+            .get("usage_reset")
+            .is_none()
+    );
+}

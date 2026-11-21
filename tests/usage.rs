@@ -1001,3 +1001,82 @@ fn duplicate_logins_share_one_fresh_fetch() {
     assert_eq!(partial.fetched_at, 1380);
     assert_eq!(partial.used(1380), None);
 }
+
+#[test]
+fn codex_reset_credits_are_parsed_bounded_and_cached() {
+    let v = serde_json::json!({
+        "rateLimits":{"primary":{"usedPercent":100,"windowDurationMins":10080,"resetsAt":1_800_500_000u64}},
+        "rateLimitResetCredits":{"availableCount":2,"credits":[
+            {"id":"synthetic-credit-1","resetType":"codexRateLimits","status":"available","grantedAt":1_800_000_000u64,"expiresAt":1_802_000_000u64,"title":"Full reset (Weekly + 5 hr)","description":"Ready\u{7}to redeem"},
+            {"id":"synthetic-credit-2","resetType":"somethingNew","status":"redeemed","grantedAt":1_800_000_000u64,"expiresAt":null,"title":null,"description":"   "},
+            {"id":"bad id with spaces","resetType":"codexRateLimits","status":"available"},
+            {"id":"","status":"available"}
+        ]}
+    });
+    let u = usage::parse_codex(&v).unwrap();
+    assert_eq!(u.available_usage_resets, Some(2));
+    assert_eq!(u.reset_credits.len(), 2);
+    let first = &u.reset_credits[0];
+    assert!(first.available());
+    assert_eq!(first.expires_at, Some(1_802_000_000));
+    assert_eq!(first.description.as_deref(), Some("Readyto redeem"));
+    let second = &u.reset_credits[1];
+    assert_eq!(second.reset_type, "unknown");
+    assert!(!second.available());
+    assert!(second.title.is_none() && second.description.is_none());
+    // Cache round trip, and caches written before credits existed still load.
+    let back: Usage = serde_json::from_value(serde_json::to_value(&u).unwrap()).unwrap();
+    assert_eq!(back.reset_credits, u.reset_credits);
+    let old: Usage = serde_json::from_value(serde_json::json!({"windows":[]})).unwrap();
+    assert!(old.reset_credits.is_empty());
+    // At most 16 rows are kept.
+    let many: Vec<_> = (0..40)
+        .map(|i| serde_json::json!({"id":format!("c{i}"),"resetType":"codexRateLimits","status":"available"}))
+        .collect();
+    let v = serde_json::json!({"rateLimits":{"primary":{"usedPercent":1}},"rateLimitResetCredits":{"availableCount":40,"credits":many}});
+    assert_eq!(usage::parse_codex(&v).unwrap().reset_credits.len(), 16);
+}
+
+#[test]
+fn limit_block_reports_blocked_accounts_and_when_they_free_up() {
+    let at = 1_800_000_000;
+    let window = |used: f64, resets_at: Option<u64>| Window {
+        name: "weekly".into(),
+        used_percent: used,
+        resets_at,
+        duration_minutes: Some(10080),
+        codex_slot: None,
+    };
+    let cache = |windows: Vec<Window>| Cached {
+        usage: Usage {
+            windows,
+            ..Default::default()
+        },
+        fetched_at: at,
+        ..Default::default()
+    };
+    assert_eq!(
+        cache(vec![window(99.0, Some(at + 10))]).limit_block(at),
+        None
+    );
+    assert_eq!(
+        cache(vec![
+            window(100.0, Some(at + 50)),
+            Window {
+                name: "session".into(),
+                used_percent: 100.0,
+                resets_at: Some(at + 20),
+                duration_minutes: Some(300),
+                codex_slot: None
+            }
+        ])
+        .limit_block(at),
+        Some(Some(at + 50))
+    );
+    assert_eq!(cache(vec![window(100.0, None)]).limit_block(at), Some(None));
+    // A passed reset no longer blocks.
+    assert_eq!(cache(vec![window(100.0, Some(at))]).limit_block(at), None);
+    let mut limited = cache(vec![window(40.0, Some(at + 10))]);
+    limited.error = Some("provider-limit".into());
+    assert_eq!(limited.limit_block(at), Some(None));
+}

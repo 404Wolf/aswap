@@ -149,3 +149,10 @@ Never edit the headline (line 1).
 - [x] Refuse imports when excluded local profiles already exist; preserve their credentials, metadata and running sessions for explicit guarded cleanup, and document that busy excluded profiles leave machine compliance unmet.
 - [x] Verify combined recovery and policy behavior with synthetic tests, formatting, Clippy, Home Manager checks and secret scans.
 - [ ] Deploy the combined build and verify each machine's declared policy and existing-profile cleanup through the coordinated rollout.
+
+## M19: Opt-in Codex usage-limit resets and reset-aware selection
+- [x] Establish from the codex-cli 0.167.1 source how "Redeem reset" works (earned, expiring credits; one redemption resets the 5-hour and weekly windows together) and redeem with the same app-server request, never by driving the TUI.
+- [x] Add `aswap auto codex reset off|dry-run|on` (default off) with a Home Manager option, shown in `list`/`status` text and JSON; old state loads as off.
+- [x] Decide in a pure core: redeem only when every Codex account is out of weekly usage, on the account whose weekly window resets farthest away (then soonest credit expiry, then label); unknown usage, no credit, money wording, cooldown or a halt mean no reset.
+- [x] Redeem behind a port: persist the idempotency key first, re-read usage before and after, retry with backoff then give up until the next window, refuse and halt on payment wording, never on followers; record a capped log.
+- [x] Verify every selection path ranks by the soonest weekly reset for both providers, and expose `limit_blocked`/`blocked_until` in `aswap sessions --json`.

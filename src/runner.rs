@@ -1923,6 +1923,59 @@ mod wake_tests {
     }
 
     #[test]
+    fn every_selection_path_prefers_the_soonest_weekly_reset_for_both_providers() {
+        let settings = store::Auto {
+            prefer: store::Prefer::WeeklyReset,
+            ..Default::default()
+        };
+        for provider in [Provider::Claude, Provider::Codex] {
+            let entries = [
+                entry(provider, "current", 100.0, Some(AT + 4 * 86_400), AT),
+                entry(provider, "later", 20.0, Some(AT + 5 * 86_400), AT),
+                entry(provider, "sooner", 60.0, Some(AT + 86_400), AT),
+                entry(provider, "unknown", 5.0, None, AT),
+            ];
+            let label = |a: Option<&Account>| a.map(|a| a.label.clone());
+            // Launch and the monitor tick: a forced switch off an exhausted account.
+            assert_eq!(
+                label(usage::choose(
+                    "current", &entries, &settings, AT, false, None
+                )),
+                Some("sooner".into()),
+                "{provider}"
+            );
+            // Quota fallback after a provider limit, and supervisor recovery.
+            assert_eq!(
+                label(usage::choose(
+                    "current", &entries, &settings, AT, true, None
+                )),
+                Some("sooner".into()),
+                "{provider}"
+            );
+            assert_eq!(
+                label(recovery_target("current", &entries, &settings, AT, None)),
+                Some("sooner".into()),
+                "{provider}"
+            );
+            // Launch preference and the monitor move off a later-resetting account.
+            for current in ["later", "unknown"] {
+                assert_eq!(
+                    label(usage::prefer_at_launch(current, &entries, &settings, AT)),
+                    Some("sooner".into()),
+                    "{provider} {current}"
+                );
+            }
+            assert!(usage::prefer_at_launch("sooner", &entries, &settings, AT).is_none());
+            // Headroom ranks by most room instead.
+            let headroom = store::Auto::default();
+            assert_eq!(
+                label(recovery_target("current", &entries, &headroom, AT, None)),
+                Some("unknown".into())
+            );
+        }
+    }
+
+    #[test]
     fn recovery_only_uses_a_reserved_label_for_its_pin() {
         let mut entries = [
             entry(Provider::Claude, "held", 95.0, Some(AT + 1000), AT),

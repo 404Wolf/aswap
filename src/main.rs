@@ -81,7 +81,7 @@ enum Action {
         #[arg(value_enum)]
         action: AutoAction,
         #[arg(
-            help = "Percentage for threshold; text or off for resume-prompt; headroom or weekly-reset for prefer; account label for reserve or unreserve"
+            help = "Percentage for threshold; text or off for resume-prompt; headroom or weekly-reset for prefer; off, dry-run or on for reset (Codex only); account label for reserve or unreserve"
         )]
         value: Option<String>,
         #[arg(
@@ -133,6 +133,9 @@ enum AutoAction {
     Off,
     Threshold,
     Prefer,
+    /// Codex: redeem a usage-limit reset credit when every account is out of
+    /// weekly usage (off, dry-run or on; default off).
+    Reset,
     /// Keep this account available for runs pinned to it.
     Reserve,
     /// Make this account available to automatic selection again.
@@ -180,8 +183,12 @@ fn snapshot(store: &Store, filter: Option<Provider>, refresh: bool) -> Result<Va
         rows.push(json!({"provider":a.provider,"label":a.label,"active":active.get(&a.provider)==Some(&a.label),"reserved":reserved,"remaining_percent":c.used(now()).map(|u|100.0-u),"usage":c.usage,"fetched_at":c.fetched_at,"next_poll_at":c.next_poll_at,"duplicates":duplicates,"usage_error":c.diagnostic(),"http_status":c.http_status,"retry_after_seconds":c.retry_after,"last_attempt":c.last_attempt,"usage_status":if c.used(now()).is_some(){"ok"}else if c.error.is_some(){"backoff"}else{"unknown"}}));
     }
     let coordination = aswap::coordination::settings(store)?;
+    let usage_resets = {
+        let _lock = store.lock()?;
+        aswap::reset::load(store)?.summary()
+    };
     Ok(
-        json!({"schema_version":1,"accounts":rows,"auto":settings,"credential_mode":if coordination.owner {"refresh-owner"}else if coordination.host.is_some(){"access-only-follower"}else{"refresh-disabled"},"last_sync":coordination.last_sync,"sync":aswap::coordination::status(store)?}),
+        json!({"schema_version":1,"accounts":rows,"auto":settings,"codex_usage_resets":usage_resets,"credential_mode":if coordination.owner {"refresh-owner"}else if coordination.host.is_some(){"access-only-follower"}else{"refresh-disabled"},"last_sync":coordination.last_sync,"sync":aswap::coordination::status(store)?}),
     )
 }
 fn duplicate_labels(store: &Store, account: &store::Account) -> Result<Vec<String>> {
@@ -268,6 +275,7 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
             enabled: a.enabled,
             threshold: a.threshold,
             prefer: a.prefer,
+            auto_reset: a.auto_reset,
         })
         .collect();
     Ok(aswap::display::render_with(
@@ -492,12 +500,13 @@ fn execute(cli: Cli) -> Result<i32> {
                 AutoAction::Threshold
                     | AutoAction::ResumePrompt
                     | AutoAction::Prefer
+                    | AutoAction::Reset
                     | AutoAction::Reserve
                     | AutoAction::Unreserve
             ) != value.is_some()
             {
                 return Err(Error(
-                    "threshold requires a percentage; resume-prompt requires text or off; prefer requires headroom or weekly-reset; reserve and unreserve require an account label; other actions take no value",
+                    "threshold requires a percentage; resume-prompt requires text or off; prefer requires headroom or weekly-reset; reset requires off, dry-run or on; reserve and unreserve require an account label; other actions take no value",
                 ));
             }
             match action {
@@ -524,6 +533,7 @@ fn execute(cli: Cli) -> Result<i32> {
                 | AutoAction::Off
                 | AutoAction::Threshold
                 | AutoAction::Prefer
+                | AutoAction::Reset
                 | AutoAction::ResumePrompt => {
                     let _lock = store.lock()?;
                     let mut state = store.load()?;
@@ -546,6 +556,16 @@ fn execute(cli: Cli) -> Result<i32> {
                                     |_| Error("prefer must be headroom or weekly-reset"),
                                 )?;
                         }
+                        AutoAction::Reset => {
+                            let mode = store::AutoReset::from_str(value.as_deref().unwrap(), false)
+                                .map_err(|_| Error("reset must be off, dry-run or on"))?;
+                            if provider != Provider::Codex && mode != store::AutoReset::Off {
+                                return Err(Error(
+                                    "usage-limit resets are only supported for Codex",
+                                ));
+                            }
+                            aswap::reset::set_mode(&store, settings, mode)?;
+                        }
                         AutoAction::ResumePrompt => {
                             let prompt = value.unwrap();
                             if prompt.is_empty() || prompt.len() > 16384 || prompt.contains('\0') {
@@ -565,6 +585,7 @@ fn execute(cli: Cli) -> Result<i32> {
                             enabled: settings.enabled,
                             threshold: settings.threshold,
                             prefer: settings.prefer,
+                            auto_reset: settings.auto_reset,
                         })
                     );
                     store.save(&state)?;
@@ -578,6 +599,20 @@ fn execute(cli: Cli) -> Result<i32> {
                         aswap::coordination::spawn_sync(&store);
                     }
                     loop {
+                        // A reset first, so this tick's selection can use it.
+                        let reset = match aswap::reset::tick(&store, provider) {
+                            Ok(step) => step,
+                            Err(err) if matches!(action, AutoAction::Watch) => {
+                                eprintln!(
+                                    "aswap: usage reset check failed ({err}); retrying next tick"
+                                );
+                                None
+                            }
+                            Err(err) => return Err(err),
+                        };
+                        if let Some(message) = reset.as_ref().and_then(|s| s.message(now())) {
+                            eprintln!("{message}");
+                        }
                         let selected = match runner::tick(&store, provider, activate_live) {
                             Ok(selected) => selected,
                             // The monitor outlives store trouble (a full disk, a
@@ -589,8 +624,12 @@ fn execute(cli: Cli) -> Result<i32> {
                             }
                             Err(err) => return Err(err),
                         };
+                        let mut report = json!({"provider":provider,"selected":selected});
+                        if let Some(step) = &reset {
+                            report["usage_reset"] = json!(step);
+                        }
                         output(
-                            &json!({"provider":provider,"selected":selected}),
+                            &report,
                             cli.json,
                             selected
                                 .map(|s| format!("Selected {provider}:{s}"))

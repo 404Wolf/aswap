@@ -1,7 +1,7 @@
 //! Terminal-only rendering: identity hints never enter JSON, Waybar or caches.
 use crate::{
     identity::Identity,
-    store::Prefer,
+    store::{AutoReset, Prefer},
     usage::{Cached, Window},
 };
 pub struct Row<'a> {
@@ -19,6 +19,7 @@ pub struct Policy<'a> {
     pub enabled: bool,
     pub threshold: f64,
     pub prefer: Prefer,
+    pub auto_reset: AutoReset,
 }
 /// Observations older than this are shown dimmed with their age.
 const FRESH: u64 = 600;
@@ -252,8 +253,12 @@ pub fn policy_text(p: &Policy<'_>) -> String {
         Prefer::Headroom => "most headroom",
         Prefer::WeeklyReset => "soonest weekly reset",
     };
+    let reset = match p.auto_reset {
+        AutoReset::Off => String::new(),
+        mode => format!(" · usage reset {}", mode.as_str()),
+    };
     format!(
-        "auto-select {} · switch at {}% used · prefer {prefer}",
+        "auto-select {} · switch at {}% used · prefer {prefer}{reset}",
         if p.enabled { "on" } else { "off" },
         p.threshold
     )

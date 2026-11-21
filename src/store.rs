@@ -26,6 +26,30 @@ pub struct Auto {
     pub prefer: Prefer,
     #[serde(default)]
     pub reserved: Vec<String>,
+    /// Opt-in redemption of Codex usage-limit reset credits; see `crate::reset`.
+    #[serde(default)]
+    pub auto_reset: AutoReset,
+}
+/// Whether the monitor may spend a Codex usage-limit reset credit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutoReset {
+    /// Never reset.
+    #[default]
+    Off,
+    /// Log the reset aswap would make, without making it.
+    DryRun,
+    /// Redeem one reset credit when every Codex account is out of weekly usage.
+    On,
+}
+impl AutoReset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::DryRun => "dry-run",
+            Self::On => "on",
+        }
+    }
 }
 /// How auto selection ranks eligible accounts.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
@@ -51,6 +75,7 @@ impl Default for Auto {
             last_switch: 0,
             prefer: Prefer::Headroom,
             reserved: Vec::new(),
+            auto_reset: AutoReset::Off,
         }
     }
 }

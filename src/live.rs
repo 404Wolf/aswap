@@ -244,8 +244,20 @@ pub(crate) fn view_in_use(root: &Path, view: &Path) -> Result<bool> {
 pub fn sessions(store: &Store) -> Result<Vec<serde_json::Value>> {
     let _lock = store.lock()?;
     let mut rows = Vec::new();
+    let at = crate::now();
     for account in store.load()?.accounts {
         count(store, &account)?;
+        // Whether this account is held by a usage limit, from its last reading.
+        let cache_path = store
+            .profile(account.provider, &account.label)?
+            .join("usage-cache.json");
+        let block = if cache_path.exists() {
+            store::json_read::<crate::usage::Cached>(&cache_path)
+                .ok()
+                .and_then(|c| c.limit_block(at))
+        } else {
+            None
+        };
         let dir = directory(store, &account)?;
         if !dir.exists() {
             continue;
@@ -263,7 +275,7 @@ pub fn sessions(store: &Store) -> Result<Vec<serde_json::Value>> {
                             .map(str::to_owned)
                     })
                 });
-                rows.push(serde_json::json!({"provider": account.provider, "account": account.label, "supervisor_pid": record.parent.pid, "child_pid": record.child.map(|p|p.pid), "terminal": terminal}));
+                rows.push(serde_json::json!({"provider": account.provider, "account": account.label, "supervisor_pid": record.parent.pid, "child_pid": record.child.map(|p|p.pid), "terminal": terminal, "limit_blocked": block.is_some(), "blocked_until": block.flatten()}));
             }
         }
     }

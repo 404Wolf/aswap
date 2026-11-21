@@ -49,4 +49,5 @@ pub mod live;
 
 pub mod models;
 
+pub mod reset;
 pub mod retention;

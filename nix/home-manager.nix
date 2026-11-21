@@ -24,6 +24,11 @@ let
         default = "headroom";
         description = "Rank eligible accounts by most headroom, or by the soonest weekly reset (new launches also move to an account whose weekly quota resets sooner).";
       };
+      autoReset = mkOption {
+        type = types.enum [ "off" "dry-run" "on" ];
+        default = "off";
+        description = "Codex only. When every Codex account is out of weekly usage, redeem one earned usage-limit reset credit on the account whose weekly window resets farthest away (this resets its 5-hour and weekly windows together). dry-run only logs what it would reset.";
+      };
     };
   };
   # Writes an account's access token into another local user's Claude
@@ -97,6 +102,8 @@ let
         "${cfg.package}/bin/aswap auto ${provider} threshold ${toString settings.threshold}"
         "${cfg.package}/bin/aswap auto ${provider} resume-prompt -- ${escapeExecArg (if settings.resumePrompt == null then "off" else settings.resumePrompt)}"
         "${cfg.package}/bin/aswap auto ${provider} prefer ${settings.prefer}"
+      ] ++ (lib.optional (provider == "codex") "${cfg.package}/bin/aswap auto ${provider} reset ${settings.autoReset}")
+        ++ [
         "${cfg.package}/bin/aswap auto ${provider} on"
       ];
       ExecStart = "${cfg.package}/bin/aswap auto ${provider} watch";
@@ -188,7 +195,10 @@ in {
     waybar.enable = mkEnableOption "the custom/aswap Waybar module in mainBar";
   };
   config = mkIf cfg.enable {
-    assertions = [{ assertion = !(cfg.refreshOwner == true && cfg.syncHost != null); message = "aswap refreshOwner and syncHost are mutually exclusive"; }];
+    assertions = [
+      { assertion = !(cfg.refreshOwner == true && cfg.syncHost != null); message = "aswap refreshOwner and syncHost are mutually exclusive"; }
+      { assertion = cfg.autoswitch.claude.autoReset == "off"; message = "aswap autoswitch.claude.autoReset: usage-limit resets are only supported for Codex"; }
+    ];
     home.packages = [ cfg.package ];
     xdg.configFile."aswap/sync-policy.json" = mkIf (cfg.syncProfiles != null) {
       text = builtins.toJSON cfg.syncProfiles;

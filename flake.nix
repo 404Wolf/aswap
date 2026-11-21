@@ -95,6 +95,7 @@
               home.stateVersion = "26.05";
               programs.aswap = {
                 enable = true; syncHost = "synthetic-owner"; autoswitch.claude.enable = true;
+                autoswitch.codex = { enable = true; autoReset = "dry-run"; };
                 syncProfiles = { allow = [ "claude:personal" "codex:personal" ]; deny = [ "codex:personal" ]; };
                 retention = { enable = true; minAge = 3600; archiveDir = "/home/synthetic/retained"; ioPressureLimit = 24.5; };
               };
@@ -149,6 +150,11 @@
             assert pkgs.lib.hasInfix "$$HOME %%n" (builtins.elemAt hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre 2);
             assert pkgs.lib.hasInfix "off" (builtins.elemAt hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre 2);
             assert pkgs.lib.hasSuffix " prefer headroom" (builtins.elemAt hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre 3);
+            # Codex usage resets are opt-in (default off); Claude has none.
+            assert pkgs.lib.hasSuffix " auto codex reset off" (builtins.elemAt hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre 4);
+            assert pkgs.lib.hasSuffix " auto codex reset dry-run" (builtins.elemAt hmPeer.config.systemd.user.services.aswap-codex.Service.ExecStartPre 4);
+            assert !(builtins.any (pkgs.lib.hasInfix " reset ") hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre);
+            assert pkgs.lib.hasSuffix " auto codex on" (pkgs.lib.last hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre);
             assert hm.config.programs.waybar.settings.mainBar."custom/aswap".return-type == "json";
             pkgs.runCommand "aswap-home-manager" { nativeBuildInputs = [ pkgs.python3 ]; } ''
               python3 - ${hmPeer.config.xdg.configFile."aswap/config.toml".source} <<'PY'

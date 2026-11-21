@@ -32,6 +32,83 @@ pub struct Usage {
     pub credits: Option<Credits>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_usage_resets: Option<u64>,
+    /// Codex usage-limit reset credits as the app-server lists them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reset_credits: Vec<ResetCredit>,
+}
+/// One Codex usage-limit reset credit. Redeeming it resets the account's
+/// eligible windows (5-hour and weekly together); it is an earned, expiring
+/// allowance. Text fields are bounded and stripped of control characters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetCredit {
+    /// Opaque backend identifier, passed back when redeeming.
+    pub id: String,
+    /// `available`, `redeeming`, `redeemed` or `unknown`.
+    pub status: String,
+    /// `codexRateLimits` or `unknown`.
+    pub reset_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+impl ResetCredit {
+    pub fn available(&self) -> bool {
+        self.status == "available" && self.reset_type == "codexRateLimits"
+    }
+}
+const MAX_RESET_CREDITS: usize = 16;
+fn bounded_text(value: Option<&Value>) -> Option<String> {
+    let text: String = value?
+        .as_str()?
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+fn parse_reset_credit(v: &Value) -> Option<ResetCredit> {
+    let id = v.get("id")?.as_str()?;
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
+    {
+        return None;
+    }
+    let known = |key: &str, values: &[&str]| {
+        let value = v.get(key).and_then(Value::as_str).unwrap_or("");
+        if values.contains(&value) {
+            value
+        } else {
+            "unknown"
+        }
+        .to_owned()
+    };
+    Some(ResetCredit {
+        id: id.to_owned(),
+        status: known("status", &["available", "redeeming", "redeemed"]),
+        reset_type: known("resetType", &["codexRateLimits"]),
+        expires_at: v.get("expiresAt").and_then(Value::as_u64),
+        title: bounded_text(v.get("title")),
+        description: bounded_text(v.get("description")),
+    })
+}
+pub fn parse_reset_credits(v: &Value) -> Vec<ResetCredit> {
+    v.pointer("/rateLimitResetCredits/credits")
+        .and_then(Value::as_array)
+        .map(|credits| {
+            credits
+                .iter()
+                .take(MAX_RESET_CREDITS)
+                .filter_map(parse_reset_credit)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Credits {
@@ -76,6 +153,10 @@ impl Usage {
     /// When the account-wide weekly window resets; model-specific weekly
     /// windows only stand in when no account-wide one was observed.
     pub fn weekly_reset(&self, at: u64) -> Option<u64> {
+        self.weekly(at).and_then(|w| w.resets_at)
+    }
+    /// The account-wide weekly window with a reset still ahead.
+    pub fn weekly(&self, at: u64) -> Option<&Window> {
         let weekly =
             |w: &&Window| w.duration_minutes == Some(10080) && w.resets_at.is_some_and(|r| r > at);
         self.windows
@@ -88,7 +169,6 @@ impl Usage {
                     .filter(weekly)
                     .min_by_key(|w| w.resets_at)
             })
-            .and_then(|w| w.resets_at)
     }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -173,6 +253,29 @@ impl Cached {
         } else {
             self.usage.used(at)
         }
+    }
+
+    /// Whether this account is held by a usage limit, and until when if the
+    /// provider said. A recorded provider limit without a known exhausted
+    /// window is blocked with an unknown end.
+    pub fn limit_block(&self, at: u64) -> Option<Option<u64>> {
+        let exhausted: Vec<&Window> = self
+            .usage
+            .windows
+            .iter()
+            .filter(|w| w.used_percent >= 100.0)
+            .chain(self.unverified_limits.iter().map(UnverifiedLimit::window))
+            .filter(|w| w.resets_at.is_none_or(|r| r > at))
+            .collect();
+        if exhausted.is_empty() && self.error.as_deref() != Some("provider-limit") {
+            return None;
+        }
+        let known = exhausted.iter().all(|w| w.resets_at.is_some());
+        Some(
+            known
+                .then(|| exhausted.iter().filter_map(|w| w.resets_at).max())
+                .flatten(),
+        )
     }
 
     pub fn reset_times(&self) -> impl Iterator<Item = u64> + '_ {
@@ -322,6 +425,7 @@ pub fn parse_codex(v: &Value) -> Result<Usage> {
         windows,
         credits,
         available_usage_resets,
+        reset_credits: parse_reset_credits(v),
     })
 }
 #[derive(Clone, Copy, Debug)]
@@ -389,6 +493,24 @@ pub(crate) fn codex_request(
     method: &str,
     params: Value,
 ) -> Result<Value> {
+    codex_request_within(
+        profile,
+        diagnostic,
+        overrides,
+        method,
+        params,
+        Duration::from_secs(10),
+    )
+}
+/// `codex_request` with its own per-response deadline.
+pub(crate) fn codex_request_within(
+    profile: &Path,
+    diagnostic: &std::cell::Cell<Failure>,
+    overrides: &[String],
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
     let mut command = Provider::Codex.command(profile);
     command.args(overrides);
     let mut child = Process(
@@ -437,7 +559,7 @@ pub(crate) fn codex_request(
             input.flush().safe("app-server flush failed")
         };
         let receive = |id: u64| -> Result<Value> {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + timeout;
             for _ in 0..128 {
                 let remain = deadline.saturating_duration_since(std::time::Instant::now());
                 let v = rx
@@ -516,16 +638,8 @@ pub(crate) fn codex_request(
 pub fn fetch(account: &Account, profile: &Path) -> std::result::Result<Usage, Failure> {
     if account.provider == Provider::Codex {
         let diagnostic = std::cell::Cell::new(Failure::new("codex-rpc-unavailable"));
-        let result = (|| -> Result<Value> {
-            // The usage-only app-server cannot rotate auth behind a running CLI.
-            let temporary = tempfile::tempdir().safe("cannot prepare usage auth")?;
-            let auth: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
-            store::json_write(
-                &temporary.path().join(account.provider.auth_file()),
-                &crate::refresh::access_only(account.provider, &auth),
-            )?;
-            codex_rpc_inner(temporary.path(), &diagnostic)
-        })();
+        let result = access_only_home(account, profile)
+            .and_then(|home| codex_rpc_inner(home.path(), &diagnostic));
         return result.and_then(|v| parse_codex(&v)).map_err(|e| {
             let mut failure = diagnostic.get();
             if e.0 == "cannot start Codex app-server" {
@@ -537,6 +651,17 @@ pub fn fetch(account: &Account, profile: &Path) -> std::result::Result<Usage, Fa
         });
     }
     fetch_claude_with(profile, request_claude)
+}
+/// A temporary Codex home holding only the profile's access token: an
+/// app-server started there cannot rotate auth behind a running CLI.
+pub(crate) fn access_only_home(account: &Account, profile: &Path) -> Result<tempfile::TempDir> {
+    let temporary = tempfile::tempdir().safe("cannot prepare usage auth")?;
+    let auth: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
+    store::json_write(
+        &temporary.path().join(account.provider.auth_file()),
+        &crate::refresh::access_only(account.provider, &auth),
+    )?;
+    Ok(temporary)
 }
 fn fetch_claude_with<F>(profile: &Path, request: F) -> std::result::Result<Usage, Failure>
 where
