@@ -446,8 +446,7 @@ impl Retention<'_> {
         };
         // Serializes concurrent GC, including old views without a lock file.
         // Flocking the existing directory leaves dry-run entirely read-only.
-        fs2::FileExt::try_lock_exclusive(&root.0)
-            .map_err(|_| Error("cannot lock runtimes directory (another GC may be active)"))?;
+        lock_runtimes(&root.0, Duration::from_secs(2))?;
         let mounts = (self.mounts)()?;
         let mut backups = codex_index::Backups::default();
         'providers: for provider in [Provider::Claude, Provider::Codex] {
@@ -872,6 +871,26 @@ fn try_lock(dir: &Dir, name: &OsStr) -> Result<Option<File>> {
         }
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(_) => Err(Error("unsafe or unreadable view lock")),
+    }
+}
+
+/// Take the runtimes directory's GC lock, waiting up to `patience`. A
+/// process forked elsewhere in this program (a test thread spawning a
+/// child, say) briefly shares the descriptor of a lock just released, until
+/// it execs; a short wait rides that out. Another GC keeps it for its whole
+/// run, so it still fails.
+fn lock_runtimes(dir: &std::fs::File, patience: Duration) -> Result<()> {
+    let deadline = Instant::now() + patience;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(dir) {
+            Ok(()) => return Ok(()),
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => {
+                return Err(Error(
+                    "cannot lock runtimes directory (another GC may be active)",
+                ));
+            }
+        }
     }
 }
 

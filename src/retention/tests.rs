@@ -1606,3 +1606,27 @@ fn operational_failure_before_publication_makes_apply_incomplete() {
             .contains("unsafe or unreadable view directory")
     );
 }
+
+#[test]
+fn the_gc_lock_waits_out_a_brief_holder_but_not_another_gc() {
+    let t = tempfile::tempdir().unwrap();
+    let ours = fs::File::open(t.path()).unwrap();
+    let other = fs::File::open(t.path()).unwrap();
+    // A brief holder (a forked child before exec) lets go within patience.
+    fs2::FileExt::lock_exclusive(&other).unwrap();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(200));
+            fs2::FileExt::unlock(&other).unwrap();
+        });
+        lock_runtimes(&ours, Duration::from_secs(5)).unwrap();
+    });
+    fs2::FileExt::unlock(&ours).unwrap();
+    // Another GC holds it throughout.
+    fs2::FileExt::lock_exclusive(&other).unwrap();
+    let failure = lock_runtimes(&ours, Duration::from_millis(200)).unwrap_err();
+    assert_eq!(
+        failure.0,
+        "cannot lock runtimes directory (another GC may be active)"
+    );
+}
