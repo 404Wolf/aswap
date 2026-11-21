@@ -104,6 +104,23 @@ alternative is at or above the soft threshold, an exhausted session uses the
 least-used eligible account below 100% as a last resort and logs that decision.
 Login and model rejections last the run. No code changes the caller's cwd.
 
+Every supervisor restart (an account switch, a return to a recovered account, a
+resume on a rotated token) first takes the machine-wide switch slot
+(`src/switch_gate.rs`), with the provider stopped and the terminal still
+responsive. At most one restart happens per `switch_interval_seconds` (default
+4; 0 disables) across all providers and supervisors of the user, so a shared
+limit or reset doesn't relaunch every session at once. Waiters queue first
+come, first served in `switch-gate.json`, which is read and rewritten only
+under an exclusive `flock` on `switch-gate.lock` next to `state.json` and never
+held across a sleep. Each waiter refreshes its ticket's heartbeat; a ticket
+silent for three intervals plus slack (at most 15 s) is dropped, so a killed
+waiter can't wedge the queue, and a waiter that stops waiting removes its own.
+A recorded switch in the future (clock stepped back) counts as now. A gate
+that can't be read or written lets the restart through. Initial launches are
+not gated: nothing has a limit yet, and a delay would only slow a new session.
+The per-session Wake stagger (1–30 s) still spreads quota checks; the gate is
+the hard cap on restarts only.
+
 Store trouble (a full disk, EIO, EAGAIN) never ends a provider. Store locks and
 private writes retry with backoff, but under the store lock for at most 1.5
 seconds: every supervisor takes that lock on its terminal thread, so a long

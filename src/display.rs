@@ -263,6 +263,18 @@ pub fn policy_text(p: &Policy<'_>) -> String {
         p.threshold
     )
 }
+/// The machine-wide spacing of supervisor account switches (all providers).
+pub fn switch_interval_text(seconds: u64) -> String {
+    if seconds == 0 {
+        "account switches: no machine-wide spacing".into()
+    } else {
+        format!("account switches: one at a time, at least {seconds}s apart across all sessions")
+    }
+}
+/// [`switch_interval_text`] wrapped and dimmed as a footer below the providers.
+pub fn switch_interval_lines(seconds: u64, width: usize, color: bool) -> Vec<String> {
+    Paint(color).lines("2", &switch_interval_text(seconds), width.max(1))
+}
 
 pub fn render(rows: &[Row<'_>], compact: bool, width: usize, color: bool, now: u64) -> String {
     render_with(rows, &[], compact, width, color, now)

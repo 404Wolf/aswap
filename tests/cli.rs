@@ -513,3 +513,53 @@ fn codex_monitor_prefers_soonest_reset_and_dry_run_only_logs_the_farthest() {
             .is_none()
     );
 }
+
+#[test]
+fn switch_interval_is_global_defaults_to_four_seconds_and_shows_in_list_and_status() {
+    let t = Sandbox::new();
+    t.seed();
+    t.ok(&["add", "claude", "work", "--json"]);
+    // Cached synthetic quota: status never touches a network.
+    fs::write(t.root().join("data/aswap/profiles/claude/work/usage-cache.json"), serde_json::to_vec(&json!({"usage":{"windows":[]},"fetched_at":aswap::now(),"next_poll_at":aswap::now()+3600,"failures":0,"error":null})).unwrap()).unwrap();
+    // A state written before the setting existed loads with the default.
+    let state = t.root().join("data/aswap/state.json");
+    let mut old: Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    old.as_object_mut()
+        .unwrap()
+        .remove("switch_interval_seconds");
+    fs::write(&state, serde_json::to_vec(&old).unwrap()).unwrap();
+    assert_eq!(t.ok(&["list", "--json"])["switch_interval_seconds"], 4);
+    assert_eq!(
+        t.ok(&["auto", "switch-interval", "--json"])["switch_interval_seconds"],
+        4
+    );
+    assert_eq!(
+        t.ok(&["auto", "switch-interval", "9", "--json"])["switch_interval_seconds"],
+        9
+    );
+    assert_eq!(t.ok(&["status", "--json"])["switch_interval_seconds"], 9);
+    let text = t.invoke(&["list"]);
+    assert!(
+        String::from_utf8_lossy(&text.stdout)
+            .contains("account switches: one at a time, at least 9s apart across all sessions"),
+        "{}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+    t.ok(&["auto", "switch-interval", "0", "--json"]);
+    let text = t.invoke(&["status"]);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("no machine-wide spacing"));
+    // Per-provider verbs are unchanged and keep the global setting.
+    t.ok(&["auto", "claude", "threshold", "80", "--json"]);
+    assert_eq!(t.ok(&["list", "--json"])["switch_interval_seconds"], 0);
+    assert!(
+        !t.invoke(&["auto", "switch-interval", "3601"])
+            .status
+            .success()
+    );
+    assert!(
+        !t.invoke(&["auto", "switch-interval", "-1"])
+            .status
+            .success()
+    );
+    assert!(!t.invoke(&["auto", "claude"]).status.success());
+}

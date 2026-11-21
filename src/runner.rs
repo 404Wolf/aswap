@@ -8,6 +8,7 @@ use crate::{
     Result, Safe,
     provider::Provider,
     store::{self, Account, Store},
+    switch_gate::SwitchGate,
     usage,
 };
 use std::{
@@ -190,6 +191,7 @@ pub fn run(
     };
     let mut rejected = Rejected::default();
     let mut switches = 0;
+    let mut gate = SwitchGate::open(store);
     let mut restarts = Restarts::default();
     let mut next_sync = 0;
     let mut syncing: Option<std::thread::JoinHandle<bool>> = None;
@@ -600,6 +602,7 @@ pub fn run(
             let _ = crate::refresh::for_run(store, &account);
             patiently("handing over the new token", || view.sync(store, &account))?;
             omit_one_shot(auto_args.as_ref().unwrap(), &mut terminal)?;
+            switch_slot(store, &mut gate, &mut terminal)?;
             launch_args = resume_args;
             switches += 1;
             restarts.record();
@@ -737,6 +740,9 @@ pub fn run(
                     .expect("auto terminal")
                     .wait_for_restart(250)?;
             }
+            // At most one supervisor on this machine switches per interval;
+            // the target is chosen below, once this one's turn comes.
+            switch_slot(store, &mut gate, &mut terminal)?;
             // Eligibility can change after stopping the old provider. A lost
             // target is a normal wait outcome; store failures retain their own
             // retry policy. Neither permits launching a rejected account.
@@ -827,6 +833,34 @@ pub fn run(
         switches += 1;
         restarts.record();
     }
+}
+
+/// Wait for this machine's switch slot (see `switch_gate`) with the provider
+/// stopped, keeping the terminal responsive. Every supervisor restart passes
+/// here: account switches, returns to a recovered account and resumes on a
+/// rotated token. Initial launches do not.
+fn switch_slot(
+    store: &Store,
+    gate: &mut SwitchGate,
+    terminal: &mut Option<Terminal>,
+) -> Result<()> {
+    // An unreadable setting keeps the default rather than end the session.
+    let seconds = store
+        .lock()
+        .and_then(|_lock| store.load())
+        .map_or(crate::switch_gate::DEFAULT_INTERVAL_SECONDS, |state| {
+            state.switch_interval_seconds
+        });
+    let interval = Duration::from_secs(seconds.min(store::MAX_SWITCH_INTERVAL));
+    gate.acquire(interval, |pause| match terminal {
+        Some(terminal) => {
+            terminal.wait_for_restart(i32::try_from(pause.as_millis()).unwrap_or(i32::MAX))
+        }
+        None => {
+            std::thread::sleep(pause);
+            Ok(())
+        }
+    })
 }
 
 fn launch_seed(

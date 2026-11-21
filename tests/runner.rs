@@ -1062,6 +1062,9 @@ fn runner_safety_child() {
     if case.starts_with("boundedhigh") || case == "boundedcap" {
         let mut state = store.load().unwrap();
         state.auto.entry(provider).or_default().threshold = 90.0;
+        // Eight quick restarts: the hourly cap, not the machine-wide
+        // switch spacing (tests/switch_gate.rs), is under test here.
+        state.switch_interval_seconds = 0;
         store.save(&state).unwrap();
     }
     if case == "limitresumed" {
