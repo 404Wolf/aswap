@@ -85,8 +85,9 @@ preference you set explicitly is kept. To rank by the most headroom instead:
 ```sh
 aswap auto codex prefer headroom        # or: aswap auto claude prefer headroom
 ```
- The 5-hour session
-window does not affect this ranking: it renews every 5 hours whatever you do.
+
+The 5-hour session window does not affect this ranking: it renews every 5
+hours whatever you do.
 Past the switch threshold, aswap's last-resort fallback ranks by the most
 headroom instead, to keep the session running as long as possible.
 

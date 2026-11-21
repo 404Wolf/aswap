@@ -663,8 +663,9 @@ fn resume(
         .find(|c| c.id == pending.credit_id)
     {
         if credit_mentions_money(credit) {
-            log.pending = None;
-            return refuse(port, settings, log, pending.label, None, at);
+            let label = pending.label.clone();
+            log.abandon(pending, "its credit now mentions money", at);
+            return refuse(port, settings, log, label, None, at);
         }
         if credit.expires_at.is_some_and(|e| e <= at) {
             return drop_pending(port, log, pending, "its credit has expired", at);
@@ -1975,6 +1976,12 @@ mod tests {
             }
         );
         assert!(fake.redeemed.is_empty() && log.pending.is_none() && log.halted.is_some());
+        // The earlier attempt may have spent: recorded unconfirmed, with a
+        // cooldown and a skip, before the refusal.
+        let outcomes: Vec<_> = log.history.iter().map(|r| r.outcome.as_str()).collect();
+        assert_eq!(outcomes, ["unconfirmed", "refused"]);
+        assert_eq!(log.cooldown_until(), Some(AT + COOLDOWN));
+        assert!(log.skipped("six", AT + DAY));
         // The fresh read fails: wait, with the key kept.
         let mut log = ResetLog {
             pending: Some(pending(1, AT)),
