@@ -11,7 +11,8 @@ use std::{
     path::Path,
 };
 
-pub(super) const PREFIX: &str = ".retiring-";
+/// A view being retired is renamed to this prefix plus its run name.
+pub(crate) const PREFIX: &str = ".retiring-";
 
 fn rename(parent: &Dir, source: &OsStr, target: &OsStr, message: &'static str) -> Result<()> {
     renameat_with(&parent.0, source, &parent.0, target, RenameFlags::NOREPLACE).safe(message)

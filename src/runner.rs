@@ -235,7 +235,9 @@ pub fn launch(
         crate::shared::View::prepare(store, &account)
     })?;
     patiently("recording the session's view", || lease.view(&view.path))?;
-    let mut cleanup = how.pick.then(|| crate::shared::ViewCleanup::new(store, &view));
+    let mut cleanup = how
+        .pick
+        .then(|| crate::shared::ViewCleanup::new(store, &view));
     if auto_args.as_ref().is_some_and(|a| a.ambiguous) {
         let help = crate::session::option_help(provider, &view.path, args);
         auto_args = Some(crate::session::AutoArgs::parse_with_help(
