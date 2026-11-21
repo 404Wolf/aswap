@@ -27,6 +27,9 @@ pub enum SqliteRisk {
     PrivateCopy,
     /// A -wal or -shm beside a linked database is a private file.
     PrivateSidecar,
+    /// A private database (recreated in the view) whose -wal or -shm still
+    /// links to the home's: its frames would land in the home database's WAL.
+    PrivateCopySharedWal,
     /// A -wal or -shm beside a linked database is not linked. Safe while
     /// clients resolve the database link, as SQLite does.
     UnlinkedSidecar,
@@ -79,6 +82,18 @@ pub fn sqlite_risks(
                 };
                 if !link(&file) {
                     if meta.is_file() {
+                        for suffix in WAL_SIDECARS {
+                            let mut name = database.clone();
+                            name.push(suffix);
+                            let sidecar = view.join(name);
+                            if link(&sidecar) {
+                                risks.push(ViewRisk {
+                                    view: view.clone(),
+                                    file: sidecar,
+                                    risk: SqliteRisk::PrivateCopySharedWal,
+                                });
+                            }
+                        }
                         risks.push(ViewRisk {
                             view: view.clone(),
                             file,

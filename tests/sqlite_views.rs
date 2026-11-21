@@ -130,6 +130,27 @@ fn sqlite_child() {
     assert_eq!(of(&old), ["unlinked-sidecar", "unlinked-sidecar"]);
     assert_eq!(of(&broken), ["private-sidecar"]);
     assert!(of(&view.path).is_empty());
+    // A database recreated as a private file while its sidecars still
+    // link to the home's: the worst case, flagged on its own.
+    let recreated = runs.join("run-New000");
+    fs::create_dir(&recreated).unwrap();
+    fs::write(recreated.join("state_5.sqlite"), b"").unwrap();
+    symlink(
+        home.join("state_5.sqlite-wal"),
+        recreated.join("state_5.sqlite-wal"),
+    )
+    .unwrap();
+    let (code, report) = check(true);
+    assert_eq!(code, Some(1), "{report}");
+    let risks = report["sqlite_views"].as_array().unwrap();
+    let of = |view: &Path| -> Vec<&str> {
+        risks
+            .iter()
+            .filter(|r| r["view"]["view"] == view.to_str().unwrap())
+            .map(|r| r["view"]["risk"].as_str().unwrap())
+            .collect()
+    };
+    assert_eq!(of(&recreated), ["private-copy-shared-wal", "private-copy"]);
     // The check changed nothing.
     assert!(broken.join("state_5.sqlite-wal").is_file());
     assert!(!old.join("state_5.sqlite-wal").exists());

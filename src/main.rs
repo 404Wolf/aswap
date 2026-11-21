@@ -479,6 +479,9 @@ fn execute(cli: Cli) -> Result<i32> {
             for (p, r) in risks.iter().filter(|(_, r)| r.risk.dangerous()) {
                 let risk = match r.risk {
                     aswap::shared::SqliteRisk::PrivateCopy => "private database copy",
+                    aswap::shared::SqliteRisk::PrivateCopySharedWal => {
+                        "private database with a link to the home's WAL"
+                    }
                     _ => "private SQLite sidecar",
                 };
                 pretty.push_str(&format!("\n{p} {risk}: {}", r.file.display()));
