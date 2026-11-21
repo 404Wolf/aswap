@@ -104,6 +104,7 @@ let
         "${cfg.package}/bin/aswap auto ${provider} prefer ${settings.prefer}"
       ] ++ (lib.optional (provider == "codex") "${cfg.package}/bin/aswap auto ${provider} reset ${settings.autoReset}")
         ++ [
+        "${cfg.package}/bin/aswap auto switch-interval ${toString cfg.switchIntervalSeconds}"
         "${cfg.package}/bin/aswap auto ${provider} on"
       ];
       ExecStart = "${cfg.package}/bin/aswap auto ${provider} watch";
@@ -123,6 +124,11 @@ in {
     autoswitch = {
       claude = mkOption { type = types.submodule providerOptions; default = {}; };
       codex = mkOption { type = types.submodule providerOptions; default = {}; };
+    };
+    switchIntervalSeconds = mkOption {
+      type = types.ints.between 0 3600;
+      default = 4;
+      description = "Minimum seconds between account switches of all run --auto sessions sharing this aswap data directory, across providers, so a shared limit or reset moves them one at a time; 0 disables. Applied when an autoswitch monitor starts.";
     };
     retention = {
       enable = mkEnableOption "retention of finished aswap runtime views";

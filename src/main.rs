@@ -76,10 +76,14 @@ enum Action {
         account: Option<String>,
     },
     /// Configure or monitor automatic account selection.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Auto {
-        provider: Provider,
-        #[arg(value_enum)]
-        action: AutoAction,
+        #[command(subcommand)]
+        global: Option<AutoGlobal>,
+        #[arg(required = true)]
+        provider: Option<Provider>,
+        #[arg(value_enum, required = true)]
+        action: Option<AutoAction>,
         #[arg(
             help = "Percentage for threshold; text or off for resume-prompt; headroom or weekly-reset for prefer; off, dry-run or on for reset (Codex only); account label for reserve or unreserve"
         )]
@@ -126,6 +130,16 @@ enum Action {
         interval: u64,
     },
 }
+/// Settings shared by every provider, given without one.
+#[derive(Subcommand)]
+enum AutoGlobal {
+    /// Show or set the minimum seconds between account switches of all
+    /// supervised sessions on this machine (every provider); 0 turns it off.
+    SwitchInterval {
+        #[arg(value_parser = clap::value_parser!(u64).range(0..=store::MAX_SWITCH_INTERVAL))]
+        seconds: Option<u64>,
+    },
+}
 #[derive(Clone, Copy, ValueEnum)]
 enum AutoAction {
     ResumePrompt,
@@ -153,10 +167,15 @@ fn output(value: &Value, structured: bool, pretty: String) -> Result<()> {
     writeln!(out, "{text}").safe("cannot write output")
 }
 fn snapshot(store: &Store, filter: Option<Provider>, refresh: bool) -> Result<Value> {
-    let (accounts, active, settings) = {
+    let (accounts, active, settings, switch_interval) = {
         let _lock = store.lock()?;
         let state = store.load()?;
-        (state.accounts, state.active, state.auto)
+        (
+            state.accounts,
+            state.active,
+            state.auto,
+            state.switch_interval_seconds,
+        )
     };
     let mut rows = Vec::new();
     for a in accounts
@@ -192,7 +211,7 @@ fn snapshot(store: &Store, filter: Option<Provider>, refresh: bool) -> Result<Va
             .unwrap_or_else(|err| json!({"error": err.to_string()}))
     };
     Ok(
-        json!({"schema_version":1,"accounts":rows,"auto":settings,"codex_usage_resets":usage_resets,"credential_mode":if coordination.owner {"refresh-owner"}else if coordination.host.is_some(){"access-only-follower"}else{"refresh-disabled"},"last_sync":coordination.last_sync,"sync":aswap::coordination::status(store)?}),
+        json!({"schema_version":1,"accounts":rows,"auto":settings,"codex_usage_resets":usage_resets,"switch_interval_seconds":switch_interval,"credential_mode":if coordination.owner {"refresh-owner"}else if coordination.host.is_some(){"access-only-follower"}else{"refresh-disabled"},"last_sync":coordination.last_sync,"sync":aswap::coordination::status(store)?}),
     )
 }
 fn duplicate_labels(store: &Store, account: &store::Account) -> Result<Vec<String>> {
@@ -282,14 +301,15 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
             auto_reset: a.auto_reset,
         })
         .collect();
-    Ok(aswap::display::render_with(
-        &rows,
-        &policies,
-        compact,
-        width,
-        io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
-        now(),
-    ))
+    let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let mut text = aswap::display::render_with(&rows, &policies, compact, width, color, now());
+    if !rows.is_empty()
+        && let Some(seconds) = value["switch_interval_seconds"].as_u64()
+    {
+        text.push_str(if compact { "\n" } else { "\n\n" });
+        text.push_str(&aswap::display::switch_interval_lines(seconds, width, color).join("\n"));
+    }
+    Ok(text)
 }
 fn rows_text(value: &Value) -> String {
     let rows = value["accounts"].as_array().unwrap();
@@ -494,11 +514,32 @@ fn execute(cli: Cli) -> Result<i32> {
             auto,
         } => return runner::run(&store, provider, account.as_deref(), &args, auto),
         Action::Auto {
+            global: Some(AutoGlobal::SwitchInterval { seconds }),
+            ..
+        } => {
+            let _lock = store.lock()?;
+            let mut state = store.load()?;
+            if let Some(seconds) = seconds {
+                state.switch_interval_seconds = seconds;
+                store.save(&state)?;
+            }
+            let seconds = state.switch_interval_seconds;
+            output(
+                &json!({"switch_interval_seconds":seconds}),
+                cli.json,
+                aswap::display::switch_interval_text(seconds),
+            )?;
+        }
+        Action::Auto {
             provider,
             action,
             value,
             activate_live,
+            ..
         } => {
+            let (Some(provider), Some(action)) = (provider, action) else {
+                unreachable!("clap requires a provider and an action without a subcommand")
+            };
             if matches!(
                 action,
                 AutoAction::Threshold

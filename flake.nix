@@ -82,6 +82,7 @@
                   autoswitch.claude.resumePrompt = ''synthetic "quotes" $HOME %n'';
                   autoswitch.codex.enable = true;
                   autoswitch.codex.resumePrompt = null;
+                  switchIntervalSeconds = 0;
                   waybar.enable = true;
                 };
               }
@@ -155,6 +156,8 @@
             assert pkgs.lib.hasSuffix " auto codex reset dry-run" (builtins.elemAt hmPeer.config.systemd.user.services.aswap-codex.Service.ExecStartPre 4);
             assert !(builtins.any (pkgs.lib.hasInfix " reset ") hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre);
             assert pkgs.lib.hasSuffix " auto codex on" (pkgs.lib.last hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre);
+            assert builtins.any (pkgs.lib.hasSuffix " auto switch-interval 0") hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre;
+            assert builtins.any (pkgs.lib.hasSuffix " auto switch-interval 4") hmPeer.config.systemd.user.services.aswap-claude.Service.ExecStartPre;
             assert hm.config.programs.waybar.settings.mainBar."custom/aswap".return-type == "json";
             pkgs.runCommand "aswap-home-manager" { nativeBuildInputs = [ pkgs.python3 ]; } ''
               python3 - ${hmPeer.config.xdg.configFile."aswap/config.toml".source} <<'PY'

@@ -85,12 +85,31 @@ impl Auto {
         pinned == Some(label) || !self.reserved.iter().any(|reserved| reserved == label)
     }
 }
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct State {
     pub accounts: Vec<Account>,
     pub active: BTreeMap<Provider, String>,
     pub auto: BTreeMap<Provider, Auto>,
+    /// Machine-wide minimum spacing of supervisor account switches, across
+    /// every provider (see `switch_gate`); 0 turns the gate off.
+    #[serde(default = "default_switch_interval")]
+    pub switch_interval_seconds: u64,
 }
+fn default_switch_interval() -> u64 {
+    crate::switch_gate::DEFAULT_INTERVAL_SECONDS
+}
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            accounts: Vec::new(),
+            active: BTreeMap::new(),
+            auto: BTreeMap::new(),
+            switch_interval_seconds: default_switch_interval(),
+        }
+    }
+}
+/// The longest accepted `switch_interval_seconds`.
+pub const MAX_SWITCH_INTERVAL: u64 = 3600;
 pub struct Store {
     pub root: PathBuf,
     pub(crate) sync_policy_path: PathBuf,
