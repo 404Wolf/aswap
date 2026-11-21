@@ -1919,9 +1919,11 @@ mod tests {
             )
             .unwrap_err()
         };
-        // An owner that refuses the stream.
+        // An owner that refuses the stream. It reads the request first, as
+        // the real owner does: exiting before then races the follower's
+        // write and reports request-write-failed instead.
         let error = fail(
-            "printf 'aswap: sync: version-mismatch\\n' >&2; exit 1",
+            "IFS= read -r request || exit 2; printf 'aswap: sync: version-mismatch\\n' >&2; exit 1",
             Duration::from_secs(5),
         );
         assert_eq!(error.0, "sync: version-mismatch");
