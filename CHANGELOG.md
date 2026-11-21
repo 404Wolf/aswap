@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 (2026-11-21)
+
+### Added
+- **Why a reading isn't usable.** Each account in `list`/`usage`/`status` JSON now carries `usage_reason` (`fresh`, `never-fetched`, `error`, `unverified-limit`, `stale`, `reset-passed` or `no-windows`) and `age_seconds` (seconds since the reading, by the machine's clock). `remaining_percent` is set exactly when the reason is `fresh`.
+- **`list --json` is a pinned interface.** A test fixes its keys and the `usage_status` values, and the README documents it as the stable, cache-only way for other programs (the Herdr Usage view) to read usage. Fields are only ever added under `schema_version` 1.
+
 ## 0.2.0 (2026-11-21)
 
 ### Added
