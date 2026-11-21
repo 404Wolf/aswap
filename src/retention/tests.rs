@@ -1158,6 +1158,34 @@ fn codex_sqlite_groups_with_only_links_are_unlinked_without_reading_targets() {
 }
 
 #[test]
+fn prelinked_sidecars_that_do_not_exist_yet_are_unlinked_with_their_database() {
+    // View::prepare links <db>-wal/-shm before they exist: dangling links.
+    let t = Fixture::new();
+    let view = t.view("codex", "run-prelinked");
+    let db = t.home.join("queue_1.sqlite");
+    write(&db, b"synthetic shared data");
+    symlink(&db, view.join("queue_1.sqlite")).unwrap();
+    for suffix in ["-wal", "-shm"] {
+        symlink(
+            t.home.join(format!("queue_1.sqlite{suffix}")),
+            view.join(format!("queue_1.sqlite{suffix}")),
+        )
+        .unwrap();
+    }
+    let apply = t.run(Mode::Apply);
+    assert_eq!(apply.totals.removed, 1, "{}", apply.text());
+    assert!(!view.exists());
+    assert!(!t.root.join("archive").exists());
+    // Nothing was created through the dangling links.
+    let names: Vec<_> = fs::read_dir(&t.home)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["queue_1.sqlite"]);
+    assert_eq!(fs::read(&db).unwrap(), b"synthetic shared data");
+}
+
+#[test]
 fn codex_full_copy_snapshots_main_and_wal_and_prunes_shared_memory() {
     let t = Fixture::new();
     let view = t.view("codex", "run-private-sqlite");
