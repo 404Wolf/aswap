@@ -1,13 +1,14 @@
 //! Terminal-only rendering: identity hints never enter JSON, Waybar or caches.
 use crate::{
     identity::Identity,
-    store::Prefer,
+    store::{AutoReset, Prefer},
     usage::{Cached, Window},
 };
 pub struct Row<'a> {
     pub provider: &'a str,
     pub label: &'a str,
     pub active: bool,
+    pub reserved: bool,
     pub identity: &'a Identity,
     pub duplicates: &'a [String],
     pub cached: &'a Cached,
@@ -18,6 +19,7 @@ pub struct Policy<'a> {
     pub enabled: bool,
     pub threshold: f64,
     pub prefer: Prefer,
+    pub auto_reset: AutoReset,
 }
 /// Observations older than this are shown dimmed with their age.
 const FRESH: u64 = 600;
@@ -251,11 +253,27 @@ pub fn policy_text(p: &Policy<'_>) -> String {
         Prefer::Headroom => "most headroom",
         Prefer::WeeklyReset => "soonest weekly reset",
     };
+    let reset = match p.auto_reset {
+        AutoReset::Off => String::new(),
+        mode => format!(" · usage reset {}", mode.as_str()),
+    };
     format!(
-        "auto-select {} · switch at {}% used · prefer {prefer}",
+        "auto-select {} · switch at {}% used · prefer {prefer}{reset}",
         if p.enabled { "on" } else { "off" },
         p.threshold
     )
+}
+/// The machine-wide spacing of supervisor account switches (all providers).
+pub fn switch_interval_text(seconds: u64) -> String {
+    if seconds == 0 {
+        "account switches: no machine-wide spacing".into()
+    } else {
+        format!("account switches: one at a time, at least {seconds}s apart across all sessions")
+    }
+}
+/// [`switch_interval_text`] wrapped and dimmed as a footer below the providers.
+pub fn switch_interval_lines(seconds: u64, width: usize, color: bool) -> Vec<String> {
+    Paint(color).lines("2", &switch_interval_text(seconds), width.max(1))
 }
 
 pub fn render(rows: &[Row<'_>], compact: bool, width: usize, color: bool, now: u64) -> String {
@@ -365,6 +383,9 @@ fn render_row(
     let marker = if row.active { "●" } else { "○" };
     let label = format!("{:<label_width$}", clean(row.label));
     let mut facts = Vec::new();
+    if row.reserved {
+        facts.push("reserved".into());
+    }
     match (&row.identity.email, &row.identity.plan) {
         (Some(e), Some(p)) => facts.push(format!("{} · {}", clean(e), clean(p))),
         (Some(e), None) => facts.push(clean(e)),

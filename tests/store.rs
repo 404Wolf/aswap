@@ -191,3 +191,21 @@ fn legacy_auto_settings_get_default_prompt_and_off_survives_reload() {
         serde_json::from_value(serde_json::to_value(policy).unwrap()).unwrap();
     assert!(restored.resume_prompt.is_none());
 }
+#[test]
+fn legacy_auto_settings_load_with_no_reservations() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = aswap::store::Store::open(temp.path().join("store")).unwrap();
+    aswap::store::json_write(
+        &store.root.join("state.json"),
+        &serde_json::json!({
+            "accounts": [],
+            "active": {},
+            "auto": {"claude": {"enabled":true,"threshold":85.0,"last_switch":10}}
+        }),
+    )
+    .unwrap();
+    let state = store.load().unwrap();
+    let settings = &state.auto[&aswap::provider::Provider::Claude];
+    assert!(settings.enabled);
+    assert!(settings.reserved.is_empty());
+}

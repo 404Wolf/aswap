@@ -48,24 +48,10 @@ pub fn tick(store: &Store, provider: Provider, activate_live: bool) -> Result<Op
     let Some(current) = state.active.get(&provider) else {
         return Ok(None);
     };
-    let Some(account) = usage::choose(
-        current,
-        &entries,
-        settings.threshold,
-        settings.prefer,
-        settings.last_switch,
-        now(),
-        false,
-    )
-    .or_else(|| {
-        usage::prefer_at_launch(
-            current,
-            &entries,
-            settings.threshold,
-            settings.prefer,
-            now(),
-        )
-    }) else {
+    let at = now();
+    let Some(account) = usage::choose(current, &entries, &settings, at, false, None)
+        .or_else(|| usage::prefer_at_launch(current, &entries, &settings, at))
+    else {
         return Ok(None);
     };
     if activate_live {

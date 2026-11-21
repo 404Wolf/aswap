@@ -32,6 +32,83 @@ pub struct Usage {
     pub credits: Option<Credits>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_usage_resets: Option<u64>,
+    /// Codex usage-limit reset credits as the app-server lists them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reset_credits: Vec<ResetCredit>,
+}
+/// One Codex usage-limit reset credit. Redeeming it resets the account's
+/// eligible windows (5-hour and weekly together); it is an earned, expiring
+/// allowance. Text fields are bounded and stripped of control characters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetCredit {
+    /// Opaque backend identifier, passed back when redeeming.
+    pub id: String,
+    /// `available`, `redeeming`, `redeemed` or `unknown`.
+    pub status: String,
+    /// `codexRateLimits` or `unknown`.
+    pub reset_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+impl ResetCredit {
+    pub fn available(&self) -> bool {
+        self.status == "available" && self.reset_type == "codexRateLimits"
+    }
+}
+const MAX_RESET_CREDITS: usize = 16;
+fn bounded_text(value: Option<&Value>) -> Option<String> {
+    let text: String = value?
+        .as_str()?
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+fn parse_reset_credit(v: &Value) -> Option<ResetCredit> {
+    let id = v.get("id")?.as_str()?;
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
+    {
+        return None;
+    }
+    let known = |key: &str, values: &[&str]| {
+        let value = v.get(key).and_then(Value::as_str).unwrap_or("");
+        if values.contains(&value) {
+            value
+        } else {
+            "unknown"
+        }
+        .to_owned()
+    };
+    Some(ResetCredit {
+        id: id.to_owned(),
+        status: known("status", &["available", "redeeming", "redeemed"]),
+        reset_type: known("resetType", &["codexRateLimits"]),
+        expires_at: v.get("expiresAt").and_then(Value::as_u64),
+        title: bounded_text(v.get("title")),
+        description: bounded_text(v.get("description")),
+    })
+}
+pub fn parse_reset_credits(v: &Value) -> Vec<ResetCredit> {
+    v.pointer("/rateLimitResetCredits/credits")
+        .and_then(Value::as_array)
+        .map(|credits| {
+            credits
+                .iter()
+                .take(MAX_RESET_CREDITS)
+                .filter_map(parse_reset_credit)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Credits {
@@ -61,6 +138,29 @@ fn deserialize_windows<'de, D: serde::Deserializer<'de>>(
     }
     Ok(windows)
 }
+/// A reading older than this many seconds no longer drives selection.
+pub const STALE_AFTER: u64 = 600;
+
+/// Why a cached reading is or isn't usable (`usage_reason` in the JSON).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Reason {
+    /// Usable: fresh, with windows, none past its reset.
+    Fresh,
+    /// No reading yet.
+    NeverFetched,
+    /// The last attempt failed; see `usage_error`.
+    Error,
+    /// A hard limit seen earlier is missing from the latest reading.
+    UnverifiedLimit,
+    /// Older than [`STALE_AFTER`] seconds.
+    Stale,
+    /// A window has passed its reset time since the reading.
+    ResetPassed,
+    /// The provider reported no windows.
+    NoWindows,
+}
+
 impl Usage {
     pub fn used(&self, at: u64) -> Option<f64> {
         // A reset makes observations obsolete, not evidence of an empty account.
@@ -76,6 +176,10 @@ impl Usage {
     /// When the account-wide weekly window resets; model-specific weekly
     /// windows only stand in when no account-wide one was observed.
     pub fn weekly_reset(&self, at: u64) -> Option<u64> {
+        self.weekly(at).and_then(|w| w.resets_at)
+    }
+    /// The account-wide weekly window with a reset still ahead.
+    pub fn weekly(&self, at: u64) -> Option<&Window> {
         let weekly =
             |w: &&Window| w.duration_minutes == Some(10080) && w.resets_at.is_some_and(|r| r > at);
         self.windows
@@ -88,7 +192,6 @@ impl Usage {
                     .filter(weekly)
                     .min_by_key(|w| w.resets_at)
             })
-            .and_then(|w| w.resets_at)
     }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -168,12 +271,63 @@ impl Cached {
     pub fn used(&self, at: u64) -> Option<f64> {
         if self.error.is_some()
             || !self.unverified_limits.is_empty()
-            || at.saturating_sub(self.fetched_at) > 600
+            || at.saturating_sub(self.fetched_at) > STALE_AFTER
         {
             None
         } else {
             self.usage.used(at)
         }
+    }
+    /// Why this reading is, or isn't, usable at `at`: exactly when it is
+    /// [`Reason::Fresh`] does [`Cached::used`] return a value.
+    pub fn reason(&self, at: u64) -> Reason {
+        if self.error.is_some() {
+            Reason::Error
+        } else if self.fetched_at == 0 {
+            Reason::NeverFetched
+        } else if !self.unverified_limits.is_empty() {
+            Reason::UnverifiedLimit
+        } else if at.saturating_sub(self.fetched_at) > STALE_AFTER {
+            Reason::Stale
+        } else if self
+            .usage
+            .windows
+            .iter()
+            .any(|w| w.resets_at.is_some_and(|r| r <= at))
+        {
+            Reason::ResetPassed
+        } else if self.usage.windows.is_empty() {
+            Reason::NoWindows
+        } else {
+            Reason::Fresh
+        }
+    }
+    /// Seconds since the reading was fetched; none if it never was.
+    pub fn age(&self, at: u64) -> Option<u64> {
+        (self.fetched_at != 0).then(|| at.saturating_sub(self.fetched_at))
+    }
+
+    /// Whether this account is held by a usage limit, and until when if the
+    /// provider said. A recorded provider limit without a known exhausted
+    /// window is blocked with an unknown end.
+    pub fn limit_block(&self, at: u64) -> Option<Option<u64>> {
+        let exhausted: Vec<&Window> = self
+            .usage
+            .windows
+            .iter()
+            .filter(|w| w.used_percent >= 100.0)
+            .chain(self.unverified_limits.iter().map(UnverifiedLimit::window))
+            .filter(|w| w.resets_at.is_none_or(|r| r > at))
+            .collect();
+        if exhausted.is_empty() && self.error.as_deref() != Some("provider-limit") {
+            return None;
+        }
+        let known = exhausted.iter().all(|w| w.resets_at.is_some());
+        Some(
+            known
+                .then(|| exhausted.iter().filter_map(|w| w.resets_at).max())
+                .flatten(),
+        )
     }
 
     pub fn reset_times(&self) -> impl Iterator<Item = u64> + '_ {
@@ -323,6 +477,7 @@ pub fn parse_codex(v: &Value) -> Result<Usage> {
         windows,
         credits,
         available_usage_resets,
+        reset_credits: parse_reset_credits(v),
     })
 }
 #[derive(Clone, Copy, Debug)]
@@ -390,6 +545,24 @@ pub(crate) fn codex_request(
     method: &str,
     params: Value,
 ) -> Result<Value> {
+    codex_request_within(
+        profile,
+        diagnostic,
+        overrides,
+        method,
+        params,
+        Duration::from_secs(10),
+    )
+}
+/// `codex_request` with its own per-response deadline.
+pub(crate) fn codex_request_within(
+    profile: &Path,
+    diagnostic: &std::cell::Cell<Failure>,
+    overrides: &[String],
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
     let mut command = Provider::Codex.command(profile);
     command.args(overrides);
     let mut child = Process(
@@ -438,7 +611,7 @@ pub(crate) fn codex_request(
             input.flush().safe("app-server flush failed")
         };
         let receive = |id: u64| -> Result<Value> {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + timeout;
             for _ in 0..128 {
                 let remain = deadline.saturating_duration_since(std::time::Instant::now());
                 let v = rx
@@ -537,6 +710,17 @@ pub(crate) fn fetch_codex(auth: Result<Value>) -> std::result::Result<Usage, Fai
 }
 pub(crate) fn fetch_claude(profile: &Path) -> std::result::Result<Usage, Failure> {
     fetch_claude_with(profile, request_claude)
+}
+/// A temporary Codex home holding only the profile's access token: an
+/// app-server started there cannot rotate auth behind a running CLI.
+pub(crate) fn access_only_home(account: &Account, profile: &Path) -> Result<tempfile::TempDir> {
+    let temporary = tempfile::tempdir().safe("cannot prepare usage auth")?;
+    let auth: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
+    store::json_write(
+        &temporary.path().join(account.provider.auth_file()),
+        &crate::refresh::access_only(account.provider, &auth),
+    )?;
+    Ok(temporary)
 }
 fn fetch_claude_with<F>(profile: &Path, request: F) -> std::result::Result<Usage, Failure>
 where
@@ -760,18 +944,21 @@ fn rank(prefer: Prefer, a: &Cached, b: &Cached, at: u64) -> std::cmp::Ordering {
 pub fn choose<'a>(
     current: &str,
     entries: &'a [(Account, Cached)],
-    threshold: f64,
-    prefer: Prefer,
-    last_switch: u64,
+    settings: &store::Auto,
     at: u64,
     limited: bool,
+    pinned: Option<&str>,
 ) -> Option<&'a Account> {
+    let threshold = settings.threshold;
     let (_, current_cache) = entries.iter().find(|(a, _)| a.label == current)?;
     let used = current_cache.used(at);
-    let exhausted =
-        limited || !current_cache.unverified_limits.is_empty() || used.is_some_and(|v| v >= 100.0);
+    let exhausted = limited
+        || !settings.allows(current, pinned)
+        || !current_cache.unverified_limits.is_empty()
+        || used.is_some_and(|v| v >= 100.0);
     if !exhausted
-        && used.is_none_or(|v| v < threshold || (v < 100.0 && at.saturating_sub(last_switch) < 300))
+        && (pinned == Some(current)
+            || used.is_none_or(|v| v < threshold || at.saturating_sub(settings.last_switch) < 300))
     {
         return None;
     }
@@ -780,6 +967,7 @@ pub fn choose<'a>(
             .iter()
             .filter(|(a, c)| {
                 a.label != current
+                    && settings.allows(&a.label, pinned)
                     && c.used(at).is_some_and(|v| {
                         v < ceiling && (forced || used.is_some_and(|u| u - v >= 10.0))
                     })
@@ -787,7 +975,7 @@ pub fn choose<'a>(
             .min_by(|(_, a), (_, b)| rank(preference, a, b, at))
             .map(|(a, _)| a)
     };
-    eligible(threshold, exhausted, prefer).or_else(|| {
+    eligible(threshold, exhausted, settings.prefer).or_else(|| {
         exhausted
             .then(|| eligible(100.0, true, Prefer::Headroom))
             .flatten()
@@ -800,17 +988,19 @@ pub fn choose<'a>(
 pub fn prefer_at_launch<'a>(
     current: &str,
     entries: &'a [(Account, Cached)],
-    threshold: f64,
-    prefer: Prefer,
+    settings: &store::Auto,
     at: u64,
 ) -> Option<&'a Account> {
+    let prefer = settings.prefer;
     if prefer != Prefer::WeeklyReset {
         return None;
     }
     let (_, mine) = entries.iter().find(|(a, _)| a.label == current)?;
     let best = entries
         .iter()
-        .filter(|(_, c)| c.used(at).is_some_and(|v| v < threshold))
+        .filter(|(a, c)| {
+            settings.allows(&a.label, None) && c.used(at).is_some_and(|v| v < settings.threshold)
+        })
         .min_by(|(_, a), (_, b)| rank(prefer, a, b, at))?;
     let sooner = match (best.1.usage.weekly_reset(at), mine.usage.weekly_reset(at)) {
         (Some(x), Some(y)) => x < y,
@@ -827,14 +1017,15 @@ pub fn prefer_at_launch<'a>(
 /// account whose last error-free reading is below the threshold. Readings
 /// may be stale here (a follower's come from the owner, often older than the
 /// freshness limit); a stale reading still tells a live account from a dead
-/// one.
+/// one. Reserved accounts are skipped unless `pinned`.
 pub fn best_known<'a>(
     current: &str,
     entries: &'a [(Account, Cached)],
-    threshold: f64,
-    prefer: Prefer,
+    settings: &store::Auto,
     at: u64,
+    pinned: Option<&str>,
 ) -> Option<&'a Account> {
+    let (threshold, prefer) = (settings.threshold, settings.prefer);
     // An exhausted window missing from the last poll may still be exhausted.
     let known = |c: &Cached| {
         (c.error.is_none() && c.unverified_limits.is_empty())
@@ -842,15 +1033,16 @@ pub fn best_known<'a>(
             .flatten()
     };
     let (_, mine) = entries.iter().find(|(a, _)| a.label == current)?;
-    if mine.used(at).is_some()
-        || (mine.error.is_none() && known(mine).is_some_and(|v| v < threshold))
+    if settings.allows(current, pinned)
+        && (mine.used(at).is_some()
+            || (mine.error.is_none() && known(mine).is_some_and(|v| v < threshold)))
     {
         return None;
     }
     entries
         .iter()
         .filter_map(|(a, c)| Some((a, c, known(c).filter(|v| *v < threshold)?)))
-        .filter(|(a, _, _)| a.label != current)
+        .filter(|(a, _, _)| a.label != current && settings.allows(&a.label, pinned))
         .min_by(|(_, a, x), (_, b, y)| {
             let by_reset = match prefer {
                 Prefer::Headroom => std::cmp::Ordering::Equal,
@@ -970,6 +1162,11 @@ mod isolation_tests {
     #[test]
     fn a_single_call_leaves_an_account_of_unknown_quota_for_a_known_one() {
         let at = 10_000;
+        let headroom = || store::Auto {
+            threshold: 90.0,
+            prefer: Prefer::Headroom,
+            ..Default::default()
+        };
         let entry = |label: &str, used: Option<f64>| {
             let mut cache = Cached {
                 fetched_at: at,
@@ -1000,7 +1197,7 @@ mod isolation_tests {
             entry("free", Some(10.0)),
         ];
         let pick = |current| {
-            best_known(current, &entries, 90.0, Prefer::Headroom, at).map(|a| a.label.as_str())
+            best_known(current, &entries, &headroom(), at, None).map(|a| a.label.as_str())
         };
         assert_eq!(pick("expired"), Some("free"));
         // A known current account is left to `choose`.
@@ -1012,15 +1209,14 @@ mod isolation_tests {
         for (_, cache) in &mut stale {
             cache.fetched_at = at - 3600;
         }
-        let pick_stale = |current| {
-            best_known(current, &stale, 90.0, Prefer::Headroom, at).map(|a| a.label.as_str())
-        };
+        let pick_stale =
+            |current| best_known(current, &stale, &headroom(), at, None).map(|a| a.label.as_str());
         assert_eq!(pick_stale("expired"), Some("free"));
         assert_eq!(pick_stale("full"), Some("free"));
         assert_eq!(pick_stale("busy"), None);
         // Nothing known below the threshold: stay.
         let only = vec![entry("expired", None), entry("full", Some(95.0))];
-        assert!(best_known("expired", &only, 90.0, Prefer::Headroom, at).is_none());
+        assert!(best_known("expired", &only, &headroom(), at, None).is_none());
         // A weekly limit the last poll left out keeps an account unknown.
         let (_, mut exhausted) = entry("free", Some(10.0));
         exhausted.fetched_at = at - 60;
@@ -1036,9 +1232,107 @@ mod isolation_tests {
         unverified[3].1 = updated(exhausted, Ok(partial), at);
         assert!(!unverified[3].1.unverified_limits.is_empty());
         assert_eq!(
-            best_known("expired", &unverified, 90.0, Prefer::Headroom, at)
-                .map(|a| a.label.as_str()),
+            best_known("expired", &unverified, &headroom(), at, None).map(|a| a.label.as_str()),
             Some("busy")
+        );
+        // A reserved account is never picked, unless it was asked for.
+        let mut reserved = headroom();
+        reserved.reserved = vec!["free".into()];
+        assert_eq!(
+            best_known("expired", &entries, &reserved, at, None).map(|a| a.label.as_str()),
+            Some("busy")
+        );
+        assert_eq!(
+            best_known("expired", &entries, &reserved, at, Some("free")).map(|a| a.label.as_str()),
+            Some("free")
+        );
+    }
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::*;
+
+    const AT: u64 = 100_000;
+
+    fn window(used: f64, reset: Option<u64>) -> Window {
+        Window {
+            name: "weekly".into(),
+            used_percent: used,
+            resets_at: reset,
+            duration_minutes: Some(10080),
+            codex_slot: None,
+        }
+    }
+    fn reading(fetched_at: u64, windows: Vec<Window>) -> Cached {
+        Cached {
+            usage: Usage {
+                windows,
+                ..Default::default()
+            },
+            fetched_at,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn every_reason_and_only_fresh_is_usable() {
+        let fresh = reading(AT - 10, vec![window(40.0, Some(AT + 60))]);
+        let mut error = fresh.clone();
+        error.error = Some("http-401".into());
+        let never = Cached::default();
+        let stale = reading(AT - STALE_AFTER - 1, vec![window(40.0, None)]);
+        let reset = reading(AT - 10, vec![window(100.0, Some(AT))]);
+        let empty = reading(AT - 10, Vec::new());
+        let old = reading(AT - 60, vec![window(100.0, Some(AT + 600))]);
+        let unverified = updated(old, Ok(Usage::default()), AT - 10);
+        assert!(!unverified.unverified_limits.is_empty());
+        let cases = [
+            (fresh, Reason::Fresh, Some(10)),
+            (error, Reason::Error, Some(10)),
+            (never, Reason::NeverFetched, None),
+            (stale, Reason::Stale, Some(STALE_AFTER + 1)),
+            (reset, Reason::ResetPassed, Some(10)),
+            (empty, Reason::NoWindows, Some(10)),
+            (unverified, Reason::UnverifiedLimit, Some(10)),
+        ];
+        for (cache, reason, age) in cases {
+            assert_eq!(cache.reason(AT), reason);
+            assert_eq!(cache.age(AT), age, "{reason:?}");
+            // The reason agrees with what selection uses.
+            assert_eq!(
+                cache.used(AT).is_some(),
+                reason == Reason::Fresh,
+                "{reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasons_serialize_as_the_documented_strings() {
+        let names: Vec<_> = [
+            Reason::Fresh,
+            Reason::NeverFetched,
+            Reason::Error,
+            Reason::UnverifiedLimit,
+            Reason::Stale,
+            Reason::ResetPassed,
+            Reason::NoWindows,
+        ]
+        .iter()
+        .map(|r| serde_json::to_value(r).unwrap())
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "fresh",
+                "never-fetched",
+                "error",
+                "unverified-limit",
+                "stale",
+                "reset-passed",
+                "no-windows"
+            ]
         );
     }
 }

@@ -104,6 +104,31 @@ alternative is at or above the soft threshold, an exhausted session uses the
 least-used eligible account below 100% as a last resort and logs that decision.
 Login and model rejections last the run. No code changes the caller's cwd.
 
+Every supervisor restart (an account switch, a return to a recovered account, a
+resume on a rotated token) first takes the switch slot (`src/switch_gate.rs`),
+with the provider stopped and the terminal still responsive. At most one slot
+is granted per `switch_interval_seconds` (default 4; 0 disables) across all
+providers and supervisors sharing the account store (`$XDG_DATA_HOME/aswap`),
+so a shared limit or reset doesn't relaunch every session at once. The gate
+spaces grants: the account commit and launch after a grant take their own
+time, and a grant whose commit finds no eligible account is spent. Waiters
+queue first come, first served in `switch-gate.json`, read and rewritten only
+under an exclusive `flock` on `switch-gate.lock` next to `state.json`. The
+clock is read under the lock, the lock is never held across a sleep, each try
+for it lasts at most 250 ms, and the state is written once without the store's
+retries. A busy lock (its holder stalled on a slow disk) is retried between
+terminal pumps for up to 30 s or two intervals, whichever is longer, so a
+short stall still spaces the herd; past that, or when the gate can't be
+opened, read or written, the restart goes through with a warning. Each waiter refreshes its ticket's heartbeat (the head
+on every poll); a ticket silent for two intervals plus slack (18 s at 4 s) is
+dropped, so a killed or stopped waiter holds up those behind it for at most
+that long, and a waiter that stops waiting removes its own. The recorded
+switch never moves back unless it is more than that TTL ahead of the clock,
+which means the clock stepped back; it then counts as now. Initial launches are
+not gated: nothing has a limit yet, and a delay would only slow a new session.
+The per-session Wake stagger (1–30 s) still spreads quota checks; the gate is
+the hard cap on restarts only.
+
 Store trouble (a full disk, EIO, EAGAIN) never ends a provider. Store locks and
 private writes retry with backoff, but under the store lock for at most 1.5
 seconds: every supervisor takes that lock on its terminal thread, so a long
@@ -542,10 +567,61 @@ the original decimal precision. Hide unknown reload settings and zero/unknown
 available reset counts in terminal output.
 The [reset credits summary](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/typescript/v2/RateLimitResetCreditsSummary.ts)
 provides availableCount separately from balance. Only bounded decimal balance,
-boolean flags and numeric reset count enter normalized usage; account IDs,
-credit detail rows and backend banners are discarded. Older caches remain
+boolean flags, numeric reset count and bounded reset-credit rows (below) enter
+normalized usage; account IDs and backend banners are discarded. Older caches remain
 readable with missing optional metadata. Live diagnostics may inspect these
 field names/types and coarse numeric magnitudes only, never log the RPC payload.
+
+Selection defaults to `prefer = weekly-reset` (soonest account-wide weekly
+reset first, then headroom) for both providers when state sets none; an
+explicit `headroom` is kept. Past the soft threshold the last-resort fallback
+still ranks by headroom.
+
+## Codex usage-limit resets
+
+Codex 0.167.1 calls these rate-limit reset credits ("Redeem reset" under
+`/usage`). `account/rateLimits/read` lists them under
+`rateLimitResetCredits.credits` (id, resetType, status, expiresAt, title,
+description). aswap keeps at most 16 rows with an id of 1-128 safe characters,
+known status/type values (others become `unknown`) and title/description
+stripped of control characters and cut at 200 characters.
+
+Redeeming is the TUI's own request, `account/rateLimitResetCredit/consume`
+`{idempotencyKey, creditId}`, sent through the same bounded app-server
+transport as usage reads, from a temporary home holding only the account's
+access token. The outcome is `reset`, `alreadyRedeemed`, `nothingToReset` or
+`noCredit`. One redemption resets the account's eligible windows, 5-hour and
+weekly together, and spends one earned, expiring credit.
+
+`src/reset.rs` separates the rule from I/O. `decide` is pure: off, non-Codex,
+halted or cooling down means no decision; any Codex account (reserved ones
+included) with unknown, stale or failed usage, or without a future weekly
+reset, means none; any with weekly usage under 100% means none. Otherwise the
+candidate is the unreserved account with a positive available count and an
+available, unexpired `codexRateLimits` credit whose weekly window resets
+farthest away; ties go to the soonest credit expiry, then the label. Any such
+credit whose text mentions money refuses the whole decision.
+
+`step` runs one decision against a `Port` (forced usage read, redeem, save,
+key). Dry-run records the decision once per account and window, uses only the
+shared cached readings and never redeems. `on` re-reads the chosen account, decides again on that
+reading, persists the pending redemption with a fresh UUID key before the
+request, counts the attempt before sending, and records the usage before and
+after. Errors and unknown outcomes keep the key for a retry after 15 and 30
+minutes; the third failure, `nothingToReset` and `noCredit` skip that account
+until its weekly reset. A pending key is retried only after the same checks
+as a fresh decision: a forced read of its account, every account still
+exhausted, the account still present and unreserved, and its credit neither
+expired nor mentioning money. If one account has room again the earlier
+request may have worked. A pending that fails these checks, outlives its
+weekly window, loses its account, or is dropped by `codex reset off` is
+recorded (`unconfirmed` once sent, which starts the cooldown and skips the
+account for that window; `abandoned` if never sent). Only `codex` settings
+touch this log. Anything that may have spent a credit starts
+a one-hour cooldown. Money wording in a credit or a response halts redemption
+until `reset off`. Followers never redeem; a second process skips the tick
+while another holds `codex-reset.lock`. The log (`codex-resets.json`) keeps 50
+records; status output omits keys and credit ids.
 
 ## SSH sync failure classes and role drift
 

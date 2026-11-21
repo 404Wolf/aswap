@@ -30,6 +30,18 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Preview retention of finished runtime views.
+    Gc {
+        /// Remove eligible views and preserve their transcripts.
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
+        /// Preview even if the configuration enables automatic application.
+        #[arg(long)]
+        dry_run: bool,
+        /// Verify an old label's original home (provider:label=/absolute/path).
+        #[arg(long, value_name = "PROVIDER:LABEL=PATH")]
+        legacy_home: Vec<String>,
+    },
     /// Show the actual account used by each locally running session.
     Sessions { provider: Option<Provider> },
     /// Capture the current file-based login under a private label.
@@ -64,12 +76,16 @@ enum Action {
         account: Option<String>,
     },
     /// Configure or monitor automatic account selection.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Auto {
-        provider: Provider,
-        #[arg(value_enum)]
-        action: AutoAction,
+        #[command(subcommand)]
+        global: Option<AutoGlobal>,
+        #[arg(required = true)]
+        provider: Option<Provider>,
+        #[arg(value_enum, required = true)]
+        action: Option<AutoAction>,
         #[arg(
-            help = "Percentage for threshold; text or off for resume-prompt; headroom or weekly-reset for prefer"
+            help = "Percentage for threshold; text or off for resume-prompt; headroom or weekly-reset for prefer; off, dry-run or on for reset (Codex only); account label for reserve or unreserve"
         )]
         value: Option<String>,
         #[arg(
@@ -127,6 +143,16 @@ enum Action {
         interval: u64,
     },
 }
+/// Settings shared by every provider, given without one.
+#[derive(Subcommand)]
+enum AutoGlobal {
+    /// Show or set the minimum seconds between account switches of all
+    /// supervised sessions on this machine (every provider); 0 turns it off.
+    SwitchInterval {
+        #[arg(value_parser = clap::value_parser!(u64).range(0..=store::MAX_SWITCH_INTERVAL))]
+        seconds: Option<u64>,
+    },
+}
 #[derive(Clone, Copy, ValueEnum)]
 enum AutoAction {
     ResumePrompt,
@@ -134,6 +160,13 @@ enum AutoAction {
     Off,
     Threshold,
     Prefer,
+    /// Codex: redeem a usage-limit reset credit when every account is out of
+    /// weekly usage (off, dry-run or on; default off).
+    Reset,
+    /// Keep this account available for runs pinned to it.
+    Reserve,
+    /// Make this account available to automatic selection again.
+    Unreserve,
     Once,
     Watch,
 }
@@ -147,10 +180,15 @@ fn output(value: &Value, structured: bool, pretty: String) -> Result<()> {
     writeln!(out, "{text}").safe("cannot write output")
 }
 fn snapshot(store: &Store, filter: Option<Provider>, refresh: bool) -> Result<Value> {
-    let (accounts, active, settings) = {
+    let (accounts, active, settings, switch_interval) = {
         let _lock = store.lock()?;
         let state = store.load()?;
-        (state.accounts, state.active, state.auto)
+        (
+            state.accounts,
+            state.active,
+            state.auto,
+            state.switch_interval_seconds,
+        )
     };
     let mut rows = Vec::new();
     for a in accounts
@@ -171,11 +209,24 @@ fn snapshot(store: &Store, filter: Option<Provider>, refresh: bool) -> Result<Va
             }
         };
         let duplicates = duplicate_labels(store, &a)?;
-        rows.push(json!({"provider":a.provider,"label":a.label,"active":active.get(&a.provider)==Some(&a.label),"remaining_percent":c.used(now()).map(|u|100.0-u),"usage":c.usage,"fetched_at":c.fetched_at,"next_poll_at":c.next_poll_at,"duplicates":duplicates,"usage_error":c.diagnostic(),"http_status":c.http_status,"retry_after_seconds":c.retry_after,"last_attempt":c.last_attempt,"usage_status":if c.used(now()).is_some(){"ok"}else if c.error.is_some(){"backoff"}else{"unknown"}}));
+        let reserved = settings
+            .get(&a.provider)
+            .is_some_and(|s| !s.allows(&a.label, None));
+        // One clock reading, so status, reason and age agree.
+        let at = now();
+        rows.push(json!({"provider":a.provider,"label":a.label,"active":active.get(&a.provider)==Some(&a.label),"reserved":reserved,"remaining_percent":c.used(at).map(|u|100.0-u),"usage":c.usage,"fetched_at":c.fetched_at,"next_poll_at":c.next_poll_at,"duplicates":duplicates,"usage_error":c.diagnostic(),"http_status":c.http_status,"retry_after_seconds":c.retry_after,"last_attempt":c.last_attempt,"usage_status":if c.used(at).is_some(){"ok"}else if c.error.is_some(){"backoff"}else{"unknown"},"usage_reason":c.reason(at),"age_seconds":c.age(at)}));
     }
     let coordination = aswap::coordination::settings(store)?;
+    // An unreadable reset log must not hide accounts; the monitor still
+    // refuses to redeem until it is readable again.
+    let usage_resets = {
+        let _lock = store.lock()?;
+        aswap::reset::load(store)
+            .map(|log| log.summary())
+            .unwrap_or_else(|err| json!({"error": err.to_string()}))
+    };
     Ok(
-        json!({"schema_version":1,"accounts":rows,"auto":settings,"credential_mode":if coordination.owner {"refresh-owner"}else if coordination.host.is_some(){"access-only-follower"}else{"refresh-disabled"},"last_sync":coordination.last_sync,"sync":aswap::coordination::status(store)?}),
+        json!({"schema_version":1,"accounts":rows,"auto":settings,"codex_usage_resets":usage_resets,"switch_interval_seconds":switch_interval,"credential_mode":if coordination.owner {"refresh-owner"}else if coordination.host.is_some(){"access-only-follower"}else{"refresh-disabled"},"last_sync":coordination.last_sync,"sync":aswap::coordination::status(store)?}),
     )
 }
 fn duplicate_labels(store: &Store, account: &store::Account) -> Result<Vec<String>> {
@@ -232,6 +283,7 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
             provider: r["provider"].as_str().unwrap(),
             label: r["label"].as_str().unwrap(),
             active: r["active"] == true,
+            reserved: r["reserved"] == true,
             identity: &identities[i],
             cached: &caches[i],
             duplicates: &duplicates[i],
@@ -261,16 +313,18 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
             enabled: a.enabled,
             threshold: a.threshold,
             prefer: a.prefer,
+            auto_reset: a.auto_reset,
         })
         .collect();
-    Ok(aswap::display::render_with(
-        &rows,
-        &policies,
-        compact,
-        width,
-        io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
-        now(),
-    ))
+    let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let mut text = aswap::display::render_with(&rows, &policies, compact, width, color, now());
+    if !rows.is_empty()
+        && let Some(seconds) = value["switch_interval_seconds"].as_u64()
+    {
+        text.push_str(if compact { "\n" } else { "\n\n" });
+        text.push_str(&aswap::display::switch_interval_lines(seconds, width, color).join("\n"));
+    }
+    Ok(text)
 }
 fn rows_text(value: &Value) -> String {
     let rows = value["accounts"].as_array().unwrap();
@@ -317,8 +371,26 @@ fn waybar(value: &Value) -> Value {
     json!({"text":if text.is_empty(){"aswap: no accounts"}else{&text},"tooltip":rows_text(value),"class":"aswap"})
 }
 fn execute(cli: Cli) -> Result<i32> {
+    if let Action::Gc {
+        apply,
+        dry_run,
+        legacy_home,
+    } = cli.command
+    {
+        use aswap::retention::{self, Mode};
+        let mode = match (apply, dry_run) {
+            (true, _) => Mode::Apply,
+            (_, true) => Mode::Preview,
+            _ => Mode::Configured,
+        };
+        let report = retention::run(mode, &legacy_home)?;
+        let value = serde_json::to_value(&report).safe("cannot encode retention report")?;
+        output(&value, cli.json, report.text())?;
+        return Ok(i32::from(report.incomplete()));
+    }
     let store = Store::from_env()?;
     match cli.command {
+        Action::Gc { .. } => unreachable!(),
         Action::Sessions { provider } => {
             let rows: Vec<_> = aswap::live::sessions(&store)?
                 .into_iter()
@@ -467,25 +539,71 @@ fn execute(cli: Cli) -> Result<i32> {
             );
         }
         Action::Auto {
+            global: Some(AutoGlobal::SwitchInterval { seconds }),
+            ..
+        } => {
+            let _lock = store.lock()?;
+            let mut state = store.load()?;
+            if let Some(seconds) = seconds {
+                state.switch_interval_seconds = seconds;
+                store.save(&state)?;
+            }
+            let seconds = state.switch_interval_seconds;
+            output(
+                &json!({"switch_interval_seconds":seconds}),
+                cli.json,
+                aswap::display::switch_interval_text(seconds),
+            )?;
+        }
+        Action::Auto {
             provider,
             action,
             value,
             activate_live,
+            ..
         } => {
+            let (Some(provider), Some(action)) = (provider, action) else {
+                unreachable!("clap requires a provider and an action without a subcommand")
+            };
             if matches!(
                 action,
-                AutoAction::Threshold | AutoAction::ResumePrompt | AutoAction::Prefer
+                AutoAction::Threshold
+                    | AutoAction::ResumePrompt
+                    | AutoAction::Prefer
+                    | AutoAction::Reset
+                    | AutoAction::Reserve
+                    | AutoAction::Unreserve
             ) != value.is_some()
             {
                 return Err(Error(
-                    "threshold requires a percentage; resume-prompt requires text or off; prefer requires headroom or weekly-reset; other actions take no value",
+                    "threshold requires a percentage; resume-prompt requires text or off; prefer requires headroom or weekly-reset; reset requires off, dry-run or on; reserve and unreserve require an account label; other actions take no value",
                 ));
             }
             match action {
+                AutoAction::Reserve | AutoAction::Unreserve => {
+                    let label = value.unwrap();
+                    let _lock = store.lock()?;
+                    let mut state = store.load()?;
+                    store.account(&state, provider, Some(&label))?;
+                    let settings = state.auto.entry(provider).or_default();
+                    let reserved = matches!(action, AutoAction::Reserve);
+                    if reserved {
+                        if settings.allows(&label, None) {
+                            settings.reserved.push(label.clone());
+                        }
+                    } else {
+                        settings.reserved.retain(|item| item != &label);
+                    }
+                    let v = json!({"provider":provider,"label":label,"reserved":reserved,"auto":settings});
+                    store.save(&state)?;
+                    let action = if reserved { "Reserved" } else { "Unreserved" };
+                    output(&v, cli.json, format!("{action} {provider}:{label}"))?;
+                }
                 AutoAction::On
                 | AutoAction::Off
                 | AutoAction::Threshold
                 | AutoAction::Prefer
+                | AutoAction::Reset
                 | AutoAction::ResumePrompt => {
                     let _lock = store.lock()?;
                     let mut state = store.load()?;
@@ -508,6 +626,11 @@ fn execute(cli: Cli) -> Result<i32> {
                                     |_| Error("prefer must be headroom or weekly-reset"),
                                 )?;
                         }
+                        AutoAction::Reset => {
+                            let mode = store::AutoReset::from_str(value.as_deref().unwrap(), false)
+                                .map_err(|_| Error("reset must be off, dry-run or on"))?;
+                            aswap::reset::set_mode(&store, provider, settings, mode)?;
+                        }
                         AutoAction::ResumePrompt => {
                             let prompt = value.unwrap();
                             if prompt.is_empty() || prompt.len() > 16384 || prompt.contains('\0') {
@@ -527,6 +650,7 @@ fn execute(cli: Cli) -> Result<i32> {
                             enabled: settings.enabled,
                             threshold: settings.threshold,
                             prefer: settings.prefer,
+                            auto_reset: settings.auto_reset,
                         })
                     );
                     store.save(&state)?;
@@ -540,6 +664,20 @@ fn execute(cli: Cli) -> Result<i32> {
                         aswap::coordination::spawn_sync(&store);
                     }
                     loop {
+                        // A reset first, so this tick's selection can use it.
+                        let reset = match aswap::reset::tick(&store, provider) {
+                            Ok(step) => step,
+                            Err(err) if matches!(action, AutoAction::Watch) => {
+                                eprintln!(
+                                    "aswap: usage reset check failed ({err}); retrying next tick"
+                                );
+                                None
+                            }
+                            Err(err) => return Err(err),
+                        };
+                        if let Some(message) = reset.as_ref().and_then(|s| s.message(now())) {
+                            eprintln!("{message}");
+                        }
                         let selected = match runner::tick(&store, provider, activate_live) {
                             Ok(selected) => selected,
                             // The monitor outlives store trouble (a full disk, a
@@ -551,8 +689,12 @@ fn execute(cli: Cli) -> Result<i32> {
                             }
                             Err(err) => return Err(err),
                         };
+                        let mut report = json!({"provider":provider,"selected":selected});
+                        if let Some(step) = &reset {
+                            report["usage_reset"] = json!(step);
+                        }
                         output(
-                            &json!({"provider":provider,"selected":selected}),
+                            &report,
                             cli.json,
                             selected
                                 .map(|s| format!("Selected {provider}:{s}"))

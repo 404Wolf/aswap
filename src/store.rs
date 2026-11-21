@@ -24,15 +24,42 @@ pub struct Auto {
     pub last_switch: u64,
     #[serde(default)]
     pub prefer: Prefer,
+    #[serde(default)]
+    pub reserved: Vec<String>,
+    /// Opt-in redemption of Codex usage-limit reset credits; see `crate::reset`.
+    #[serde(default)]
+    pub auto_reset: AutoReset,
+}
+/// Whether the monitor may spend a Codex usage-limit reset credit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutoReset {
+    /// Never reset.
+    #[default]
+    Off,
+    /// Log the reset aswap would make, without making it.
+    DryRun,
+    /// Redeem one reset credit when every Codex account is out of weekly usage.
+    On,
+}
+impl AutoReset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::DryRun => "dry-run",
+            Self::On => "on",
+        }
+    }
 }
 /// How auto selection ranks eligible accounts.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Prefer {
     /// The lowest used percentage.
-    #[default]
     Headroom,
-    /// The soonest weekly reset, so quota that would expire unused goes first.
+    /// The soonest weekly reset, so quota that would expire unused goes
+    /// first. The default when state does not set a preference.
+    #[default]
     WeeklyReset,
 }
 pub const RESUME_PROMPT: &str =
@@ -47,16 +74,42 @@ impl Default for Auto {
             enabled: false,
             threshold: 90.0,
             last_switch: 0,
-            prefer: Prefer::Headroom,
+            prefer: Prefer::WeeklyReset,
+            reserved: Vec::new(),
+            auto_reset: AutoReset::Off,
         }
     }
 }
-#[derive(Clone, Default, Serialize, Deserialize)]
+impl Auto {
+    pub fn allows(&self, label: &str, pinned: Option<&str>) -> bool {
+        pinned == Some(label) || !self.reserved.iter().any(|reserved| reserved == label)
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
 pub struct State {
     pub accounts: Vec<Account>,
     pub active: BTreeMap<Provider, String>,
     pub auto: BTreeMap<Provider, Auto>,
+    /// Machine-wide minimum spacing of supervisor account switches, across
+    /// every provider (see `switch_gate`); 0 turns the gate off.
+    #[serde(default = "default_switch_interval")]
+    pub switch_interval_seconds: u64,
 }
+fn default_switch_interval() -> u64 {
+    crate::switch_gate::DEFAULT_INTERVAL_SECONDS
+}
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            accounts: Vec::new(),
+            active: BTreeMap::new(),
+            auto: BTreeMap::new(),
+            switch_interval_seconds: default_switch_interval(),
+        }
+    }
+}
+/// The longest accepted `switch_interval_seconds`.
+pub const MAX_SWITCH_INTERVAL: u64 = 3600;
 pub struct Store {
     pub root: PathBuf,
     pub(crate) sync_policy_path: PathBuf,
@@ -291,12 +344,22 @@ pub fn json_write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     )
 }
 impl Store {
-    pub fn from_env() -> Result<Self> {
+    pub(crate) fn root_from_env() -> Result<PathBuf> {
         let base = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
             .unwrap_or(crate::provider::home()?.join(".local/share"));
-        Self::open(base.join("aswap"))
+        Ok(base.join("aswap"))
+    }
+    pub(crate) fn config_dir() -> Result<PathBuf> {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or(crate::provider::home()?.join(".config"));
+        Ok(base.join("aswap"))
+    }
+    pub fn from_env() -> Result<Self> {
+        Self::open(Self::root_from_env()?)
     }
     pub fn open(root: PathBuf) -> Result<Self> {
         no_links(&root)?;
@@ -305,13 +368,9 @@ impl Store {
             return Err(Error("account stores must live outside a Git checkout"));
         }
         private_dir(&root)?;
-        let config = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .unwrap_or(crate::provider::home()?.join(".config"));
         Ok(Self {
             root,
-            sync_policy_path: config.join("aswap/sync-policy.json"),
+            sync_policy_path: Self::config_dir()?.join("sync-policy.json"),
         })
     }
     pub fn lock(&self) -> Result<Guard> {
@@ -361,6 +420,9 @@ impl Store {
         }
         for a in state.auto.values() {
             threshold(a.threshold)?;
+            for reserved in &a.reserved {
+                label(reserved)?;
+            }
         }
         Ok(state)
     }

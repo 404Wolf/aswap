@@ -1,6 +1,6 @@
 use aswap::{
     provider::Provider,
-    store::{Account, Prefer, Store},
+    store::{Account, Auto, Prefer, Store},
     usage::{self, Cached, Usage, Window},
 };
 fn account(name: &str) -> Account {
@@ -25,6 +25,39 @@ fn observation(p: f64, at: u64) -> Cached {
         next_poll_at: at + 180,
         ..Default::default()
     }
+}
+
+#[test]
+fn reserved_accounts_are_excluded_from_quota_and_launch_preference_unless_pinned() {
+    let at = 1000;
+    let mut settings = Auto {
+        reserved: vec!["held".into()],
+        ..Default::default()
+    };
+    let mut entries = [
+        (account("current"), weekly(100.0, Some(9000), at)),
+        (account("held"), weekly(1.0, Some(2000), at)),
+        (account("other"), weekly(95.0, Some(5000), at)),
+    ];
+    for prefer in [Prefer::Headroom, Prefer::WeeklyReset] {
+        settings.prefer = prefer;
+        assert_eq!(
+            usage::choose("current", &entries, &settings, at, true, None).map(|a| a.label.as_str()),
+            Some("other")
+        );
+        assert_eq!(
+            usage::choose("current", &entries, &settings, at, true, Some("held"))
+                .map(|a| a.label.as_str()),
+            Some("held")
+        );
+    }
+    entries[0].1 = weekly(20.0, Some(9000), at);
+    assert!(usage::prefer_at_launch("current", &entries, &settings, at).is_none());
+    settings.reserved.clear();
+    assert_eq!(
+        usage::prefer_at_launch("current", &entries, &settings, at).map(|a| a.label.as_str()),
+        Some("held")
+    );
 }
 #[test]
 fn cache_serializes_fetches_and_backoff_survives_processes() {
@@ -80,18 +113,43 @@ fn selection_cooldown_hysteresis_and_stale_safety() {
         (account("c"), observation(30.0, 1000)),
     ];
     assert_eq!(
-        usage::choose("a", &entries, 90.0, Prefer::Headroom, 0, 1000, false)
+        usage::choose("a", &entries, &Auto::default(), 1000, false, None)
             .unwrap()
             .label,
         "c"
     );
-    assert!(usage::choose("a", &entries, 90.0, Prefer::Headroom, 900, 1000, false).is_none());
-    assert!(usage::choose("a", &entries, 90.0, Prefer::Headroom, 0, 1700, false).is_none());
-    assert!(usage::choose("b", &entries, 90.0, Prefer::Headroom, 0, 1000, false).is_none());
+    assert!(
+        usage::choose(
+            "a",
+            &entries,
+            &Auto {
+                prefer: Prefer::Headroom,
+                last_switch: 900,
+                ..Default::default()
+            },
+            1000,
+            false,
+            None
+        )
+        .is_none()
+    );
+    assert!(usage::choose("a", &entries, &Auto::default(), 1700, false, None).is_none());
+    assert!(usage::choose("b", &entries, &Auto::default(), 1000, false, None).is_none());
     assert_eq!(
-        usage::choose("b", &entries, 90.0, Prefer::Headroom, 900, 1000, true)
-            .unwrap()
-            .label,
+        usage::choose(
+            "b",
+            &entries,
+            &Auto {
+                prefer: Prefer::Headroom,
+                last_switch: 900,
+                ..Default::default()
+            },
+            1000,
+            true,
+            None
+        )
+        .unwrap()
+        .label,
         "c"
     );
 }
@@ -164,11 +222,14 @@ fn partial_provider_success_preserves_each_unverified_hard_limit() {
             usage::choose(
                 "current",
                 &entries,
-                90.0,
-                Prefer::Headroom,
+                &Auto {
+                    prefer: Prefer::Headroom,
+                    last_switch: 1200,
+                    ..Default::default()
+                },
                 1200,
-                1200,
-                false
+                false,
+                None
             )
             .map(|a| a.label.as_str()),
             Some("verified")
@@ -297,36 +358,60 @@ fn exhausted_accounts_use_remaining_quota_above_the_soft_threshold() {
             usage::choose(
                 "full",
                 &entries,
-                90.0,
-                Prefer::WeeklyReset,
-                999,
+                &Auto {
+                    prefer: Prefer::WeeklyReset,
+                    last_switch: 999,
+                    ..Default::default()
+                },
                 1000,
-                limited
+                limited,
+                None
             )
             .unwrap()
             .label,
             "room"
         );
         assert_eq!(
-            usage::choose("full", &entries, 90.0, Prefer::Headroom, 999, 1000, limited)
-                .unwrap()
-                .label,
+            usage::choose(
+                "full",
+                &entries,
+                &Auto {
+                    prefer: Prefer::Headroom,
+                    last_switch: 999,
+                    ..Default::default()
+                },
+                1000,
+                limited,
+                None
+            )
+            .unwrap()
+            .label,
             "room"
         );
     }
     // Soft-threshold crossing alone must not churn accounts above it.
-    assert!(usage::choose("soon", &entries, 90.0, Prefer::Headroom, 0, 1000, false).is_none());
+    assert!(usage::choose("soon", &entries, &Auto::default(), 1000, false, None).is_none());
     // Unknown, stale, failed and exhausted observations are never fallback targets.
     let mut unavailable = entries.clone();
     unavailable[1].1.error = Some("provider-limit".into());
     unavailable[2].1.fetched_at = 1;
-    assert!(usage::choose("full", &unavailable, 90.0, Prefer::Headroom, 0, 1000, true).is_none());
+    assert!(usage::choose("full", &unavailable, &Auto::default(), 1000, true, None).is_none());
     let mut preferred = entries;
     preferred.push((account("below"), weekly(80.0, Some(8000), 1000)));
     assert_eq!(
-        usage::choose("full", &preferred, 90.0, Prefer::WeeklyReset, 0, 1000, true)
-            .unwrap()
-            .label,
+        usage::choose(
+            "full",
+            &preferred,
+            &Auto {
+                prefer: Prefer::WeeklyReset,
+                ..Default::default()
+            },
+            1000,
+            true,
+            None
+        )
+        .unwrap()
+        .label,
         "below"
     );
 }
@@ -341,8 +426,19 @@ fn last_resort_uses_headroom_even_when_weekly_reset_is_preferred() {
         (account("room"), weekly(90.0, Some(5000), 1000)),
     ];
     assert_eq!(
-        usage::choose("full", &entries, 90.0, Prefer::WeeklyReset, 999, 1000, true)
-            .map(|a| a.label.as_str()),
+        usage::choose(
+            "full",
+            &entries,
+            &Auto {
+                prefer: Prefer::WeeklyReset,
+                last_switch: 999,
+                ..Default::default()
+            },
+            1000,
+            true,
+            None
+        )
+        .map(|a| a.label.as_str()),
         Some("room")
     );
 }
@@ -358,10 +454,20 @@ fn weekly_reset_preference_ranks_and_moves_launches() {
     let full = &entries[..4];
     // Forced switch: headroom picks the emptiest; weekly-reset the soonest reset.
     let pick = |prefer| {
-        usage::choose("a", full, 90.0, prefer, 0, 1000, false)
-            .unwrap()
-            .label
-            .clone()
+        usage::choose(
+            "a",
+            full,
+            &Auto {
+                prefer,
+                ..Default::default()
+            },
+            1000,
+            false,
+            None,
+        )
+        .unwrap()
+        .label
+        .clone()
     };
     assert_eq!(pick(Prefer::Headroom), "d");
     assert_eq!(pick(Prefer::WeeklyReset), "c");
@@ -372,30 +478,79 @@ fn weekly_reset_preference_ranks_and_moves_launches() {
         (account("c"), weekly(40.0, Some(5000), 1000)),
     ];
     assert_eq!(
-        usage::choose("a", &over, 90.0, Prefer::WeeklyReset, 0, 1000, false)
-            .unwrap()
-            .label,
+        usage::choose(
+            "a",
+            &over,
+            &Auto {
+                prefer: Prefer::WeeklyReset,
+                ..Default::default()
+            },
+            1000,
+            false,
+            None
+        )
+        .unwrap()
+        .label,
         "c"
     );
     // Launch preference: never under headroom; moves only to a strictly sooner reset.
-    assert!(usage::prefer_at_launch("b", &entries, 90.0, Prefer::Headroom, 1000).is_none());
+    let headroom = Auto {
+        prefer: Prefer::Headroom,
+        ..Default::default()
+    };
+    assert!(usage::prefer_at_launch("b", &entries, &headroom, 1000).is_none());
     assert_eq!(
-        usage::prefer_at_launch("b", &entries, 90.0, Prefer::WeeklyReset, 1000)
-            .unwrap()
-            .label,
+        usage::prefer_at_launch(
+            "b",
+            &entries,
+            &Auto {
+                prefer: Prefer::WeeklyReset,
+                ..Default::default()
+            },
+            1000
+        )
+        .unwrap()
+        .label,
         "e"
     );
-    assert!(usage::prefer_at_launch("e", &entries, 90.0, Prefer::WeeklyReset, 1000).is_none());
+    assert!(
+        usage::prefer_at_launch(
+            "e",
+            &entries,
+            &Auto {
+                prefer: Prefer::WeeklyReset,
+                ..Default::default()
+            },
+            1000
+        )
+        .is_none()
+    );
     assert_eq!(
-        usage::prefer_at_launch("d", &entries, 90.0, Prefer::WeeklyReset, 1000)
-            .unwrap()
-            .label,
+        usage::prefer_at_launch(
+            "d",
+            &entries,
+            &Auto {
+                prefer: Prefer::WeeklyReset,
+                ..Default::default()
+            },
+            1000
+        )
+        .unwrap()
+        .label,
         "e"
     );
     // A passed reset makes the observation stale, so it is no candidate.
     assert_eq!(
-        usage::prefer_at_launch("b", &entries, 90.0, Prefer::WeeklyReset, 2500)
-            .map(|a| a.label.as_str()),
+        usage::prefer_at_launch(
+            "b",
+            &entries,
+            &Auto {
+                prefer: Prefer::WeeklyReset,
+                ..Default::default()
+            },
+            2500
+        )
+        .map(|a| a.label.as_str()),
         None
     );
 }
@@ -684,6 +839,7 @@ fn codex_weekly_only_rpc_uses_its_own_epoch_and_optional_credit_metadata() {
                 provider: "codex",
                 label: "synthetic",
                 active: true,
+                reserved: false,
                 identity: &identity,
                 duplicates: &[],
                 cached: &cached,
@@ -727,6 +883,7 @@ fn codex_weekly_only_rpc_uses_its_own_epoch_and_optional_credit_metadata() {
                 provider: "codex",
                 label: "synthetic",
                 active: true,
+                reserved: false,
                 identity: &identity,
                 duplicates: &[],
                 cached: &quiet,
@@ -847,4 +1004,83 @@ fn duplicate_logins_share_one_fresh_fetch() {
         usage::cached_with(&store, &a, 1380, |_| Ok(observation(39.0, 1380).usage)).unwrap();
     assert_eq!(partial.fetched_at, 1380);
     assert_eq!(partial.used(1380), None);
+}
+
+#[test]
+fn codex_reset_credits_are_parsed_bounded_and_cached() {
+    let v = serde_json::json!({
+        "rateLimits":{"primary":{"usedPercent":100,"windowDurationMins":10080,"resetsAt":1_800_500_000u64}},
+        "rateLimitResetCredits":{"availableCount":2,"credits":[
+            {"id":"synthetic-credit-1","resetType":"codexRateLimits","status":"available","grantedAt":1_800_000_000u64,"expiresAt":1_802_000_000u64,"title":"Full reset (Weekly + 5 hr)","description":"Ready\u{7}to redeem"},
+            {"id":"synthetic-credit-2","resetType":"somethingNew","status":"redeemed","grantedAt":1_800_000_000u64,"expiresAt":null,"title":null,"description":"   "},
+            {"id":"bad id with spaces","resetType":"codexRateLimits","status":"available"},
+            {"id":"","status":"available"}
+        ]}
+    });
+    let u = usage::parse_codex(&v).unwrap();
+    assert_eq!(u.available_usage_resets, Some(2));
+    assert_eq!(u.reset_credits.len(), 2);
+    let first = &u.reset_credits[0];
+    assert!(first.available());
+    assert_eq!(first.expires_at, Some(1_802_000_000));
+    assert_eq!(first.description.as_deref(), Some("Readyto redeem"));
+    let second = &u.reset_credits[1];
+    assert_eq!(second.reset_type, "unknown");
+    assert!(!second.available());
+    assert!(second.title.is_none() && second.description.is_none());
+    // Cache round trip, and caches written before credits existed still load.
+    let back: Usage = serde_json::from_value(serde_json::to_value(&u).unwrap()).unwrap();
+    assert_eq!(back.reset_credits, u.reset_credits);
+    let old: Usage = serde_json::from_value(serde_json::json!({"windows":[]})).unwrap();
+    assert!(old.reset_credits.is_empty());
+    // At most 16 rows are kept.
+    let many: Vec<_> = (0..40)
+        .map(|i| serde_json::json!({"id":format!("c{i}"),"resetType":"codexRateLimits","status":"available"}))
+        .collect();
+    let v = serde_json::json!({"rateLimits":{"primary":{"usedPercent":1}},"rateLimitResetCredits":{"availableCount":40,"credits":many}});
+    assert_eq!(usage::parse_codex(&v).unwrap().reset_credits.len(), 16);
+}
+
+#[test]
+fn limit_block_reports_blocked_accounts_and_when_they_free_up() {
+    let at = 1_800_000_000;
+    let window = |used: f64, resets_at: Option<u64>| Window {
+        name: "weekly".into(),
+        used_percent: used,
+        resets_at,
+        duration_minutes: Some(10080),
+        codex_slot: None,
+    };
+    let cache = |windows: Vec<Window>| Cached {
+        usage: Usage {
+            windows,
+            ..Default::default()
+        },
+        fetched_at: at,
+        ..Default::default()
+    };
+    assert_eq!(
+        cache(vec![window(99.0, Some(at + 10))]).limit_block(at),
+        None
+    );
+    assert_eq!(
+        cache(vec![
+            window(100.0, Some(at + 50)),
+            Window {
+                name: "session".into(),
+                used_percent: 100.0,
+                resets_at: Some(at + 20),
+                duration_minutes: Some(300),
+                codex_slot: None
+            }
+        ])
+        .limit_block(at),
+        Some(Some(at + 50))
+    );
+    assert_eq!(cache(vec![window(100.0, None)]).limit_block(at), Some(None));
+    // A passed reset no longer blocks.
+    assert_eq!(cache(vec![window(100.0, Some(at))]).limit_block(at), None);
+    let mut limited = cache(vec![window(40.0, Some(at + 10))]);
+    limited.error = Some("provider-limit".into());
+    assert_eq!(limited.limit_block(at), Some(None));
 }

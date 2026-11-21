@@ -14,7 +14,11 @@ pub(super) fn quota_fallback(
     entries: &[(Account, usage::Cached)],
     settings: &store::Auto,
     at: u64,
+    pinned: Option<&str>,
 ) -> Option<(f64, f64)> {
+    if !settings.allows(&account.label, pinned) {
+        return None;
+    }
     let used = entries
         .iter()
         .find(|(a, _)| a.provider == account.provider && a.label == account.label)?
@@ -41,22 +45,20 @@ pub(super) fn recovery_target<'a>(
     entries: &'a [(Account, usage::Cached)],
     settings: &store::Auto,
     at: u64,
+    pinned: Option<&str>,
 ) -> Option<&'a Account> {
-    usage::choose(
-        current,
-        entries,
-        settings.threshold,
-        settings.prefer,
-        settings.last_switch,
-        at,
-        true,
-    )
-    .or_else(|| {
+    let usable = |label| {
         entries.iter().find_map(|(account, cache)| {
-            (account.label == current && cache.used(at).is_some_and(|used| used < 100.0))
-                .then_some(account)
+            (account.label == label
+                && settings.allows(&account.label, pinned)
+                && cache.used(at).is_some_and(|used| used < 100.0))
+            .then_some(account)
         })
-    })
+    };
+    pinned
+        .and_then(usable)
+        .or_else(|| usage::choose(current, entries, settings, at, true, pinned))
+        .or_else(|| usable(current))
 }
 
 /// Pure wall-clock schedule, also used with synthetic time in tests. Shared
@@ -71,7 +73,7 @@ impl Wake {
     pub(super) fn new(seed: u64) -> Self {
         Self {
             next: 0,
-            stagger: 1 + seed % 5,
+            stagger: 1 + seed % 30,
             reported: None,
         }
     }
@@ -99,7 +101,7 @@ impl Wake {
         self.next = next.saturating_add(self.stagger);
     }
     pub(super) fn retry(&mut self, at: u64) {
-        self.next = at.saturating_add(5 + self.stagger);
+        self.next = at.saturating_add(6 + self.stagger % 5);
     }
     pub(super) fn report(&mut self, provider: Provider, current: &str, at: u64) {
         if self.reported != Some(self.next) {
@@ -516,6 +518,90 @@ mod wake_tests {
     }
 
     #[test]
+    fn every_selection_path_prefers_the_soonest_weekly_reset_for_both_providers() {
+        let settings = store::Auto {
+            prefer: store::Prefer::WeeklyReset,
+            ..Default::default()
+        };
+        for provider in [Provider::Claude, Provider::Codex] {
+            let entries = [
+                entry(provider, "current", 100.0, Some(AT + 4 * 86_400), AT),
+                entry(provider, "later", 20.0, Some(AT + 5 * 86_400), AT),
+                entry(provider, "sooner", 60.0, Some(AT + 86_400), AT),
+                entry(provider, "unknown", 5.0, None, AT),
+            ];
+            let label = |a: Option<&Account>| a.map(|a| a.label.clone());
+            // Launch and the monitor tick: a forced switch off an exhausted account.
+            assert_eq!(
+                label(usage::choose(
+                    "current", &entries, &settings, AT, false, None
+                )),
+                Some("sooner".into()),
+                "{provider}"
+            );
+            // Quota fallback after a provider limit, and supervisor recovery.
+            assert_eq!(
+                label(usage::choose(
+                    "current", &entries, &settings, AT, true, None
+                )),
+                Some("sooner".into()),
+                "{provider}"
+            );
+            assert_eq!(
+                label(recovery_target("current", &entries, &settings, AT, None)),
+                Some("sooner".into()),
+                "{provider}"
+            );
+            // Launch preference and the monitor move off a later-resetting account.
+            for current in ["later", "unknown"] {
+                assert_eq!(
+                    label(usage::prefer_at_launch(current, &entries, &settings, AT)),
+                    Some("sooner".into()),
+                    "{provider} {current}"
+                );
+            }
+            assert!(usage::prefer_at_launch("sooner", &entries, &settings, AT).is_none());
+            // Headroom ranks by most room instead.
+            let headroom = store::Auto {
+                prefer: store::Prefer::Headroom,
+                ..Default::default()
+            };
+            assert_eq!(
+                label(recovery_target("current", &entries, &headroom, AT, None)),
+                Some("unknown".into())
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_only_uses_a_reserved_label_for_its_pin() {
+        let mut entries = [
+            entry(Provider::Claude, "held", 95.0, Some(AT + 1000), AT),
+            entry(Provider::Claude, "other", 100.0, Some(AT + 1800), AT),
+        ];
+        let settings = store::Auto {
+            reserved: vec!["held".into()],
+            ..Default::default()
+        };
+        assert!(recovery_target("held", &entries, &settings, AT, None).is_none());
+        assert!(quota_fallback(&entries[0].0, &entries, &settings, AT, None).is_none());
+        for current in ["held", "other"] {
+            assert_eq!(
+                recovery_target(current, &entries, &settings, AT, Some("held"))
+                    .map(|a| a.label.as_str()),
+                Some("held")
+            );
+        }
+        entries[0].1.usage.windows[0].used_percent = 100.0;
+        entries[1].1.usage.windows[0].used_percent = 95.0;
+        assert_eq!(
+            recovery_target("held", &entries, &settings, AT, Some("held"))
+                .map(|a| a.label.as_str()),
+            Some("other")
+        );
+    }
+
+    #[test]
     fn recovery_rechecks_weekly_quota_from_the_locked_cache_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("store")).unwrap();
@@ -555,7 +641,7 @@ mod wake_tests {
             let _lock = store.lock().unwrap();
             let entries = entries_from_cache(&store, Provider::Claude).unwrap();
             let entries = rejected.filter_at(&store, "current", settings.threshold, entries, AT);
-            recovery_target("current", &entries, &settings, AT).map(|a| a.label.clone())
+            recovery_target("current", &entries, &settings, AT, None).map(|a| a.label.clone())
         };
         let rejected = Rejected::default();
         let usable = usage::updated(usage::Cached::default(), Ok(full(80.0)), AT - 120);
@@ -608,9 +694,9 @@ mod wake_tests {
             });
             let mut wake = Wake::new(17);
             wake.schedule(&entries, None, AT);
-            assert!((AT + 30..=AT + 35).contains(&wake.next));
+            assert!((AT + 31..=AT + 60).contains(&wake.next));
             assert!(!wake.due(AT + 29));
-            assert!(wake.due(AT + 35));
+            assert!(wake.due(AT + 60));
         }
     }
 
@@ -621,11 +707,11 @@ mod wake_tests {
             let mut entries = vec![entry(Provider::Claude, "current", 100.0, reset, AT - 600)];
             entries[0].1.next_poll_at = AT - 1;
             wake.schedule(&entries, None, AT);
-            assert!((AT + 300..=AT + 305).contains(&wake.next));
+            assert!((AT + 301..=AT + 330).contains(&wake.next));
             assert!(!wake.due(AT + 1));
         }
         wake.schedule(&[], Some(AT + 20), AT);
-        assert!((AT + 20..=AT + 25).contains(&wake.next));
+        assert!((AT + 21..=AT + 50).contains(&wake.next));
     }
 
     #[test]
@@ -635,11 +721,11 @@ mod wake_tests {
             .map(|seed| {
                 let mut wake = Wake::new(seed);
                 wake.schedule(&entries, None, AT);
-                assert!((AT + usage::TTL..=AT + usage::TTL + 5).contains(&wake.next));
+                assert!((AT + usage::TTL + 1..=AT + usage::TTL + 30).contains(&wake.next));
                 wake.next
             })
             .collect::<std::collections::BTreeSet<_>>();
-        assert!(times.len() > 1);
+        assert_eq!(times.len(), 30);
     }
 
     #[test]
@@ -679,8 +765,14 @@ mod wake_tests {
                     });
                     let entries = rejected.filter_at(&store, "current", 90.0, entries, AT + 30);
                     assert_eq!(
-                        recovery_target("current", &entries, &store::Auto::default(), AT + 30)
-                            .map(|a| a.label.as_str()),
+                        recovery_target(
+                            "current",
+                            &entries,
+                            &store::Auto::default(),
+                            AT + 30,
+                            None
+                        )
+                        .map(|a| a.label.as_str()),
                         Some(recovered),
                         "{provider} {recovered} at {used}%"
                     );
@@ -739,6 +831,7 @@ mod wake_tests {
                         &rejected.filter_at(&store, "current", 90.0, entries, at),
                         &store::Auto::default(),
                         at,
+                        None,
                     )
                     .map(|a| a.label.clone())
                 };
@@ -773,7 +866,7 @@ mod wake_tests {
                 vec![entry(Provider::Codex, "current", 5.0, None, at)],
                 at,
             );
-            recovery_target("current", &entries, &store::Auto::default(), at)
+            recovery_target("current", &entries, &store::Auto::default(), at, None)
                 .map(|a| a.label.clone())
         };
         assert_eq!(choose(&rejected, AT + 10), None);

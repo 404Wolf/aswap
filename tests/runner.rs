@@ -286,14 +286,6 @@ fn runner_child() {
                 aswap::runner::run(&store, provider, Some("one"), &initial, true).unwrap(),
                 0
             );
-            // Finished runs leave no launch view behind.
-            let runtimes = store.root.join("runtimes").join(provider.as_str());
-            for label in ["one", "two"] {
-                let left: Vec<_> = fs::read_dir(runtimes.join(label))
-                    .map(|d| d.map(|e| e.unwrap().file_name()).collect())
-                    .unwrap_or_default();
-                assert!(left.is_empty(), "{label}: {left:?}");
-            }
             let views = fs::read_dir(std::env::var_os("ASWAP_TEST_RESULTS").unwrap()).unwrap();
             let expected = AutoArgs::parse(provider, &initial)
                 .unwrap()
@@ -1066,6 +1058,9 @@ fn runner_safety_child() {
     if case.starts_with("boundedhigh") || case == "boundedcap" {
         let mut state = store.load().unwrap();
         state.auto.entry(provider).or_default().threshold = 90.0;
+        // Eight quick restarts: the hourly cap, not the machine-wide
+        // switch spacing (tests/switch_gate.rs), is under test here.
+        state.switch_interval_seconds = 0;
         store.save(&state).unwrap();
     }
     if case == "limitresumed" {

@@ -8,9 +8,12 @@ use crate::{
     Error, Result, Safe,
     provider::Provider,
     store::{self, Account, Store},
+    switch_gate::SwitchGate,
     usage,
 };
 use std::{
+    collections::hash_map::RandomState,
+    hash::BuildHasher,
     io::{IsTerminal, Write},
     os::unix::process::CommandExt,
     process::{Child, Stdio},
@@ -128,6 +131,7 @@ pub fn launch(
     }
     // Whether the account is chosen by quota at launch.
     let pick = auto || how.pick;
+    let pinned = name;
     // Nothing runs yet: wait out a full disk or a busy store rather than exit.
     store::set_patience(PREPARE_PATIENCE);
     let mut auto_args = if auto {
@@ -140,7 +144,7 @@ pub fn launch(
     // follower with no usable profile yet waits for the owner.
     let synced = {
         let _lock = store.lock()?;
-        store.account(&store.load()?, provider, name).is_ok()
+        launch_seed(store, &store.load()?, provider, pinned, auto).is_ok()
     };
     if synced {
         drop(background_poll(store));
@@ -152,7 +156,7 @@ pub fn launch(
     crate::coordination::spawn_sync(store);
     let mut account = {
         let _lock = store.lock()?;
-        store.account(&store.load()?, provider, name)?
+        launch_seed(store, &store.load()?, provider, pinned, auto)?
     };
     let mut models = if auto {
         crate::models::Gate::new(provider, args)?
@@ -163,55 +167,51 @@ pub fn launch(
         models.resolve(store, &account)?;
     }
     if pick {
-        let (entries, _) = patiently("reading usage", || observations(store, provider))?;
+        let (mut entries, settings) = patiently("reading usage", || observations(store, provider))?;
+        entries.retain(|(a, _)| settings.allows(&a.label, pinned));
         let _ = models.filter(store, &account.label, entries);
     }
     let mut lease = patiently("reserving the account", || {
         let mut account = account.clone();
         let mut fallback = None;
         let _lock = store.lock()?;
+        let state = store.load()?;
         if pick {
-            let state = store.load()?;
             let settings = state.auto.get(&provider).cloned().unwrap_or_default();
             let entries =
                 models.filter_cached(store, &account.label, entries_from_cache(store, provider)?);
             trace_candidates("launch", &entries, settings.threshold, now(), None);
-            if let Some(best) = usage::choose(
-                &account.label,
-                &entries,
-                settings.threshold,
-                settings.prefer,
-                settings.last_switch,
-                now(),
-                false,
-            )
-            .or_else(|| {
-                usage::prefer_at_launch(
-                    &account.label,
-                    &entries,
-                    settings.threshold,
-                    settings.prefer,
-                    now(),
-                )
-            })
-            .or_else(|| {
-                how.pick
-                    .then(|| {
-                        usage::best_known(
-                            &account.label,
-                            &entries,
-                            settings.threshold,
-                            settings.prefer,
-                            now(),
-                        )
-                    })
-                    .flatten()
-            }) {
+            let current = state
+                .active
+                .get(&provider)
+                .filter(|label| pinned.is_none() && !settings.allows(label, None))
+                .map_or(account.label.as_str(), String::as_str);
+            let at = now();
+            let best = usage::choose(current, &entries, &settings, at, false, pinned)
+                .or_else(|| {
+                    pinned
+                        .is_none()
+                        .then(|| usage::prefer_at_launch(current, &entries, &settings, at))
+                        .flatten()
+                })
+                .or_else(|| {
+                    // `--pick` serves one call: a stale but error-free reading
+                    // still tells a live account from a dead one.
+                    how.pick
+                        .then(|| usage::best_known(current, &entries, &settings, at, pinned))
+                        .flatten()
+                });
+            if let Some(best) = best {
                 account = best.clone();
-                fallback = quota_fallback(&account, &entries, &settings, now());
+                fallback = quota_fallback(&account, &entries, &settings, at, pinned);
+            }
+            if !settings.allows(&account.label, pinned) {
+                return Err(crate::Error(
+                    "no unreserved account available for automatic launch",
+                ));
             }
         }
-        store.account(&store.load()?, provider, Some(&account.label))?;
+        store.account(&state, provider, Some(&account.label))?;
         Ok((
             account.clone(),
             Arc::new(store.lease_locked(&account)?),
@@ -235,7 +235,7 @@ pub fn launch(
         crate::shared::View::prepare(store, &account)
     })?;
     patiently("recording the session's view", || lease.view(&view.path))?;
-    let mut cleanup = crate::shared::ViewCleanup::new(&view);
+    let mut cleanup = how.pick.then(|| crate::shared::ViewCleanup::new(&view));
     if auto_args.as_ref().is_some_and(|a| a.ambiguous) {
         let help = crate::session::option_help(provider, &view.path, args);
         auto_args = Some(crate::session::AutoArgs::parse_with_help(
@@ -269,10 +269,12 @@ pub fn launch(
     };
     let mut rejected = Rejected::default();
     let mut switches = 0;
+    let mut gate = SwitchGate::open(store);
     let mut restarts = Restarts::default();
     let mut next_sync = 0;
     let mut syncing: Option<std::thread::JoinHandle<bool>> = None;
     let mut auth_restarts = 0;
+    let wake_seed = RandomState::new().hash_one(std::process::id());
     // A follower learns of a rotation from the owner, a moment after the old
     // token stopped working: give it this long to arrive before deciding
     // that a login error means the account itself has expired.
@@ -296,7 +298,6 @@ pub fn launch(
         let resumed = switches > 0;
         let mut quiet = Quiet::new(tracker.as_ref());
         let mut limits = crate::limits::Limits::new(tracker.as_ref());
-        cleanup.synced = false;
         let mut cmd = match how.via {
             Some(via) => via.command(provider, &view.path),
             None => provider.command(&view.path),
@@ -310,10 +311,14 @@ pub fn launch(
         }
         cmd.args(&launch_args);
         let supervisor = std::process::id();
-        // SAFETY: only async-signal-safe Linux syscalls run after fork. Close the
+        // SAFETY: only async-signal-safe syscalls run after fork. Close the
         // spawn/record gap: a killed supervisor cannot leave an untracked provider.
+        // Without Linux's parent-death signal (macOS), a provider whose
+        // supervisor is SIGKILLed keeps running on its own; a supervisor that
+        // exits normally still stops it.
         unsafe {
             cmd.pre_exec(move || {
+                #[cfg(target_os = "linux")]
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -366,7 +371,7 @@ pub fn launch(
         let mut auth_seen: Option<Instant> = None;
         let mut rotated = false;
         let mut reported_resume = false;
-        let mut wake = Wake::new(u64::from(std::process::id()));
+        let mut wake = Wake::new(wake_seed);
         let status = loop {
             // Whether the screen showed a limit this tick; for Claude, its
             // transcript decides whether that is live (see `limit_seen`).
@@ -548,7 +553,10 @@ pub fn launch(
                     );
                     let entries =
                         rejected.filter(store, &account.label, settings.threshold, entries);
-                    Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
+                    Ok(
+                        recovery_target(&account.label, &entries, &settings, now(), pinned)
+                            .cloned(),
+                    )
                 })();
                 // An unreadable store leaves the decision to the next tick.
                 let decided = hiccups.note("choosing another account", decided);
@@ -620,9 +628,12 @@ pub fn launch(
             }
             quiet.apply(terminal, tracker.as_ref());
         }
-        cleanup.synced = hiccups
+        let saved = hiccups
             .note("saving the provider's view", view.sync(store, &account))
             .is_some();
+        if let Some(cleanup) = &mut cleanup {
+            cleanup.synced = saved;
+        }
         if !auto {
             return Ok(status.code().unwrap_or(1));
         }
@@ -657,7 +668,16 @@ pub fn launch(
         {
             rotated = true;
         }
-        if rotated {
+        if rotated
+            && patiently("checking account reservation", || {
+                let _lock = store.lock()?;
+                let state = store.load()?;
+                Ok(state
+                    .auto
+                    .get(&provider)
+                    .is_none_or(|settings| settings.allows(&account.label, pinned)))
+            })?
+        {
             store::set_patience(PREPARE_PATIENCE);
             let resume_args = match prepared_resume.take() {
                 Some(args) => args,
@@ -675,6 +695,7 @@ pub fn launch(
             let _ = crate::refresh::for_run(store, &account);
             patiently("handing over the new token", || view.sync(store, &account))?;
             omit_one_shot(auto_args.as_ref().unwrap(), &mut terminal)?;
+            switch_slot(store, &mut gate, &mut terminal)?;
             launch_args = resume_args;
             switches += 1;
             restarts.record();
@@ -733,7 +754,10 @@ pub fn launch(
                     );
                     let entries =
                         rejected.filter(store, &account.label, settings.threshold, entries);
-                    Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
+                    Ok(
+                        recovery_target(&account.label, &entries, &settings, now(), pinned)
+                            .cloned(),
+                    )
                 })();
                 // Keep the decision that stopped the provider if this one fails.
                 if let Some(choice) = hiccups.note("choosing another account", decided) {
@@ -785,7 +809,10 @@ pub fn launch(
                         );
                         let entries =
                             rejected.filter(store, &account.label, settings.threshold, entries);
-                        Ok(recovery_target(&account.label, &entries, &settings, now()).cloned())
+                        Ok(
+                            recovery_target(&account.label, &entries, &settings, now(), pinned)
+                                .cloned(),
+                        )
                     })();
                     if let Some(choice) = hiccups.note("waiting for usable quota", decided) {
                         target = choice;
@@ -806,6 +833,9 @@ pub fn launch(
                     .expect("auto terminal")
                     .wait_for_restart(250)?;
             }
+            // At most one supervisor on this machine switches per interval;
+            // the target is chosen below, once this one's turn comes.
+            switch_slot(store, &mut gate, &mut terminal)?;
             // Eligibility can change after stopping the old provider. A lost
             // target is a normal wait outcome; store failures retain their own
             // retry policy. Neither permits launching a rejected account.
@@ -830,7 +860,8 @@ pub fn launch(
                 );
                 let entries =
                     rejected.filter_at(store, &account.label, settings.threshold, entries, at);
-                let Some(next) = recovery_target(&account.label, &entries, &settings, at).cloned()
+                let Some(next) =
+                    recovery_target(&account.label, &entries, &settings, at, pinned).cloned()
                 else {
                     return Ok(None);
                 };
@@ -844,7 +875,7 @@ pub fn launch(
                 state.auto.entry(provider).or_default().last_switch = at;
                 store.save(&state)?;
                 rejected.resumed(store, &next, &state.accounts);
-                let fallback = quota_fallback(&next, &entries, &settings, at);
+                let fallback = quota_fallback(&next, &entries, &settings, at, pinned);
                 Ok(Some((next, next_lease, fallback)))
             };
             // Retried with the store lock released between attempts.
@@ -856,6 +887,7 @@ pub fn launch(
             );
             match committed {
                 Ok(Some(next)) => break next,
+                // The grant is spent; the next attempt queues again.
                 Ok(None) if quota_wait => {
                     eprintln!(
                         "aswap: quota recovery lost eligibility before commit; waiting for verified quota"
@@ -895,6 +927,57 @@ pub fn launch(
         switches += 1;
         restarts.record();
     }
+}
+/// Wait for this machine's switch slot (see `switch_gate`) with the provider
+/// stopped, keeping the terminal responsive. Every supervisor restart passes
+/// here: account switches, returns to a recovered account and resumes on a
+/// rotated token. Initial launches do not.
+fn switch_slot(
+    store: &Store,
+    gate: &mut SwitchGate,
+    terminal: &mut Option<Terminal>,
+) -> Result<()> {
+    // An unreadable setting keeps the default rather than end the session.
+    let seconds = store
+        .lock()
+        .and_then(|_lock| store.load())
+        .map_or(crate::switch_gate::DEFAULT_INTERVAL_SECONDS, |state| {
+            state.switch_interval_seconds
+        });
+    let interval = Duration::from_secs(seconds.min(store::MAX_SWITCH_INTERVAL));
+    gate.acquire(interval, |pause| match terminal {
+        Some(terminal) => {
+            terminal.wait_for_restart(i32::try_from(pause.as_millis()).unwrap_or(i32::MAX))
+        }
+        None => {
+            std::thread::sleep(pause);
+            Ok(())
+        }
+    })
+}
+
+fn launch_seed(
+    store: &Store,
+    state: &store::State,
+    provider: Provider,
+    pinned: Option<&str>,
+    auto: bool,
+) -> Result<Account> {
+    let selected = store.account(state, provider, pinned)?;
+    let Some(settings) = state.auto.get(&provider) else {
+        return Ok(selected);
+    };
+    if !auto || settings.allows(&selected.label, pinned) {
+        return Ok(selected);
+    }
+    state
+        .accounts
+        .iter()
+        .find(|account| account.provider == provider && settings.allows(&account.label, pinned))
+        .cloned()
+        .ok_or(crate::Error(
+            "no unreserved account available for automatic launch",
+        ))
 }
 /// Whether the provider hit a usage limit. A provider that records limits
 /// in its transcript (`Spec::records_limits`) is believed only once that

@@ -39,9 +39,6 @@ if provider=='claude':
     (p/'sessions'/(str(os.getpid())+'.json')).write_text(json.dumps({'pid':os.getpid(),'sessionId':id}))
     with transcript.open('a') as out:
         out.write(json.dumps({'type':'assistant','timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat(),'isApiErrorMessage':True,'error':'rate_limit'})+'\n')
-print("You've hit your weekly limit" if provider=='claude' else 'usage_limit_reached',flush=True)
-(log/(id+'-initial')).write_text('limited')
-if os.environ['ASWAP_TEST_EXITED']=='yes': sys.exit(1)
 if mode=='race':
     import signal
     def quota_lost(*unused):
@@ -54,5 +51,12 @@ if mode=='race':
         (log/'revoked').write_text('quota revoked before commit')
         sys.exit(1)
     signal.signal(signal.SIGTERM,quota_lost)
+print("You've hit your weekly limit" if provider=='claude' else 'usage_limit_reached',flush=True)
+(log/(id+'-initial')).write_text('limited')
+if os.environ['ASWAP_TEST_EXITED']=='yes': sys.exit(1)
+if mode=='race':
+    # Remain alive until the supervisor has selected a target and stops us.
+    while True:
+        signal.pause()
 time.sleep(12 if mode=='model' else 25)
 sys.exit(9)

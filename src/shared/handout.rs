@@ -18,10 +18,14 @@ use std::{
 /// provider home. It holds the label of the account whose credentials the view
 /// carries, so a hand-out never gives one account's token to a view that has
 /// switched to another. Closing the file releases the lock.
-pub(super) fn view_lock(view: &Path, create: bool) -> Result<File> {
+/// The lock file beside a launch view (see `view_lock`).
+pub(crate) fn view_lock_path(view: &Path) -> PathBuf {
     let mut name = view.as_os_str().to_owned();
     name.push(".lock");
-    let path = PathBuf::from(name);
+    PathBuf::from(name)
+}
+pub(super) fn view_lock(view: &Path, create: bool) -> Result<File> {
+    let path = view_lock_path(view);
     store::no_links(&path)?;
     let file = fs::OpenOptions::new()
         .read(true)

@@ -14,14 +14,16 @@
         let pkgs = pkgsFor system;
         in pkgs.rustPlatform.buildRustPackage {
           pname = "aswap";
-          version = "0.1.0";
+          version = "0.2.1";
           src = pkgs.lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
           # nixpkgs' cargoSetupHook sets LIBSQLITE3_SYS_USE_PKG_CONFIG=1
           # (NixOS/nixpkgs 44cddf92c4), which overrides rusqlite's "bundled"
           # feature and links the system SQLite instead.
           nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.sqlite ];
+          buildInputs = [ pkgs.sqlite pkgs.zstd ];
+          # Use the system libzstd on nixpkgs revisions without a zstd-sys hook.
+          ZSTD_SYS_USE_PKG_CONFIG = "1";
           nativeCheckInputs = [ pkgs.python3 ];
           preCheck = ''
             aswapTestRoot=$(mktemp -d)
@@ -50,6 +52,8 @@
       devShells = eachSystem (system: let pkgs = pkgsFor system; in {
         default = pkgs.mkShell {
           packages = with pkgs; [ cargo rustc rustfmt clippy gitleaks pkg-config python3 ];
+          buildInputs = [ pkgs.zstd ];
+          ZSTD_SYS_USE_PKG_CONFIG = "1";
           shellHook = ''
             git config --local core.hooksPath .githooks
             echo "aswap: secret-scanning commit/push hooks installed"
@@ -79,6 +83,7 @@
                   autoswitch.codex.enable = true;
                   autoswitch.codex.resumePrompt = null;
                   autoswitch.pi.enable = true;
+                  switchIntervalSeconds = 0;
                   waybar.enable = true;
                 };
               }
@@ -92,7 +97,9 @@
               home.stateVersion = "26.05";
               programs.aswap = {
                 enable = true; syncHost = "synthetic-owner"; autoswitch.claude.enable = true;
+                autoswitch.codex = { enable = true; autoReset = "dry-run"; };
                 syncProfiles = { allow = [ "claude:personal" "codex:personal" ]; deny = [ "codex:personal" ]; };
+                retention = { enable = true; minAge = 3600; archiveDir = "/home/synthetic/retained"; ioPressureLimit = 24.5; };
               };
             } ];
           };
@@ -130,6 +137,7 @@
           '';
           home-manager = assert builtins.elem package hm.config.home.packages;
             assert !(hm.config.xdg.configFile ? "aswap/sync-policy.json");
+            assert !(hm.config.xdg.configFile ? "aswap/config.toml");
             assert hmPolicyOnly.config.xdg.configFile."aswap/sync-policy.json".text == builtins.toJSON { allow = []; deny = []; };
             assert !(hmPolicyOnly.config.systemd.user.services ? aswap-claude);
             assert builtins.fromJSON hmPeer.config.xdg.configFile."aswap/sync-policy.json".text == {
@@ -144,9 +152,26 @@
             assert pkgs.lib.hasInfix " resume-prompt -- " (builtins.elemAt hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre 2);
             assert pkgs.lib.hasInfix "$$HOME %%n" (builtins.elemAt hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre 2);
             assert pkgs.lib.hasInfix "off" (builtins.elemAt hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre 2);
-            assert pkgs.lib.hasSuffix " prefer headroom" (builtins.elemAt hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre 3);
+            assert pkgs.lib.hasSuffix " prefer weekly-reset" (builtins.elemAt hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre 3);
+            # Codex usage resets are opt-in (default off); Claude has none.
+            assert pkgs.lib.hasSuffix " auto codex reset off" (builtins.elemAt hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre 4);
+            assert pkgs.lib.hasSuffix " auto codex reset dry-run" (builtins.elemAt hmPeer.config.systemd.user.services.aswap-codex.Service.ExecStartPre 4);
+            assert !(builtins.any (pkgs.lib.hasInfix " reset ") hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre);
+            assert pkgs.lib.hasSuffix " auto codex on" (pkgs.lib.last hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre);
+            assert builtins.any (pkgs.lib.hasSuffix " auto switch-interval 0") hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre;
+            assert builtins.any (pkgs.lib.hasSuffix " auto switch-interval 4") hmPeer.config.systemd.user.services.aswap-claude.Service.ExecStartPre;
             assert hm.config.programs.waybar.settings.mainBar."custom/aswap".return-type == "json";
-            pkgs.runCommand "aswap-home-manager" {} "touch $out";
+            pkgs.runCommand "aswap-home-manager" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+              python3 - ${hmPeer.config.xdg.configFile."aswap/config.toml".source} <<'PY'
+              import sys, tomllib
+              with open(sys.argv[1], "rb") as config:
+                  assert tomllib.load(config)["retention"] == {
+                      "enabled": True, "min_age": 3600, "archive_dir": "/home/synthetic/retained",
+                      "dry_run": True, "io_pressure_limit": 24.5,
+                  }
+              PY
+              touch "$out"
+            '';
         });
     };
 }

@@ -6,11 +6,12 @@ use aswap::{
 use serde_json::json;
 use std::{
     fs,
-    io::Read,
     os::unix::fs::PermissionsExt,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
+
+const LOST_ELIGIBILITY: &str = "lost eligibility before commit; waiting";
 
 struct Children(Vec<Child>);
 impl Drop for Children {
@@ -36,6 +37,9 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
     let log = temp.path().join("launches");
     fs::create_dir(&log).unwrap();
     let reset = aswap::now() + 4;
+    // Leave enough time for every staggered probe to reject the other model
+    // before publishing the current account's post-reset observation.
+    let model_reset = reset + 35;
     let mut state = store.load().unwrap();
     for (label, used) in [("current", 20.0), ("other", 100.0)] {
         let profile = store.profile(provider, label).unwrap();
@@ -61,7 +65,7 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
                             reset
                         } else {
                             if mode == "model" {
-                                reset + 10
+                                model_reset
                             } else {
                                 reset + 60
                             }
@@ -81,6 +85,9 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
         });
     }
     state.active.insert(provider, "current".into());
+    if mode == "gated" {
+        state.switch_interval_seconds = 1;
+    }
     store.save(&state).unwrap();
 
     let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
@@ -99,6 +106,8 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
     )
     .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    let stderr_path = |index| temp.path().join(format!("supervisor-{index}.stderr"));
+    let read_stderr = |index| fs::read_to_string(stderr_path(index)).unwrap();
     let mut children = Children(Vec::new());
     for index in 0..count {
         let id = format!("11111111-2222-4333-8444-{index:012}");
@@ -138,14 +147,20 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
                     Stdio::null()
                 })
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stderr(fs::File::create(stderr_path(index)).unwrap())
                 .spawn()
                 .unwrap(),
         );
     }
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(100);
     let mut sent = false;
-    while aswap::now() < reset {
+    // In the revocation case, publish quota only once the supervisor is waiting
+    // and the provider has acknowledged the limit with its signal handler armed.
+    while aswap::now() < reset
+        || (mode == "race"
+            && (fs::read_dir(&log).unwrap().count() != count
+                || !(0..count).all(|index| read_stderr(index).contains("watching all accounts"))))
+    {
         assert!(Instant::now() < deadline);
         if exited
             && !sent
@@ -172,16 +187,29 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
         std::thread::sleep(Duration::from_millis(20));
     }
     if fs::read_dir(&log).unwrap().count() != count {
-        for child in &mut children.0 {
+        for (index, child) in children.0.iter_mut().enumerate() {
             if let Some(status) = child.try_wait().unwrap() {
-                let mut stderr = String::new();
-                std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+                let stderr = read_stderr(index);
                 let mut stdout = String::new();
                 std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
                 panic!("provider exited before barrier: {status}: {stderr} {stdout}");
             }
         }
         panic!("providers did not reach launch barrier");
+    }
+    // Keep the global switch slot taken (a switch recorded just now, again
+    // and again) from before quota returns until the supervisor queues.
+    let hold = |store: &Store| {
+        use aswap::switch_gate::{Clock, FileShelf, Shelf, SystemClock};
+        FileShelf::new(&store.root)
+            .update(|shared| {
+                shared.last_switch_at = SystemClock.now_ms();
+                ((), true)
+            })
+            .unwrap();
+    };
+    if mode == "gated" {
+        hold(&store);
     }
     if interrupted {
         for child in &children.0 {
@@ -200,30 +228,48 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
         cache.usage.windows[0].resets_at = Some(reset + 3600);
         store::json_write(&cache_path, &cache).unwrap();
     }
+    if mode == "gated" {
+        let resumed = |index: usize| {
+            log.join(format!("11111111-2222-4333-8444-{index:012}-resumed"))
+                .exists()
+        };
+        while !read_stderr(0).contains("waiting for the global switch slot") {
+            assert!(
+                Instant::now() < deadline,
+                "the restart never queued for the slot"
+            );
+            assert!(!resumed(0), "restarted without the switch slot");
+            hold(&store);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let held = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < held {
+            hold(&store);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!resumed(0), "restarted while the slot was taken");
+        }
+    }
     if mode == "model" || mode == "race" {
         while if mode == "model" {
-            aswap::now() < reset + 10
+            aswap::now() < model_reset
         } else {
+            // Wait for both the fixture's revocation and the supervisor's
+            // commit-time rejection before making quota available again.
             !log.join("revoked").exists()
+                || !(0..count).all(|index| read_stderr(index).contains(LOST_ELIGIBILITY))
         } {
             assert!(Instant::now() < deadline, "review barrier timed out");
-            for child in &mut children.0 {
+            for (index, child) in children.0.iter_mut().enumerate() {
                 if let Some(status) = child.try_wait().unwrap() {
-                    let mut stderr = String::new();
-                    std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr)
-                        .unwrap();
+                    let stderr = read_stderr(index);
                     panic!("supervisor abandoned quota recovery: {status}: {stderr}");
                 }
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        if mode == "race" {
-            std::thread::sleep(Duration::from_millis(750));
-        }
-        for child in &mut children.0 {
+        for (index, child) in children.0.iter_mut().enumerate() {
             if let Some(status) = child.try_wait().unwrap() {
-                let mut stderr = String::new();
-                std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+                let stderr = read_stderr(index);
                 panic!("supervisor launched without verified quota: {status}: {stderr}");
             }
         }
@@ -239,7 +285,7 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
         cache.usage.windows[0].resets_at = Some(reset + 3600);
         store::json_write(&path, &cache).unwrap();
     }
-    for child in &mut children.0 {
+    for (index, child) in children.0.iter_mut().enumerate() {
         while child.try_wait().unwrap().is_none() {
             if Instant::now() >= deadline {
                 let cache: Cached = store::json_read(
@@ -253,20 +299,12 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
                     format!("supervisor never woke after reset; cache={cache:?}\n");
                 let _ = child.kill();
                 let _ = child.wait();
-                let mut stderr = String::new();
-                child
-                    .stderr
-                    .as_mut()
-                    .unwrap()
-                    .read_to_string(&mut stderr)
-                    .unwrap();
-                diagnostics.push_str(&stderr);
+                diagnostics.push_str(&read_stderr(index));
                 panic!("{diagnostics}");
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        let mut stderr = String::new();
-        std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+        let stderr = read_stderr(index);
         let status = child.wait().unwrap();
         if interrupted {
             assert!(!status.success());
@@ -279,10 +317,6 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
             panic!("{stderr}\n{stdout}");
         }
         if mode == "race" {
-            assert!(
-                stderr.contains("lost eligibility before commit; waiting"),
-                "{stderr}"
-            );
             assert!(!stderr.contains("resuming on claude:current"), "{stderr}");
         }
         assert!(stderr.contains("watching all accounts"), "{stderr}");
@@ -305,6 +339,11 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
         fs::read_dir(log).unwrap().count(),
         count * if interrupted { 1 } else { 2 } + usize::from(mode == "race")
     );
+}
+
+#[test]
+fn a_quota_switch_waits_for_the_global_switch_slot() {
+    review_scenario(Provider::Claude, "other", false, 1, "gated");
 }
 
 #[test]

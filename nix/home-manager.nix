@@ -21,8 +21,13 @@ let
       };
       prefer = mkOption {
         type = types.enum [ "headroom" "weekly-reset" ];
-        default = "headroom";
-        description = "Rank eligible accounts by most headroom, or by the soonest weekly reset (new launches also move to an account whose weekly quota resets sooner).";
+        default = "weekly-reset";
+        description = "Rank eligible accounts by the soonest weekly reset (the default; new launches also move to an account whose weekly quota resets sooner), or by most headroom.";
+      };
+      autoReset = mkOption {
+        type = types.enum [ "off" "dry-run" "on" ];
+        default = "off";
+        description = "Codex only, and only while this provider's monitor is enabled (enable = true). When every Codex account is out of weekly usage, redeem one earned usage-limit reset credit on the account whose weekly window resets farthest away (this resets its 5-hour and weekly windows together). dry-run only logs what it would reset.";
       };
     };
   };
@@ -97,6 +102,9 @@ let
         "${cfg.package}/bin/aswap auto ${provider} threshold ${toString settings.threshold}"
         "${cfg.package}/bin/aswap auto ${provider} resume-prompt -- ${escapeExecArg (if settings.resumePrompt == null then "off" else settings.resumePrompt)}"
         "${cfg.package}/bin/aswap auto ${provider} prefer ${settings.prefer}"
+      ] ++ (lib.optional (provider == "codex") "${cfg.package}/bin/aswap auto ${provider} reset ${settings.autoReset}")
+        ++ [
+        "${cfg.package}/bin/aswap auto switch-interval ${toString cfg.switchIntervalSeconds}"
         "${cfg.package}/bin/aswap auto ${provider} on"
       ];
       ExecStart = "${cfg.package}/bin/aswap auto ${provider} watch";
@@ -120,6 +128,39 @@ in {
         type = types.submodule providerOptions;
         default = {};
         description = "pi's own ChatGPT logins (aswap add pi).";
+      };
+    };
+    switchIntervalSeconds = mkOption {
+      type = types.ints.between 0 3600;
+      default = 4;
+      description = "Minimum seconds between account switches of all run --auto sessions sharing this aswap data directory, across providers, so a shared limit or reset moves them one at a time; 0 disables. Applied when an autoswitch monitor starts.";
+    };
+    retention = {
+      enable = mkEnableOption "retention of finished aswap runtime views";
+      minAge = mkOption {
+        type = types.ints.unsigned;
+        default = 172800;
+        description = "Minimum age in seconds before a runtime view is eligible for garbage collection.";
+      };
+      archiveDir = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Absolute path for retained private state and conflicting transcripts. Null uses the archive directory in the aswap data store.";
+      };
+      legacyHomes = mkOption {
+        type = types.attrsOf types.str;
+        default = {};
+        description = "Verified original homes for old runtime views, keyed by provider:label.";
+      };
+      dryRun = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Preview changes by default when invoking aswap gc.";
+      };
+      ioPressureLimit = mkOption {
+        type = types.addCheck types.number (n: n >= 0 && n <= 100);
+        default = 30;
+        description = "Stop GC when Linux I/O pressure some avg10 exceeds this percentage.";
       };
     };
     refreshOwner = mkOption {
@@ -165,10 +206,28 @@ in {
     waybar.enable = mkEnableOption "the custom/aswap Waybar module in mainBar";
   };
   config = mkIf cfg.enable {
-    assertions = [{ assertion = !(cfg.refreshOwner == true && cfg.syncHost != null); message = "aswap refreshOwner and syncHost are mutually exclusive"; }];
+    assertions = [
+      { assertion = !(cfg.refreshOwner == true && cfg.syncHost != null); message = "aswap refreshOwner and syncHost are mutually exclusive"; }
+      { assertion = cfg.autoswitch.claude.autoReset == "off"; message = "aswap autoswitch.claude.autoReset: usage-limit resets are only supported for Codex"; }
+      { assertion = cfg.autoswitch.codex.autoReset == "off" || cfg.autoswitch.codex.enable; message = "aswap autoswitch.codex.autoReset needs autoswitch.codex.enable: only the monitor redeems resets"; }
+    ];
     home.packages = [ cfg.package ];
     xdg.configFile."aswap/sync-policy.json" = mkIf (cfg.syncProfiles != null) {
       text = builtins.toJSON cfg.syncProfiles;
+    };
+    xdg.configFile."aswap/config.toml" = mkIf cfg.retention.enable {
+      source = (pkgs.formats.toml {}).generate "aswap-config.toml" {
+        retention = {
+          enabled = true;
+          min_age = cfg.retention.minAge;
+          dry_run = cfg.retention.dryRun;
+          io_pressure_limit = cfg.retention.ioPressureLimit;
+        } // lib.optionalAttrs (cfg.retention.archiveDir != null) {
+          archive_dir = cfg.retention.archiveDir;
+        } // lib.optionalAttrs (cfg.retention.legacyHomes != {}) {
+          legacy_homes = cfg.retention.legacyHomes;
+        };
+      };
     };
     systemd.user.services = lib.mapAttrs' (provider: settings:
       lib.nameValuePair "aswap-${provider}" (serviceFor provider settings)

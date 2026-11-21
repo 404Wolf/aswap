@@ -342,8 +342,9 @@ fn is_transcript_file(path: &Path) -> bool {
 }
 
 fn writable_proc_fd(path: &Path) -> bool {
-    // Linux gives /proc/<pid>/fd symlinks the access mode of the open fd.
-    fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink() && m.mode() & libc::S_IWUSR != 0)
+    // Linux gives /proc/<pid>/fd symlinks the access mode of the open fd:
+    // owner-writable (0o200) for an fd open for writing.
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink() && m.mode() & 0o200 != 0)
 }
 
 fn fd_directory_state(path: &Path) -> Option<(u64, u64)> {

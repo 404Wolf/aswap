@@ -80,7 +80,13 @@ fn set_clock(path: &Path, at: u64) {
     store::atomic(path, at.to_string().as_bytes()).unwrap();
 }
 
-fn scenario(provider: Provider, recovered: &str, delayed: bool, recovered_usage: f64) {
+fn scenario(
+    provider: Provider,
+    recovered: &str,
+    delayed: bool,
+    recovered_usage: f64,
+    pinned: bool,
+) {
     let temp = tempfile::tempdir().unwrap();
     let store = Store::open(temp.path().join("data/aswap")).unwrap();
     let base = crate::now();
@@ -177,6 +183,7 @@ fn scenario(provider: Provider, recovered: &str, delayed: bool, recovered_usage:
             .env("ASWAP_TEST_LOG", &log)
             .env("ASWAP_TEST_RECOVERED", recovered)
             .env("ASWAP_TEST_EXITED", "yes")
+            .env("ASWAP_TEST_PINNED", if pinned { "yes" } else { "no" })
             .env(
                 "ASWAP_TEST_MODE",
                 if delayed { "delayed" } else { "ordinary" },
@@ -260,18 +267,34 @@ fn scenario(provider: Provider, recovered: &str, delayed: bool, recovered_usage:
     );
     {
         let _lock = store.lock().unwrap();
-        let path = store
-            .profile(provider, recovered)
-            .unwrap()
-            .join("usage-cache.json");
-        let mut cache: usage::Cached = store::json_read(&path).unwrap();
-        cache.error = None;
-        cache.fetched_at = reset;
-        cache.usage.windows[0].used_percent = recovered_usage;
-        cache.usage.windows[0].resets_at = Some(base + 86_400);
-        store::json_write(&path, &cache).unwrap();
+        let mut state = store.load().unwrap();
+        let reserved = if pinned { "current" } else { "other" };
+        state
+            .auto
+            .entry(provider)
+            .or_default()
+            .reserved
+            .push(reserved.into());
+        store.save(&state).unwrap();
+        let publish = |label, used| {
+            let path = store
+                .profile(provider, label)
+                .unwrap()
+                .join("usage-cache.json");
+            let mut cache: usage::Cached = store::json_read(&path).unwrap();
+            cache.error = None;
+            cache.fetched_at = reset;
+            cache.usage.windows[0].used_percent = used;
+            cache.usage.windows[0].resets_at = Some(base + 86_400);
+            store::json_write(&path, &cache).unwrap();
+        };
+        publish(recovered, recovered_usage);
+        if !pinned {
+            // Verified earlier and better quota on a freshly reserved target.
+            publish(reserved, 1.0);
+        }
     }
-    set_clock(&clock, reset + 6); // past every supervisor's 1..5s stagger
+    set_clock(&clock, reset + 31); // past every supervisor's 1..30s stagger
 
     let mut closed = BTreeSet::new();
     barrier(&rx, &workers, "verified recovery", |event| {
@@ -310,27 +333,32 @@ fn scenario(provider: Provider, recovered: &str, delayed: bool, recovered_usage:
 #[test]
 fn exited_claude_waits_and_many_sessions_resume_on_the_first_reset() {
     for account in ["current", "other"] {
-        scenario(Provider::Claude, account, false, 2.0);
+        scenario(Provider::Claude, account, false, 2.0, true);
     }
 }
 #[test]
 fn exited_codex_waits_and_many_sessions_resume_on_the_first_reset() {
     for account in ["current", "other"] {
-        scenario(Provider::Codex, account, false, 2.0);
+        scenario(Provider::Codex, account, false, 2.0, true);
     }
 }
 #[test]
 fn delayed_rejections_wait_for_reset_acknowledgements() {
-    scenario(Provider::Claude, "current", true, 2.0);
+    scenario(Provider::Claude, "current", true, 2.0, true);
 }
 
 #[test]
 fn verified_resets_resume_above_threshold_and_log_the_last_resort() {
     for provider in [Provider::Claude, Provider::Codex] {
         for account in ["current", "other"] {
-            scenario(provider, account, false, 90.0);
+            scenario(provider, account, false, 90.0, true);
         }
     }
+}
+
+#[test]
+fn unpinned_supervisors_skip_an_account_reserved_while_waiting() {
+    scenario(Provider::Claude, "current", false, 2.0, false);
 }
 
 #[test]
@@ -360,7 +388,7 @@ fn supervisor_child() {
         run(
             &Store::from_env().unwrap(),
             provider,
-            Some("current"),
+            (std::env::var("ASWAP_TEST_PINNED").unwrap() == "yes").then_some("current"),
             &args,
             true
         )

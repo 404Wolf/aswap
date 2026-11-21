@@ -150,7 +150,13 @@ Never edit the headline (line 1).
 - [x] Verify combined recovery and policy behavior with synthetic tests, formatting, Clippy, Home Manager checks and secret scans.
 - [ ] Deploy the combined build and verify each machine's declared policy and existing-profile cleanup through the coordinated rollout.
 
-## M19: pi
+## M19: Opt-in Codex usage-limit resets and reset-aware selection
+- [x] Establish from the codex-cli 0.167.1 source how "Redeem reset" works (earned, expiring credits; one redemption resets the 5-hour and weekly windows together) and redeem with the same app-server request, never by driving the TUI.
+- [x] Add `aswap auto codex reset off|dry-run|on` (default off) with a Home Manager option, shown in `list`/`status` text and JSON; old state loads as off.
+- [x] Decide in a pure core: redeem only when every Codex account is out of weekly usage, on the account whose weekly window resets farthest away (then soonest credit expiry, then label); unknown usage, no credit, money wording, cooldown or a halt mean no reset.
+- [x] Redeem behind a port: persist the idempotency key first, re-read usage before and after, retry with backoff then give up until the next window, refuse and halt on payment wording, never on followers; record a capped log.
+- [x] Verify every selection path ranks by the soonest weekly reset for both providers, and expose `limit_blocked`/`blocked_until` in `aswap sessions --json`.
+## M20: pi
 - [x] Split runner.rs, shared.rs and coordination.rs along their seams, and put every provider fact behind a `provider::Spec` trait (Claude, Codex, pi), with no behaviour change.
 - [x] `run claude --pick`: choose the account by quota with plain stdio for `claude -p` pipes; `run claude --via pi [--account]` for pi-claude-code-provider, one account per session or one picked per call.
 - [x] pi as a third provider: `add pi` moves the ChatGPT login out of pi's auth.json; access-only launch views beside shared settings, sessions and extensions; refresh for both pi ChatGPT logins; quota for `openai-codex` logins; list/status/usage/waybar/sessions; sync-safe for older followers; Home Manager `autoswitch.pi`.

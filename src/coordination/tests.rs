@@ -576,7 +576,7 @@ fn a_failed_or_hanging_watch_backs_off_itself_but_never_the_poll() {
     // An owner that refuses the stream. It reads the request first, as the
     // real owner does; exiting before that races the write (EPIPE).
     let error = fail(
-        "head -c 1 >/dev/null; printf 'aswap: sync: version-mismatch\\n' >&2; exit 1",
+        "IFS= read -r request || exit 2; printf 'aswap: sync: version-mismatch\\n' >&2; exit 1",
         Duration::from_secs(5),
     );
     assert_eq!(error.0, "sync: version-mismatch");
@@ -910,7 +910,7 @@ fn the_sync_log_is_private_secret_free_capped_and_shown_in_status() {
             let mut command = Command::new("sh");
             command.args([
                 "-c",
-                "printf 'aswap: sync: version-mismatch\\n' >&2; exit 1",
+                "IFS= read -r request || exit 2; printf 'aswap: sync: version-mismatch\\n' >&2; exit 1",
             ]);
             Ok(command)
         },

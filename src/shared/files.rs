@@ -62,31 +62,33 @@ pub(super) fn sqlite_file(path: &Path) -> bool {
         && &header == b"SQLite format 3\0"
 }
 /// Copy committed pages through SQLite so live WAL writes cannot tear snapshots.
-pub(super) fn sqlite_snapshot(source: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn sqlite_snapshot(source: &Path, dest: &Path) -> Result<()> {
     let source =
         rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .safe("cannot open SQLite snapshot source")?;
+    sqlite_snapshot_from(&source, dest, || Ok(()))
+}
+
+pub(crate) fn sqlite_snapshot_from(
+    source: &rusqlite::Connection,
+    dest: &Path,
+    mut check_pressure: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    check_pressure()?;
     source
         .busy_timeout(std::time::Duration::from_secs(5))
         .safe("cannot set SQLite timeout")?;
     let mut target =
         rusqlite::Connection::open(dest).safe("cannot open SQLite snapshot destination")?;
-    let backup = rusqlite::backup::Backup::new(&source, &mut target)
+    let backup = rusqlite::backup::Backup::new(source, &mut target)
         .safe("cannot prepare SQLite snapshot")?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if matches!(
-            backup.step(128).safe("cannot snapshot SQLite database")?,
-            rusqlite::backup::StepResult::Done
-        ) {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(Error("SQLite snapshot timed out; original retained"));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    copy_sqlite_pages(
+        &backup,
+        &mut check_pressure,
+        std::time::Duration::from_secs(10),
+    )?;
     drop(backup);
+    check_pressure()?;
     let check: String = target
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
         .safe("cannot validate SQLite snapshot")?;
@@ -95,7 +97,43 @@ pub(super) fn sqlite_snapshot(source: &Path, dest: &Path) -> Result<()> {
             "SQLite snapshot source is corrupt; original retained",
         ));
     }
-    Ok(())
+    check_pressure()
+}
+
+fn copy_sqlite_pages(
+    backup: &rusqlite::backup::Backup<'_, '_>,
+    mut check_pressure: impl FnMut() -> Result<()>,
+    stall_timeout: std::time::Duration,
+) -> Result<()> {
+    use rusqlite::backup::StepResult;
+
+    let mut stalled_since = None;
+    let mut fewest_remaining = i32::MAX;
+    loop {
+        check_pressure()?;
+        let started = std::time::Instant::now();
+        if stalled_since.is_some_and(|since: std::time::Instant| since.elapsed() >= stall_timeout) {
+            return Err(Error(
+                "SQLite snapshot made no progress before timeout; original retained",
+            ));
+        }
+        match backup.step(128).safe("cannot snapshot SQLite database")? {
+            StepResult::Done => return Ok(()),
+            StepResult::More => {
+                let remaining = backup.progress().remaining;
+                if remaining < fewest_remaining {
+                    fewest_remaining = remaining;
+                    stalled_since = None;
+                    continue;
+                }
+            }
+            _ => {} // Busy or locked.
+        }
+        // Live writes can restart a backup. Count only net progress and
+        // sleep only while nothing advances.
+        stalled_since.get_or_insert(started);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 /// Stream into a private temporary file, then publish without replacing anything.
 pub(super) fn new_file(source: &Path, dest: &Path) -> Result<()> {
@@ -172,6 +210,58 @@ pub(crate) fn stamp(path: &Path) -> Option<Stamp> {
 #[cfg(test)]
 mod sqlite_tests {
     use super::*;
+
+    #[test]
+    fn progressing_backup_uses_no_lock_wait_budget_and_checks_pressure_between_steps() {
+        let source = rusqlite::Connection::open_in_memory().unwrap();
+        source
+            .execute_batch(
+                "CREATE TABLE payload (data BLOB);
+                 WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n<200)
+                 INSERT INTO payload SELECT zeroblob(8192) FROM ids;",
+            )
+            .unwrap();
+        let mut target = rusqlite::Connection::open_in_memory().unwrap();
+        let mut checks = 0;
+        let backup = rusqlite::backup::Backup::new(&source, &mut target).unwrap();
+        copy_sqlite_pages(
+            &backup,
+            || {
+                checks += 1;
+                if checks == 2 {
+                    return Err(Error("synthetic I/O pressure stop"));
+                }
+                Ok(())
+            },
+            std::time::Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(checks, 2);
+        copy_sqlite_pages(&backup, || Ok(()), std::time::Duration::ZERO).unwrap();
+        drop(backup);
+        let rows: u32 = target
+            .query_row("SELECT count(*) FROM payload", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 200);
+    }
+
+    #[test]
+    fn locked_backup_respects_its_stall_timeout() {
+        let source = rusqlite::Connection::open_in_memory().unwrap();
+        source
+            .execute_batch(
+                "CREATE TABLE payload (id INTEGER); BEGIN; INSERT INTO payload VALUES (1);",
+            )
+            .unwrap();
+        let mut target = rusqlite::Connection::open_in_memory().unwrap();
+        let backup = rusqlite::backup::Backup::new(&source, &mut target).unwrap();
+        let failure = copy_sqlite_pages(&backup, || Ok(()), std::time::Duration::ZERO).unwrap_err();
+        assert_eq!(
+            failure.0,
+            "SQLite snapshot made no progress before timeout; original retained"
+        );
+    }
+
     #[test]
     fn live_wal_snapshots_include_committed_rows_and_omit_sidecars() {
         let t = tempfile::tempdir().unwrap();

@@ -11,7 +11,10 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},
     io::Write,
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{OpenOptionsExt, PermissionsExt, symlink},
+    },
     path::{Path, PathBuf},
 };
 
@@ -23,10 +26,11 @@ mod mcp;
 pub use config::{account_config, account_key, merge_changes};
 use config::{merge_missing, read_config, shared_config};
 pub use files::merge_new;
+pub(crate) use files::sqlite_snapshot_from;
 pub(crate) use files::{Stamp, stamp};
 use files::{dir, entries, exists, link, snapshot};
-pub(crate) use handout::hand_out;
 use handout::{carry, view_lock};
+pub(crate) use handout::{hand_out, view_lock_path};
 use mcp::{MCP_OAUTH, mcp_record, with_mcp};
 
 /// A mkdir lock (proper-lockfile: a directory named `<file>.lock`), as Claude
@@ -44,7 +48,7 @@ fn lock_dir(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with(".lock"))
         && fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
-fn private(provider: Provider, name: &OsStr) -> bool {
+pub(crate) fn private(provider: Provider, name: &OsStr) -> bool {
     let name = name.to_string_lossy();
     name == provider.auth_file()
         || matches!(
@@ -60,6 +64,8 @@ fn private(provider: Provider, name: &OsStr) -> bool {
                 // file is per view, so its lock is too; through a symlink the
                 // lock can never be removed and every MCP OAuth write fails.
                 | ".storage-write.lock"
+                | VIEW_LIFETIME_LOCK
+                | SESSION_REPORT
         )
         || name.starts_with(".credentials")
         || name.starts_with("auth")
@@ -151,8 +157,8 @@ fn shared_names(provider: Provider) -> impl Iterator<Item = &'static str> {
 /// as home would snapshot every shared entry (each is a symlink there),
 /// copying the whole session history into the new view. Follow the view's
 /// links back to the home it shares instead.
-fn shared_home(store: &Store, provider: Provider, mut home: PathBuf) -> Result<PathBuf> {
-    let runtimes = store.root.join("runtimes");
+pub(crate) fn shared_home(root: &Path, provider: Provider, mut home: PathBuf) -> Result<PathBuf> {
+    let runtimes = root.join("runtimes");
     for _ in 0..8 {
         if !home.starts_with(&runtimes) {
             return Ok(home);
@@ -172,11 +178,9 @@ fn shared_home(store: &Store, provider: Provider, mut home: PathBuf) -> Result<P
     }
     Err(Error("provider home is a chain of aswap launch views"))
 }
-/// Removes a run's launch view, with its lock and session report, when the
-/// run ends, but only once `synced` says its last sync published everything
-/// it holds of the user's: what remains is disposable (an access-only login,
-/// account config already merged back, symlinks). A view whose last sync
-/// failed is kept, so nothing written there is lost.
+/// Removes a one-shot launch view (`run --pick`, one per `claude -p` call)
+/// once its final sync succeeded. Interactive views are kept for runtime
+/// retention (`aswap gc`), which archives their private state first.
 pub struct ViewCleanup {
     path: PathBuf,
     pub synced: bool,
@@ -196,11 +200,7 @@ impl Drop for ViewCleanup {
         }
         // remove_dir_all never follows the view's links into shared state.
         let _ = fs::remove_dir_all(&self.path);
-        for suffix in [".lock", ".session.json"] {
-            let mut name = self.path.as_os_str().to_owned();
-            name.push(suffix);
-            let _ = fs::remove_file(PathBuf::from(name));
-        }
+        let _ = fs::remove_file(view_lock_path(&self.path));
     }
 }
 /// A private auth/config view; actual history lives in the caller's home.
@@ -219,14 +219,22 @@ pub struct View {
     /// The canonical profile auth this view last copied; a different stamp
     /// means the owner rotated or a follower installed a new token.
     auth_stamp: Option<Stamp>,
+    _lifetime: File,
 }
+pub(crate) const VIEW_LIFETIME_LOCK: &str = ".aswap-active";
+/// A supervised provider's report of its current session (pi).
+pub(crate) const SESSION_REPORT: &str = ".aswap-session.json";
 impl View {
     /// The global store lock covers migration, shared-home creation and the
     /// credential/MCP writes in `select_locked`. Linking and snapshotting into
     /// the new run directory, which no other process knows about, happen
     /// outside it: a large managed entry must never stall other launches.
     pub fn prepare(store: &Store, account: &Account) -> Result<Self> {
-        let home = shared_home(store, account.provider, account.provider.current_home()?)?;
+        let home = shared_home(
+            &store.root,
+            account.provider,
+            account.provider.current_home()?,
+        )?;
         if home.ancestors().any(|p| p.join(".git").exists()) {
             return Err(Error("provider state must live outside a Git checkout"));
         }
@@ -287,11 +295,42 @@ impl View {
             .join(account.provider.as_str())
             .join(&account.label);
         store::private_dir(&parent)?;
-        let path = tempfile::Builder::new()
-            .prefix("run-")
+        let pending = tempfile::Builder::new()
+            .prefix(".preparing-")
             .tempdir_in(parent)
-            .safe("cannot create private launch view")?
-            .keep();
+            .safe("cannot create private launch view")?;
+        // Credential hand-outs use a separate lock. This one spans setup,
+        // child restarts and final sync, and pins the view's shared home for GC.
+        let mut lifetime = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(pending.path().join(VIEW_LIFETIME_LOCK))
+            .safe("cannot open launch view lifetime lock")?;
+        fs2::FileExt::lock_exclusive(&lifetime).safe("cannot hold launch view lifetime lock")?;
+        lifetime
+            .write_all(home.as_os_str().as_bytes())
+            .safe("cannot record launch view home")?;
+        let mut run = OsString::from("run-");
+        run.push(OsStr::from_bytes(
+            pending
+                .path()
+                .file_name()
+                .unwrap()
+                .as_bytes()
+                .strip_prefix(b".preparing-")
+                .unwrap(),
+        ));
+        let path = pending.path().with_file_name(run);
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            pending.path(),
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .safe("cannot publish private launch view")?;
+        let _ = pending.keep();
         let mut names: BTreeSet<OsString> = entries(&home)?
             .into_iter()
             .map(|p| p.file_name().unwrap().to_owned())
@@ -328,6 +367,7 @@ impl View {
             managed: BTreeSet::new(),
             stamps: BTreeMap::new(),
             auth_stamp: None,
+            _lifetime: lifetime,
         };
         for name in names {
             if private(view.provider, &name) || lock_dir(&view.home.join(&name)) {
@@ -425,10 +465,11 @@ impl View {
     }
     /// Where the provider reports its current session: beside the view, never
     /// inside the provider home, like the view's lock.
+    /// Where the provider reports its current session
+    /// (`Spec::report_session`): inside the view, private, so retention
+    /// retires it with the view.
     pub fn report_path(&self) -> PathBuf {
-        let mut name = self.path.as_os_str().to_owned();
-        name.push(".session.json");
-        PathBuf::from(name)
+        self.path.join(SESSION_REPORT)
     }
     pub fn select(&mut self, store: &Store, account: &Account) -> Result<()> {
         let _lock = store.lock()?;

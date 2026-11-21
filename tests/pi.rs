@@ -192,8 +192,8 @@ fn a_pi_launch_has_a_private_access_only_login_and_shared_state() {
     assert_eq!(seen["openai_key"], Value::Null);
     // The view's login file is private; pi's own auth.json is untouched.
     assert_eq!(seen["auth_mode"], 0o600);
-    // The finished run's view is gone.
-    assert!(!home.exists());
+    // The finished run's view stays for runtime retention (`aswap gc`).
+    assert!(home.join(".aswap-active").is_file());
     assert_eq!(t.auth(), json!({}));
 }
 
