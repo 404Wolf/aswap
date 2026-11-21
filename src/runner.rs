@@ -790,6 +790,7 @@ pub fn run(
             );
             match committed {
                 Ok(Some(next)) => break next,
+                // The grant is spent; the next attempt queues again.
                 Ok(None) if quota_wait => {
                     eprintln!(
                         "aswap: quota recovery lost eligibility before commit; waiting for verified quota"

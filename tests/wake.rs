@@ -85,6 +85,9 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
         });
     }
     state.active.insert(provider, "current".into());
+    if mode == "gated" {
+        state.switch_interval_seconds = 1;
+    }
     store.save(&state).unwrap();
 
     let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
@@ -194,6 +197,20 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
         }
         panic!("providers did not reach launch barrier");
     }
+    // Keep the global switch slot taken (a switch recorded just now, again
+    // and again) from before quota returns until the supervisor queues.
+    let hold = |store: &Store| {
+        use aswap::switch_gate::{Clock, FileShelf, Shelf, SystemClock};
+        FileShelf::new(&store.root)
+            .update(|shared| {
+                shared.last_switch_at = SystemClock.now_ms();
+                ((), true)
+            })
+            .unwrap();
+    };
+    if mode == "gated" {
+        hold(&store);
+    }
     if interrupted {
         for child in &children.0 {
             // SAFETY: this is our unreaped supervisor child, never a reused PID.
@@ -210,6 +227,27 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
         cache.usage.windows[0].used_percent = 2.0;
         cache.usage.windows[0].resets_at = Some(reset + 3600);
         store::json_write(&cache_path, &cache).unwrap();
+    }
+    if mode == "gated" {
+        let resumed = |index: usize| {
+            log.join(format!("11111111-2222-4333-8444-{index:012}-resumed"))
+                .exists()
+        };
+        while !read_stderr(0).contains("waiting for the global switch slot") {
+            assert!(
+                Instant::now() < deadline,
+                "the restart never queued for the slot"
+            );
+            assert!(!resumed(0), "restarted without the switch slot");
+            hold(&store);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let held = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < held {
+            hold(&store);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!resumed(0), "restarted while the slot was taken");
+        }
     }
     if mode == "model" || mode == "race" {
         while if mode == "model" {
@@ -301,6 +339,11 @@ fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usi
         fs::read_dir(log).unwrap().count(),
         count * if interrupted { 1 } else { 2 } + usize::from(mode == "race")
     );
+}
+
+#[test]
+fn a_quota_switch_waits_for_the_global_switch_slot() {
+    review_scenario(Provider::Claude, "other", false, 1, "gated");
 }
 
 #[test]
