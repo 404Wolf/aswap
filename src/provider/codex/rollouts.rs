@@ -110,6 +110,21 @@ impl ViewPath {
     }
 }
 
+/// A shared lock on the runtimes directory (the parent of `views`), held
+/// while the sweep runs; none while `aswap gc` holds it exclusively. A
+/// missing runtimes directory has nothing to sweep.
+fn gc_idle(views: &Path) -> Option<std::fs::File> {
+    let runtimes = std::fs::File::open(views.parent()?).ok()?;
+    fs2::FileExt::try_lock_shared(&runtimes).ok()?;
+    Some(runtimes)
+}
+/// Where `aswap gc` moves `view` while it retires it.
+fn retiring(view: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(crate::retention::RETIRING_PREFIX);
+    name.push(view.file_name().unwrap_or_default());
+    view.with_file_name(name)
+}
+
 /// Whether `path` is a regular file whose name carries thread `id`.
 fn names_thread(path: &Path, id: &SessionId) -> bool {
     path.file_name()
@@ -235,6 +250,16 @@ pub(super) fn scan(home: &Path, views: &Path) -> Result<Vec<Finding>, RolloutErr
 /// `views` (limited by `scope`) to the same file under `home`. Returns how
 /// many rows changed.
 pub(super) fn repair(home: &Path, views: &Path, scope: Scope) -> Result<usize, RolloutError> {
+    // The sweep stands aside while `aswap gc` runs: it holds the runtimes
+    // directory's lock exclusively, renames a view to `.retiring-<run>` and
+    // repairs that view's rows itself.
+    let _gc = match scope {
+        Scope::Gone => match gc_idle(views) {
+            Some(lock) => Some(lock),
+            None => return Ok(0),
+        },
+        Scope::View(_) => None,
+    };
     let views = Views::new(views);
     let busy = match scope {
         Scope::View(_) => BUSY,
@@ -254,7 +279,7 @@ pub(super) fn repair(home: &Path, views: &Path, scope: Scope) -> Result<usize, R
                 let through = ViewPath::parse(&views, home, &path)?;
                 let in_scope = match scope {
                     Scope::View(view) => same_view(&through.view, view),
-                    Scope::Gone => !through.view.exists(),
+                    Scope::Gone => !through.view.exists() && !retiring(&through.view).exists(),
                 };
                 // While the view exists, its path must still be this file.
                 // (If the home's sessions/ is itself a link, the view holds a
@@ -440,6 +465,24 @@ mod tests {
             live.iter()
                 .any(|x| x.id.as_str() == ID && x.problem == Problem::InView)
         );
+    }
+
+    #[test]
+    fn the_sweep_stands_aside_for_a_running_gc() {
+        let f = Fixture::new();
+        let gone = f.views.join("work/run-Gone00");
+        f.row(ID, &f.through(&gone, ID));
+        // gc renamed the view while retiring it: not gone yet.
+        std::fs::create_dir_all(f.views.join("work/.retiring-run-Gone00")).unwrap();
+        assert_eq!(repair(&f.home, &f.views, Scope::Gone).unwrap(), 0);
+        std::fs::remove_dir(f.views.join("work/.retiring-run-Gone00")).unwrap();
+        // gc holds the runtimes lock.
+        let runtimes = std::fs::File::open(f.views.parent().unwrap()).unwrap();
+        fs2::FileExt::lock_exclusive(&runtimes).unwrap();
+        assert_eq!(repair(&f.home, &f.views, Scope::Gone).unwrap(), 0);
+        fs2::FileExt::unlock(&runtimes).unwrap();
+        assert_eq!(repair(&f.home, &f.views, Scope::Gone).unwrap(), 1);
+        assert_eq!(f.path_of(ID), f.through(&f.home, ID));
     }
 
     #[test]

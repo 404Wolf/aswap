@@ -5,6 +5,7 @@ mod files;
 mod mounts;
 mod process;
 mod retire;
+pub(crate) use retire::PREFIX as RETIRING_PREFIX;
 
 use crate::{
     Error, Result, Safe, live,
