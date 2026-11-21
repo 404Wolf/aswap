@@ -563,3 +563,83 @@ fn switch_interval_is_global_defaults_to_four_seconds_and_shows_in_list_and_stat
     );
     assert!(!t.invoke(&["auto", "claude"]).status.success());
 }
+
+/// `list --json` is the stable, cache-only contract for other programs (the
+/// Herdr Usage view polls it). Changing these keys or enums breaks them:
+/// add fields, never rename or remove, and bump schema_version if you must.
+#[test]
+fn list_json_schema_is_pinned() {
+    let t = Sandbox::new();
+    t.seed();
+    t.ok(&["add", "claude", "work", "--json"]);
+    t.ok(&["add", "codex", "spare", "--json"]);
+    let at = aswap::now();
+    let cache = json!({"usage":{"windows":[{"name":"five_hour","used_percent":40.0,"resets_at":at+3600,"duration_minutes":300}]},"fetched_at":at-5,"next_poll_at":at+3600,"failures":0,"error":null});
+    fs::write(
+        t.root()
+            .join("data/aswap/profiles/claude/work/usage-cache.json"),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+    let v = t.ok(&["list", "--json"]);
+    let keys = |v: &Value| {
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    };
+    assert_eq!(v["schema_version"], 1);
+    assert_eq!(
+        keys(&v),
+        [
+            "accounts",
+            "auto",
+            "codex_usage_resets",
+            "credential_mode",
+            "last_sync",
+            "schema_version",
+            "switch_interval_seconds",
+            "sync"
+        ]
+    );
+    let rows = v["accounts"].as_array().unwrap();
+    for row in rows {
+        assert_eq!(
+            keys(row),
+            [
+                "active",
+                "age_seconds",
+                "duplicates",
+                "fetched_at",
+                "http_status",
+                "label",
+                "last_attempt",
+                "next_poll_at",
+                "provider",
+                "remaining_percent",
+                "reserved",
+                "retry_after_seconds",
+                "usage",
+                "usage_error",
+                "usage_reason",
+                "usage_status",
+            ]
+        );
+        let status = row["usage_status"].as_str().unwrap();
+        assert!(["ok", "backoff", "unknown"].contains(&status), "{status}");
+    }
+    let row = |label: &str| rows.iter().find(|r| r["label"] == label).unwrap();
+    let work = row("work");
+    assert_eq!(work["usage_status"], "ok");
+    assert_eq!(work["usage_reason"], "fresh");
+    assert_eq!(work["remaining_percent"], 60.0);
+    assert!(work["age_seconds"].as_u64().unwrap() >= 5);
+    assert_eq!(
+        keys(&work["usage"]["windows"][0]),
+        ["duration_minutes", "name", "resets_at", "used_percent"]
+    );
+    let spare = row("spare");
+    assert_eq!(spare["usage_status"], "unknown");
+    assert_eq!(spare["usage_reason"], "never-fetched");
+    assert_eq!(spare["age_seconds"], Value::Null);
+    assert!(!v.to_string().contains("synthetic-private"));
+}

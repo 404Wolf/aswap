@@ -138,6 +138,29 @@ fn deserialize_windows<'de, D: serde::Deserializer<'de>>(
     }
     Ok(windows)
 }
+/// A reading older than this many seconds no longer drives selection.
+pub const STALE_AFTER: u64 = 600;
+
+/// Why a cached reading is or isn't usable (`usage_reason` in the JSON).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Reason {
+    /// Usable: fresh, with windows, none past its reset.
+    Fresh,
+    /// No reading yet.
+    NeverFetched,
+    /// The last attempt failed; see `usage_error`.
+    Error,
+    /// A hard limit seen earlier is missing from the latest reading.
+    UnverifiedLimit,
+    /// Older than [`STALE_AFTER`] seconds.
+    Stale,
+    /// A window has passed its reset time since the reading.
+    ResetPassed,
+    /// The provider reported no windows.
+    NoWindows,
+}
+
 impl Usage {
     pub fn used(&self, at: u64) -> Option<f64> {
         // A reset makes observations obsolete, not evidence of an empty account.
@@ -247,12 +270,40 @@ impl Cached {
     pub fn used(&self, at: u64) -> Option<f64> {
         if self.error.is_some()
             || !self.unverified_limits.is_empty()
-            || at.saturating_sub(self.fetched_at) > 600
+            || at.saturating_sub(self.fetched_at) > STALE_AFTER
         {
             None
         } else {
             self.usage.used(at)
         }
+    }
+    /// Why this reading is, or isn't, usable at `at`: exactly when it is
+    /// [`Reason::Fresh`] does [`Cached::used`] return a value.
+    pub fn reason(&self, at: u64) -> Reason {
+        if self.error.is_some() {
+            Reason::Error
+        } else if self.fetched_at == 0 {
+            Reason::NeverFetched
+        } else if !self.unverified_limits.is_empty() {
+            Reason::UnverifiedLimit
+        } else if at.saturating_sub(self.fetched_at) > STALE_AFTER {
+            Reason::Stale
+        } else if self
+            .usage
+            .windows
+            .iter()
+            .any(|w| w.resets_at.is_some_and(|r| r <= at))
+        {
+            Reason::ResetPassed
+        } else if self.usage.windows.is_empty() {
+            Reason::NoWindows
+        } else {
+            Reason::Fresh
+        }
+    }
+    /// Seconds since the reading was fetched; none if it never was.
+    pub fn age(&self, at: u64) -> Option<u64> {
+        (self.fetched_at != 0).then(|| at.saturating_sub(self.fetched_at))
     }
 
     /// Whether this account is held by a usage limit, and until when if the
@@ -1052,5 +1103,93 @@ mod isolation_tests {
                 10.0 + index as f64 * 30.0
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::*;
+
+    const AT: u64 = 100_000;
+
+    fn window(used: f64, reset: Option<u64>) -> Window {
+        Window {
+            name: "weekly".into(),
+            used_percent: used,
+            resets_at: reset,
+            duration_minutes: Some(10080),
+            codex_slot: None,
+        }
+    }
+    fn reading(fetched_at: u64, windows: Vec<Window>) -> Cached {
+        Cached {
+            usage: Usage {
+                windows,
+                ..Default::default()
+            },
+            fetched_at,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn every_reason_and_only_fresh_is_usable() {
+        let fresh = reading(AT - 10, vec![window(40.0, Some(AT + 60))]);
+        let mut error = fresh.clone();
+        error.error = Some("http-401".into());
+        let never = Cached::default();
+        let stale = reading(AT - STALE_AFTER - 1, vec![window(40.0, None)]);
+        let reset = reading(AT - 10, vec![window(100.0, Some(AT))]);
+        let empty = reading(AT - 10, Vec::new());
+        let old = reading(AT - 60, vec![window(100.0, Some(AT + 600))]);
+        let unverified = updated(old, Ok(Usage::default()), AT - 10);
+        assert!(!unverified.unverified_limits.is_empty());
+        let cases = [
+            (fresh, Reason::Fresh, Some(10)),
+            (error, Reason::Error, Some(10)),
+            (never, Reason::NeverFetched, None),
+            (stale, Reason::Stale, Some(STALE_AFTER + 1)),
+            (reset, Reason::ResetPassed, Some(10)),
+            (empty, Reason::NoWindows, Some(10)),
+            (unverified, Reason::UnverifiedLimit, Some(10)),
+        ];
+        for (cache, reason, age) in cases {
+            assert_eq!(cache.reason(AT), reason);
+            assert_eq!(cache.age(AT), age, "{reason:?}");
+            // The reason agrees with what selection uses.
+            assert_eq!(
+                cache.used(AT).is_some(),
+                reason == Reason::Fresh,
+                "{reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasons_serialize_as_the_documented_strings() {
+        let names: Vec<_> = [
+            Reason::Fresh,
+            Reason::NeverFetched,
+            Reason::Error,
+            Reason::UnverifiedLimit,
+            Reason::Stale,
+            Reason::ResetPassed,
+            Reason::NoWindows,
+        ]
+        .iter()
+        .map(|r| serde_json::to_value(r).unwrap())
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "fresh",
+                "never-fetched",
+                "error",
+                "unverified-limit",
+                "stale",
+                "reset-passed",
+                "no-windows"
+            ]
+        );
     }
 }

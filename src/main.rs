@@ -199,7 +199,9 @@ fn snapshot(store: &Store, filter: Option<Provider>, refresh: bool) -> Result<Va
         let reserved = settings
             .get(&a.provider)
             .is_some_and(|s| !s.allows(&a.label, None));
-        rows.push(json!({"provider":a.provider,"label":a.label,"active":active.get(&a.provider)==Some(&a.label),"reserved":reserved,"remaining_percent":c.used(now()).map(|u|100.0-u),"usage":c.usage,"fetched_at":c.fetched_at,"next_poll_at":c.next_poll_at,"duplicates":duplicates,"usage_error":c.diagnostic(),"http_status":c.http_status,"retry_after_seconds":c.retry_after,"last_attempt":c.last_attempt,"usage_status":if c.used(now()).is_some(){"ok"}else if c.error.is_some(){"backoff"}else{"unknown"}}));
+        // One clock reading, so status, reason and age agree.
+        let at = now();
+        rows.push(json!({"provider":a.provider,"label":a.label,"active":active.get(&a.provider)==Some(&a.label),"reserved":reserved,"remaining_percent":c.used(at).map(|u|100.0-u),"usage":c.usage,"fetched_at":c.fetched_at,"next_poll_at":c.next_poll_at,"duplicates":duplicates,"usage_error":c.diagnostic(),"http_status":c.http_status,"retry_after_seconds":c.retry_after,"last_attempt":c.last_attempt,"usage_status":if c.used(at).is_some(){"ok"}else if c.error.is_some(){"backoff"}else{"unknown"},"usage_reason":c.reason(at),"age_seconds":c.age(at)}));
     }
     let coordination = aswap::coordination::settings(store)?;
     // An unreadable reset log must not hide accounts; the monitor still

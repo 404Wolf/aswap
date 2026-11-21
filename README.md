@@ -156,6 +156,27 @@ records each attempt, with the account's usage before and after, in
 is held by a usage limit (`limit_blocked`) and, when Codex or Claude said,
 when it frees up (`blocked_until`, Unix seconds).
 
+## Reading usage from another program
+
+`aswap list --json` is the stable, cache-only interface: it makes no network
+request and is safe to poll (the Herdr Usage view polls it every minute;
+over hc: `hc exec --on <machine> aswap list --json`). Fields are only ever
+added under `schema_version` 1. For each account:
+
+- `usage.windows[]`: `name`, `used_percent` (0–100), `resets_at` and
+  `duration_minutes`. Times are Unix seconds.
+- `remaining_percent`: 100 minus the highest window, or null when the
+  reading isn't usable.
+- `usage_status`: `ok`, `backoff` (see `usage_error`) or `unknown`.
+- `usage_reason`: why: `fresh`, `never-fetched`, `error`, `unverified-limit`,
+  `stale` (older than 10 minutes), `reset-passed` or `no-windows`.
+- `age_seconds`: seconds since the reading, by this machine's clock; null if
+  never fetched.
+
+`aswap usage --json` returns the same shape after a read that respects backoff.
+The JSON never carries tokens, emails or paths; the plain-text output shows
+identity hints, so don't parse it.
+
 ## How it works
 
 - Each account's login is stored privately under `~/.local/share/aswap/`
