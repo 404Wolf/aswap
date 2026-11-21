@@ -69,9 +69,9 @@ aswap auto claude threshold 90          # when --auto switches
 Arguments after `--` go to the provider unchanged.
 
 When a shared limit or reset hits many `--auto` sessions at once, they switch
-one at a time: across all providers and sessions on the machine, at most one
-switch happens every `switch_interval_seconds` (default 4), first come first
-served. A delayed session prints its place in line. Set it with
+one at a time: across all providers and sessions using the same aswap data
+directory, at most one switch starts every `switch_interval_seconds` (default
+4), first come first served. A delayed session prints its place in line. Set it with
 `aswap auto switch-interval 4` (0 turns it off), or the Home Manager option
 `programs.aswap.switchIntervalSeconds`. `aswap list` and `aswap status` show
 it. First launches are not delayed.
