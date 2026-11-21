@@ -56,9 +56,10 @@ impl AutoReset {
 #[serde(rename_all = "kebab-case")]
 pub enum Prefer {
     /// The lowest used percentage.
-    #[default]
     Headroom,
-    /// The soonest weekly reset, so quota that would expire unused goes first.
+    /// The soonest weekly reset, so quota that would expire unused goes
+    /// first. The default when state does not set a preference.
+    #[default]
     WeeklyReset,
 }
 pub const RESUME_PROMPT: &str =
@@ -73,7 +74,7 @@ impl Default for Auto {
             enabled: false,
             threshold: 90.0,
             last_switch: 0,
-            prefer: Prefer::Headroom,
+            prefer: Prefer::WeeklyReset,
             reserved: Vec::new(),
             auto_reset: AutoReset::Off,
         }

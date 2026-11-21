@@ -494,7 +494,11 @@ fn weekly_reset_preference_ranks_and_moves_launches() {
         "c"
     );
     // Launch preference: never under headroom; moves only to a strictly sooner reset.
-    assert!(usage::prefer_at_launch("b", &entries, &Auto::default(), 1000).is_none());
+    let headroom = Auto {
+        prefer: Prefer::Headroom,
+        ..Default::default()
+    };
+    assert!(usage::prefer_at_launch("b", &entries, &headroom, 1000).is_none());
     assert_eq!(
         usage::prefer_at_launch(
             "b",

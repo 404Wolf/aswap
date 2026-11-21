@@ -203,6 +203,38 @@ impl ResetLog {
     fn prune(&mut self, at: u64) {
         self.skipped.retain(|s| s.until > at);
     }
+    /// Records a dropped pending redemption; see `drop_pending`.
+    fn abandon(&mut self, pending: Pending, why: &str, at: u64) {
+        self.pending = None;
+        let sent = pending.attempts > 0;
+        if sent {
+            self.skip(&pending.label, pending.weekly_resets_at);
+        }
+        self.push(Record {
+            at,
+            label: pending.label,
+            outcome: if sent { "unconfirmed" } else { "abandoned" }.into(),
+            weekly_resets_at: Some(pending.weekly_resets_at),
+            reason: if sent {
+                format!("dropped a redeem request that got no answer: {why}")
+            } else {
+                format!("dropped a redeem request before sending it: {why}")
+            },
+            pre: pending.pre,
+            post: None,
+        });
+    }
+    /// `reset off`: clears a halt and drops any pending redemption, recording
+    /// it. Returns whether anything changed.
+    pub fn turn_off(&mut self, at: u64) -> bool {
+        let halted = self.halted.take().is_some();
+        let pending = self.pending.take();
+        let changed = halted || pending.is_some();
+        if let Some(pending) = pending {
+            self.abandon(pending, "usage resets were turned off", at);
+        }
+        changed
+    }
     /// The log without idempotency keys or credit ids, for status output.
     pub fn summary(&self) -> Value {
         serde_json::json!({
@@ -221,7 +253,7 @@ impl ResetLog {
 
 const MONEY_PREFIXES: &[&str] = &[
     "purchas", "pay", "paid", "bill", "invoic", "upgrad", "buy", "bought", "charg", "pric", "cost",
-    "subscri", "credit", "checkout", "money", "refund", "topup", "spend",
+    "subscri", "credit", "checkout", "money", "refund", "topup", "spend", "overage", "reserve",
 ];
 const MONEY_WORDS: &[&str] = &["fee", "fees", "usd", "eur", "gbp", "card"];
 const MONEY_PHRASES: &[&str] = &["extra usage", "add credit", "top up"];
@@ -574,9 +606,13 @@ pub fn step(
     attempt(port, settings, log, &account, at)
 }
 
-/// A pending redemption retries with its original key while every Codex
-/// account is still out of weekly usage. If one has room again, the earlier
-/// request may have succeeded: record it as unconfirmed instead of retrying.
+/// A pending redemption retries with its original key, so it can never spend
+/// a second credit. Before each retry it is checked like a fresh decision: the
+/// account is read again, must still exist, be unreserved and out of weekly
+/// usage, and its credit must not have expired or mention money. If any
+/// Codex account has room again the earlier request may have worked. A
+/// pending whose window passed, whose account is gone, or that can no longer
+/// be sent is dropped and recorded, never left waiting forever.
 fn resume(
     port: &mut impl Port,
     settings: &Auto,
@@ -589,38 +625,70 @@ fn resume(
         label: pending.label.clone(),
         retry_at: pending.retry_at,
     };
-    match guard(entries, at) {
-        Err(Hold::UsageUnknown { .. }) => return Ok(waiting),
-        Err(_) => {
-            log.pending = None;
-            log.push(Record {
-                at,
-                label: pending.label.clone(),
-                outcome: "unconfirmed".into(),
-                weekly_resets_at: Some(pending.weekly_resets_at),
-                reason:
-                    "an earlier redeem attempt got no answer and an account has weekly usage again"
-                        .into(),
-                pre: pending.pre,
-                post: None,
-            });
-            log.skip(&pending.label, pending.weekly_resets_at);
-            port.save(log)?;
-            return Ok(Step::Held {
-                hold: Hold::Changed {
-                    label: pending.label,
-                },
-            });
-        }
-        Ok(_) => {}
+    let Some(index) = entries.iter().position(|(a, _)| a.label == pending.label) else {
+        return drop_pending(port, log, pending, "its account was removed", at);
+    };
+    if at >= pending.weekly_resets_at {
+        return drop_pending(port, log, pending, "its weekly window has passed", at);
+    }
+    if !settings.allows(&pending.label, None) {
+        return drop_pending(port, log, pending, "its account is reserved", at);
+    }
+    if !matches!(guard(entries, at), Ok(_) | Err(Hold::UsageUnknown { .. })) {
+        return drop_pending(port, log, pending, "an account has weekly usage again", at);
     }
     if settings.auto_reset != AutoReset::On || at < pending.retry_at || log.halted.is_some() {
         return Ok(waiting);
     }
-    let Some((account, _)) = entries.iter().find(|(a, _)| a.label == pending.label) else {
+    let account = entries[index].0.clone();
+    let Ok(fresh) = port.refresh(&account) else {
         return Ok(waiting);
     };
-    attempt(port, settings, log, &account.clone(), at)
+    let mut entries = entries.to_vec();
+    entries[index].1 = fresh;
+    match guard(&entries, at) {
+        Ok(_) => {}
+        Err(Hold::UsageUnknown { .. }) => return Ok(waiting),
+        Err(_) => {
+            return drop_pending(port, log, pending, "an account has weekly usage again", at);
+        }
+    }
+    // The credit is sent by id, so only that credit can be spent. A credit
+    // no longer listed may be the one this key already redeemed: retry.
+    if let Some(credit) = entries[index]
+        .1
+        .usage
+        .reset_credits
+        .iter()
+        .find(|c| c.id == pending.credit_id)
+    {
+        if credit_mentions_money(credit) {
+            log.pending = None;
+            return refuse(port, settings, log, pending.label, None, at);
+        }
+        if credit.expires_at.is_some_and(|e| e <= at) {
+            return drop_pending(port, log, pending, "its credit has expired", at);
+        }
+    }
+    attempt(port, settings, log, &account, at)
+}
+
+/// Drops a pending redemption and records why. One that was sent may have
+/// spent its credit: it is recorded as unconfirmed, which starts the
+/// cooldown, and its account is skipped until that weekly window passes.
+fn drop_pending(
+    port: &mut impl Port,
+    log: &mut ResetLog,
+    pending: Pending,
+    why: &str,
+    at: u64,
+) -> Result<Step> {
+    let label = pending.label.clone();
+    log.abandon(pending, why, at);
+    port.save(log)?;
+    Ok(Step::Held {
+        hold: Hold::Changed { label },
+    })
 }
 
 enum Outcome {
@@ -784,13 +852,23 @@ pub fn load(store: &Store) -> Result<ResetLog> {
         Ok(ResetLog::default())
     }
 }
-/// Setting `off` clears a halt; other modes keep it.
-pub fn set_mode(store: &Store, settings: &mut Auto, mode: AutoReset) -> Result<()> {
+/// Sets one provider's reset mode. Only Codex has a reset log: `codex reset
+/// off` clears its halt and drops (and records) a pending redemption; other
+/// modes, and every Claude setting, leave the log alone. Caller holds the
+/// store lock.
+pub fn set_mode(
+    store: &Store,
+    provider: Provider,
+    settings: &mut Auto,
+    mode: AutoReset,
+) -> Result<()> {
+    if provider != Provider::Codex && mode != AutoReset::Off {
+        return Err(Error("usage-limit resets are only supported for Codex"));
+    }
     settings.auto_reset = mode;
-    if mode == AutoReset::Off {
+    if provider == Provider::Codex && mode == AutoReset::Off {
         let mut log = load(store)?;
-        if log.halted.take().is_some() || log.pending.is_some() {
-            log.pending = None;
+        if log.turn_off(crate::now()) {
             store::json_write(&log_path(store), &log)?;
         }
     }
@@ -1331,16 +1409,22 @@ mod tests {
         before: Option<Cached>,
         saved: Vec<ResetLog>,
         keys: u32,
+        /// When set, a fresh read is stamped with this time.
+        clock: Option<u64>,
     }
     impl Port for Fake {
+        /// `before` until a redeem call, then `after` if given.
         fn refresh(&mut self, account: &Account) -> Result<Cached> {
             self.refreshed.push(account.label.clone());
-            let next = if self.redeemed.is_empty() {
-                self.before.clone()
-            } else {
-                self.after.clone()
+            let next = match &self.after {
+                Some(after) if !self.redeemed.is_empty() => Some(after.clone()),
+                _ => self.before.clone(),
             };
-            next.ok_or(Error("synthetic refresh failure"))
+            let mut next = next.ok_or(Error("synthetic refresh failure"))?;
+            if let Some(clock) = self.clock {
+                next.fetched_at = clock;
+            }
+            Ok(next)
         }
         fn redeem(&mut self, account: &Account, key: &str, credit: &str) -> Result<Value> {
             let persisted = self.saved.last().and_then(|log| log.pending.clone());
@@ -1362,6 +1446,7 @@ mod tests {
     }
     /// One step over `exhausted()`, read just now.
     fn run(fake: &mut Fake, mode: AutoReset, log: &mut ResetLog, at: u64) -> Step {
+        fake.clock = Some(at);
         let mut entries = exhausted();
         for (_, c) in &mut entries {
             c.fetched_at = at;
@@ -1704,6 +1789,264 @@ mod tests {
             }
         );
         assert!(fake.redeemed.is_empty() && fake.saved.is_empty());
+    }
+
+    fn pending(attempts: u32, retry_at: u64) -> Pending {
+        Pending {
+            label: "six".into(),
+            credit_id: "c6".into(),
+            idempotency_key: "synthetic-key-1".into(),
+            weekly_resets_at: AT + 6 * DAY,
+            reason: "synthetic".into(),
+            started_at: AT - 900,
+            attempts,
+            retry_at,
+            pre: None,
+        }
+    }
+    fn resume_with(
+        fake: &mut Fake,
+        log: &mut ResetLog,
+        entries: Vec<(Account, Cached)>,
+        at: u64,
+    ) -> Step {
+        fake.clock = Some(at);
+        step(
+            fake,
+            Provider::Codex,
+            &settings(AutoReset::On),
+            entries,
+            log,
+            false,
+            at,
+        )
+        .unwrap()
+    }
+    fn exhausted_at(at: u64) -> Vec<(Account, Cached)> {
+        let mut entries = exhausted();
+        for (_, c) in &mut entries {
+            c.fetched_at = at;
+        }
+        entries
+    }
+
+    #[test]
+    fn a_crashed_attempt_resends_its_saved_key_and_records_already_redeemed() {
+        // Saved before sending, then the monitor died: attempts is still 0.
+        let mut log = ResetLog {
+            pending: Some(pending(0, AT)),
+            ..Default::default()
+        };
+        let mut fake = Fake {
+            before: Some(cache(100.0, Some(6), vec![credit("c6", None)])),
+            after: Some(cache(0.0, Some(7), vec![])),
+            responses: vec![Ok(serde_json::json!({"outcome": "alreadyRedeemed"}))],
+            ..Default::default()
+        };
+        let done = resume_with(&mut fake, &mut log, exhausted_at(AT), AT);
+        assert!(matches!(&done, Step::Reset { outcome, .. } if outcome == "already-redeemed"));
+        assert_eq!(fake.keys, 0, "no new key");
+        assert_eq!(fake.redeemed.len(), 1);
+        assert_eq!(fake.redeemed[0].1, "synthetic-key-1");
+        // A fresh read before resending, and one after.
+        assert_eq!(fake.refreshed, ["six", "six"]);
+        assert_eq!(log.history.last().unwrap().outcome, "already-redeemed");
+        assert!(log.pending.is_none() && log.cooldown_until().is_some());
+    }
+
+    #[test]
+    fn a_pending_is_dropped_and_recorded_instead_of_waiting_forever() {
+        type Change = fn(&mut Vec<(Account, Cached)>, &mut Auto) -> u64;
+        let cases: [(&str, Change); 3] = [
+            ("its account was removed", |entries, _| {
+                entries.retain(|(a, _)| a.label != "six");
+                AT
+            }),
+            ("its weekly window has passed", |_, _| AT + 6 * DAY),
+            ("its account is reserved", |_, settings| {
+                settings.reserved = vec!["six".into()];
+                AT
+            }),
+        ];
+        for (why, change) in cases {
+            for attempts in [0, 2] {
+                let mut entries = exhausted_at(AT);
+                let mut settings = settings(AutoReset::On);
+                let at = change(&mut entries, &mut settings);
+                for (_, c) in &mut entries {
+                    c.fetched_at = at;
+                    // Keep later readings valid past the session reset.
+                    c.usage.windows[0].resets_at = Some(at + 3600);
+                    c.usage.windows[1].resets_at = Some(at + DAY);
+                }
+                let mut log = ResetLog {
+                    pending: Some(pending(attempts, AT)),
+                    ..Default::default()
+                };
+                let mut fake = Fake::default();
+                let held = step(
+                    &mut fake,
+                    Provider::Codex,
+                    &settings,
+                    entries,
+                    &mut log,
+                    false,
+                    at,
+                )
+                .unwrap();
+                assert!(
+                    matches!(
+                        held,
+                        Step::Held {
+                            hold: Hold::Changed { .. }
+                        }
+                    ),
+                    "{why}"
+                );
+                assert!(
+                    fake.redeemed.is_empty() && fake.refreshed.is_empty(),
+                    "{why}"
+                );
+                assert!(log.pending.is_none(), "{why}");
+                let record = log.history.last().unwrap();
+                assert!(record.reason.contains(why), "{why}: {}", record.reason);
+                // A sent request may have spent its credit: cool down and skip.
+                if attempts > 0 {
+                    assert_eq!(record.outcome, "unconfirmed");
+                    assert_eq!(log.cooldown_until(), Some(at + COOLDOWN));
+                } else {
+                    assert_eq!(record.outcome, "abandoned");
+                    assert_eq!(log.cooldown_until(), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_retry_rechecks_fresh_usage_credit_expiry_and_wording() {
+        let retry = |fresh: Cached| {
+            let mut log = ResetLog {
+                pending: Some(pending(1, AT)),
+                ..Default::default()
+            };
+            let mut fake = Fake {
+                before: Some(fresh),
+                responses: vec![Ok(serde_json::json!({"outcome": "reset"}))],
+                ..Default::default()
+            };
+            let step = resume_with(&mut fake, &mut log, exhausted_at(AT), AT);
+            (step, log, fake)
+        };
+        // The fresh read shows room: the earlier attempt may have worked.
+        let (held, log, fake) = retry(cache(0.0, Some(7), vec![]));
+        assert!(matches!(
+            held,
+            Step::Held {
+                hold: Hold::Changed { .. }
+            }
+        ));
+        assert!(fake.redeemed.is_empty());
+        assert_eq!(log.history.last().unwrap().outcome, "unconfirmed");
+        // The credit expired since.
+        let (held, log, fake) = retry(cache(100.0, Some(6), vec![credit("c6", Some(AT))]));
+        assert!(matches!(
+            held,
+            Step::Held {
+                hold: Hold::Changed { .. }
+            }
+        ));
+        assert!(fake.redeemed.is_empty());
+        assert!(
+            log.history
+                .last()
+                .unwrap()
+                .reason
+                .contains("its credit has expired")
+        );
+        // Its wording now mentions money: refuse and halt.
+        let mut priced = credit("c6", None);
+        priced.description = Some("Purchase this reset".into());
+        let (refused, log, fake) = retry(cache(100.0, Some(6), vec![priced]));
+        assert_eq!(
+            refused,
+            Step::Refused {
+                label: "six".into(),
+                halted: true
+            }
+        );
+        assert!(fake.redeemed.is_empty() && log.pending.is_none() && log.halted.is_some());
+        // The fresh read fails: wait, with the key kept.
+        let mut log = ResetLog {
+            pending: Some(pending(1, AT)),
+            ..Default::default()
+        };
+        let mut failing = Fake::default();
+        assert!(matches!(
+            resume_with(&mut failing, &mut log, exhausted_at(AT), AT),
+            Step::Waiting { .. }
+        ));
+        assert!(failing.redeemed.is_empty() && log.pending.is_some());
+        // Unchanged, the same key and credit are sent again.
+        let (sent, _, fake) = retry(cache(100.0, Some(6), vec![credit("c6", None)]));
+        assert!(matches!(sent, Step::Reset { .. }));
+        assert_eq!(fake.redeemed[0].1, "synthetic-key-1");
+        assert_eq!(fake.redeemed[0].2, "c6");
+    }
+
+    #[test]
+    fn only_codex_reset_off_clears_the_codex_halt_and_records_a_dropped_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("store")).unwrap();
+        let halted = ResetLog {
+            pending: Some(pending(1, AT)),
+            halted: Some("synthetic".into()),
+            ..Default::default()
+        };
+        store::json_write(&log_path(&store), &halted).unwrap();
+        let mut claude = Auto::default();
+        // Claude: off is accepted and leaves the Codex log alone; others refuse.
+        set_mode(&store, Provider::Claude, &mut claude, AutoReset::Off).unwrap();
+        for mode in [AutoReset::DryRun, AutoReset::On] {
+            assert!(set_mode(&store, Provider::Claude, &mut claude, mode).is_err());
+        }
+        assert_eq!(claude.auto_reset, AutoReset::Off);
+        assert_eq!(load(&store).unwrap(), halted);
+        // Codex dry-run and on keep the halt and the key.
+        let mut codex = Auto::default();
+        for mode in [AutoReset::DryRun, AutoReset::On] {
+            set_mode(&store, Provider::Codex, &mut codex, mode).unwrap();
+            assert_eq!(load(&store).unwrap(), halted);
+        }
+        // Codex off clears the halt and records the dropped key.
+        set_mode(&store, Provider::Codex, &mut codex, AutoReset::Off).unwrap();
+        let log = load(&store).unwrap();
+        assert!(log.halted.is_none() && log.pending.is_none());
+        let record = log.history.last().unwrap();
+        assert_eq!(record.outcome, "unconfirmed");
+        assert!(record.reason.contains("turned off"));
+        assert!(log.cooldown_until().is_some());
+        assert!(log.skipped("six", AT + DAY));
+        // Off again changes nothing more.
+        let before = load(&store).unwrap();
+        set_mode(&store, Provider::Codex, &mut codex, AutoReset::Off).unwrap();
+        assert_eq!(load(&store).unwrap(), before);
+    }
+
+    #[test]
+    fn a_second_tick_skips_while_another_holds_the_reset_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("store")).unwrap();
+        let mut state = store.load().unwrap();
+        state
+            .auto
+            .insert(Provider::Codex, settings(AutoReset::DryRun));
+        store.save(&state).unwrap();
+        let held = exclusive(&store).unwrap().expect("first holder");
+        assert!(exclusive(&store).unwrap().is_none());
+        assert_eq!(tick(&store, Provider::Codex).unwrap(), None);
+        assert!(!log_path(&store).exists());
+        drop(held);
+        assert!(exclusive(&store).unwrap().is_some());
     }
 
     #[test]

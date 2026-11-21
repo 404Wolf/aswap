@@ -1967,7 +1967,10 @@ mod wake_tests {
             }
             assert!(usage::prefer_at_launch("sooner", &entries, &settings, AT).is_none());
             // Headroom ranks by most room instead.
-            let headroom = store::Auto::default();
+            let headroom = store::Auto {
+                prefer: store::Prefer::Headroom,
+                ..Default::default()
+            };
             assert_eq!(
                 label(recovery_target("current", &entries, &headroom, AT, None)),
                 Some("unknown".into())

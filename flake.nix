@@ -149,7 +149,7 @@
             assert pkgs.lib.hasInfix " resume-prompt -- " (builtins.elemAt hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre 2);
             assert pkgs.lib.hasInfix "$$HOME %%n" (builtins.elemAt hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre 2);
             assert pkgs.lib.hasInfix "off" (builtins.elemAt hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre 2);
-            assert pkgs.lib.hasSuffix " prefer headroom" (builtins.elemAt hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre 3);
+            assert pkgs.lib.hasSuffix " prefer weekly-reset" (builtins.elemAt hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre 3);
             # Codex usage resets are opt-in (default off); Claude has none.
             assert pkgs.lib.hasSuffix " auto codex reset off" (builtins.elemAt hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre 4);
             assert pkgs.lib.hasSuffix " auto codex reset dry-run" (builtins.elemAt hmPeer.config.systemd.user.services.aswap-codex.Service.ExecStartPre 4);

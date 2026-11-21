@@ -74,15 +74,18 @@ use it and fall back to other accounts when it runs out of quota. Reservations
 appear in `aswap list` and `aswap status`. Use `aswap auto claude unreserve work`
 to return it to the automatic pool.
 
-### Pick the account whose quota expires first
+### Use the quota that expires first
+
+By default (`weekly-reset`), when several accounts have room, aswap uses the
+one whose weekly window resets soonest, so quota that would expire unused goes
+first. New launches and the monitor also move to such an account. This is the
+default for Claude and Codex whenever the state sets no preference; a
+preference you set explicitly is kept. To rank by the most headroom instead:
 
 ```sh
-aswap auto codex prefer weekly-reset    # or: aswap auto claude prefer weekly-reset
+aswap auto codex prefer headroom        # or: aswap auto claude prefer headroom
 ```
-
-With `weekly-reset`, when several accounts have room, aswap uses the one whose
-weekly window resets soonest, so quota that would expire unused goes first.
-New launches and the monitor also move to such an account. The 5-hour session
+ The 5-hour session
 window does not affect this ranking: it renews every 5 hours whatever you do.
 Past the switch threshold, aswap's last-resort fallback ranks by the most
 headroom instead, to keep the session running as long as possible.
@@ -112,7 +115,14 @@ Read this before you enable it:
   upgrades, credits or extra usage, aswap refuses and stops redeeming until you
   run `aswap auto codex reset off`.
 - Only the monitor (`aswap auto codex watch`, the `aswap-codex` service) on
-  the refresh owner redeems; sync followers never do.
+  the refresh owner redeems; sync followers never do. With Home Manager,
+  `autoReset` needs `autoswitch.codex.enable = true`.
+- Right after a session hits its limit, that account's usage counts as unknown
+  until the next successful usage read (up to 3 minutes), so the first reset
+  decision can come a few minutes after the last account runs out.
+- `aswap auto codex reset off` also drops a redemption that is waiting to be
+  retried. If that request may already have spent a credit, it is recorded as
+  unconfirmed and the hour's cooldown applies.
 
 Try the dry run first. It logs `would reset codex:LABEL (weekly resets in …)`
 to the monitor's output and to the reset log, and spends nothing:

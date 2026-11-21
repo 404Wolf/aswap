@@ -477,6 +477,11 @@ normalized usage; account IDs and backend banners are discarded. Older caches re
 readable with missing optional metadata. Live diagnostics may inspect these
 field names/types and coarse numeric magnitudes only, never log the RPC payload.
 
+Selection defaults to `prefer = weekly-reset` (soonest account-wide weekly
+reset first, then headroom) for both providers when state sets none; an
+explicit `headroom` is kept. Past the soft threshold the last-resort fallback
+still ranks by headroom.
+
 ## Codex usage-limit resets
 
 Codex 0.167.1 calls these rate-limit reset credits ("Redeem reset" under
@@ -509,9 +514,15 @@ reading, persists the pending redemption with a fresh UUID key before the
 request, counts the attempt before sending, and records the usage before and
 after. Errors and unknown outcomes keep the key for a retry after 15 and 30
 minutes; the third failure, `nothingToReset` and `noCredit` skip that account
-until its weekly reset. A pending key is retried only while every account is
-still exhausted; if one has room again the earlier request may have worked,
-so it is recorded as unconfirmed. Anything that may have spent a credit starts
+until its weekly reset. A pending key is retried only after the same checks
+as a fresh decision: a forced read of its account, every account still
+exhausted, the account still present and unreserved, and its credit neither
+expired nor mentioning money. If one account has room again the earlier
+request may have worked. A pending that fails these checks, outlives its
+weekly window, loses its account, or is dropped by `codex reset off` is
+recorded (`unconfirmed` once sent, which starts the cooldown and skips the
+account for that window; `abandoned` if never sent). Only `codex` settings
+touch this log. Anything that may have spent a credit starts
 a one-hour cooldown. Money wording in a credit or a response halts redemption
 until `reset off`. Followers never redeem; a second process skips the tick
 while another holds `codex-reset.lock`. The log (`codex-resets.json`) keeps 50

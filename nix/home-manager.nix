@@ -21,13 +21,13 @@ let
       };
       prefer = mkOption {
         type = types.enum [ "headroom" "weekly-reset" ];
-        default = "headroom";
-        description = "Rank eligible accounts by most headroom, or by the soonest weekly reset (new launches also move to an account whose weekly quota resets sooner).";
+        default = "weekly-reset";
+        description = "Rank eligible accounts by the soonest weekly reset (the default; new launches also move to an account whose weekly quota resets sooner), or by most headroom.";
       };
       autoReset = mkOption {
         type = types.enum [ "off" "dry-run" "on" ];
         default = "off";
-        description = "Codex only. When every Codex account is out of weekly usage, redeem one earned usage-limit reset credit on the account whose weekly window resets farthest away (this resets its 5-hour and weekly windows together). dry-run only logs what it would reset.";
+        description = "Codex only, and only while this provider's monitor is enabled (enable = true). When every Codex account is out of weekly usage, redeem one earned usage-limit reset credit on the account whose weekly window resets farthest away (this resets its 5-hour and weekly windows together). dry-run only logs what it would reset.";
       };
     };
   };
@@ -198,6 +198,7 @@ in {
     assertions = [
       { assertion = !(cfg.refreshOwner == true && cfg.syncHost != null); message = "aswap refreshOwner and syncHost are mutually exclusive"; }
       { assertion = cfg.autoswitch.claude.autoReset == "off"; message = "aswap autoswitch.claude.autoReset: usage-limit resets are only supported for Codex"; }
+      { assertion = cfg.autoswitch.codex.autoReset == "off" || cfg.autoswitch.codex.enable; message = "aswap autoswitch.codex.autoReset needs autoswitch.codex.enable: only the monitor redeems resets"; }
     ];
     home.packages = [ cfg.package ];
     xdg.configFile."aswap/sync-policy.json" = mkIf (cfg.syncProfiles != null) {

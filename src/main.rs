@@ -183,9 +183,13 @@ fn snapshot(store: &Store, filter: Option<Provider>, refresh: bool) -> Result<Va
         rows.push(json!({"provider":a.provider,"label":a.label,"active":active.get(&a.provider)==Some(&a.label),"reserved":reserved,"remaining_percent":c.used(now()).map(|u|100.0-u),"usage":c.usage,"fetched_at":c.fetched_at,"next_poll_at":c.next_poll_at,"duplicates":duplicates,"usage_error":c.diagnostic(),"http_status":c.http_status,"retry_after_seconds":c.retry_after,"last_attempt":c.last_attempt,"usage_status":if c.used(now()).is_some(){"ok"}else if c.error.is_some(){"backoff"}else{"unknown"}}));
     }
     let coordination = aswap::coordination::settings(store)?;
+    // An unreadable reset log must not hide accounts; the monitor still
+    // refuses to redeem until it is readable again.
     let usage_resets = {
         let _lock = store.lock()?;
-        aswap::reset::load(store)?.summary()
+        aswap::reset::load(store)
+            .map(|log| log.summary())
+            .unwrap_or_else(|err| json!({"error": err.to_string()}))
     };
     Ok(
         json!({"schema_version":1,"accounts":rows,"auto":settings,"codex_usage_resets":usage_resets,"credential_mode":if coordination.owner {"refresh-owner"}else if coordination.host.is_some(){"access-only-follower"}else{"refresh-disabled"},"last_sync":coordination.last_sync,"sync":aswap::coordination::status(store)?}),
@@ -559,12 +563,7 @@ fn execute(cli: Cli) -> Result<i32> {
                         AutoAction::Reset => {
                             let mode = store::AutoReset::from_str(value.as_deref().unwrap(), false)
                                 .map_err(|_| Error("reset must be off, dry-run or on"))?;
-                            if provider != Provider::Codex && mode != store::AutoReset::Off {
-                                return Err(Error(
-                                    "usage-limit resets are only supported for Codex",
-                                ));
-                            }
-                            aswap::reset::set_mode(&store, settings, mode)?;
+                            aswap::reset::set_mode(&store, provider, settings, mode)?;
                         }
                         AutoAction::ResumePrompt => {
                             let prompt = value.unwrap();
