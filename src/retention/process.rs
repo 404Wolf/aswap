@@ -9,14 +9,15 @@ use std::{
 };
 
 pub(super) fn lower_priority() -> Result<()> {
-    // Linux IOPRIO_WHO_PROCESS and IOPRIO_CLASS_IDLE with data zero.
-    // SAFETY: both calls take only integers, with PID zero meaning ourselves.
-    let (nice, ionice) = unsafe {
-        (
-            libc::setpriority(libc::PRIO_PROCESS, 0, 19),
-            libc::syscall(libc::SYS_ioprio_set, 1, 0, 3 << 13),
-        )
-    };
+    // SAFETY: these calls take only integers, with PID zero meaning ourselves.
+    let nice = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19) };
+    // Linux IOPRIO_WHO_PROCESS and IOPRIO_CLASS_IDLE with data zero; other
+    // systems only lower the CPU priority.
+    #[cfg(target_os = "linux")]
+    // SAFETY: as above.
+    let ionice = unsafe { libc::syscall(libc::SYS_ioprio_set, 1, 0, 3 << 13) };
+    #[cfg(not(target_os = "linux"))]
+    let ionice = 0;
     if nice != 0 || ionice != 0 {
         return Err(Error("cannot lower retention I/O and CPU priority"));
     }

@@ -895,7 +895,10 @@ fn stream_command(
     mut stop: impl FnMut() -> bool,
 ) -> (usize, Result<()>) {
     // SAFETY: prctl is async-signal-safe. The stream outlives no watcher: if
-    // this process dies, the SSH child (and its pipes) die with it.
+    // this process dies, the SSH child (and its pipes) die with it. Without
+    // Linux's parent-death signal (macOS), a killed watcher's SSH child ends
+    // only when the owner sees its stdin close and ends the stream.
+    #[cfg(target_os = "linux")]
     unsafe {
         command.pre_exec(|| {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {

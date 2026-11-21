@@ -221,10 +221,14 @@ pub fn run(
         let mut cmd = provider.command(&view.path);
         cmd.args(&launch_args);
         let supervisor = std::process::id();
-        // SAFETY: only async-signal-safe Linux syscalls run after fork. Close the
+        // SAFETY: only async-signal-safe syscalls run after fork. Close the
         // spawn/record gap: a killed supervisor cannot leave an untracked provider.
+        // Without Linux's parent-death signal (macOS), a provider whose
+        // supervisor is SIGKILLed keeps running on its own; a supervisor that
+        // exits normally still stops it.
         unsafe {
             cmd.pre_exec(move || {
+                #[cfg(target_os = "linux")]
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }

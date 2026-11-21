@@ -61,6 +61,10 @@ pub(crate) struct InputActivity {
     pub(crate) waiting: bool,
 }
 
+/// macOS declares the request narrower than `ioctl` takes it.
+#[allow(clippy::unnecessary_cast)]
+const TIOCSCTTY: libc::c_ulong = libc::TIOCSCTTY as libc::c_ulong;
+
 impl Terminal {
     pub fn open() -> Result<Self> {
         let interrupt = Interrupt::new()?;
@@ -72,8 +76,9 @@ impl Terminal {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                // Linux takes these as const and macOS as mut pointers.
+                std::ptr::null_mut::<libc::termios>(),
+                std::ptr::null_mut::<libc::winsize>(),
             )
         } != 0
         {
@@ -133,7 +138,7 @@ impl Terminal {
         // SAFETY: only async-signal-safe syscalls run between fork and exec.
         unsafe {
             command.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                if libc::setsid() < 0 || libc::ioctl(0, TIOCSCTTY, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())

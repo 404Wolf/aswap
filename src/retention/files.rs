@@ -48,6 +48,17 @@ impl Dir {
             .map(Self)
     }
 
+    /// Without Linux's openat2 there is no race-free way to refuse a mount or
+    /// symlink below the view, so retention refuses to descend at all.
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn contained_child(&self, _name: &OsStr) -> io::Result<Self> {
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "runtime retention requires Linux openat2",
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
     pub(super) fn contained_child(&self, name: &OsStr) -> io::Result<Self> {
         use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
         let fd = openat2(
