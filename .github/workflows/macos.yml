@@ -1,0 +1,14 @@
+name: macos
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo build --locked
+      - run: cargo test --locked --lib switch_gate
+      # The integration tests arrive with the switch gate (PR #24).
+      - run: if [ -f tests/switch_gate.rs ]; then cargo test --locked --test switch_gate; fi
