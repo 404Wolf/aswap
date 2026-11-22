@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2-preview.agy.2 (2026-11-22)
+
+The same product as 0.2.2-preview.agy.1 (#44 at 1c627b8). Only a test fixture changed: each fake provider in the wake tests writes its own temp file (from #45), so a shared-path race no longer fails them. Not a release.
+
 ## 0.2.2-preview.agy.1 (2026-11-22)
 
 A preview of #44 (agy) for the VM, on main c0ff893. Not a release.
