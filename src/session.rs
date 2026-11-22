@@ -78,6 +78,18 @@ impl AutoArgs {
             let (key, inline) = flag
                 .split_once('=')
                 .map_or((flag.as_str(), None), |(a, b)| (a, Some(b)));
+            // agy parses Go flags: `-name` is `--name`.
+            let long;
+            let key = if provider == Provider::Agy
+                && key.len() > 2
+                && key.starts_with('-')
+                && !key.starts_with("--")
+            {
+                long = format!("-{key}");
+                long.as_str()
+            } else {
+                key
+            };
             if key == "--" {
                 one_shot |= i + 1 < args.len();
                 break;

@@ -806,7 +806,12 @@ impl View {
         if !agy {
             names.insert("history.jsonl".into());
         } else {
-            crate::agy::prepare_view(&path, &home)?;
+            let config_home = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .map_or_else(|| provider::home().map(|h| h.join(".config")), Ok)?;
+            crate::agy::prepare_view(&path, &home, &config_home)?;
+            crate::agy::sweep_finished_views(&store.root.join("runtimes").join("agy"));
         }
         drop(lock);
         let mut view = Self {

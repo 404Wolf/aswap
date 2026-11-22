@@ -158,6 +158,9 @@ pub fn run(
         crate::shared::View::prepare(store, &account)
     })?;
     patiently("recording the session's view", || lease.view(&view.path))?;
+    if provider == Provider::Agy {
+        crate::agy::check_args(args)?;
+    }
     if provider == Provider::Agy && crate::agy::spends_credits(&view.path) {
         return Err(crate::Error(
             "agy settings have useG1Credits on (paid AI credits after quota runs out); turn it off first",
@@ -1005,9 +1008,7 @@ fn limit_seen(
                 .is_some_and(|input| input > at);
             let worked = tracker
                 .and_then(crate::session::Tracker::transcript)
-                .and_then(|path| std::fs::metadata(path).ok())
-                .and_then(|m| m.modified().ok())
-                .is_some_and(|modified| modified > wall);
+                .is_some_and(|path| crate::agy::worked_since(&path, wall));
             typed || worked
         };
         return limits.check_agy(screen.notice, moment.exited == Some(true), since);

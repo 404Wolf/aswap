@@ -30,7 +30,13 @@ args=sys.argv[1:]
 root=pathlib.Path(next(a.split('=',1)[1] for a in args if a.startswith('--gemini_dir=')))
 args=[a for a in args if not a.startswith('--gemini_dir=')]
 assert 'DBUS_SESSION_BUS_ADDRESS' not in os.environ and 'GEMINI_API_KEY' not in os.environ
-assert os.environ['XDG_CONFIG_HOME']==str(root/'.config')
+config=pathlib.Path(os.environ['XDG_CONFIG_HOME'])
+assert config==root/'.config'
+# Tools agy runs see the user's config (gh here), but agy's own secrets
+# are the view's.
+assert (config/'gh'/'hosts.yml').read_text()=='synthetic: gh\n'
+assert not (config/'antigravity'/'plugin-secrets.json').exists()
+assert (root/'antigravity-cli'/'jetski_state.pbtxt').is_file() and not (root/'antigravity-cli'/'jetski_state.pbtxt').is_symlink()
 assert os.environ['AGY_CLI_DISABLE_AUTO_UPDATE']=='true'
 app=root/'antigravity-cli'
 token=app/'antigravity-oauth-token'
@@ -60,11 +66,20 @@ if mode=='stuck':
     time.sleep(40); sys.exit(9)
 for _ in range(20):
     time.sleep(1)
-    with transcript.open('a') as f: f.write('{"type":"assistant"}\n')
+    step={'type':'PLANNER_RESPONSE','status':'DONE','source':'MODEL',
+          'created_at':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()}
+    with transcript.open('a') as f: f.write(json.dumps(step)+'\n')
 sys.exit(0)
 "##;
 
 fn child(name: &str, mode: &str) -> (Vec<Value>, std::path::PathBuf, tempfile::TempDir) {
+    child_with(name, mode, "[]")
+}
+fn child_with(
+    name: &str,
+    mode: &str,
+    args: &str,
+) -> (Vec<Value>, std::path::PathBuf, tempfile::TempDir) {
     let t = tempfile::tempdir().unwrap();
     let bin = t.path().join("bin");
     fs::create_dir(&bin).unwrap();
@@ -93,6 +108,7 @@ fn child(name: &str, mode: &str) -> (Vec<Value>, std::path::PathBuf, tempfile::T
         .env("ASWAP_TEST_MODE", mode)
         .env("ASWAP_TEST_ID", ID)
         .env("ASWAP_TEST_LAUNCHES", &launches)
+        .env("ASWAP_TEST_ARGS", args)
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();
@@ -117,6 +133,18 @@ fn is_child(name: &str) -> bool {
 fn two_accounts() -> Store {
     let store = Store::from_env().unwrap();
     let home = provider::home().unwrap();
+    // The user's own config, and agy's first-run state.
+    let config = std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+    fs::create_dir_all(config.join("gh")).unwrap();
+    fs::write(config.join("gh/hosts.yml"), "synthetic: gh\n").unwrap();
+    fs::create_dir_all(config.join("antigravity")).unwrap();
+    fs::write(config.join("antigravity/plugin-secrets.json"), "{}").unwrap();
+    fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+    fs::write(
+        home.join(".gemini/antigravity-cli/jetski_state.pbtxt"),
+        "post_onboarding: true\n",
+    )
+    .unwrap();
     for name in ["one", "two"] {
         store::json_write(
             &token_path(&home),
@@ -191,7 +219,13 @@ fn capture_child() {
 
 #[test]
 fn a_stuck_agy_at_its_quota_fails_over_and_resumes_the_conversation() {
-    let (launches, _, _t) = child("run_child", "stuck");
+    // The user's first prompt (-i) is said once, never replayed.
+    let (launches, _, _t) = child_with("run_child", "stuck", r#"["-i","synthetic first prompt"]"#);
+    let first: Vec<String> = serde_json::from_value(launches[0]["args"].clone()).unwrap();
+    assert!(
+        first.contains(&"synthetic first prompt".to_owned()),
+        "{first:?}"
+    );
     assert_eq!(launches.len(), 2, "{launches:?}");
     assert_eq!(launches[0]["account"], "one");
     assert_eq!(launches[1]["account"], "two");
@@ -202,6 +236,7 @@ fn a_stuck_agy_at_its_quota_fails_over_and_resumes_the_conversation() {
         "{resumed:?}"
     );
     assert_eq!(resumed.len(), 3, "{resumed:?}");
+    assert!(!resumed.iter().any(|a| a.contains("synthetic first prompt")));
 }
 
 #[test]
@@ -244,6 +279,56 @@ fn run_child() {
         return;
     }
     let store = two_accounts();
-    let code = aswap::runner::run(&store, Provider::Agy, Some("one"), &[], true).unwrap();
+    let args: Vec<String> =
+        serde_json::from_str(&std::env::var("ASWAP_TEST_ARGS").unwrap_or("[]".into())).unwrap();
+    let code = aswap::runner::run(&store, Provider::Agy, Some("one"), &args, true).unwrap();
     assert!(matches!(code, 0 | 9), "exit {code}");
+}
+
+#[test]
+fn options_that_leave_the_view_or_spend_credits_are_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let paid = t.path().join("paid.json");
+    fs::write(&paid, r#"{"useG1Credits": true}"#).unwrap();
+    let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    for refused in [
+        args(&["--gemini_dir=/elsewhere"]),
+        args(&["-gemini_dir", "/elsewhere"]),
+        args(&["--app_data_dir=other"]),
+        args(&["--settings", r#"{"useG1Credits":true}"#]),
+        args(&["-settings="]),
+        args(&["--settings", paid.to_str().unwrap()]),
+    ] {
+        assert!(aswap::agy::check_args(&refused).is_err(), "{refused:?}");
+    }
+    for allowed in [
+        args(&["--settings", r#"{"toolPermission":"always-proceed"}"#]),
+        args(&["--model", "synthetic"]),
+        args(&["--", "--gemini_dir=/literal/prompt/text"]),
+    ] {
+        assert!(aswap::agy::check_args(&allowed).is_ok(), "{allowed:?}");
+    }
+}
+
+#[test]
+fn go_style_single_dash_flags_are_read_like_double_dash_ones() {
+    use aswap::session::AutoArgs;
+    let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let named =
+        AutoArgs::parse(Provider::Agy, &args(&["-conversation", ID, "-model", "m"])).unwrap();
+    assert_eq!(named.id.as_deref(), Some(ID));
+    // -prompt-interactive's text is never kept for a restart.
+    let first = AutoArgs::parse(
+        Provider::Agy,
+        &args(&["-prompt-interactive", "hello", "-model", "m"]),
+    )
+    .unwrap();
+    let resumed = first.resume(Provider::Agy, ID, None).unwrap();
+    assert!(!resumed.contains(&"hello".to_owned()), "{resumed:?}");
+    assert!(resumed.contains(&"-model".to_owned()), "{resumed:?}");
+    assert!(
+        AutoArgs::parse(Provider::Agy, &args(&["-print", "x"]))
+            .unwrap()
+            .one_shot
+    );
 }

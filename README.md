@@ -116,6 +116,13 @@ like Claude and Codex logins: `aswap add agy <label>` after signing in with
   `presence/`, `cache/`, `history.jsonl`) and `~/.gemini/config`
   (plugins, hooks, MCP servers, skills) are linked in. The Gemini CLI's own
   files in `~/.gemini` are not.
+- **Tools agy runs** see your `~/.config` (git, gh, herdr, ...) through the
+  view's own config directory, except `antigravity/` (agy's per-account
+  plugin secrets). They don't see a D-Bus session bus, so a tool that keeps
+  its secrets in the Secret Service (libsecret) can't reach them from inside
+  agy. That is the price of agy's login staying a per-account file.
+- **Refused options.** `--gemini_dir`/`--app_data_dir` (they would leave
+  the view), and `--settings` that turns on `useG1Credits`.
 - **Refreshing.** agy refreshes its own login; aswap never contacts
   Google's token endpoint. A view's newer login is written back to its
   profile, and the view's copy is removed when the run ends.

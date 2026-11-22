@@ -130,13 +130,29 @@ pub fn read_settled(path: &Path) -> Result<Value> {
     ))
 }
 
+/// Create a directory of the user's (0700) if it's missing; an existing one
+/// is left exactly as it is.
+fn ensure_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    if path.exists() {
+        return Ok(());
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .safe("cannot create shared agy state")
+}
+
 /// Lay out a launch view at `view` for the user's `home` (`~/.gemini`).
-/// The login and settings are the view's own; everything else agy shares
-/// across accounts is linked from `home`, created there first if missing.
-pub fn prepare_view(view: &Path, home: &Path) -> Result<()> {
+/// The login, settings and first-run state are the view's own; everything
+/// else agy shares across accounts is linked from `home`, created there
+/// first if missing. `config_home` is the user's real `XDG_CONFIG_HOME`: the
+/// view's own one links all of it except agy's plugin secrets.
+pub fn prepare_view(view: &Path, home: &Path, config_home: &Path) -> Result<()> {
     use std::os::unix::fs::symlink;
-    store::private_dir(&home.join(APP))?;
-    store::private_dir(&home.join("config"))?;
+    ensure_dir(&home.join(APP))?;
+    ensure_dir(&home.join("config"))?;
     for name in SHARED_ROOT {
         let source = home.join(name);
         if source.exists() {
@@ -151,21 +167,156 @@ pub fn prepare_view(view: &Path, home: &Path) -> Result<()> {
             if name.ends_with(".jsonl") {
                 store::atomic(&source, b"")?;
             } else {
-                store::private_dir(&source)?;
+                ensure_dir(&source)?;
             }
         }
         symlink(&source, app.join(name)).safe("cannot link shared agy state")?;
     }
-    let settings = home.join(APP).join("settings.json");
-    if settings.is_file() {
-        store::atomic(&app.join("settings.json"), &store::read_private(&settings)?)?;
+    // Settings and first-run state (onboarding, workspace trust) start as
+    // the user's, so a launch doesn't stop at a first-run dialog.
+    for name in ["settings.json", "jetski_state.pbtxt"] {
+        let source = home.join(APP).join(name);
+        if source.is_file() {
+            store::atomic(&app.join(name), &store::read_private(&source)?)?;
+        }
     }
     let summaries = home.join(APP).join(SUMMARIES);
     if summaries.is_file() {
         // The picker's index; a stale or missing one costs only the picker.
         let _ = crate::shared::sqlite_snapshot(&summaries, &app.join(SUMMARIES));
     }
+    config_shim(&view.join(CONFIG), config_home)
+}
+
+/// The view's `XDG_CONFIG_HOME`, as agy and every tool it runs see it.
+pub const CONFIG: &str = ".config";
+/// agy's own entry there: plugin and MCP sign-in secrets, per account.
+const CONFIG_OWN: &str = "antigravity";
+
+/// `shim` links every entry of the user's `config_home` (gh, git, herdr,
+/// ...) except agy's own, which is the view's. Entries the user adds to
+/// `config_home` later appear in the next run's view.
+fn config_shim(shim: &Path, config_home: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+    store::private_dir(shim)?;
+    store::private_dir(&shim.join(CONFIG_OWN))?;
+    let Ok(entries) = std::fs::read_dir(config_home) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name == CONFIG_OWN {
+            continue;
+        }
+        symlink(entry.path(), shim.join(&name)).safe("cannot link the user's config")?;
+    }
     Ok(())
+}
+
+/// Remove the login from finished agy views of every account: a run that
+/// was killed (SIGKILL) never removed its own. A view still in use holds
+/// its lifetime lock and is left alone.
+pub fn sweep_finished_views(runtimes: &Path) {
+    let Ok(labels) = std::fs::read_dir(runtimes) else {
+        return;
+    };
+    for label in labels.flatten() {
+        let Ok(views) = std::fs::read_dir(label.path()) else {
+            continue;
+        };
+        for view in views.flatten() {
+            let path = view.path();
+            let login = path.join(AUTH_FILE);
+            if !login.exists() {
+                continue;
+            }
+            let Ok(lock) = std::fs::OpenOptions::new()
+                .read(true)
+                .open(path.join(crate::shared::VIEW_LIFETIME_LOCK))
+            else {
+                continue;
+            };
+            if fs2::FileExt::try_lock_exclusive(&lock).is_ok() {
+                let _ = std::fs::remove_file(&login);
+            }
+        }
+    }
+}
+
+/// Options aswap refuses on an agy launch: ones that would move agy off its
+/// view (another root or app directory), and session settings that turn on
+/// paid credits (`--settings`, inline JSON or a file). Go flags take one or
+/// two dashes.
+pub fn check_args(args: &[String]) -> Result<()> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            break;
+        }
+        let flag = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'));
+        let Some(flag) = flag.filter(|f| !f.is_empty()) else {
+            i += 1;
+            continue;
+        };
+        let (name, inline) = flag
+            .split_once('=')
+            .map_or((flag, None), |(n, v)| (n, Some(v)));
+        match name {
+            "gemini_dir" | "app_data_dir" => {
+                return Err(Error(
+                    "aswap runs agy in its own view; --gemini_dir and --app_data_dir are refused",
+                ));
+            }
+            "settings" => {
+                let value = inline
+                    .map(str::to_owned)
+                    .or_else(|| args.get(i + 1).cloned());
+                let settings: Option<Value> = value.as_deref().and_then(|v| {
+                    serde_json::from_str(v)
+                        .ok()
+                        .or_else(|| store::json_read(Path::new(v)).ok())
+                });
+                let Some(settings) = settings else {
+                    return Err(Error(
+                        "agy --settings must be readable JSON so aswap can check it",
+                    ));
+                };
+                if settings.get("useG1Credits").and_then(Value::as_bool) == Some(true) {
+                    return Err(Error(
+                        "agy --settings turns on useG1Credits (paid AI credits); refused",
+                    ));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Whether agy moved on since an early quota notice made at `since`: a
+/// model step or user input in the transcript after it. System messages
+/// and failed steps don't count, so an error agy logs there isn't progress.
+pub fn worked_since(transcript: &Path, since: std::time::SystemTime) -> bool {
+    let Ok(text) = std::fs::read_to_string(transcript) else {
+        return false;
+    };
+    let since: chrono::DateTime<chrono::Utc> = since.into();
+    text.lines().rev().any(|line| {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        let kind = entry.get("type").and_then(Value::as_str);
+        let status = entry.get("status").and_then(Value::as_str);
+        let at = entry
+            .get("created_at")
+            .and_then(Value::as_str)
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+        matches!(kind, Some("PLANNER_RESPONSE" | "GENERIC" | "USER_INPUT"))
+            && !matches!(status, Some("ERROR" | "FAILED" | "CANCELED"))
+            && at.is_some_and(|at| at > since)
+    })
 }
 
 /// A paid fallback agy offers once quota runs out; aswap never launches
@@ -199,36 +350,6 @@ pub fn names_session(args: &[String]) -> bool {
     })
 }
 
-/// The conversation a running agy (`pid`) has open: agy holds
-/// `antigravity-cli/presence/<id>.lock` for it.
-pub fn conversation_of(pid: u32) -> Option<String> {
-    let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
-    let mut found = None;
-    for fd in fds.flatten() {
-        let Ok(target) = std::fs::read_link(fd.path()) else {
-            continue;
-        };
-        let Some(id) = presence_id(&target) else {
-            continue;
-        };
-        if found.as_ref().is_some_and(|f: &String| f != &id) {
-            // Two conversations open at once: not one we can name.
-            return None;
-        }
-        found = Some(id);
-    }
-    found
-}
-
-fn presence_id(path: &Path) -> Option<String> {
-    let parent = path.parent()?;
-    if parent.file_name()? != "presence" || parent.parent()?.file_name()? != APP {
-        return None;
-    }
-    let id = path.file_name()?.to_str()?.strip_suffix(".lock")?;
-    crate::session::valid_id(id).then(|| id.to_owned())
-}
-
 /// A conversation's transcript under a root.
 pub fn transcript(root: &Path, id: &str) -> PathBuf {
     root.join(APP)
@@ -239,7 +360,9 @@ pub fn transcript(root: &Path, id: &str) -> PathBuf {
 
 /// aswap processes running another build on this store (`root`): they
 /// predate agy support (or a later change), and an older build can't read
-/// state.json once it has an agy account. Returns their process ids.
+/// state.json once it has an agy account. Returns their process ids. It
+/// can't stop an older build started later; README says to upgrade every
+/// machine's aswap first.
 pub fn other_builds(root: &Path) -> Vec<u32> {
     let Ok(me) = std::env::current_exe().and_then(|p| p.canonicalize()) else {
         return Vec::new();
@@ -261,10 +384,15 @@ pub fn other_builds(root: &Path) -> Vec<u32> {
         };
         // A replaced binary reads as "<path> (deleted)".
         let name = exe.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !(name == "aswap" || name.starts_with("aswap ")) || exe == me {
+        let aswap = name == "aswap"
+            || name.starts_with("aswap ")
+            || name == ".aswap-wrapped"
+            || name.starts_with(".aswap-wrapped ");
+        if !aswap || exe == me {
             continue;
         }
-        if process_store(&entry.path()).as_deref() == Some(root) {
+        // An environment we can't read could be this store's: count it.
+        if process_store(&entry.path()).is_none_or(|store| store == root) {
             others.push(pid);
         }
     }
@@ -356,15 +484,55 @@ mod tests {
     }
 
     #[test]
-    fn presence_locks_name_the_open_conversation() {
-        let id = "666838c2-f624-4ff9-9039-82e50ca540cf";
-        let lock = PathBuf::from(format!("/v/antigravity-cli/presence/{id}.lock"));
-        assert_eq!(presence_id(&lock).as_deref(), Some(id));
-        assert_eq!(presence_id(Path::new("/v/presence/x.lock")), None);
-        assert_eq!(
-            presence_id(Path::new("/v/antigravity-cli/presence/not-an-id.lock")),
-            None
+    fn only_model_work_after_a_notice_is_progress() {
+        let t = tempfile::tempdir().unwrap();
+        let transcript = t.path().join("transcript.jsonl");
+        let notice =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let entry = |kind: &str, status: &str, at: &str| {
+            json!({"type":kind,"status":status,"created_at":at,"source":"MODEL"}).to_string()
+        };
+        let before = "2027-01-15T08:00:00Z"; // before the notice
+        let after = "2027-01-15T08:00:30Z";
+        let write = |lines: &[String]| std::fs::write(&transcript, lines.join("\n")).unwrap();
+        write(&[entry("PLANNER_RESPONSE", "DONE", before)]);
+        assert!(!worked_since(&transcript, notice));
+        write(&[
+            entry("SYSTEM_MESSAGE", "DONE", after),
+            entry("GENERIC", "ERROR", after),
+        ]);
+        assert!(
+            !worked_since(&transcript, notice),
+            "errors and system messages are not work"
         );
+        write(&[
+            entry("SYSTEM_MESSAGE", "DONE", after),
+            entry("GENERIC", "DONE", after),
+        ]);
+        assert!(worked_since(&transcript, notice));
+        write(&[entry("USER_INPUT", "DONE", after)]);
+        assert!(worked_since(&transcript, notice));
+        assert!(!worked_since(&t.path().join("missing"), notice));
+    }
+
+    #[test]
+    fn a_killed_runs_login_is_swept_and_a_live_ones_kept() {
+        let t = tempfile::tempdir().unwrap();
+        let runtimes = t.path().join("runtimes/agy");
+        let view = |name: &str| {
+            let path = runtimes.join("one").join(name);
+            std::fs::create_dir_all(path.join(APP)).unwrap();
+            std::fs::write(path.join(AUTH_FILE), "{}").unwrap();
+            std::fs::write(path.join(crate::shared::VIEW_LIFETIME_LOCK), "").unwrap();
+            path
+        };
+        let killed = view("run-killed");
+        let live = view("run-live");
+        let held = std::fs::File::open(live.join(crate::shared::VIEW_LIFETIME_LOCK)).unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        sweep_finished_views(&runtimes);
+        assert!(!killed.join(AUTH_FILE).exists());
+        assert!(live.join(AUTH_FILE).exists());
     }
 
     #[test]

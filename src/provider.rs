@@ -84,7 +84,7 @@ impl Provider {
             // The view is agy's whole root; its plugin secrets live in the
             // view too, and without a session bus the login stays a file.
             cmd.arg(format!("--gemini_dir={}", profile.display()));
-            cmd.env("XDG_CONFIG_HOME", profile.join(".config"));
+            cmd.env("XDG_CONFIG_HOME", profile.join(crate::agy::CONFIG));
             cmd.env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
             for key in crate::agy::SCRUBBED {
                 cmd.env_remove(key);
