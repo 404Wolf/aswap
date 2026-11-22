@@ -55,7 +55,12 @@ if 'app-server' in args:
         req=json.loads(line); method=req.get('method'); result=None
         if method=='initialize': result={}
         elif method=='model/list': result={'data':[{'id':'synthetic-model','model':'synthetic-model','isDefault':True}]}
-        elif method=='account/rateLimits/read': result=limits(label)
+        elif method=='account/rateLimits/read':
+            # Optionally, the first read after a reset is slow (3 s).
+            if (dir/'slow-post-read').exists() and state.get(label)=='reset' and not (dir/'slow-read-done').exists():
+                (dir/'slow-read-done').write_text('')
+                time.sleep(3)
+            result=limits(label)
         elif method=='account/rateLimitResetCredit/consume':
             key=req['params']['idempotencyKey']
             seen=[c for c in lines('consumes.jsonl') if c['key']==key]
@@ -251,8 +256,11 @@ fn tick_child() {
 fn resumed_on_two(fixture: &Fixture, supervisor: Supervisor) {
     resumed_on(fixture, supervisor, "two");
 }
-fn resumed_on(fixture: &Fixture, mut supervisor: Supervisor, label: &str) {
-    let end = Instant::now() + Duration::from_secs(60);
+fn resumed_on(fixture: &Fixture, supervisor: Supervisor, label: &str) {
+    resumed_within(fixture, supervisor, label, 60);
+}
+fn resumed_within(fixture: &Fixture, mut supervisor: Supervisor, label: &str, secs: u64) {
+    let end = Instant::now() + Duration::from_secs(secs);
     let status = loop {
         if let Some(status) = supervisor.0.try_wait().unwrap() {
             break status;
@@ -382,4 +390,19 @@ fn a_spend_whose_reply_is_lost_is_reconciled_without_a_second_send() {
         .map(|r| r["outcome"].as_str().unwrap().to_owned())
         .collect();
     assert!(outcomes.contains(&"reconciled".to_owned()), "{outcomes:?}");
+}
+
+#[test]
+fn a_slow_post_reset_read_still_wakes_the_waiting_session_promptly() {
+    // The outcome is journaled before the post-reset read lands; the
+    // waiting session must wake on the fresh reading (Recovered), not go
+    // back to its long poll on the old, full one.
+    let fixture = Fixture::new();
+    fs::write(fixture.dir().join("farthest-one"), "").unwrap();
+    fs::write(fixture.dir().join("slow-post-read"), "").unwrap();
+    fixture.run("setup_child", "0");
+    let (supervisor, _) = fixture.waiting_supervisor();
+    fixture.run("tick_child", "0");
+    assert_eq!(fixture.lines("spends.jsonl").len(), 1);
+    resumed_within(&fixture, supervisor, "one", 10);
 }

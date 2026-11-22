@@ -111,8 +111,9 @@ Read this before you enable it:
   says "eligible", not which ones) and **spends one earned credit**. Credits
   are limited and expire; a spent credit can't be returned.
 - **When.** aswap redeems only when every *usable* Codex account has no
-  usable quota now: its weekly window used up and not yet reset, or Codex's
-  backend denying ordinary use (`ordinaryUsageAllowed: false`). Reserved and
+  usable quota now: its weekly window used up and not yet reset. (A backend
+  denial, `ordinaryUsageAllowed: false`, with weekly room left is a hold, not
+  a spend, unless the session-window opt-in below is on.) Reserved and
   signed-out accounts are not usable, so they neither block a reset nor get
   one. Unknown usage on a usable account means no redemption; aswap reads it
   first. *(This reading of "exhausted" is Wolf's call; see the PR.)*
@@ -138,16 +139,23 @@ Read this before you enable it:
     right before sending.
 - **Never forgotten.** A request that got no answer (three tries, a mode
   change, quota coming back) may have spent its credit. It is paused, with
-  its key, never replaced by a new one: `aswap auto codex reset retry`
-  resends it, `aswap auto codex reset dismiss` drops it.
-- **Resuming.** Once a reset is redeemed, waiting `run --auto` sessions check
-  at once (not at their next scheduled check), and a session held on that
-  very account is released. Where Codex reports `ordinaryUsageAllowed`, only
+  its key, never replaced by a new one. `aswap auto codex reset retry`
+  settles it: if the account reads usable again, the request evidently
+  worked and is recorded as redeemed, with nothing sent; if it is still out
+  of usage and the pool still qualifies (the same checks as a new spend),
+  the same key is resent; otherwise it stays paused. `aswap auto codex reset
+  dismiss` drops it.
+- **Resuming.** Once a reset is redeemed and a fresh read shows the account
+  usable, aswap journals that (`recovered`) and waiting `run --auto` sessions
+  check at once (not at their next scheduled check); a session held on that
+  very account is released. A failed or still-full post-reset read is
+  retried on a short backoff, never with a new spend. Where Codex reports `ordinaryUsageAllowed`, only
   a grant counts as recovery.
 - **Money.** It uses only credits Codex lists as available. If a credit's
   title or description, or Codex's answer, mentions payment, purchase,
   billing, upgrades, credits or extra usage, aswap refuses and stops
-  redeeming until you run `aswap auto codex reset off`.
+  redeeming until you run `aswap auto codex reset off`. The halt is
+  journaled first, so it survives a crash.
 - **Who.** Only the monitor (`aswap auto codex watch`, the `aswap-codex`
   service) on the refresh owner redeems; sync followers never do. The
   guarantees hold within that one data directory; nothing coordinates across
