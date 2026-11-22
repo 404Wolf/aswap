@@ -78,6 +78,13 @@ pub fn from_values(provider: Provider, auth: &Value, config: &Value) -> Identity
                 None,
             )
         }
+        // `config` is the profile's google_accounts.json.
+        Provider::Gemini => (
+            crate::gemini::email(config),
+            None,
+            crate::gemini::account_id(auth, config),
+            None,
+        ),
     };
     let fingerprint = account.map(|a| {
         let bytes = serde_json::to_vec(&(provider.as_str(), a.trim().to_lowercase(), organization))
@@ -94,8 +101,11 @@ pub fn from_values(provider: Provider, auth: &Value, config: &Value) -> Identity
 }
 pub fn read(provider: Provider, profile: &Path) -> Result<Identity> {
     let auth: Value = store::json_read(&profile.join(provider.auth_file()))?;
-    let path = profile.join(".claude.json");
-    let config = if provider == Provider::Claude && path.exists() {
+    let path = profile.join(match provider {
+        Provider::Gemini => crate::gemini::ACCOUNTS_FILE,
+        _ => ".claude.json",
+    });
+    let config = if matches!(provider, Provider::Claude | Provider::Gemini) && path.exists() {
         store::json_read(&path)?
     } else {
         Value::Null

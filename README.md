@@ -156,6 +156,27 @@ records each attempt, with the account's usage before and after, in
 is held by a usage limit (`limit_blocked`) and, when Codex or Claude said,
 when it frees up (`blocked_until`, Unix seconds).
 
+## Gemini accounts (preview)
+
+aswap pools Gemini CLI accounts signed in with Google ("Login with Google").
+API-key and Vertex logins are billed, so `aswap add gemini` refuses them.
+
+```sh
+gemini                      # choose "Login with Google", finish, then /quit
+aswap add gemini personal   # capture that login
+gemini                      # /auth → Login with Google with another account → /quit
+aswap add gemini work
+aswap run gemini --auto     # switch accounts at a limit and resume the same session
+aswap list                  # quota per model, where Google reports it
+```
+
+- **Launch views:** each run gets a private copy of the login under `GEMINI_CLI_HOME`, while chat history and settings stay shared in `~/.gemini`.
+- **Refresh:** the machine that owns the logins refreshes them. A newer login refreshed by Gemini itself is written back to the profile.
+- **Quota:** read with Gemini CLI's own read-only Code Assist calls. If they fail, the account's usage shows as unknown.
+- **This machine only:** Gemini logins are never sent to sync followers.
+- **Limit menus:** aswap never answers Gemini's overage or credit menus.
+- **Not yet:** `aswap gc` doesn't retire Gemini views, and there's no `gemini` wrapper; launch with `aswap run gemini`.
+
 ## Reading usage from another program
 
 `aswap list --json` is the stable, cache-only interface: it makes no network

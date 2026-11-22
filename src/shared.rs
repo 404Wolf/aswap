@@ -79,6 +79,14 @@ fn shared_config(config: &Value) -> Value {
     )
 }
 pub(crate) fn private(provider: Provider, name: &OsStr) -> bool {
+    if provider == Provider::Gemini
+        && matches!(
+            name.to_str(),
+            Some(crate::gemini::ACCOUNTS_FILE | crate::gemini::SHIM)
+        )
+    {
+        return true;
+    }
     let name = name.to_string_lossy();
     name == provider.auth_file()
         || matches!(
@@ -566,6 +574,9 @@ fn migrate_root(
 }
 /// Entries a launch view always links to the shared home of the same name.
 fn shared_names(provider: Provider) -> &'static [&'static str] {
+    if provider == Provider::Gemini {
+        return &crate::gemini::SHARED;
+    }
     if provider == Provider::Claude {
         &[
             "projects",
@@ -624,6 +635,7 @@ pub(crate) fn shared_home(root: &Path, provider: Provider, mut home: PathBuf) ->
             None => provider::home()?.join(match provider {
                 Provider::Claude => ".claude",
                 Provider::Codex => ".codex",
+                Provider::Gemini => ".gemini",
             }),
         };
     }
@@ -767,7 +779,7 @@ impl View {
             }
         }
         let history = home.join("history.jsonl");
-        if !exists(&history) {
+        if account.provider != Provider::Gemini && !exists(&history) {
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -776,7 +788,9 @@ impl View {
             file.set_permissions(fs::Permissions::from_mode(0o600))
                 .safe("cannot secure shared history")?;
         }
-        names.insert("history.jsonl".into());
+        if account.provider != Provider::Gemini {
+            names.insert("history.jsonl".into());
+        }
         drop(lock);
         let mut view = Self {
             path,
@@ -807,6 +821,9 @@ impl View {
                 symlink(&src, &dst).safe("cannot link shared provider state")?;
             }
         }
+        if view.provider == Provider::Gemini {
+            crate::gemini::prepare_shim(&view.path, &provider::home()?)?;
+        }
         let _lock = store.lock()?;
         if view.provider == Provider::Claude {
             view.baseline = shared_config(&read_config(&view.config_path)?);
@@ -836,6 +853,15 @@ impl View {
         carry(&lock, account)?;
         drop(lock);
         self.auth_stamp = observed;
+        if account.provider == Provider::Gemini {
+            let accounts = profile.join(crate::gemini::ACCOUNTS_FILE);
+            if accounts.is_file() {
+                store::atomic(
+                    &self.path.join(crate::gemini::ACCOUNTS_FILE),
+                    &store::read_private(&accounts)?,
+                )?;
+            }
+        }
         if account.provider == Provider::Claude {
             let mut config = if self.path.join(".claude.json").exists() {
                 shared_config(&store::json_read(&self.path.join(".claude.json"))?)
@@ -898,10 +924,28 @@ impl View {
         // Launch views never own refresh tokens. Re-read the authority rather than
         // letting a stale/late native write roll canonical credentials backwards.
         // Stamp before reading: a write after the read shows up as a change.
-        let observed = stamp(&profile.join(account.provider.auth_file()));
-        let canonical: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
+        let mut observed = stamp(&profile.join(account.provider.auth_file()));
+        let mut canonical: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
         let auth_path = self.path.join(account.provider.auth_file());
         let seen = store::json_read::<Value>(&auth_path).ok();
+        // Gemini CLI refreshes its own login in the view. Adopt a newer one
+        // into the profile, under the profile's refresh lock so only one
+        // writer updates it, rather than rolling the view back.
+        if self.provider == Provider::Gemini
+            && let Some(view) = seen.as_ref()
+            && crate::gemini::newer_view_login(view, &canonical).is_some()
+        {
+            let _refresh = store.refresh_lock(account)?;
+            let path = profile.join(account.provider.auth_file());
+            let current: Value = store::json_read(&path)?;
+            if let Some(newer) = crate::gemini::newer_view_login(view, &current) {
+                store::json_write(&path, &newer)?;
+                canonical = newer;
+                observed = stamp(&path);
+            } else {
+                canonical = current;
+            }
+        }
         let mut auth = crate::refresh::launch_auth(account.provider, &canonical);
         if self.provider == Provider::Claude {
             auth = with_mcp(auth, &self.merge_mcp(store, seen.as_ref())?);

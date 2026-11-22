@@ -18,33 +18,46 @@ use std::{
 pub enum Provider {
     Claude,
     Codex,
+    /// Google's Gemini CLI, signed in with a Google account (see `crate::gemini`).
+    Gemini,
 }
 impl Provider {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Gemini => "gemini",
         }
     }
     pub fn auth_file(self) -> &'static str {
         match self {
             Self::Claude => ".credentials.json",
             Self::Codex => "auth.json",
+            Self::Gemini => crate::gemini::AUTH_FILE,
         }
     }
     pub fn env_var(self) -> &'static str {
         match self {
             Self::Claude => "CLAUDE_CONFIG_DIR",
             Self::Codex => "CODEX_HOME",
+            // Gemini's variable names the directory holding `.gemini`, not
+            // `.gemini` itself: see `current_home` and `command`.
+            Self::Gemini => crate::gemini::HOME_VAR,
         }
     }
     pub fn current_home(self) -> Result<PathBuf> {
+        if self == Self::Gemini {
+            let p = crate::gemini::current_home()?;
+            store::no_links(&p)?;
+            return Ok(p);
+        }
         let p = std::env::var_os(self.env_var())
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or(home()?.join(match self {
                 Self::Claude => ".claude",
                 Self::Codex => ".codex",
+                Self::Gemini => unreachable!("handled above"),
             }));
         store::no_links(&p)?;
         Ok(p)
@@ -55,6 +68,7 @@ impl Provider {
         match self {
             Self::Claude => "ASWAP_CLAUDE_BIN",
             Self::Codex => "ASWAP_CODEX_BIN",
+            Self::Gemini => "ASWAP_GEMINI_BIN",
         }
     }
     pub fn command(self, profile: &Path) -> Command {
@@ -65,7 +79,15 @@ impl Provider {
         // PATH may contain a provider wrapper that invokes aswap. Tell it this
         // launch is already supervised so it executes the native CLI directly.
         cmd.env(self.bin_var(), &bin);
-        cmd.env(self.env_var(), profile);
+        if self == Self::Gemini {
+            // GEMINI_CLI_HOME names the directory whose `.gemini` is the view.
+            cmd.env(self.env_var(), crate::gemini::cli_home(profile));
+            for key in crate::gemini::SCRUBBED {
+                cmd.env_remove(key);
+            }
+        } else {
+            cmd.env(self.env_var(), profile);
+        }
         // Prevent inherited credentials/config overrides from defeating account isolation.
         for key in [
             "ANTHROPIC_API_KEY",
@@ -147,6 +169,7 @@ fn auth_valid(provider: Provider, value: &Value) -> bool {
         Provider::Codex => {
             string(value.pointer("/tokens/access_token")) || string(value.get("OPENAI_API_KEY"))
         }
+        Provider::Gemini => crate::gemini::auth_valid(value),
     }
 }
 pub fn validate_auth(provider: Provider, bytes: &[u8]) -> Result<()> {
@@ -193,6 +216,8 @@ pub fn add(store: &Store, provider: Provider, name: &str) -> Result<Account> {
                 );
                 store::json_write(&target.join(".claude.json"), &config)?;
             }
+        } else if provider == Provider::Gemini {
+            crate::gemini::capture_extras(&source, &target)?;
         } else {
             store::atomic(
                 &target.join("config.toml"),
@@ -264,6 +289,18 @@ fn preserve_live(
         let saved: Value = store::json_read(&profile.join(candidate.provider.auth_file()))?;
         let matched = if saved == current {
             true
+        } else if target.provider == Provider::Gemini {
+            // The same Google account: id token subject, else refresh token.
+            match (
+                crate::gemini::account_id(&current, &Value::Null),
+                crate::gemini::account_id(&saved, &Value::Null),
+            ) {
+                (Some(a), Some(b)) => a == b,
+                _ => {
+                    current.get("refresh_token").is_some()
+                        && current.get("refresh_token") == saved.get("refresh_token")
+                }
+            }
         } else if target.provider == Provider::Codex {
             let identity = current
                 .pointer("/tokens/account_id")
@@ -343,6 +380,15 @@ pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
         bytes = old.clone();
     }
     store::atomic(&auth_path, &bytes)?;
+    if provider == Provider::Gemini {
+        let accounts = profile.join(crate::gemini::ACCOUNTS_FILE);
+        if accounts.is_file() {
+            store::atomic(
+                &dest.join(crate::gemini::ACCOUNTS_FILE),
+                &store::read_private(&accounts)?,
+            )?;
+        }
+    }
     if let Some((path, value)) = config
         && let Err(e) = store::json_write(&path, &value)
     {

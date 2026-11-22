@@ -505,7 +505,7 @@ impl Failure {
             },
         }
     }
-    fn unavailable() -> Self {
+    pub(crate) fn unavailable() -> Self {
         Self {
             status: None,
             kind: "usage-unavailable",
@@ -687,6 +687,9 @@ pub(crate) fn codex_request_within(
     result
 }
 pub fn fetch(account: &Account, profile: &Path) -> std::result::Result<Usage, Failure> {
+    if account.provider == Provider::Gemini {
+        return crate::gemini::fetch_usage(profile);
+    }
     if account.provider == Provider::Codex {
         let diagnostic = std::cell::Cell::new(Failure::new("codex-rpc-unavailable"));
         let result = access_only_home(account, profile)

@@ -292,8 +292,14 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
     let auto: std::collections::BTreeMap<Provider, store::Auto> =
         serde_json::from_value(value["auto"].clone()).unwrap_or_default();
     let default = store::Auto::default();
-    let policies: Vec<_> = [Provider::Claude, Provider::Codex]
+    // Gemini's policy shows only once a Gemini account exists, so Claude's
+    // and Codex's output stays as it was.
+    let has_gemini = value["accounts"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|r| r["provider"] == "gemini"));
+    let policies: Vec<_> = [Provider::Claude, Provider::Codex, Provider::Gemini]
         .into_iter()
+        .filter(|p| *p != Provider::Gemini || has_gemini)
         .map(|provider| (provider, auto.get(&provider).unwrap_or(&default)))
         .map(|(provider, a)| aswap::display::Policy {
             provider: provider.as_str(),

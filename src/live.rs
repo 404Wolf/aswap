@@ -212,6 +212,7 @@ pub(crate) fn view_in_use(root: &Path, view: &Path) -> Result<bool> {
     for provider in [
         crate::provider::Provider::Claude,
         crate::provider::Provider::Codex,
+        crate::provider::Provider::Gemini,
     ] {
         for label in dirs(&root.join("live").join(provider.as_str()))? {
             for path in dirs(&label)? {

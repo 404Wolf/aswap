@@ -34,6 +34,7 @@ pub mod terminal;
 pub mod limits;
 
 pub mod display;
+pub mod gemini;
 pub mod identity;
 
 pub mod rename;

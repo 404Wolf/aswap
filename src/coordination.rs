@@ -412,7 +412,13 @@ fn packet(store: &Store, request: &Request) -> Result<Packet> {
         store.load()?.accounts
     };
     let mut profiles = Vec::new();
-    for account in accounts {
+    // Gemini logins stay on this machine: followers of every released
+    // version reject a packet that names a provider they don't know, and a
+    // Gemini view needs the refresh token, which followers never hold.
+    for account in accounts
+        .into_iter()
+        .filter(|a| a.provider != Provider::Gemini)
+    {
         let force = request
             .force
             .as_ref()
@@ -1287,6 +1293,33 @@ mod tests {
         owner(&store).unwrap();
         (t, store)
     }
+    #[test]
+    fn gemini_logins_never_leave_the_owner() {
+        // A follower of any released version rejects a packet naming a
+        // provider it doesn't know, and a Gemini view carries the refresh
+        // token: the owner's packet leaves Gemini out entirely.
+        let (_t, store) = seed();
+        let gemini = Account {
+            provider: Provider::Gemini,
+            label: "google".into(),
+        };
+        let mut state = store.load().unwrap();
+        state.accounts.push(gemini.clone());
+        store.save(&state).unwrap();
+        let profile = store.profile(gemini.provider, &gemini.label).unwrap();
+        store::json_write(
+            &profile.join(crate::gemini::AUTH_FILE),
+            &json!({"access_token":"synthetic-g-access","refresh_token":"synthetic-g-refresh","expiry_date":9999999999999u64}),
+        )
+        .unwrap();
+        store::json_write(&profile.join("usage-cache.json"), &Cached::default()).unwrap();
+        let wire = serde_json::to_string(&owner_packet(&store)).unwrap();
+        assert!(!wire.contains("gemini"), "{wire}");
+        assert!(!wire.contains("synthetic-g-"));
+        // The Claude profile still travels.
+        assert!(wire.contains("\"label\":\"one\""));
+    }
+
     #[test]
     fn owner_packets_share_one_cache_and_never_export_refresh_capability_or_project_state() {
         let (_t, store) = seed();

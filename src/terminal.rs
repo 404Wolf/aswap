@@ -502,7 +502,8 @@ fn diagnostic_line(line: &str) -> (bool, bool, bool) {
         || line.starts_with("oauth token revoked \u{b7} please run /login")
         || line.starts_with("login expired \u{b7} please run /login")
         || notice
-        || line.starts_with("you're out of extra usage");
+        || line.starts_with("you're out of extra usage")
+        || crate::gemini::limit_notice(line);
     let Some(text) = api.or(standalone.then_some(line)) else {
         return (false, false, false);
     };
@@ -510,6 +511,7 @@ fn diagnostic_line(line: &str) -> (bool, bool, bool) {
         limit_message(text)
             || text.trim_start().starts_with("429 ")
             || notice
+            || crate::gemini::limit_notice(line)
             || line.contains("out of extra usage"),
         auth_message(text) || text.trim_start().starts_with("401 "),
         unsupported_model_message(text),
@@ -601,6 +603,17 @@ pub fn limit_message(text: &str) -> bool {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn geminis_limit_notices_count_as_limits() {
+        // gemini-cli 0.47.0 and 0.70.0, as normalize() leaves them.
+        for line in [
+            "usage limit reached for gemini-2.5-pro.",
+            "you have exhausted your daily quota on this model.",
+        ] {
+            assert!(super::diagnostic_line(line).0, "{line}");
+        }
+        assert!(!super::diagnostic_line("you have exhausted your patience").0);
+    }
     #[test]
     fn limit_signals_do_not_match_arbitrary_numbers() {
         assert!(!super::limit_message("processed 429 items"));

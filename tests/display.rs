@@ -252,3 +252,37 @@ fn accounts_sort_by_next_future_window_with_unknown_last() {
         assert!(text.contains("Next reset: unknown"));
     }
 }
+
+#[test]
+fn gemini_windows_read_as_their_model() {
+    let gemini = identity::Identity::default();
+    let cache = Cached {
+        usage: aswap::gemini::parse_quota(&json!({"buckets":[
+            {"modelId":"gemini-2.5-pro","remainingFraction":0.4,"resetTime":"1970-01-02T00:00:00Z"},
+            {"modelId":"gemini-2.5-flash","remainingFraction":0.9}
+        ]}))
+        .unwrap(),
+        fetched_at: 1000,
+        ..Default::default()
+    };
+    let text = display::render(
+        &[Row {
+            provider: "gemini",
+            label: "personal",
+            active: true,
+            reserved: false,
+            identity: &gemini,
+            duplicates: &[],
+            cached: &cache,
+        }],
+        false,
+        100,
+        false,
+        1000,
+    );
+    assert!(text.contains("2.5-pro"), "{text}");
+    assert!(text.contains("2.5-flash"), "{text}");
+    assert!(!text.contains("gemini-2.5"), "{text}");
+    assert!(text.contains("60%"), "{text}");
+    // Claude's and Codex's layouts are pinned by rendering_snapshots.
+}

@@ -82,8 +82,8 @@ impl AutoArgs {
                 one_shot |= i + 1 < args.len();
                 break;
             }
-            let takes_session =
-                provider == Provider::Claude && matches!(key, "--resume" | "-r" | "--session-id");
+            let takes_session = matches!(provider, Provider::Claude | Provider::Gemini)
+                && matches!(key, "--resume" | "-r" | "--session-id");
             if takes_session {
                 selection = true;
                 let value = inline.or_else(|| {
@@ -102,11 +102,18 @@ impl AutoArgs {
             } else if (provider == Provider::Claude
                 && matches!(key, "--continue" | "-c" | "--fork-session"))
                 || (provider == Provider::Codex && key == "--last")
+                || (provider == Provider::Gemini && key == "--session-file")
             {
                 selection = true;
                 fork |= key == "--fork-session";
             } else if provider == Provider::Claude && matches!(key, "--print" | "-p") {
                 one_shot = true;
+            } else if provider == Provider::Gemini && matches!(key, "--prompt" | "-p") {
+                // Gemini's non-interactive prompt takes its text as a value.
+                one_shot = true;
+                if inline.is_none() {
+                    i += 1;
+                }
             } else if flag.starts_with('-') {
                 sticky.push(flag.clone());
                 // Arity descriptions are not an allowlist: every option passes
@@ -207,7 +214,9 @@ impl AutoArgs {
             i += 1;
         }
         let mut initial = args.to_vec();
-        if provider == Provider::Claude && !selection {
+        // Claude and Gemini start a new session under an id given up front,
+        // so a supervised run knows exactly which session to resume.
+        if matches!(provider, Provider::Claude | Provider::Gemini) && !selection {
             let mut bytes = [0u8; 16];
             use ring::rand::SecureRandom;
             ring::rand::SystemRandom::new()
@@ -261,7 +270,7 @@ impl AutoArgs {
             ));
         }
         let mut args = match provider {
-            Provider::Claude => vec!["--resume".into(), id.into()],
+            Provider::Claude | Provider::Gemini => vec!["--resume".into(), id.into()],
             Provider::Codex => vec!["resume".into(), id.into()],
         };
         args.extend(self.sticky.clone());
@@ -287,6 +296,9 @@ fn transcript_depth(provider: Provider) -> usize {
     match provider {
         Provider::Claude => 1,
         Provider::Codex => 5,
+        // tmp/<project>/chats/session-*.json; Gemini names files by a time
+        // and an id prefix, so the transcript is never found by name.
+        Provider::Gemini => 3,
     }
 }
 
@@ -446,6 +458,7 @@ impl Tracker {
         let root = home.join(match provider {
             Provider::Claude => "projects",
             Provider::Codex => "sessions",
+            Provider::Gemini => "tmp",
         });
         // A resume needs the pre-launch transcript as its baseline. If it
         // doesn't exist yet, give the running provider one immediate probe.
@@ -502,7 +515,11 @@ impl Tracker {
                     .process_tree
                     .as_mut()
                     .is_none_or(|tree| !tree.iter_mut().all(ProcessSnapshot::unchanged)));
-        let scan = registered.is_none() && (self.transcript.is_none() || fd_due);
+        // Gemini's session id is given up front (`--session-id`) and its
+        // transcripts aren't named by it: descriptors prove nothing there.
+        let scan = registered.is_none()
+            && self.provider != Provider::Gemini
+            && (self.transcript.is_none() || fd_due);
         let mut descriptors = Vec::new();
         if scan {
             self.last_fd_scan = Some((pid, now));

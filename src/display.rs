@@ -86,6 +86,10 @@ fn window_name(name: &str, duration: Option<u64>) -> String {
         ("seven_day_sonnet", _) => "weekly sonnet".into(),
         (_, Some(10080)) => "weekly".into(),
         ("primary" | "secondary", None) => "quota".into(),
+        // Gemini's per-model quota, e.g. gemini-2.5-pro shows as "2.5-pro".
+        (model, None) if model.starts_with("gemini-") => {
+            clean(&model["gemini-".len()..]).to_lowercase()
+        }
         (_, Some(n)) if n % 1440 == 0 => format!("{}d window", n / 1440),
         (_, Some(n)) if n % 60 == 0 => format!("{}h window", n / 60),
         (_, Some(n)) => format!("{n}m window"),

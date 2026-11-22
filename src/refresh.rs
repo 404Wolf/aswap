@@ -17,6 +17,9 @@ pub const MARGIN: u64 = 900;
 /// The shortest time between two unforced refreshes of one login.
 pub const MIN_INTERVAL: u64 = 60;
 pub fn expires_at(provider: Provider, auth: &Value) -> Option<u64> {
+    if provider == Provider::Gemini {
+        return crate::gemini::expires_at(auth);
+    }
     if provider == Provider::Claude {
         auth.pointer("/claudeAiOauth/expiresAt")?
             .as_u64()
@@ -31,6 +34,19 @@ pub fn expires_at(provider: Provider, auth: &Value) -> Option<u64> {
     }
 }
 pub fn request_body(provider: Provider, auth: &Value) -> std::result::Result<Value, Failure> {
+    if provider == Provider::Gemini {
+        // Sent as a form (see `request`); carried here as a JSON object.
+        // The installed CLI's own client; without it there is no refresh.
+        let client =
+            crate::gemini::Client::installed().ok_or(Failure::new("gemini-cli-unavailable"))?;
+        let form = crate::gemini::refresh_form(auth, client)
+            .ok_or(Failure::new("refresh-invalid-grant"))?;
+        return Ok(Value::Object(
+            form.into_iter()
+                .map(|(k, v)| (k.to_owned(), json!(v)))
+                .collect(),
+        ));
+    }
     let path = if provider == Provider::Claude {
         "/claudeAiOauth/refreshToken"
     } else {
@@ -65,6 +81,10 @@ pub fn apply_response(
     response: &Value,
     at: u64,
 ) -> std::result::Result<Value, Failure> {
+    if provider == Provider::Gemini {
+        return crate::gemini::apply_refresh(old, response, at)
+            .ok_or(Failure::new("refresh-invalid-response"));
+    }
     let access = response
         .get("access_token")
         .and_then(Value::as_str)
@@ -123,22 +143,33 @@ pub fn apply_response(
     Ok(auth)
 }
 fn request(provider: Provider, body: &Value) -> std::result::Result<Value, Failure> {
-    let url = if provider == Provider::Claude {
-        "https://platform.claude.com/v1/oauth/token"
-    } else {
-        "https://auth.openai.com/oauth/token"
+    let url = match provider {
+        Provider::Claude => "https://platform.claude.com/v1/oauth/token",
+        Provider::Codex => "https://auth.openai.com/oauth/token",
+        Provider::Gemini => crate::gemini::TOKEN_URL,
     };
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| Failure::new("network"))?;
-    // Both published clients use JSON for the default account token endpoint.
-    let response = client
-        .post(url)
-        .json(body)
-        .send()
-        .map_err(|_| Failure::new("network"))?;
+    // Claude's and Codex's published clients send JSON; Google's token
+    // endpoint takes a form, as google-auth-library sends it.
+    let request = client.post(url);
+    let request = if provider == Provider::Gemini {
+        let form: Vec<(String, String)> = body
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        request.form(&form)
+    } else {
+        request.json(body)
+    };
+    let response = request.send().map_err(|_| Failure::new("network"))?;
     let status = response.status().as_u16();
     let retry = crate::usage::parse_retry_after(
         response
@@ -374,6 +405,14 @@ pub fn access_only(provider: Provider, auth: &Value) -> Value {
 /// enables that reload path without distributing a refresh-capable token.
 /// Suppress proactive refresh of the sentinel; actual JWT validity is unchanged.
 pub fn launch_auth(provider: Provider, auth: &Value) -> Value {
+    // Gemini CLI keeps its access token in memory and refreshes it itself;
+    // without the refresh token a session would fail after an hour. Google
+    // isn't expected to rotate refresh tokens on use; if it does, the view
+    // writes the newer login back (`View::sync`). Gemini views stay on this
+    // machine: never exported.
+    if provider == Provider::Gemini {
+        return auth.clone();
+    }
     let mut auth = access_only(provider, auth);
     if provider == Provider::Claude {
         if let Some(o) = auth.get_mut("claudeAiOauth").and_then(Value::as_object_mut) {
@@ -409,13 +448,22 @@ pub(crate) fn propagate(store: &Store, account: &Account, auth: &Value) -> crate
             .profile(other.provider, &other.label)?
             .join(other.provider.auth_file());
         let mut saved: Value = store::json_read(&path)?;
-        let field = if account.provider == Provider::Claude {
-            "claudeAiOauth"
+        if account.provider == Provider::Gemini {
+            // The whole login is the credential; same account by identity.
+            if let (Some(saved), Some(auth)) = (saved.as_object_mut(), auth.as_object()) {
+                for (k, v) in auth {
+                    saved.insert(k.clone(), v.clone());
+                }
+            }
         } else {
-            "tokens"
-        };
-        if let Some(value) = auth.get(field) {
-            saved[field] = value.clone();
+            let field = if account.provider == Provider::Claude {
+                "claudeAiOauth"
+            } else {
+                "tokens"
+            };
+            if let Some(value) = auth.get(field) {
+                saved[field] = value.clone();
+            }
         }
         if account.provider == Provider::Codex
             && let Some(value) = auth.get("last_refresh")
