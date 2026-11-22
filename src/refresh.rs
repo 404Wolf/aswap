@@ -17,6 +17,9 @@ pub const MARGIN: u64 = 900;
 /// The shortest time between two unforced refreshes of one login.
 pub const MIN_INTERVAL: u64 = 60;
 pub fn expires_at(provider: Provider, auth: &Value) -> Option<u64> {
+    if provider == Provider::Agy {
+        return crate::agy::expires_at(auth);
+    }
     if provider == Provider::Claude {
         auth.pointer("/claudeAiOauth/expiresAt")?
             .as_u64()
@@ -196,6 +199,11 @@ pub(crate) fn refresh_inner<F>(
 where
     F: FnOnce(Provider, &Value) -> std::result::Result<Value, Failure>,
 {
+    // agy refreshes its own login; aswap never calls Google's token endpoint
+    // (see crate::agy).
+    if account.provider == Provider::Agy {
+        return Ok(false);
+    }
     if crate::coordination::follower(store).map_err(|_| Failure::new("usage-unavailable"))?
         || (!active
             && !crate::coordination::is_owner(store)
@@ -474,6 +482,9 @@ pub fn for_run(store: &Store, account: &Account) -> std::result::Result<bool, Fa
 /// the stored login (written atomically, so safe to read unlocked) has a
 /// known expiry beyond the margin, or none at all.
 fn may_be_due(store: &Store, account: &Account, at: u64) -> bool {
+    if account.provider == Provider::Agy {
+        return false;
+    }
     let Ok(profile) = store.profile(account.provider, &account.label) else {
         return true;
     };
@@ -530,6 +541,11 @@ pub fn access_only(provider: Provider, auth: &Value) -> Value {
 /// enables that reload path without distributing a refresh-capable token.
 /// Suppress proactive refresh of the sentinel; actual JWT validity is unchanged.
 pub fn launch_auth(provider: Provider, auth: &Value) -> Value {
+    // agy keeps its own login fresh in the view, so it gets the whole login;
+    // a newer one is written back to the profile (View::sync).
+    if provider == Provider::Agy {
+        return auth.clone();
+    }
     let mut auth = access_only(provider, auth);
     if provider == Provider::Claude {
         if let Some(o) = auth.get_mut("claudeAiOauth").and_then(Value::as_object_mut) {

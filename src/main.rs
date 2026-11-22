@@ -292,8 +292,13 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
     let auto: std::collections::BTreeMap<Provider, store::Auto> =
         serde_json::from_value(value["auto"].clone()).unwrap_or_default();
     let default = store::Auto::default();
-    let policies: Vec<_> = [Provider::Claude, Provider::Codex]
+    // agy's policy line shows only once an agy account exists.
+    let agy = value["accounts"]
+        .as_array()
+        .is_some_and(|rows| rows.iter().any(|r| r["provider"] == "agy"));
+    let policies: Vec<_> = [Provider::Claude, Provider::Codex, Provider::Agy]
         .into_iter()
+        .filter(|p| *p != Provider::Agy || agy)
         .map(|provider| (provider, auto.get(&provider).unwrap_or(&default)))
         .map(|(provider, a)| aswap::display::Policy {
             provider: provider.as_str(),

@@ -99,6 +99,41 @@ hours whatever you do.
 Past the switch threshold, aswap's last-resort fallback ranks by the most
 headroom instead, to keep the session running as long as possible.
 
+## Antigravity CLI (agy) accounts
+
+aswap pools personal Google sign-ins of Google's Antigravity CLI (`agy`)
+like Claude and Codex logins: `aswap add agy <label>` after signing in with
+`agy`, then `aswap run agy --auto`.
+
+- **Only personal sign-ins.** An API key, application-default credentials
+  or a Cloud project login is refused: those are billed. A launch also
+  refuses settings with `useG1Credits` on (paid credits once quota runs
+  out).
+- **Isolated per account.** Each run gets its own `--gemini_dir`, its own
+  `XDG_CONFIG_HOME` and no D-Bus session bus, so the login is that
+  directory's file, never the shared keyring.
+- **What's shared.** Conversations (`brain/`, `conversations/`,
+  `presence/`, `cache/`, `history.jsonl`) and `~/.gemini/config`
+  (plugins, hooks, MCP servers, skills) are linked in. The Gemini CLI's own
+  files in `~/.gemini` are not.
+- **Refreshing.** agy refreshes its own login; aswap never contacts
+  Google's token endpoint. A view's newer login is written back to its
+  profile, and the view's copy is removed when the run ends.
+  `aswap add agy` only reads `~/.gemini` and never writes it.
+- **Resuming.** A failover resumes the same conversation with
+  `--conversation <id>`. aswap reads the id from the lock agy holds for it.
+- **Limits.** There's no documented quota API, so agy accounts show no
+  usage, and one that hit its quota is left out for an hour.
+  - A quota notice counts at once after the first 15 s of a run.
+  - Before that (it may be a redraw on resume), it counts when agy exits
+    with a failure, or when the 15 s pass with no new conversation activity
+    and no typing.
+- **Only on the refresh owner's machine, never synced.** `aswap add agy`
+  refuses while an aswap process of another build runs, because older
+  builds can't read state.json with an agy account in it.
+- **Not yet.** Whether a conversation resumes on a *different* Google
+  account depends on agy's backend and is untested.
+
 ## Codex usage-limit resets (opt-in)
 
 Codex accounts can hold a few **usage-limit reset credits** (in Codex, `/usage`

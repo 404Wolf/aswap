@@ -687,6 +687,11 @@ pub(crate) fn codex_request_within(
     result
 }
 pub fn fetch(account: &Account, profile: &Path) -> std::result::Result<Usage, Failure> {
+    if account.provider == Provider::Agy {
+        // No documented quota API (see crate::agy): an empty reading, which
+        // clears a limit mark once it lapses.
+        return Ok(Usage::default());
+    }
     if account.provider == Provider::Codex {
         let diagnostic = std::cell::Cell::new(Failure::new("codex-rpc-unavailable"));
         let result = access_only_home(account, profile)
@@ -975,7 +980,9 @@ pub fn cached(store: &Store, account: &Account) -> Result<Cached> {
     cached_force(store, account, false)
 }
 pub fn cached_force(store: &Store, account: &Account, force: bool) -> Result<Cached> {
-    if crate::coordination::follower(store)? {
+    // agy accounts are local everywhere (never synced), so a follower reads
+    // them like an owner does.
+    if account.provider != Provider::Agy && crate::coordination::follower(store)? {
         let result = crate::coordination::poll(store, force.then_some(account), false);
         let _lock = store.lock()?;
         let path = store
@@ -1163,7 +1170,14 @@ pub fn mark_limited(store: &Store, account: &Account) -> Result<()> {
         entry.http_status = None;
         entry.retry_after = None;
     }
-    entry.next_poll_at = entry.next_poll_at.max(now().saturating_add(TTL));
+    // agy has no quota reading to show when the limit lifts: hold the mark
+    // for an hour, then let a launch try the account again.
+    let hold = if account.provider == Provider::Agy {
+        crate::agy::LIMIT_HOLD
+    } else {
+        TTL
+    };
+    entry.next_poll_at = entry.next_poll_at.max(now().saturating_add(hold));
     store::json_write(&path, &entry)
 }
 

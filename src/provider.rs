@@ -18,33 +18,47 @@ use std::{
 pub enum Provider {
     Claude,
     Codex,
+    /// Google's Antigravity CLI, signed in with a personal Google account
+    /// (see `crate::agy`).
+    Agy,
 }
 impl Provider {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Agy => "agy",
         }
     }
     pub fn auth_file(self) -> &'static str {
         match self {
             Self::Claude => ".credentials.json",
             Self::Codex => "auth.json",
+            Self::Agy => crate::agy::AUTH_FILE,
         }
     }
     pub fn env_var(self) -> &'static str {
         match self {
             Self::Claude => "CLAUDE_CONFIG_DIR",
             Self::Codex => "CODEX_HOME",
+            // agy takes its root as a flag (`--gemini_dir`, see `command`);
+            // this variable is the one aswap sets for its plugin secrets.
+            Self::Agy => "XDG_CONFIG_HOME",
         }
     }
     pub fn current_home(self) -> Result<PathBuf> {
+        if self == Self::Agy {
+            let p = crate::agy::current_home()?;
+            store::no_links(&p)?;
+            return Ok(p);
+        }
         let p = std::env::var_os(self.env_var())
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or(home()?.join(match self {
                 Self::Claude => ".claude",
                 Self::Codex => ".codex",
+                Self::Agy => unreachable!("handled above"),
             }));
         store::no_links(&p)?;
         Ok(p)
@@ -55,6 +69,7 @@ impl Provider {
         match self {
             Self::Claude => "ASWAP_CLAUDE_BIN",
             Self::Codex => "ASWAP_CODEX_BIN",
+            Self::Agy => "ASWAP_AGY_BIN",
         }
     }
     pub fn command(self, profile: &Path) -> Command {
@@ -65,7 +80,18 @@ impl Provider {
         // PATH may contain a provider wrapper that invokes aswap. Tell it this
         // launch is already supervised so it executes the native CLI directly.
         cmd.env(self.bin_var(), &bin);
-        cmd.env(self.env_var(), profile);
+        if self == Self::Agy {
+            // The view is agy's whole root; its plugin secrets live in the
+            // view too, and without a session bus the login stays a file.
+            cmd.arg(format!("--gemini_dir={}", profile.display()));
+            cmd.env("XDG_CONFIG_HOME", profile.join(".config"));
+            cmd.env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+            for key in crate::agy::SCRUBBED {
+                cmd.env_remove(key);
+            }
+        } else {
+            cmd.env(self.env_var(), profile);
+        }
         // Prevent inherited credentials/config overrides from defeating account isolation.
         for key in [
             "ANTHROPIC_API_KEY",
@@ -147,6 +173,7 @@ fn auth_valid(provider: Provider, value: &Value) -> bool {
         Provider::Codex => {
             string(value.pointer("/tokens/access_token")) || string(value.get("OPENAI_API_KEY"))
         }
+        Provider::Agy => crate::agy::auth_valid(value),
     }
 }
 pub fn validate_auth(provider: Provider, bytes: &[u8]) -> Result<()> {
@@ -171,7 +198,24 @@ pub fn add(store: &Store, provider: Provider, name: &str) -> Result<Account> {
         return Err(Error("account already exists"));
     }
     let source = provider.current_home()?;
-    let bytes = store::read_private(&source.join(provider.auth_file()))?;
+    if provider == Provider::Agy {
+        // An older aswap can't read state.json once it holds an agy account.
+        let others = crate::agy::other_builds(&store.root);
+        if !others.is_empty() {
+            eprintln!("aswap: other aswap builds are running: pids {others:?}");
+            return Err(Error(
+                "restart every aswap process on this build before adding an agy account",
+            ));
+        }
+    }
+    let bytes = if provider == Provider::Agy {
+        // agy rewrites its login in place: read it only once it parses, and
+        // never write to it.
+        let login = crate::agy::read_settled(&source.join(provider.auth_file()))?;
+        serde_json::to_vec(&login).safe("cannot encode the agy login")?
+    } else {
+        store::read_private(&source.join(provider.auth_file()))?
+    };
     validate_auth(provider, &bytes)?;
     let target = store.profile(provider, name)?;
     if target.exists() {
@@ -201,7 +245,7 @@ pub fn add(store: &Store, provider: Provider, name: &str) -> Result<Account> {
                 );
                 store::json_write(&target.join(".claude.json"), &config)?;
             }
-        } else {
+        } else if provider == Provider::Codex {
             store::atomic(
                 &target.join("config.toml"),
                 b"cli_auth_credentials_store = \"file\"\n",

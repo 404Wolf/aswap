@@ -78,6 +78,10 @@ pub fn from_values(provider: Provider, auth: &Value, config: &Value) -> Identity
                 None,
             )
         }
+        Provider::Agy => {
+            let email = crate::agy::email(auth).map(str::to_owned);
+            (email.clone(), None, email, None)
+        }
     };
     let fingerprint = account.map(|a| {
         let bytes = serde_json::to_vec(&(provider.as_str(), a.trim().to_lowercase(), organization))

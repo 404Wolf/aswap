@@ -158,6 +158,11 @@ pub fn run(
         crate::shared::View::prepare(store, &account)
     })?;
     patiently("recording the session's view", || lease.view(&view.path))?;
+    if provider == Provider::Agy && crate::agy::spends_credits(&view.path) {
+        return Err(crate::Error(
+            "agy settings have useG1Credits on (paid AI credits after quota runs out); turn it off first",
+        ));
+    }
     if auto_args.as_ref().is_some_and(|a| a.ambiguous) {
         let help = crate::session::option_help(provider, &view.path, args);
         auto_args = Some(crate::session::AutoArgs::parse_with_help(
@@ -167,6 +172,7 @@ pub fn run(
     let mut terminal = if auto {
         let mut terminal = Terminal::open()?;
         terminal.codex = provider == Provider::Codex;
+        terminal.agy = provider == Provider::Agy;
         Some(terminal)
     } else {
         None
@@ -992,6 +998,20 @@ fn limit_seen(
             now,
         );
     }
+    if account.provider == Provider::Agy {
+        let since = |at: Instant, wall: std::time::SystemTime| {
+            let typed = terminal
+                .and_then(|t| t.input_activity().last_forwarded)
+                .is_some_and(|input| input > at);
+            let worked = tracker
+                .and_then(crate::session::Tracker::transcript)
+                .and_then(|path| std::fs::metadata(path).ok())
+                .and_then(|m| m.modified().ok())
+                .is_some_and(|modified| modified > wall);
+            typed || worked
+        };
+        return limits.check_agy(screen.notice, moment.exited == Some(true), since);
+    }
     if account.provider != Provider::Claude || tracker.is_none() {
         return screen.notice;
     }
@@ -1228,10 +1248,10 @@ mod quiet_tests {
 /// changed, without keeping the token itself in memory.
 fn access_print(provider: Provider, path: &std::path::Path) -> Option<Vec<u8>> {
     let auth: serde_json::Value = store::json_read(path).ok()?;
-    let pointer = if provider == Provider::Claude {
-        "/claudeAiOauth/accessToken"
-    } else {
-        "/tokens/access_token"
+    let pointer = match provider {
+        Provider::Claude => "/claudeAiOauth/accessToken",
+        Provider::Codex => "/tokens/access_token",
+        Provider::Agy => "/token/access_token",
     };
     let token = auth.pointer(pointer)?.as_str()?;
     Some(
@@ -1764,9 +1784,21 @@ pub fn observations(
             state.auto.get(&provider).cloned().unwrap_or_default(),
         )
     };
+    let at = now();
     let entries = accounts
         .into_iter()
-        .map(|a| usage::cached(store, &a).map(|c| (a, c)))
+        .map(|a| {
+            usage::cached(store, &a).map(|c| {
+                // agy accounts have no quota reading; one not marked limited
+                // counts as available (see crate::agy::assumed).
+                let c = if a.provider == Provider::Agy {
+                    crate::agy::assumed(c, at)
+                } else {
+                    c
+                };
+                (a, c)
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok((entries, settings))
 }
@@ -1816,6 +1848,13 @@ fn entries_from_cache(store: &Store, provider: Provider) -> Result<Vec<(Account,
                 store::json_read(&path)?
             } else {
                 usage::Cached::default()
+            };
+            // As in `observations`: an agy account not marked limited counts
+            // as available.
+            let cache = if provider == Provider::Agy {
+                crate::agy::assumed(cache, now())
+            } else {
+                cache
             };
             Ok((a, cache))
         })

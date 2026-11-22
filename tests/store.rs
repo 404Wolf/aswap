@@ -216,14 +216,14 @@ fn legacy_auto_settings_load_with_no_reservations() {
 const NEWER: &str = r#"{
   "accounts": [
     {"provider": "claude", "label": "personal"},
-    {"provider": "agy", "label": "personal", "since": "0.3.0"},
+    {"provider": "futurecli", "label": "personal", "since": "0.3.0"},
     {"provider": "codex", "label": "work"}
   ],
-  "active": {"claude": "personal", "agy": "personal"},
+  "active": {"claude": "personal", "futurecli": "personal"},
   "auto": {
     "claude": {"resume_prompt": null, "enabled": true, "threshold": 90.0, "last_switch": 5,
                "reserved": ["work"], "future_knob": {"level": 3}},
-    "agy": {"enabled": true, "threshold": 80.0, "last_switch": 0, "quota_groups": ["flash"]}
+    "futurecli": {"enabled": true, "threshold": 80.0, "last_switch": 0, "quota_groups": ["flash"]}
   },
   "switch_interval_seconds": 7,
   "future_top_level": [1, 2, 3]

@@ -80,6 +80,10 @@ fn shared_config(config: &Value) -> Value {
 }
 pub(crate) fn private(provider: Provider, name: &OsStr) -> bool {
     let name = name.to_string_lossy();
+    // agy's directory holds its login; its view's plugin secrets too.
+    if provider == Provider::Agy && matches!(name.as_ref(), crate::agy::APP | ".config") {
+        return true;
+    }
     name == provider.auth_file()
         || matches!(
             name.as_ref(),
@@ -519,7 +523,9 @@ fn migrate_root(
     home: &Path,
     config_path: &Path,
 ) -> Result<()> {
-    if !source.is_dir() || link(source) {
+    // agy profiles never had the older in-profile layout, and theirs holds
+    // the login: nothing to migrate, ever.
+    if provider == Provider::Agy || !source.is_dir() || link(source) {
         return Ok(());
     }
     let config = source.join(".claude.json");
@@ -566,6 +572,10 @@ fn migrate_root(
 }
 /// Entries a launch view always links to the shared home of the same name.
 fn shared_names(provider: Provider) -> &'static [&'static str] {
+    if provider == Provider::Agy {
+        // An agy view is laid out by crate::agy::prepare_view.
+        return &[];
+    }
     if provider == Provider::Claude {
         &[
             "projects",
@@ -624,6 +634,7 @@ pub(crate) fn shared_home(root: &Path, provider: Provider, mut home: PathBuf) ->
             None => provider::home()?.join(match provider {
                 Provider::Claude => ".claude",
                 Provider::Codex => ".codex",
+                Provider::Agy => ".gemini",
             }),
         };
     }
@@ -648,6 +659,15 @@ pub struct View {
     _lifetime: File,
 }
 pub(crate) const VIEW_LIFETIME_LOCK: &str = ".aswap-active";
+impl Drop for View {
+    /// An agy view holds a refresh-capable login (agy refreshes it there);
+    /// it goes when the run ends, after its last write-back.
+    fn drop(&mut self) {
+        if self.provider == Provider::Agy {
+            let _ = fs::remove_file(self.path.join(crate::agy::AUTH_FILE));
+        }
+    }
+}
 impl View {
     /// The global store lock covers migration, shared-home creation and the
     /// credential/MCP writes in `select_locked`. Linking and snapshotting into
@@ -755,10 +775,17 @@ impl View {
         )
         .safe("cannot publish private launch view")?;
         let _ = pending.keep();
-        let mut names: BTreeSet<OsString> = entries(&home)?
-            .into_iter()
-            .map(|p| p.file_name().unwrap().to_owned())
-            .collect();
+        let agy = account.provider == Provider::Agy;
+        let mut names: BTreeSet<OsString> = if agy {
+            // Only what crate::agy lists is shared; ~/.gemini also holds the
+            // Gemini CLI's own login, never linked.
+            BTreeSet::new()
+        } else {
+            entries(&home)?
+                .into_iter()
+                .map(|p| p.file_name().unwrap().to_owned())
+                .collect()
+        };
         let dirs = shared_names(account.provider);
         for name in dirs {
             names.insert((*name).into());
@@ -767,7 +794,7 @@ impl View {
             }
         }
         let history = home.join("history.jsonl");
-        if !exists(&history) {
+        if !agy && !exists(&history) {
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -776,7 +803,11 @@ impl View {
             file.set_permissions(fs::Permissions::from_mode(0o600))
                 .safe("cannot secure shared history")?;
         }
-        names.insert("history.jsonl".into());
+        if !agy {
+            names.insert("history.jsonl".into());
+        } else {
+            crate::agy::prepare_view(&path, &home)?;
+        }
         drop(lock);
         let mut view = Self {
             path,
@@ -898,17 +929,39 @@ impl View {
         // Launch views never own refresh tokens. Re-read the authority rather than
         // letting a stale/late native write roll canonical credentials backwards.
         // Stamp before reading: a write after the read shows up as a change.
-        let observed = stamp(&profile.join(account.provider.auth_file()));
-        let canonical: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
+        let mut observed = stamp(&profile.join(account.provider.auth_file()));
+        let mut canonical: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
         let auth_path = self.path.join(account.provider.auth_file());
+        // agy rewrites its login in place: a torn read is None and waits a tick.
         let seen = store::json_read::<Value>(&auth_path).ok();
+        // agy refreshes its own login in the view. Adopt a newer one into
+        // the profile under the profile's refresh lock, rather than roll the
+        // view back to the older login.
+        if self.provider == Provider::Agy
+            && let Some(view) = seen.as_ref()
+            && crate::agy::newer_view_login(view, &canonical).is_some()
+        {
+            let _refresh = store.refresh_lock(account)?;
+            let path = profile.join(account.provider.auth_file());
+            let current: Value = store::json_read(&path)?;
+            if let Some(newer) = crate::agy::newer_view_login(view, &current) {
+                store::json_write(&path, &newer)?;
+                canonical = newer;
+                observed = stamp(&path);
+            } else {
+                canonical = current;
+            }
+        }
         let mut auth = crate::refresh::launch_auth(account.provider, &canonical);
         if self.provider == Provider::Claude {
             auth = with_mcp(auth, &self.merge_mcp(store, seen.as_ref())?);
         }
         // Rewrite only on change, and never over a native write that landed
         // after the read above: that edit merges on the next pass instead.
-        if seen.as_ref() != Some(&auth) {
+        // An unreadable agy login is mid-write by agy itself: never write
+        // over it; the next tick sees the finished file.
+        let mid_write = self.provider == Provider::Agy && seen.is_none();
+        if !mid_write && seen.as_ref() != Some(&auth) {
             if store::json_read::<Value>(&auth_path).ok() == seen {
                 store::json_write(&auth_path, &auth)?;
                 self.auth_stamp = observed;
@@ -916,7 +969,7 @@ impl View {
                 // Leave the stamp: the next tick retries the canonical copy.
                 self.mcp_baseline = native.clone();
             }
-        } else {
+        } else if !mid_write {
             self.auth_stamp = observed;
         }
         drop(held);
@@ -944,6 +997,10 @@ impl View {
                 store::json_write(&self.config_path, &current)?;
             }
             self.baseline = after;
+        }
+        if self.provider == Provider::Agy {
+            // Everything an agy view shares is a link; the rest is its own.
+            return Ok(());
         }
         for path in entries(&self.path)? {
             let name = path.file_name().unwrap();

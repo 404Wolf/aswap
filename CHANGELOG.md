@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- **Antigravity CLI (agy) accounts.** `aswap add agy <label>` and `aswap run agy --auto` pool personal Google sign-ins of Google's agy. Each run gets its own `--gemini_dir`, config home and no D-Bus, so logins never share a keyring. Conversations, plugins, hooks and MCP servers are shared. agy refreshes its own login and aswap writes the newer one back; aswap never calls Google's token endpoint. A failover resumes the conversation by id, and quota notices are agy's own. Billed sign-ins and paid credits are refused. agy accounts are never synced, and adding one refuses while an older aswap build runs. See README, "Antigravity CLI (agy) accounts".
+
 ### Fixed
 - **A newer owner no longer breaks an older follower's sync.** A sync packet with a profile of a provider the follower doesn't know now skips that profile instead of failing the whole packet. And settings only a newer aswap knows stay out of `--json` output.
 - **A rotated login survives a failed write.** When a token refresh succeeded but writing the new login failed (a full disk, EIO), the provider had already invalidated the old refresh token, and the new one was only in memory: the account needed a new login. The new login is now written first to two private pending copies: one beside the login, and one under `$XDG_RUNTIME_DIR` (a tmpfs, so a full or failing data disk keeps one). Each records which login file it replaces. The next refresh installs a copy only over that same file, so a stale copy never rolls back a newer login. `add` and a preserved live login drop any copies. (Audit asw-0ti P2-5.)

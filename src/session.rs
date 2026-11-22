@@ -82,8 +82,9 @@ impl AutoArgs {
                 one_shot |= i + 1 < args.len();
                 break;
             }
-            let takes_session =
-                provider == Provider::Claude && matches!(key, "--resume" | "-r" | "--session-id");
+            let takes_session = (provider == Provider::Claude
+                && matches!(key, "--resume" | "-r" | "--session-id"))
+                || (provider == Provider::Agy && key == "--conversation");
             if takes_session {
                 selection = true;
                 let value = inline.or_else(|| {
@@ -102,11 +103,20 @@ impl AutoArgs {
             } else if (provider == Provider::Claude
                 && matches!(key, "--continue" | "-c" | "--fork-session"))
                 || (provider == Provider::Codex && key == "--last")
+                || (provider == Provider::Agy && matches!(key, "--continue" | "-c"))
             {
                 selection = true;
                 fork |= key == "--fork-session";
-            } else if provider == Provider::Claude && matches!(key, "--print" | "-p") {
+            } else if matches!(provider, Provider::Claude | Provider::Agy)
+                && matches!(key, "--print" | "-p" | "--prompt")
+            {
                 one_shot = true;
+            } else if provider == Provider::Agy && matches!(key, "--prompt-interactive" | "-i") {
+                // An interactive session started with a first prompt: the
+                // prompt is said once, never replayed on a restart.
+                if inline.is_none() {
+                    i += 1;
+                }
             } else if flag.starts_with('-') {
                 sticky.push(flag.clone());
                 // Arity descriptions are not an allowlist: every option passes
@@ -135,7 +145,11 @@ impl AutoArgs {
                         | "-h"
                         | "--version"
                         | "-V"
-                );
+                ) || (provider == Provider::Agy
+                    && matches!(
+                        key,
+                        "--new-project" | "--remote-agent" | "--remote-control" | "--sandbox"
+                    ));
                 let single = matches!(
                     key,
                     "--model"
@@ -167,7 +181,12 @@ impl AutoArgs {
                         | "--config"
                         | "--remote"
                         | "--remote-auth-token-env"
-                ) || (provider == Provider::Codex && matches!(key, "-c" | "-p"));
+                ) || (provider == Provider::Codex && matches!(key, "-c" | "-p"))
+                    || (provider == Provider::Agy
+                        && matches!(
+                            key,
+                            "--mode" | "--project" | "--log-file" | "--print-timeout"
+                        ));
                 let described = schema.get(key).copied();
                 let variadic = matches!(
                     key,
@@ -263,10 +282,16 @@ impl AutoArgs {
         let mut args = match provider {
             Provider::Claude => vec!["--resume".into(), id.into()],
             Provider::Codex => vec!["resume".into(), id.into()],
+            Provider::Agy => vec!["--conversation".into(), id.into()],
         };
         args.extend(self.sticky.clone());
         if let Some(prompt) = prompt {
-            args.extend(["--".into(), prompt.into()]);
+            if provider == Provider::Agy {
+                // agy (Go flags) takes an interactive first prompt as a flag.
+                args.push(format!("--prompt-interactive={prompt}"));
+            } else {
+                args.extend(["--".into(), prompt.into()]);
+            }
         }
         Ok(args)
     }
@@ -287,10 +312,17 @@ fn transcript_depth(provider: Provider) -> usize {
     match provider {
         Provider::Claude => 1,
         Provider::Codex => 5,
+        // brain/<id>/.system_generated/logs/transcript.jsonl
+        Provider::Agy => 4,
     }
 }
 
 fn find_transcript(provider: Provider, root: &Path, id: &str) -> Result<Option<PathBuf>> {
+    if provider == Provider::Agy {
+        // `root` is the shared antigravity-cli directory; the path is known.
+        let path = crate::agy::transcript(root.parent().unwrap_or(root), id);
+        return Ok(is_transcript_file(&path).then_some(path));
+    }
     fn walk(
         provider: Provider,
         path: &Path,
@@ -326,6 +358,14 @@ fn find_transcript(provider: Provider, root: &Path, id: &str) -> Result<Option<P
     Ok(found)
 }
 fn filename_id(provider: Provider, path: &Path) -> Option<&str> {
+    if provider == Provider::Agy {
+        // agy holds presence/<id>.lock open for its conversation.
+        if path.parent()?.file_name()? != "presence" || path.extension()? != "lock" {
+            return None;
+        }
+        let id = path.file_stem()?.to_str()?;
+        return valid_id(id).then_some(id);
+    }
     let stem = path.file_stem()?.to_str()?;
     if path.extension()? != "jsonl" {
         return None;
@@ -446,6 +486,7 @@ impl Tracker {
         let root = home.join(match provider {
             Provider::Claude => "projects",
             Provider::Codex => "sessions",
+            Provider::Agy => crate::agy::APP,
         });
         // A resume needs the pre-launch transcript as its baseline. If it
         // doesn't exist yet, give the running provider one immediate probe.
@@ -490,7 +531,7 @@ impl Tracker {
             self.refresh_registry(pid);
         }
         let registered = self.registry.as_ref().map(|(_, _, id)| id.as_str());
-        let fd_due = self.provider == Provider::Codex
+        let fd_due = self.provider != Provider::Claude
             && (fresh
                 || self.last_fd_scan.is_none_or(|(previous, at)| {
                     previous != pid || now.duration_since(at) >= FD_CHECK
@@ -556,12 +597,14 @@ impl Tracker {
         // An open descriptor can name the exact file without guessing how
         // Claude encodes project directories, even between history lookups.
         // Exclude deeper subagent paths.
+        // agy's descriptor is a lock, not the transcript.
         let direct = descriptors.into_iter().map(|(_, path)| path).find(|path| {
-            path.strip_prefix(&self.root).is_ok_and(|relative| {
-                relative.components().count() <= transcript_depth(self.provider) + 1
-                    && filename_id(self.provider, relative) == Some(id)
-                    && is_transcript_file(path)
-            })
+            self.provider != Provider::Agy
+                && path.strip_prefix(&self.root).is_ok_and(|relative| {
+                    relative.components().count() <= transcript_depth(self.provider) + 1
+                        && filename_id(self.provider, relative) == Some(id)
+                        && is_transcript_file(path)
+                })
         });
         if let Some(path) = direct {
             self.cache_transcript(path, now);

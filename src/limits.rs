@@ -56,6 +56,8 @@ pub struct Limits {
     /// and whether an early notice is still unconfirmed.
     early_checked: bool,
     early_unconfirmed: bool,
+    /// agy: when the first early notice was seen (monotonic, wall clock).
+    early_notice: Option<(Instant, SystemTime)>,
     late_started: bool,
     /// A Codex quota read running in the background.
     reading: Option<Reading>,
@@ -132,6 +134,7 @@ impl Limits {
             pending: None,
             early_checked: false,
             early_unconfirmed: false,
+            early_notice: None,
             late_started: false,
             reading: None,
         }
@@ -252,6 +255,46 @@ impl Limits {
                     });
                 }
             }
+        }
+        self.screen_seen
+    }
+
+    /// Whether an agy quota notice is live. agy has no quota reading to
+    /// confirm against, so: after `CODEX_EARLY` a notice counts at once. One
+    /// before that (possibly a redraw on resume) counts when agy exits with
+    /// a failure, or when the window ends without progress since the notice
+    /// (`progressed(at, wall)`: the transcript grew, or the user typed, after
+    /// it). So a stuck, unattended agy is switched, and a redraw followed by
+    /// normal work isn't.
+    pub fn check_agy(
+        &mut self,
+        notice: bool,
+        gone: bool,
+        progressed: impl FnOnce(Instant, SystemTime) -> bool,
+    ) -> bool {
+        if self.screen_seen {
+            return true;
+        }
+        if gone && (notice || self.early_unconfirmed) {
+            self.screen_seen = true;
+            return true;
+        }
+        let early = self.launched.elapsed() < CODEX_EARLY;
+        if notice {
+            if !early {
+                self.screen_seen = true;
+            } else if self.early_notice.is_none() {
+                self.early_notice = Some((Instant::now(), SystemTime::now()));
+                self.early_unconfirmed = true;
+            }
+        }
+        if !early
+            && self.early_unconfirmed
+            && !self.late_started
+            && let Some((at, wall)) = self.early_notice
+        {
+            self.late_started = true;
+            self.screen_seen |= !progressed(at, wall);
         }
         self.screen_seen
     }
@@ -563,6 +606,53 @@ pub fn limit_entry(entry: &Value, since: SystemTime) -> bool {
                 }),
             _ => false,
         }
+}
+
+#[cfg(test)]
+mod agy_tests {
+    use super::*;
+
+    fn launched(ago: Duration) -> Limits {
+        let mut limits = Limits::new(None);
+        limits.launched = Instant::now() - ago;
+        limits
+    }
+
+    #[test]
+    fn an_early_agy_notice_counts_unless_agy_moves_on() {
+        let early = Duration::from_secs(2);
+        let unasked = |_: Instant, _: SystemTime| -> bool { panic!("asked") };
+        // A stuck, unattended agy: the notice, then nothing until the window
+        // ends. It counts then.
+        let mut limits = launched(early);
+        assert!(!limits.check_agy(true, false, unasked));
+        assert!(!limits.check_agy(false, false, unasked));
+        limits.launched = Instant::now() - CODEX_EARLY;
+        assert!(limits.check_agy(false, false, |_, _| false));
+        // A redraw on resume, then normal work: the transcript grew after
+        // the notice. Ignored.
+        let mut limits = launched(early);
+        assert!(!limits.check_agy(true, false, unasked));
+        limits.launched = Instant::now() - CODEX_EARLY;
+        let mut asked = None;
+        assert!(!limits.check_agy(false, false, |at, _| {
+            asked = Some(at);
+            true
+        }));
+        assert!(asked.is_some());
+        // Asked once only; shown again later, it counts.
+        assert!(!limits.check_agy(false, false, unasked));
+        assert!(limits.check_agy(true, false, unasked));
+        // A failed exit after an early notice counts.
+        let mut limits = launched(early);
+        assert!(!limits.check_agy(true, false, unasked));
+        assert!(limits.check_agy(false, true, unasked));
+        // No notice: nothing, even at a failed exit or after the window.
+        assert!(!launched(early).check_agy(false, true, unasked));
+        assert!(!launched(CODEX_EARLY).check_agy(false, false, unasked));
+        // After the window: at once.
+        assert!(launched(CODEX_EARLY).check_agy(true, false, unasked));
+    }
 }
 
 #[cfg(test)]

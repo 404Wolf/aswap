@@ -1,4 +1,5 @@
 //! Linux account profiles. Secret bytes never implement Debug or Serialize.
+pub mod agy;
 pub mod provider;
 pub mod store;
 

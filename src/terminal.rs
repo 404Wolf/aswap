@@ -48,6 +48,8 @@ pub struct Terminal {
     /// A Codex terminal matches only Codex's own limit notices (see
     /// `diagnostic_line`); Claude's rules would misread its tool output.
     pub codex: bool,
+    /// An agy terminal matches only agy's quota notices.
+    pub agy: bool,
     last_input: Option<std::time::Instant>,
     pub auth_expired: bool,
     pub model_unsupported: bool,
@@ -121,6 +123,7 @@ impl Terminal {
             childless: true,
             diagnostics: Diagnostics::default(),
             codex: false,
+            agy: false,
             last_input: None,
             auth_expired: false,
             model_unsupported: false,
@@ -181,6 +184,7 @@ impl Terminal {
         }
         self.diagnostics = Diagnostics {
             codex: self.codex,
+            agy: self.agy,
             ..Diagnostics::default()
         };
         self.last_input = None;
@@ -394,6 +398,7 @@ struct Diagnostics {
     truncated: bool,
     menu_header: bool,
     codex: bool,
+    agy: bool,
 }
 impl Diagnostics {
     fn feed(&mut self, bytes: &[u8]) -> (ScreenLimits, bool, bool) {
@@ -462,6 +467,12 @@ impl Diagnostics {
         let decoded = normalize(&self.line);
         self.line.clear();
         let line = decoded.as_str();
+        if self.agy {
+            // agy's own notices only; Claude's and Codex's wording would
+            // misread its tool output.
+            signals.0.notice |= crate::agy::limit_notice(line);
+            return;
+        }
         let (limit, auth, model) = diagnostic_line(line, self.codex);
         signals.0.notice |= limit;
         signals.1 |= auth;

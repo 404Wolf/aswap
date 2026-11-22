@@ -432,6 +432,9 @@ fn packet(store: &Store, request: &Request) -> Result<Packet> {
         let _lock = store.lock()?;
         store.load()?.accounts
     };
+    // agy logins are refresh-capable (agy refreshes them itself), so they
+    // never leave this machine; older followers couldn't parse them anyway.
+    let accounts = accounts.into_iter().filter(|a| a.provider != Provider::Agy);
     let mut profiles = Vec::new();
     for account in accounts {
         let force = request
@@ -544,7 +547,10 @@ fn install_permitted(
             .or_insert(p.account.label);
     }
     for account in &state.accounts {
-        if !seen.contains(&(account.provider, account.label.clone())) {
+        // agy accounts are local on every machine; the owner never sends them.
+        if account.provider != Provider::Agy
+            && !seen.contains(&(account.provider, account.label.clone()))
+        {
             let path = store
                 .profile(account.provider, &account.label)?
                 .join("usage-cache.json");
@@ -2319,7 +2325,7 @@ mod packet_compat_tests {
         })
         .unwrap();
         let mut newer = value["profiles"][0].clone();
-        newer["account"]["provider"] = "agy".into();
+        newer["account"]["provider"] = "futurecli".into();
         value["profiles"].as_array_mut().unwrap().insert(0, newer);
         let packet: Packet = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(packet.profiles.len(), 1);
