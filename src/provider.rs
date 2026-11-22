@@ -383,6 +383,8 @@ pub fn remove(store: &Store, provider: Provider, name: &str) -> Result<Vec<Strin
         settings.reserved.retain(|label| label != name);
     }
     store.save(&state)?;
+    // Including the copy under $XDG_RUNTIME_DIR, a refresh-capable login.
+    crate::refresh::discard_pending(store, &account);
     if profile.exists() {
         std::fs::remove_dir_all(profile).safe("cannot remove private profile")?;
     }

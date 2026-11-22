@@ -477,3 +477,51 @@ fn pending_runtime_copy_child() {
     );
     assert!(!runtime.exists());
 }
+
+#[test]
+fn pending_copies_are_kept_while_the_login_cannot_be_read() {
+    with_runtime_dir("pending_unreadable_child");
+}
+#[test]
+fn pending_unreadable_child() {
+    if std::env::var("ASWAP_REFRESH_CHILD").as_deref() != Ok("pending_unreadable_child") {
+        return;
+    }
+    let (_t, store, a) = seed();
+    coordination::owner(&store).unwrap();
+    let _lock = store.lock().unwrap();
+    let path = store
+        .profile(a.provider, &a.label)
+        .unwrap()
+        .join(a.provider.auth_file());
+    let original = std::fs::read(&path).unwrap();
+    // A rotation whose login write failed leaves both pending copies.
+    let failed = refresh::refresh_with(&store, &a, 1000, false, |_, _| {
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        Ok(
+            json!({"access_token":"synthetic-new","refresh_token":"synthetic-refresh-rotated","expires_in":3600}),
+        )
+    });
+    assert!(failed.is_err());
+    let runtime_dir =
+        std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join("aswap");
+    let copies = || {
+        std::fs::read_dir(&runtime_dir).unwrap().count()
+            + usize::from(path.with_file_name(".credentials.json.pending").exists())
+    };
+    assert_eq!(copies(), 2);
+    // The login still can't be read: nothing is dropped, nothing installed.
+    assert!(refresh::refresh_with(&store, &a, 1001, false, |_, _| panic!("no request")).is_err());
+    assert_eq!(copies(), 2);
+    // Once it reads again, the copy is installed and both are dropped.
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, &original).unwrap();
+    assert!(!refresh::refresh_with(&store, &a, 1002, false, |_, _| panic!("no request")).unwrap());
+    let installed: Value = store::json_read(&path).unwrap();
+    assert_eq!(
+        installed["claudeAiOauth"]["refreshToken"],
+        "synthetic-refresh-rotated"
+    );
+    assert_eq!(copies(), 0);
+}

@@ -122,6 +122,9 @@ pub fn rename(store: &Store, provider: Provider, old: &str, new: &str) -> Result
     if !source.is_dir() {
         return Err(Error("profile directory is missing"));
     }
+    // A pending login (refresh.rs) is named after the old label; drop it
+    // rather than leave a refresh-capable copy behind under a stale name.
+    crate::refresh::discard_pending(store, &account);
     for path in [
         store.profile(provider, new)?,
         store.sessions(provider, new)?,

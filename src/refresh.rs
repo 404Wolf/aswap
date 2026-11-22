@@ -415,11 +415,22 @@ fn install(
 /// Install a pending login left by a rotation whose final write failed,
 /// if the login file is still the one it replaces; drop it otherwise.
 fn recover_pending(store: &Store, account: &Account, path: &std::path::Path) -> crate::Result<()> {
-    let current = file_hash(path);
-    for copy in pending_paths(store, account) {
-        if !copy.exists() {
-            continue;
-        }
+    let copies: Vec<_> = pending_paths(store, account)
+        .into_iter()
+        .filter(|copy| copy.exists())
+        .collect();
+    if copies.is_empty() {
+        return Ok(());
+    }
+    // A login file that can't be read (the disk still failing) proves
+    // nothing: keep every copy, the tmpfs one above all, and retry later.
+    let Some(current) = file_hash(path) else {
+        return Err(crate::Error(
+            "cannot read the login to recover its pending copy",
+        ));
+    };
+    let current = Some(current);
+    for copy in copies {
         let pending: Option<Pending> = store::json_read(&copy).ok();
         let usable = pending.filter(|p| {
             Some(&p.replaces) == current.as_ref()
@@ -563,4 +574,40 @@ pub(crate) fn propagate(store: &Store, account: &Account, auth: &Value) -> crate
         crate::usage::credentials_changed(store, &other)?;
     }
     Ok(())
+}
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+
+    #[test]
+    fn an_unreadable_login_keeps_its_pending_copy() {
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let account = Account {
+            provider: Provider::Claude,
+            label: "one".into(),
+        };
+        let path = store
+            .profile(account.provider, &account.label)
+            .unwrap()
+            .join(account.provider.auth_file());
+        // The login file can't be read (here: a directory in its place).
+        std::fs::create_dir_all(&path).unwrap();
+        let copy = pending_path(&path);
+        store::json_write(
+            &copy,
+            &Pending {
+                replaces: "synthetic-hash".into(),
+                auth: serde_json::json!({"claudeAiOauth":{"accessToken":"synthetic"}}),
+            },
+        )
+        .unwrap();
+        assert!(recover_pending(&store, &account, &path).is_err());
+        assert!(copy.exists(), "the pending copy was dropped");
+        // Once the file reads and differs, the copy is stale and dropped.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"{}").unwrap();
+        recover_pending(&store, &account, &path).unwrap();
+        assert!(!copy.exists());
+    }
 }
