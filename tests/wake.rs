@@ -27,7 +27,12 @@ fn scenario(provider: Provider, recovered: &str, exited: bool, count: usize) {
     review_scenario(provider, recovered, exited, count, "ordinary");
 }
 
+/// Each scenario runs supervisor processes for up to a minute: one at a time,
+/// so they don't starve each other (or time out) under load.
+static PROCESS_SUITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn review_scenario(provider: Provider, recovered: &str, exited: bool, count: usize, mode: &str) {
+    let _serial = PROCESS_SUITE.lock().unwrap_or_else(|e| e.into_inner());
     let interrupted = recovered == "interrupt";
     let temp = tempfile::tempdir().unwrap();
     let store = Store::open(temp.path().join("data/aswap")).unwrap();
