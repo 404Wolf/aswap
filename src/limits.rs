@@ -32,6 +32,9 @@ const ANCHOR: usize = 256;
 /// Without a known transcript, a limit on screen counts only when shown this
 /// long after launch: a resumed provider's redraw is over by then.
 pub const UNCONFIRMED: Duration = Duration::from_secs(10);
+/// A Codex limit notice this soon after a launch or resume may be a redraw
+/// of an old one; it counts only if the account's quota confirms it.
+pub const CODEX_EARLY: Duration = Duration::from_secs(15);
 
 pub struct Limits {
     launched: Instant,
@@ -46,6 +49,10 @@ pub struct Limits {
     seen: bool,
     screen_seen: bool,
     pending: Option<PendingScreen>,
+    /// Codex: whether the one quota check for an early notice was made,
+    /// and whether an early notice is still unconfirmed.
+    early_checked: bool,
+    early_unconfirmed: bool,
 }
 
 struct PendingScreen {
@@ -110,6 +117,8 @@ impl Limits {
             seen: false,
             screen_seen: false,
             pending: None,
+            early_checked: false,
+            early_unconfirmed: false,
         }
     }
 
@@ -143,6 +152,56 @@ impl Limits {
             return self.seen;
         }
         self.screen_seen |= screen && self.launched.elapsed() >= UNCONFIRMED;
+        self.screen_seen
+    }
+
+    /// Whether a Codex limit notice (`notice`: shown since the last check)
+    /// is live. After `CODEX_EARLY` it is. Before, the quota is checked once
+    /// per launch, and the notice counts only if it has the account
+    /// exhausted: first the cached reading (`cached`), then, if that reading
+    /// predates this launch and doesn't confirm, one fresh read (`fresh`).
+    /// So a real limit right after a switch is confirmed, and a redrawn old
+    /// notice is rejected. If neither confirms, the notice counts only when
+    /// it is shown again after the window, or when Codex exits with a failure
+    /// (`gone`): a redraw doesn't make the CLI fail, a limit that stopped it
+    /// does.
+    ///
+    /// One exception: when the login was rotated since launch (`rotated`),
+    /// Codex may be refusing with the token it started with, so the notice
+    /// counts and the run reloads the same account with the new login
+    /// (the supervisor's credential recovery decides that).
+    pub fn check_codex(
+        &mut self,
+        notice: bool,
+        gone: bool,
+        rotated: impl FnOnce() -> bool,
+        cached: impl FnOnce() -> Option<usage::Cached>,
+        fresh: impl FnOnce() -> Option<usage::Cached>,
+        now: impl Fn() -> u64,
+    ) -> bool {
+        if gone && (notice || self.early_unconfirmed) {
+            self.screen_seen = true;
+        }
+        if self.screen_seen || !notice {
+            return self.screen_seen;
+        }
+        if self.launched.elapsed() >= CODEX_EARLY {
+            self.screen_seen = true;
+        } else if !self.early_checked {
+            self.early_checked = true;
+            let launched = self
+                .launched_wall
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let reading = cached();
+            self.screen_seen = match &reading {
+                Some(cache) if exhausted(cache, now()) => true,
+                _ if rotated() => true,
+                Some(cache) if cache.fetched_at >= launched => false,
+                _ => fresh().is_some_and(|cache| exhausted(&cache, now())),
+            };
+        }
+        self.early_unconfirmed |= !self.screen_seen;
         self.screen_seen
     }
 
@@ -213,6 +272,16 @@ impl Limits {
         }
         cache.is_some_and(|cache| corroborates(pending.evidence, &cache, now()))
     }
+}
+
+/// A fresh reading with some window used up and not yet reset.
+fn exhausted(cache: &usage::Cached, at: u64) -> bool {
+    matches!(cache.error.as_deref(), None | Some("provider-limit"))
+        && cache.fetched_at != 0
+        && at.saturating_sub(cache.fetched_at) < usage::TTL
+        && cache.usage.windows.iter().any(|window| {
+            window.used_percent >= 100.0 && window.resets_at.is_none_or(|reset| reset > at)
+        })
 }
 
 fn corroborates(screen: ScreenLimits, cache: &usage::Cached, at: u64) -> bool {
@@ -412,6 +481,99 @@ pub fn limit_entry(entry: &Value, since: SystemTime) -> bool {
                 }),
             _ => false,
         }
+}
+
+#[cfg(test)]
+mod codex_tests {
+    use super::*;
+
+    fn reading(used: f64, at: u64) -> usage::Cached {
+        usage::Cached {
+            usage: usage::Usage {
+                windows: vec![usage::Window {
+                    name: "primary".into(),
+                    used_percent: used,
+                    resets_at: Some(at + 3600),
+                    duration_minutes: Some(300),
+                    codex_slot: None,
+                }],
+                ..Default::default()
+            },
+            fetched_at: at,
+            ..Default::default()
+        }
+    }
+    /// Limits for a launch `ago` back.
+    fn launched(ago: Duration) -> Limits {
+        let mut limits = Limits::new(None);
+        limits.launched = Instant::now() - ago;
+        limits
+    }
+
+    #[test]
+    fn an_early_codex_notice_needs_the_quota_to_confirm_it() {
+        let at = 100_000;
+        let early = Duration::from_secs(2);
+        let never = || -> Option<usage::Cached> { panic!("read") };
+        let no = || false;
+        // The cached reading already has the account exhausted.
+        let mut limits = launched(early);
+        assert!(limits.check_codex(true, false, no, || Some(reading(100.0, at)), never, || at));
+        // A real limit right after a switch: the cached reading (from before
+        // this launch) had room, and the fresh read confirms the limit.
+        let mut limits = launched(early);
+        let before = reading(20.0, at - 30);
+        assert!(limits.check_codex(
+            true,
+            false,
+            no,
+            || Some(before.clone()),
+            || Some(reading(100.0, at)),
+            || at
+        ));
+        // A redraw of an old notice on resume: the fresh read has room.
+        // Rejected, and the quota is checked only once per launch.
+        let mut limits = launched(early);
+        assert!(!limits.check_codex(
+            true,
+            false,
+            no,
+            || Some(before.clone()),
+            || Some(reading(20.0, at)),
+            || at
+        ));
+        assert!(!limits.check_codex(true, false, no, never, never, || at));
+        // Shown again after the window, it counts.
+        limits.launched = Instant::now() - CODEX_EARLY;
+        assert!(limits.check_codex(true, false, no, never, never, || at));
+        // A reading taken since this launch is fresh enough on its own.
+        let since = reading(20.0, crate::now() + 1);
+        assert!(!launched(early).check_codex(true, false, no, || Some(since), never, || at));
+        // A failed or stale fresh read doesn't confirm.
+        assert!(!launched(early).check_codex(true, false, no, || None, || None, || at));
+        let mut failed = reading(100.0, at);
+        failed.error = Some("http-500".into());
+        assert!(!launched(early).check_codex(true, false, no, || None, || Some(failed), || at));
+        let stale = reading(100.0, at - usage::TTL);
+        assert!(!launched(early).check_codex(true, false, no, || None, || Some(stale), || at));
+        // No notice, no read; after the window, no read either.
+        assert!(!launched(early).check_codex(false, false, no, never, never, || at));
+        assert!(launched(CODEX_EARLY).check_codex(true, false, no, never, never, || at));
+        // Codex exits after an unconfirmed early notice: a limit stopped it.
+        let mut limits = launched(early);
+        assert!(!limits.check_codex(true, false, no, || None, || None, || at));
+        assert!(limits.check_codex(false, true, no, never, never, || at));
+        // The login rotated since launch: Codex may be using the old token,
+        // so the notice counts (and the run reloads the same account),
+        // although the quota has room.
+        let mut limits = launched(early);
+        let room = reading(20.0, crate::now() + 1);
+        assert!(limits.check_codex(true, false, || true, || Some(room.clone()), never, || at));
+        // The same notice without a rotation, with clear quota: a redraw.
+        assert!(!launched(early).check_codex(true, false, no, || Some(room), never, || at));
+        // Exiting without any notice is not a limit.
+        assert!(!launched(early).check_codex(false, true, no, never, never, || at));
+    }
 }
 
 #[cfg(test)]

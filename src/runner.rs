@@ -363,7 +363,10 @@ pub fn run(
                     tracker.as_ref(),
                     screen_limit,
                     terminal.as_ref(),
-                    false,
+                    Moment {
+                        exited: None,
+                        launched: launched.as_deref(),
+                    },
                 );
             }
             if let Some(terminal) = &mut terminal {
@@ -541,7 +544,10 @@ pub fn run(
                     tracker.as_ref(),
                     screen_limit,
                     Some(terminal),
-                    true,
+                    Moment {
+                        exited: Some(!status.success()),
+                        launched: launched.as_deref(),
+                    },
                 );
             }
             quiet.apply(terminal, tracker.as_ref());
@@ -675,6 +681,11 @@ pub fn run(
                 // Keep the decision that stopped the provider if this one fails.
                 if let Some(choice) = hiccups.note("choosing another account", decided) {
                     target = choice.or(target);
+                }
+                // A limit first confirmed by the exit (an early Codex notice)
+                // explains a missing model fit here, as a live one does above.
+                if target.is_none() && limited && !reported_none {
+                    models.report_none();
                 }
             }
         }
@@ -939,8 +950,15 @@ impl Hiccups {
         }
     }
 }
+/// When a limit check happens: while the provider runs (`exited` None) or
+/// after it exited (`Some(failed)`), with the login it was launched with.
+struct Moment<'a> {
+    exited: Option<bool>,
+    launched: Option<&'a [u8]>,
+}
 /// Claude usually confirms limits in its transcript. Its active limit menu
 /// and compaction failure can also be corroborated by the account's quota.
+/// A Codex notice right after a launch or resume needs its quota to agree.
 fn limit_seen(
     store: &Store,
     account: &Account,
@@ -948,8 +966,20 @@ fn limit_seen(
     tracker: Option<&crate::session::Tracker>,
     screen: crate::terminal::ScreenLimits,
     terminal: Option<&Terminal>,
-    fresh: bool,
+    moment: Moment,
 ) -> bool {
+    let fresh = moment.exited.is_some();
+    if account.provider == Provider::Codex {
+        // An early notice needs the quota to agree (single-flight reads).
+        return limits.check_codex(
+            screen.notice,
+            moment.exited == Some(true),
+            || rotated_since(store, account, moment.launched),
+            || usage::cached(store, account).ok(),
+            || usage::cached_force(store, account, true).ok(),
+            now,
+        );
+    }
     if account.provider != Provider::Claude || tracker.is_none() {
         return screen.notice;
     }

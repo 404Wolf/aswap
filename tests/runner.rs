@@ -100,7 +100,9 @@ if scenario.startswith('codex-') and 'synthetic-first' in auth:
     data=json.loads((profile/'auth.json').read_text())
     data['tokens']['access_token']='synthetic-rotated'
     replace_json(profile/'auth.json',data)
-if scenario in ('codex-exhausted','claude-menu','claude-startup-redraw') and 'synthetic-first' in auth:
+# A real Codex limit: its quota reads exhausted (an early notice needs that).
+codex_limit=provider=='codex' and not scenario and 'limit' in os.environ['ASWAP_TEST_FAILURE']
+if (codex_limit or scenario in ('codex-exhausted','claude-menu','claude-startup-redraw')) and 'synthetic-first' in auth:
     cache=json.loads((profile/'usage-cache.json').read_text())
     cache['usage']['windows']=[{'name':'weekly','used_percent':100,'duration_minutes':10080,'resets_at':int(time.time())+3600}]
     cache['fetched_at']=int(time.time())
@@ -328,6 +330,8 @@ fn runner_child() {
             .join("usage-cache.json");
         let mut c: Cached = store::json_read(&cache).unwrap();
         c.error = None;
+        // The limit is over: the quota reads as it did before it.
+        c.usage.windows[0].used_percent = 20.0;
         store::json_write(&cache, &c).unwrap();
         store::json_write(
             &store
