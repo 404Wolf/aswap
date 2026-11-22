@@ -217,7 +217,12 @@ pub enum Event {
     Unhalted { at: u64 },
     /// Post-reset re-reads stopped without a usable reading (out of tries,
     /// or the weekly window ended). Waiters keep their own schedule.
-    Unverified { at: u64, key: String },
+    Unverified {
+        at: u64,
+        key: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        why: String,
+    },
 }
 impl Event {
     fn key(&self) -> &str {
@@ -761,6 +766,11 @@ fn verify(
         port.journal(&Event::Unverified {
             at,
             key: key.to_owned(),
+            why: if at >= until {
+                "its weekly window ended".into()
+            } else {
+                format!("no usable reading after {VERIFY_TRIES} re-reads")
+            },
         })?;
         log.verifying = None;
         return Ok(last);
@@ -900,6 +910,12 @@ pub fn step(
             let account = account.clone();
             verify(port, log, &account, &v.key, v.until, at, &[])?;
         } else {
+            // Its account is gone: end it for good, or load would rebuild it.
+            port.journal(&Event::Unverified {
+                at,
+                key: v.key.clone(),
+                why: "account removed".into(),
+            })?;
             log.verifying = None;
         }
         port.save(log)?;
@@ -3359,6 +3375,25 @@ mod tests {
         }
         assert_eq!(kinds(&fake).last().unwrap(), "unverified");
         assert_eq!(fake.redeemed.len(), 1);
+        // Its account removed: ended with Unverified, not just cleared.
+        let mut fake = Fake::default();
+        let mut log = ResetLog {
+            verifying: Some(Verifying {
+                label: "gone".into(),
+                key: "synthetic-key-9".into(),
+                next_at: AT,
+                tries: 0,
+                until: AT + DAY,
+            }),
+            ..Default::default()
+        };
+        run(&mut fake, AutoReset::On, &mut log, AT);
+        assert!(log.verifying.is_none());
+        assert!(
+            matches!(fake.journal.as_slice(), [Event::Unverified { key, .. }] if key == "synthetic-key-9"),
+            "{:?}",
+            fake.journal
+        );
     }
 
     #[test]
@@ -3424,6 +3459,49 @@ mod tests {
         .unwrap();
         assert!(load(&store).unwrap().verifying.is_none());
         assert_eq!(monitor_wait(&store, Provider::Codex, now), usage::TTL);
+    }
+
+    #[test]
+    fn a_removed_accounts_verification_ends_across_real_ticks() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("store")).unwrap();
+        {
+            let _lock = store.lock().unwrap();
+            let mut state = store.load().unwrap();
+            state.auto.entry(Provider::Codex).or_default().auto_reset = AutoReset::DryRun;
+            store.save(&state).unwrap();
+        }
+        // A successful redemption for "six", an account no longer present.
+        let now = crate::now();
+        let mut intent = pending(0, now);
+        intent.weekly_resets_at = now + 6 * DAY;
+        let key = "synthetic-key-1".to_owned();
+        for event in [
+            Event::Intent {
+                at: now,
+                pending: intent,
+            },
+            Event::Attempt {
+                at: now,
+                key: key.clone(),
+                n: 1,
+            },
+            Event::Outcome {
+                at: now,
+                key: key.clone(),
+                outcome: "reset".into(),
+            },
+        ] {
+            append(&store, &event).unwrap();
+        }
+        assert_eq!(monitor_wait(&store, Provider::Codex, now), 1);
+        tick(&store, Provider::Codex).unwrap();
+        tick(&store, Provider::Codex).unwrap();
+        assert_eq!(verify_due(&store, Provider::Codex), None);
+        assert_eq!(monitor_wait(&store, Provider::Codex, now), usage::TTL);
+        let journal = std::fs::read_to_string(journal_path(&store)).unwrap();
+        assert_eq!(journal.matches("\"unverified\"").count(), 1, "{journal}");
+        assert!(journal.contains("account removed"));
     }
 
     #[test]
