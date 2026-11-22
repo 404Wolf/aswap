@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Fixed
+- **A rotated login survives a failed write.** When a token refresh succeeded but writing the new login failed (a full disk, EIO), the provider had already invalidated the old refresh token, and the new one was only in memory: the account needed a new login. The new login is now written to a private `<auth file>.pending` first, and the next refresh installs it before doing anything else. (Audit asw-0ti P2-5.)
+
+## Unreleased
+
+### Fixed
 - **state.json written by a newer aswap is kept whole.** Unknown top-level fields, unknown per-provider settings, and the accounts, active labels and settings of providers this version doesn't know were dropped on save, or (an unknown provider) made state.json unreadable. A long-running older supervisor could then undo a newer one's `reserved` accounts or switch interval, and a future provider's account would stop every older aswap. They are now read past and written back unchanged. A known provider's malformed settings are still an error. (Audit asw-0ti P2-3.)
 - **Codex usage failures no longer rotate the login.** A failed Codex usage read forced a token refresh for nearly any failure: a changed response shape, an app-server that exited early, too many notifications. Each refresh revoked the access token of every running Codex session and restarted them, on every poll. Now only an explicit 401, or an app-server failure while the stored access token has expired, forces one. (Audit asw-0ti P2-2.)
 - **A slow usage poll no longer freezes every session's typing.** Usage fetches (a Claude HTTP call or a Codex app-server request, up to 10–20 s) ran under the store lock that every supervisor takes on its terminal thread. They now run outside it, one at a time per account under a per-account usage lock. A second reader returns the cache at once; an explicit `--refresh` waits up to 20 s for it. A supervisor's 30-second refresh check also no longer takes the store lock unless the login is close to expiry. (Audit asw-0ti P2-1.)

@@ -232,6 +232,9 @@ where
         .profile(account.provider, &account.label)
         .map_err(|_| Failure::new("usage-unavailable"))?
         .join(account.provider.auth_file());
+    // A rotation whose final write failed left the only valid refresh token
+    // in the pending sidecar: install it before anything else.
+    recover_pending(store, account, &path).map_err(|_| Failure::new("usage-unavailable"))?;
     // Re-read only after acquiring the identity lock; another refresher may have won.
     let old: Value = store::json_read(&path).map_err(|_| Failure::new("usage-unavailable"))?;
     if account.provider == Provider::Codex
@@ -293,13 +296,12 @@ where
         &serde_json::to_vec(&auth).map_err(|_| Failure::new("refresh-invalid-response"))?,
     )
     .map_err(|_| Failure::new("refresh-invalid-response"))?;
-    store::json_write(&path, &auth).map_err(|_| Failure::new("usage-unavailable"))?;
-    // The old access token is already revoked: hand the new one to every
-    // live run now, before anything else, rather than on each run's tick.
-    crate::shared::hand_out(store, account, &auth);
-    propagate(store, account, &auth).map_err(|_| Failure::new("usage-unavailable"))?;
-    crate::usage::credentials_changed(store, account)
-        .map_err(|_| Failure::new("usage-unavailable"))?;
+    // The provider has already invalidated the old refresh token, so the
+    // new login must survive a failed write: it goes to a private sidecar
+    // first, and the next refresh installs it if the main write fails.
+    let pending = pending_path(&path);
+    store::json_write(&pending, &auth).map_err(|_| Failure::new("usage-unavailable"))?;
+    install(store, account, &path, &auth).map_err(|_| Failure::new("usage-unavailable"))?;
     // A token that lives under twice the margin would be due again soon, or
     // on every check: the next unforced refresh waits half its lifetime, and
     // never less than a minute, even for a token that is already expired.
@@ -317,6 +319,47 @@ where
         std::fs::remove_file(&gate).map_err(|_| Failure::new("usage-unavailable"))?;
     }
     Ok(true)
+}
+/// `<auth file>.pending`: private by name (shared::private), never linked
+/// into a view.
+fn pending_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(".pending");
+    path.with_file_name(name)
+}
+/// Write a rotated login, hand it to every live run and alias, then drop
+/// its pending copy.
+fn install(
+    store: &Store,
+    account: &Account,
+    path: &std::path::Path,
+    auth: &Value,
+) -> crate::Result<()> {
+    store::json_write(path, auth)?;
+    // The old access token is already revoked: hand the new one to every
+    // live run now, before anything else, rather than on each run's tick.
+    crate::shared::hand_out(store, account, auth);
+    propagate(store, account, auth)?;
+    crate::usage::credentials_changed(store, account)?;
+    match std::fs::remove_file(pending_path(path)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(crate::Error("cannot remove the pending login"))
+        }
+        _ => Ok(()),
+    }
+}
+/// Install a pending login left by a rotation whose final write failed.
+fn recover_pending(store: &Store, account: &Account, path: &std::path::Path) -> crate::Result<()> {
+    let pending = pending_path(path);
+    if !pending.exists() {
+        return Ok(());
+    }
+    let auth: Value = store::json_read(&pending)?;
+    provider::validate_auth(
+        account.provider,
+        &serde_json::to_vec(&auth).map_err(|_| crate::Error("invalid pending login"))?,
+    )?;
+    install(store, account, path, &auth)
 }
 /// An active local run may refresh even when inactive-profile monitoring is off.
 /// Followers still only pull from the designated owner.

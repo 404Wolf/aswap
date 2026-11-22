@@ -311,3 +311,52 @@ fn tokens_refresh_well_before_expiry_but_short_lived_ones_do_not_spin() {
         .unwrap()
     );
 }
+
+#[test]
+fn a_rotated_login_survives_a_failed_write_and_is_installed_next_time() {
+    let (_t, store, a) = seed();
+    coordination::owner(&store).unwrap();
+    let _lock = store.lock().unwrap();
+    let path = store
+        .profile(a.provider, &a.label)
+        .unwrap()
+        .join(a.provider.auth_file());
+    // The token endpoint rotates the login; then the disk refuses the write
+    // (here: the auth file's place is taken by a directory).
+    let failed = refresh::refresh_with(&store, &a, 1000, false, |_, _| {
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        Ok(
+            json!({"access_token":"synthetic-new","refresh_token":"synthetic-refresh-rotated","expires_in":3600}),
+        )
+    });
+    assert!(failed.is_err());
+    let pending = path.with_file_name(".credentials.json.pending");
+    let kept: Value = store::json_read(&pending).unwrap();
+    assert_eq!(
+        kept["claudeAiOauth"]["refreshToken"],
+        "synthetic-refresh-rotated"
+    );
+    // The disk recovers. The next refresh installs the pending login first,
+    // so it needn't (and can't) refresh with the invalidated old token.
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, b"{}").unwrap();
+    assert!(
+        !refresh::refresh_with(&store, &a, 1001, false, |_, _| panic!(
+            "the old refresh token is no longer valid"
+        ))
+        .unwrap()
+    );
+    let installed: Value = store::json_read(&path).unwrap();
+    assert_eq!(
+        installed["claudeAiOauth"]["refreshToken"],
+        "synthetic-refresh-rotated"
+    );
+    assert!(!pending.exists());
+    // A normal rotation leaves no pending file behind.
+    assert!(refresh::refresh_with(&store, &a, 9_999_999, true, |_, _| {
+        Ok(json!({"access_token":"synthetic-newer","refresh_token":"synthetic-refresh-3","expires_in":3600}))
+    })
+    .unwrap());
+    assert!(!pending.exists());
+}
