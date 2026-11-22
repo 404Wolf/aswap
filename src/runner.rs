@@ -1651,7 +1651,9 @@ impl Rejected {
             &store.profile(account.provider, &account.label).ok()?,
         )
         .ok()?
-        .lock_key()
+        // The real account, not the legacy key: that is Codex's workspace,
+        // and one member's limit must not hold a teammate's account.
+        .account_key()
     }
     fn filter(
         &self,
@@ -1979,6 +1981,52 @@ mod rejection_tests {
                 "{ordinary:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_limit_on_one_workspace_member_does_not_hold_a_teammate() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let mut state = store.load().unwrap();
+        let account = |label: &str, member: &str| {
+            let account = Account {
+                provider: Provider::Codex,
+                label: label.into(),
+            };
+            let claims = serde_json::json!({"https://api.openai.com/auth":{
+                "chatgpt_account_id":"synthetic-workspace","chatgpt_account_user_id":member}});
+            let jwt = format!(
+                "synthetic.{}.synthetic",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+            );
+            let profile = store.profile(account.provider, label).unwrap();
+            std::fs::create_dir_all(&profile).unwrap();
+            store::json_write(
+                &profile.join("auth.json"),
+                &serde_json::json!({"tokens":{"account_id":"synthetic-workspace","access_token":jwt}}),
+            )
+            .unwrap();
+            account
+        };
+        let alice = account("alice", "synthetic-member-a");
+        let bob = account("bob", "synthetic-member-b");
+        state.accounts.extend([alice.clone(), bob.clone()]);
+        store.save(&state).unwrap();
+        let mut rejected = Rejected::default();
+        rejected.reject(&store, &alice, true).unwrap();
+        let at = now();
+        let kept: Vec<_> = rejected
+            .filter(
+                &store,
+                "other",
+                90.0,
+                vec![(alice, cache(100.0, at)), (bob, cache(10.0, at))],
+            )
+            .into_iter()
+            .map(|(a, _)| a.label)
+            .collect();
+        assert_eq!(kept, ["bob"]);
     }
 
     #[test]
