@@ -524,6 +524,38 @@ impl Store {
             .safe("cannot open sync watch lock")?;
         Ok(f.try_lock_exclusive().is_ok().then_some(Guard(f, false)))
     }
+    /// One usage fetch per account at a time, taken without the store lock
+    /// so no supervisor waits on the network. None while another process
+    /// fetches; `wait` bounds how long to keep trying.
+    pub(crate) fn usage_lock(
+        &self,
+        account: &Account,
+        wait: std::time::Duration,
+    ) -> Result<Option<Guard>> {
+        label(&account.label)?;
+        let path = self
+            .root
+            .join(format!("{}-{}.usage.lock", account.provider, account.label));
+        no_links(&path)?;
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .safe("cannot open usage lock")?;
+        let start = std::time::Instant::now();
+        loop {
+            if f.try_lock_exclusive().is_ok() {
+                return Ok(Some(Guard(f, false)));
+            }
+            if start.elapsed() >= wait {
+                return Ok(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
     pub(crate) fn legacy_lock(&self, account: &Account) -> Result<Guard> {
         let path = self
             .root

@@ -321,10 +321,29 @@ where
 /// An active local run may refresh even when inactive-profile monitoring is off.
 /// Followers still only pull from the designated owner.
 pub fn for_run(store: &Store, account: &Account) -> std::result::Result<bool, Failure> {
+    let at = crate::now();
+    // Every supervisor asks on its terminal thread every 30 s. Answer "not
+    // due" without the store lock, so a slow lock holder never stalls
+    // typing; refresh_inner decides again under the lock when it may be due.
+    if !may_be_due(store, account, at) {
+        return Ok(false);
+    }
     let _lock = store
         .lock()
         .map_err(|_| Failure::new("usage-unavailable"))?;
-    refresh_inner(store, account, crate::now(), false, true, request)
+    refresh_inner(store, account, at, false, true, request)
+}
+/// False only when an unforced refresh_inner would certainly do nothing:
+/// the stored login (written atomically, so safe to read unlocked) has a
+/// known expiry beyond the margin, or none at all.
+fn may_be_due(store: &Store, account: &Account, at: u64) -> bool {
+    let Ok(profile) = store.profile(account.provider, &account.label) else {
+        return true;
+    };
+    let Ok(auth) = store::json_read::<Value>(&profile.join(account.provider.auth_file())) else {
+        return true;
+    };
+    expires_at(account.provider, &auth).is_some_and(|expiry| expiry <= at.saturating_add(MARGIN))
 }
 pub fn refresh(
     store: &Store,

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     io::{BufRead, BufReader, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Stdio},
     sync::mpsc,
     time::Duration,
@@ -826,6 +826,10 @@ fn read_cache(path: &Path, ignore_invalid_json: bool) -> Result<Cached> {
     store::json_read(path)
 }
 
+/// How long an explicit (forced) read waits for another process's fetch of
+/// the same account before returning the cache as it is.
+const FORCED_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub fn cached_mode_with<F>(
     store: &Store,
     account: &Account,
@@ -836,8 +840,47 @@ pub fn cached_mode_with<F>(
 where
     F: FnOnce(&Path) -> std::result::Result<Usage, Failure>,
 {
-    // A cross-process store lock serializes the cache claim and fetch; timeout
-    // bounds are deliberately short. This prevents CLI/Waybar/auto stampedes.
+    // The decision and the cache writes happen under the store lock; the
+    // fetch itself does not. Every supervisor takes the store lock on its
+    // terminal thread, so a network call under it would stall typing in
+    // every session. A per-account usage lock keeps it one fetch at a time.
+    let (old, path, profile) = match fresh_enough(store, account, at, force)? {
+        Decision::Cached(cached) => return Ok(cached),
+        Decision::Fetch { old, path, profile } => (old, path, profile),
+    };
+    let wait = if force {
+        FORCED_WAIT
+    } else {
+        std::time::Duration::ZERO
+    };
+    let Some(_fetching) = store.usage_lock(account, wait)? else {
+        // Another process is fetching this account: use what it leaves.
+        let _lock = store.lock()?;
+        return read_cache(&path, force).or(Ok(old));
+    };
+    // It may have just finished: decide again before fetching.
+    let path = match fresh_enough(store, account, at, force)? {
+        Decision::Cached(cached) => return Ok(cached),
+        Decision::Fetch { path, .. } => path,
+    };
+    let result = fetcher(&profile);
+    let _lock = store.lock()?;
+    let latest = read_cache(&path, force)?;
+    let entry = updated(latest, result, at);
+    store::json_write(&path, &entry)?;
+    Ok(entry)
+}
+enum Decision {
+    Cached(Cached),
+    Fetch {
+        old: Cached,
+        path: PathBuf,
+        profile: PathBuf,
+    },
+}
+/// Under the store lock: the cache if it is still good (or a fresh alias's
+/// reading, which it adopts), else what a fetch needs.
+fn fresh_enough(store: &Store, account: &Account, at: u64, force: bool) -> Result<Decision> {
     let _lock = store.lock()?;
     let state = store.load()?;
     store.account(&state, account.provider, Some(&account.label))?;
@@ -853,7 +896,7 @@ where
         .reset_times()
         .any(|r| r <= at && old.last_attempt.max(old.fetched_at) < r);
     if !force && !reset_due && at < old.next_poll_at {
-        return Ok(old);
+        return Ok(Decision::Cached(old));
     }
     // Aliases of one login share one quota: reuse a fresh sibling observation
     // instead of fetching again, which would double the provider's rate limit.
@@ -876,13 +919,11 @@ where
                     continue;
                 }
                 store::json_write(&path, &other)?;
-                return Ok(other);
+                return Ok(Decision::Cached(other));
             }
         }
     }
-    let entry = updated(old, fetcher(&profile), at);
-    store::json_write(&path, &entry)?;
-    Ok(entry)
+    Ok(Decision::Fetch { old, path, profile })
 }
 pub fn cached(store: &Store, account: &Account) -> Result<Cached> {
     cached_force(store, account, false)
@@ -902,14 +943,22 @@ pub fn cached_force(store: &Store, account: &Account, force: bool) -> Result<Cac
         return Ok(cached);
     }
 
+    // A refresh rewrites shared state (views, aliases), so it runs under
+    // the store lock; it is due rarely, unlike the fetch around it.
+    let refresh = |force: bool| {
+        let _lock = store
+            .lock()
+            .map_err(|_| Failure::new("usage-unavailable"))?;
+        crate::refresh::refresh(store, account, now(), force)
+    };
     cached_mode_with(store, account, now(), force, |p| {
-        crate::refresh::refresh(store, account, now(), false)?;
+        refresh(false)?;
         let first = fetch(account, p);
         if first
             .as_ref()
             .err()
             .is_some_and(|e| e.status == Some(401) || e.kind == "codex-rpc-unavailable")
-            && crate::refresh::refresh(store, account, now(), true)?
+            && refresh(true)?
         {
             fetch(account, p)
         } else {
