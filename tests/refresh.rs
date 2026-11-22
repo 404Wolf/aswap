@@ -525,3 +525,54 @@ fn pending_unreadable_child() {
     );
     assert_eq!(copies(), 0);
 }
+
+#[test]
+fn a_rename_never_loses_a_pending_login() {
+    let (_t, store, a) = seed();
+    coordination::owner(&store).unwrap();
+    let path = store
+        .profile(a.provider, &a.label)
+        .unwrap()
+        .join(a.provider.auth_file());
+    let original = std::fs::read(&path).unwrap();
+    {
+        let _lock = store.lock().unwrap();
+        let failed = refresh::refresh_with(&store, &a, 1000, false, |_, _| {
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            Ok(
+                json!({"access_token":"synthetic-new","refresh_token":"synthetic-refresh-rotated","expires_in":3600}),
+            )
+        });
+        assert!(failed.is_err());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, &original).unwrap();
+    }
+    let pending = path.with_file_name(".credentials.json.pending");
+    assert!(pending.exists());
+    // A rename that fails its preflight (the new label is taken) keeps it.
+    let mut state = store.load().unwrap();
+    state.accounts.push(Account {
+        provider: a.provider,
+        label: "taken".into(),
+    });
+    store.save(&state).unwrap();
+    assert!(aswap::rename::rename(&store, a.provider, "one", "taken").is_err());
+    assert!(
+        pending.exists(),
+        "a failed rename dropped the pending login"
+    );
+    // A rename that goes ahead installs it first: the renamed account has
+    // the rotated login and no copy is left under either label.
+    aswap::rename::rename(&store, a.provider, "one", "renamed").unwrap();
+    let moved = store
+        .profile(a.provider, "renamed")
+        .unwrap()
+        .join(a.provider.auth_file());
+    let login: Value = store::json_read(&moved).unwrap();
+    assert_eq!(
+        login["claudeAiOauth"]["refreshToken"],
+        "synthetic-refresh-rotated"
+    );
+    assert!(!moved.with_file_name(".credentials.json.pending").exists());
+}
