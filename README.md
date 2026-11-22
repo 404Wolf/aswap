@@ -122,7 +122,14 @@ like Claude and Codex logins: `aswap add agy <label>` after signing in with
   its secrets in the Secret Service (libsecret) can't reach them from inside
   agy. That is the price of agy's login staying a per-account file.
 - **Refused options.** `--gemini_dir`/`--app_data_dir` (they would leave
-  the view), and `--settings` that turns on `useG1Credits`.
+  the view), and `--settings` that turns on `useG1Credits`. A `--settings`
+  file that is a symlink (as Home Manager makes) is refused too, because
+  aswap reads it without following links. Pass the JSON inline instead.
+  Flags a wrapper on PATH adds are not seen by aswap.
+- **New config entries.** The view's config directory links your
+  `~/.config` entries when the run starts. A new top-level entry that a tool
+  inside agy creates, or one it replaces by rename, lands in the view and is
+  gone after the run.
 - **Refreshing.** agy refreshes its own login; aswap never contacts
   Google's token endpoint. A view's newer login is written back to its
   profile, and the view's copy is removed when the run ends.

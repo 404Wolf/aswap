@@ -160,6 +160,13 @@ pub fn run(
     patiently("recording the session's view", || lease.view(&view.path))?;
     if provider == Provider::Agy {
         crate::agy::check_args(args)?;
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty()) {
+            // Once per run: agy and the tools it runs see no session bus, so
+            // agy keeps this account's login in the view's own file.
+            eprintln!(
+                "aswap: agy runs without the D-Bus session bus (per-account login file); Secret Service is unavailable to tools inside it"
+            );
+        }
     }
     if provider == Provider::Agy && crate::agy::spends_credits(&view.path) {
         return Err(crate::Error(

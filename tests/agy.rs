@@ -72,14 +72,14 @@ for _ in range(20):
 sys.exit(0)
 "##;
 
-fn child(name: &str, mode: &str) -> (Vec<Value>, std::path::PathBuf, tempfile::TempDir) {
+fn child(name: &str, mode: &str) -> (Vec<Value>, std::path::PathBuf, tempfile::TempDir, String) {
     child_with(name, mode, "[]")
 }
 fn child_with(
     name: &str,
     mode: &str,
     args: &str,
-) -> (Vec<Value>, std::path::PathBuf, tempfile::TempDir) {
+) -> (Vec<Value>, std::path::PathBuf, tempfile::TempDir, String) {
     let t = tempfile::tempdir().unwrap();
     let bin = t.path().join("bin");
     fs::create_dir(&bin).unwrap();
@@ -124,7 +124,12 @@ fn child_with(
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
     let home = t.path().join("home");
-    (launches, home, t)
+    (
+        launches,
+        home,
+        t,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 fn is_child(name: &str) -> bool {
     std::env::var("ASWAP_AGY_CHILD").as_deref() == Ok(name)
@@ -158,7 +163,7 @@ fn two_accounts() -> Store {
 
 #[test]
 fn capture_copies_the_login_and_refuses_billed_or_torn_ones() {
-    child("capture_child", "none");
+    let _ = child("capture_child", "none");
 }
 #[test]
 fn capture_child() {
@@ -220,7 +225,8 @@ fn capture_child() {
 #[test]
 fn a_stuck_agy_at_its_quota_fails_over_and_resumes_the_conversation() {
     // The user's first prompt (-i) is said once, never replayed.
-    let (launches, _, _t) = child_with("run_child", "stuck", r#"["-i","synthetic first prompt"]"#);
+    let (launches, _, _t, stderr) =
+        child_with("run_child", "stuck", r#"["-i","synthetic first prompt"]"#);
     let first: Vec<String> = serde_json::from_value(launches[0]["args"].clone()).unwrap();
     assert!(
         first.contains(&"synthetic first prompt".to_owned()),
@@ -237,17 +243,23 @@ fn a_stuck_agy_at_its_quota_fails_over_and_resumes_the_conversation() {
     );
     assert_eq!(resumed.len(), 3, "{resumed:?}");
     assert!(!resumed.iter().any(|a| a.contains("synthetic first prompt")));
+    // The hidden session bus is said once.
+    assert_eq!(
+        stderr.matches("runs without the D-Bus session bus").count(),
+        1,
+        "{stderr}"
+    );
 }
 
 #[test]
 fn a_redrawn_agy_notice_followed_by_work_never_switches() {
-    let (launches, _, _t) = child("run_child", "redraw");
+    let (launches, _, _t, _) = child("run_child", "redraw");
     assert_eq!(launches.len(), 1, "{launches:?}");
 }
 
 #[test]
 fn a_login_agy_refreshed_in_its_view_is_written_back() {
-    let (launches, home, _t) = child("run_child", "refresh");
+    let (launches, home, _t, _) = child("run_child", "refresh");
     assert_eq!(launches.len(), 1, "{launches:?}");
     let data = home.parent().unwrap().join("data/aswap");
     let profile: Value = store::json_read(

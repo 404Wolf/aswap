@@ -279,7 +279,7 @@ pub fn check_args(args: &[String]) -> Result<()> {
                 });
                 let Some(settings) = settings else {
                     return Err(Error(
-                        "agy --settings must be readable JSON so aswap can check it",
+                        "agy --settings must be inline JSON or a regular JSON file (not a symlink) so aswap can check it",
                     ));
                 };
                 if settings.get("useG1Credits").and_then(Value::as_bool) == Some(true) {
@@ -379,6 +379,17 @@ pub fn other_builds(root: &Path) -> Vec<u32> {
         else {
             continue;
         };
+        // Only this user's processes can use this user's store; another
+        // user's aswap never blocks `add agy`.
+        let mine = {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: getuid has no preconditions and cannot fail.
+            let uid = unsafe { libc::getuid() };
+            std::fs::metadata(entry.path()).is_ok_and(|m| m.uid() == uid)
+        };
+        if !mine {
+            continue;
+        }
         let Ok(exe) = std::fs::read_link(entry.path().join("exe")) else {
             continue;
         };
