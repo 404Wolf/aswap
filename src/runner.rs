@@ -976,7 +976,19 @@ fn limit_seen(
             moment.exited == Some(true),
             || rotated_since(store, account, moment.launched),
             || usage::cached(store, account).ok(),
-            || usage::cached_force(store, account, true).ok(),
+            || {
+                // Off the terminal thread: a forced read can wait for
+                // another fetch, or for the owner on a follower.
+                let (tx, rx) = std::sync::mpsc::channel();
+                let (root, account) = (store.root.clone(), account.clone());
+                std::thread::spawn(move || {
+                    let reading = Store::open(root)
+                        .and_then(|store| usage::cached_force(&store, &account, true))
+                        .ok();
+                    let _ = tx.send(reading);
+                });
+                rx
+            },
             now,
         );
     }

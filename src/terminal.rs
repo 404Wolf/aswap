@@ -538,35 +538,83 @@ fn diagnostic_line(line: &str, on_codex: bool) -> (bool, bool, bool) {
     )
 }
 
+/// Codex's usage-limit notice in each wording its plans get, as normalize()
+/// leaves it: "you've hit your usage limit", then optionally " · resets ..."
+/// or one sentence that ends in a retry time ("try again later", "at 4:31
+/// pm", "in 2 hours 15 minutes"), led by an upgrade, credits or admin offer.
+/// Free plans get only the upgrade ("upgrade to plus to continue using
+/// codex ..."). Anything else after the notice is prose, not a notice.
 fn codex_limit_notice(line: &str) -> bool {
     let Some(suffix) = line.strip_prefix(CODEX_LIMIT) else {
         return false;
     };
-    if matches!(suffix, "" | ".") {
+    if matches!(suffix, "" | ".") || suffix.starts_with(" · resets ") {
         return true;
     }
-    if suffix.starts_with(" · resets ") {
+    let Some(sentence) = suffix.strip_prefix(". ") else {
+        return false;
+    };
+    if sentence.starts_with("upgrade to plus to continue using codex") && sentence.ends_with('.') {
         return true;
     }
-    const SETTINGS: &str = ". visit https://chatgpt.com/settings/usage to purchase more credits";
-    let reset = suffix.strip_prefix(". try again ").or_else(|| {
-        suffix
-            .strip_prefix(SETTINGS)?
-            .strip_prefix(" or try again ")
-    });
-    reset.is_some_and(|reset| {
-        reset == "later."
-            || reset.strip_prefix("at ").is_some_and(|at| {
-                let at = at.strip_suffix('.').unwrap_or(at);
-                let mut parts = at.rsplitn(3, ' ');
-                let (Some(period), Some(time)) = (parts.next(), parts.next()) else {
-                    return false;
-                };
-                matches!(period, "am" | "pm")
-                    && chrono::NaiveTime::parse_from_str(&format!("{time} {period}"), "%I:%M %P")
-                        .is_ok()
-            })
-    })
+    const OFFERS: [&str; 4] = [
+        "visit https://chatgpt.com/settings/usage to purchase more credits or ",
+        "visit https://chatgpt.com/codex/settings/usage to purchase more credits or ",
+        "to get more access now, send a request to your admin or ",
+        "",
+    ];
+    // "upgrade to pro (<link>) or ...", "upgrade to pro (<link>), visit ...".
+    let offer = match sentence.strip_prefix("upgrade to ") {
+        Some(upgrade) => {
+            let Some((_, rest)) = upgrade.split_once(')') else {
+                return false;
+            };
+            let rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
+            rest.strip_prefix("or ").unwrap_or(rest)
+        }
+        None => sentence,
+    };
+    let Some(retry) = OFFERS.iter().find_map(|o| {
+        offer
+            .strip_prefix(o)
+            .and_then(|r| r.strip_prefix("try again "))
+    }) else {
+        return false;
+    };
+    retry_time(retry)
+}
+
+/// "later.", "at 4:31 pm.", "at nov 21st, 2026 4:31 pm." or "in 2 hours 15
+/// minutes." (also "1 day, 3 hours and 5 minutes").
+fn retry_time(retry: &str) -> bool {
+    if retry == "later." {
+        return true;
+    }
+    if let Some(at) = retry.strip_prefix("at ") {
+        let at = at.strip_suffix('.').unwrap_or(at);
+        let mut parts = at.rsplitn(3, ' ');
+        let (Some(period), Some(time)) = (parts.next(), parts.next()) else {
+            return false;
+        };
+        return matches!(period, "am" | "pm")
+            && chrono::NaiveTime::parse_from_str(&format!("{time} {period}"), "%I:%M %P").is_ok();
+    }
+    let Some(span) = retry.strip_prefix("in ").and_then(|s| s.strip_suffix('.')) else {
+        return false;
+    };
+    let words: Vec<&str> = span
+        .split([' ', ','])
+        .filter(|w| !w.is_empty() && *w != "and")
+        .collect();
+    !words.is_empty()
+        && words.len().is_multiple_of(2)
+        && words.chunks(2).all(|pair| {
+            pair[0].parse::<u64>().is_ok()
+                && matches!(
+                    pair[1],
+                    "day" | "days" | "hour" | "hours" | "minute" | "minutes" | "second" | "seconds"
+                )
+        })
 }
 
 pub(crate) fn claude_compaction_limit(line: &str) -> bool {
@@ -640,8 +688,23 @@ mod tests {
             "\u{25a0} You've hit your usage limit\r\n",
             "\u{25a0} Error running remote compact task: You've hit your usage limit. Try again later.\r\n",
             "usage_limit_reached\r\n",
+            // Each plan's wording.
+            "\u{25a0} You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing) or try again in 2 hours 15 minutes.\r\n",
+            "\u{25a0} You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:31 PM.\r\n",
+            "\u{25a0} You've hit your usage limit. Upgrade to Plus to continue using Codex (https://openai.com/chatgpt/pricing).\r\n",
+            "\u{25a0} You've hit your usage limit. To get more access now, send a request to your admin or try again in 1 day, 3 hours and 5 minutes.\r\n",
+            "\u{25a0} You've hit your usage limit. Try again in 5 hours.\r\n",
+            "\u{25a0} You've hit your usage limit. Try again in 1 minute.\r\n",
         ] {
             assert!(codex_feed(notice).notice, "{notice:?}");
+        }
+        for prose in [
+            "You've hit your usage limit. Try again in a bit, I guess.\r\n",
+            "You've hit your usage limit. Upgrade to Pro, they said.\r\n",
+            "You've hit your usage limit. Try again in 5 hours\r\n",
+            "You've hit your usage limit, apparently. Try again later.\r\n",
+        ] {
+            assert_eq!(codex_feed(prose), Default::default(), "{prose:?}");
         }
         // Tool output and Claude's wording, as Codex's TUI draws them.
         for other in [

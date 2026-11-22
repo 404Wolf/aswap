@@ -35,6 +35,16 @@ fn codex_usage_limit_reloads_rotated_auth_only_when_quota_is_available() {
 }
 
 #[test]
+fn a_redrawn_codex_notice_over_a_healthy_account_never_switches() {
+    // The resumed Codex shows an old limit notice at once; its account has
+    // 20% used (cached, and again when read at the end of the window).
+    diagnostic_case(
+        "\u{25a0} You've hit your usage limit. Try again later.",
+        "codex-redraw",
+    );
+}
+
+#[test]
 fn claude_screen_only_limit_requires_an_active_menu_and_exhausted_quota_at_startup() {
     let menu = "│ What do you want to do?\n│ ❯ 1. Stop and wait for limit to reset\n│   2. Upgrade";
     diagnostic_case(menu, "claude-menu");
@@ -62,6 +72,7 @@ if args[:1]==['app-server']:
         req=json.loads(line)
         if req.get('method')=='initialize': result={}
         elif req.get('method')=='model/list': result={'data':[{'model':'synthetic-model','id':'synthetic-model','isDefault':True}]}
+        elif req.get('method')=='account/rateLimits/read': result={'rateLimits':{'primary':{'usedPercent':20,'windowDurationMins':300,'resetsAt':int(time.time())+3600}}}
         else: continue
         print(json.dumps({'id':req['id'],'result':result}),flush=True)
     sys.exit(0)
@@ -79,7 +90,7 @@ transcript.parent.mkdir(parents=True,exist_ok=True)
 if 'synthetic-second' in auth or 'synthetic-rotated' in auth:
     if scenario=='codex-rotated': assert 'synthetic-rotated' in auth
     if scenario=='codex-exhausted': assert 'synthetic-second' in auth
-    assert scenario not in ('claude-healthy-menu','claude-startup-redraw')
+    assert scenario not in ('claude-healthy-menu','claude-startup-redraw','codex-redraw')
     expected=base+sticky
     assert args==expected or args==expected+['--','You were interrupted by a usage-limit account switch. Continue exactly where you left off.']
     assert transcript.read_text().startswith('synthetic shared conversation')
@@ -96,7 +107,7 @@ def replace_json(path, data):
     replacement=path.with_suffix('.synthetic-replacement')
     replacement.write_text(json.dumps(data))
     replacement.replace(path)
-if scenario.startswith('codex-') and 'synthetic-first' in auth:
+if scenario in ('codex-rotated','codex-exhausted') and 'synthetic-first' in auth:
     data=json.loads((profile/'auth.json').read_text())
     data['tokens']['access_token']='synthetic-rotated'
     replace_json(profile/'auth.json',data)
@@ -114,8 +125,10 @@ if provider=='claude' and not scenario and 'limit' in os.environ['ASWAP_TEST_FAI
     with transcript.open('a') as t:
         t.write('\n'+json.dumps({'type':'assistant','timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat(),'isApiErrorMessage':True,'error':'rate_limit'})+'\n')
 if 'synthetic-clean' in auth: sys.exit(0)
-if scenario in ('claude-healthy-menu','claude-startup-redraw'):
-    time.sleep(.8)
+if scenario in ('claude-healthy-menu','claude-startup-redraw','codex-redraw'):
+    # A resumed Codex redraws an old notice, then keeps working past the
+    # early window (15 s) and the quota check at its end.
+    time.sleep(18 if scenario=='codex-redraw' else .8)
     (p/'completed').write_text('provider continued')
     sys.exit(0)
 with transcript.open('a') as held:
@@ -164,7 +177,10 @@ with transcript.open('a') as held:
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    if scenario.starts_with("codex-") {
+    if scenario == "codex-redraw" {
+        let trace = String::from_utf8_lossy(&out.stderr);
+        assert!(!trace.contains("waiting on a usage limit"), "{trace}");
+    } else if scenario.starts_with("codex-") {
         let trace = String::from_utf8_lossy(&out.stderr);
         assert!(
             trace.contains("credentials_changed_since_launch=true"),
@@ -297,7 +313,7 @@ fn runner_child() {
                 .unwrap();
             if matches!(
                 scenario.as_str(),
-                "claude-healthy-menu" | "claude-startup-redraw"
+                "claude-healthy-menu" | "claude-startup-redraw" | "codex-redraw"
             ) {
                 assert!(
                     views
