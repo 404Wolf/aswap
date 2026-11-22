@@ -85,7 +85,7 @@ enum Action {
         #[arg(value_enum, required = true)]
         action: Option<AutoAction>,
         #[arg(
-            help = "Percentage for threshold; text or off for resume-prompt; headroom or weekly-reset for prefer; off, dry-run or on for reset (Codex only); account label for reserve or unreserve"
+            help = "Percentage for threshold; text or off for resume-prompt; headroom or weekly-reset for prefer; off, dry-run, on, retry or dismiss for reset (Codex only); account label for reserve or unreserve"
         )]
         value: Option<String>,
         #[arg(
@@ -553,7 +553,7 @@ fn execute(cli: Cli) -> Result<i32> {
             ) != value.is_some()
             {
                 return Err(Error(
-                    "threshold requires a percentage; resume-prompt requires text or off; prefer requires headroom or weekly-reset; reset requires off, dry-run or on; reserve and unreserve require an account label; other actions take no value",
+                    "threshold requires a percentage; resume-prompt requires text or off; prefer requires headroom or weekly-reset; reset requires off, dry-run, on, retry or dismiss; reserve and unreserve require an account label; other actions take no value",
                 ));
             }
             match action {
@@ -582,6 +582,32 @@ fn execute(cli: Cli) -> Result<i32> {
                 | AutoAction::Prefer
                 | AutoAction::Reset
                 | AutoAction::ResumePrompt => {
+                    // A reset mode change waits for a running reset tick and
+                    // holds it off: the reset lock first, then the store lock.
+                    let _reset = matches!(action, AutoAction::Reset)
+                        .then(|| aswap::reset::change_lock(&store))
+                        .transpose()?;
+                    let value_ref = value.as_deref();
+                    if matches!(action, AutoAction::Reset)
+                        && matches!(value_ref, Some("retry" | "dismiss"))
+                    {
+                        let _lock = store.lock()?;
+                        let dismiss = value_ref == Some("dismiss");
+                        let label = aswap::reset::settle_paused(&store, dismiss)?;
+                        let verb = if dismiss { "dropped" } else { "will resend" };
+                        let pretty = match &label {
+                            Some(label) => format!(
+                                "codex:{label}: {verb} the unresolved usage reset (same key)"
+                            ),
+                            None => "no unresolved Codex usage reset".into(),
+                        };
+                        output(
+                            &json!({"provider":provider,"pending":label,"dismissed":dismiss}),
+                            cli.json,
+                            pretty,
+                        )?;
+                        return Ok(0);
+                    }
                     let _lock = store.lock()?;
                     let mut state = store.load()?;
                     let settings = state.auto.entry(provider).or_default();
@@ -605,7 +631,9 @@ fn execute(cli: Cli) -> Result<i32> {
                         }
                         AutoAction::Reset => {
                             let mode = store::AutoReset::from_str(value.as_deref().unwrap(), false)
-                                .map_err(|_| Error("reset must be off, dry-run or on"))?;
+                                .map_err(|_| {
+                                    Error("reset must be off, dry-run, on, retry or dismiss")
+                                })?;
                             aswap::reset::set_mode(&store, provider, settings, mode)?;
                         }
                         AutoAction::ResumePrompt => {

@@ -35,6 +35,48 @@ pub struct Usage {
     /// Codex usage-limit reset credits as the app-server lists them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reset_credits: Vec<ResetCredit>,
+    /// Whether the read listed credit details (`credits` was an array). When
+    /// only the count is known (`credits` null), or the cache predates this
+    /// field, availability stays unknown rather than "none".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset_credits_listed: bool,
+    /// Codex's `ordinaryUsageAllowed`, the backend's permission for ordinary
+    /// usage (see [`OrdinaryUsage`]).
+    #[serde(default, skip_serializing_if = "OrdinaryUsage::not_reported")]
+    pub ordinary_usage: OrdinaryUsage,
+}
+/// Codex's `ordinaryUsageAllowed` (app-server protocol v2): the backend's
+/// permission for ordinary included usage. Upstream: "Null means
+/// unavailable; clients must not infer recovery from percentages or reset
+/// times." Older Codex versions don't report it at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OrdinaryUsage {
+    /// The read has no such field: an older Codex. Percentages decide.
+    #[default]
+    NotReported,
+    /// Reported as null: permission unknown.
+    Unknown,
+    Allowed,
+    Denied,
+}
+impl OrdinaryUsage {
+    fn not_reported(&self) -> bool {
+        *self == Self::NotReported
+    }
+    pub fn from_read(v: &Value) -> Self {
+        match v.get("ordinaryUsageAllowed") {
+            None => Self::NotReported,
+            Some(Value::Bool(true)) => Self::Allowed,
+            Some(Value::Bool(false)) => Self::Denied,
+            Some(_) => Self::Unknown,
+        }
+    }
+    /// Whether this reading may count as recovered usage: not denied, and
+    /// not unknown on a Codex that reports the permission.
+    pub fn permits_recovery(self) -> bool {
+        matches!(self, Self::NotReported | Self::Allowed)
+    }
 }
 /// One Codex usage-limit reset credit. Redeeming it resets the account's
 /// eligible windows (5-hour and weekly together); it is an earned, expiring
@@ -477,6 +519,10 @@ pub fn parse_codex(v: &Value) -> Result<Usage> {
         credits,
         available_usage_resets,
         reset_credits: parse_reset_credits(v),
+        reset_credits_listed: v
+            .pointer("/rateLimitResetCredits/credits")
+            .is_some_and(Value::is_array),
+        ordinary_usage: OrdinaryUsage::from_read(v),
     })
 }
 #[derive(Clone, Copy, Debug)]
@@ -1456,5 +1502,48 @@ mod rotation_tests {
         assert_eq!(forced(live, Failure::new("codex-rpc-timeout")), 0);
         assert_eq!(forced(now() - 1, Failure::new("codex-rpc-unavailable")), 1);
         assert_eq!(forced(live, Failure::http(401, 0)), 1);
+    }
+}
+#[cfg(test)]
+mod read_contract_tests {
+    use super::*;
+
+    fn read(extra: serde_json::Value) -> Usage {
+        let mut v = serde_json::json!({"rateLimits":{"primary":{"usedPercent":10,"windowDurationMins":300,"resetsAt":2000000000}}});
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        parse_codex(&v).unwrap()
+    }
+
+    #[test]
+    fn ordinary_usage_permission_is_kept_as_reported() {
+        assert_eq!(
+            read(serde_json::json!({})).ordinary_usage,
+            OrdinaryUsage::NotReported
+        );
+        let null = read(serde_json::json!({"ordinaryUsageAllowed": null}));
+        assert_eq!(null.ordinary_usage, OrdinaryUsage::Unknown);
+        assert!(!null.ordinary_usage.permits_recovery());
+        let denied = read(serde_json::json!({"ordinaryUsageAllowed": false}));
+        assert_eq!(denied.ordinary_usage, OrdinaryUsage::Denied);
+        assert!(!denied.ordinary_usage.permits_recovery());
+        let allowed = read(serde_json::json!({"ordinaryUsageAllowed": true}));
+        assert!(allowed.ordinary_usage.permits_recovery());
+        assert!(OrdinaryUsage::NotReported.permits_recovery());
+    }
+
+    #[test]
+    fn credit_details_null_and_empty_stay_distinct() {
+        let counted =
+            read(serde_json::json!({"rateLimitResetCredits":{"availableCount":2,"credits":null}}));
+        assert_eq!(counted.available_usage_resets, Some(2));
+        assert!(!counted.reset_credits_listed);
+        let empty =
+            read(serde_json::json!({"rateLimitResetCredits":{"availableCount":0,"credits":[]}}));
+        assert!(empty.reset_credits_listed && empty.reset_credits.is_empty());
+        let none = read(serde_json::json!({}));
+        assert_eq!(none.available_usage_resets, None);
+        assert!(!none.reset_credits_listed);
     }
 }

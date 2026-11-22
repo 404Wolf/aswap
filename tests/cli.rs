@@ -396,7 +396,8 @@ fn write_codex_cache(t: &Sandbox, label: &str, weekly: f64, reset: u64, credits:
                     {"name":"weekly","used_percent":weekly,"resets_at":reset,"duration_minutes":10080,"codex_slot":1}
                 ],
                 "available_usage_resets":count,
-                "reset_credits":credits
+                "reset_credits":credits,
+                "reset_credits_listed":true
             },
             "fetched_at":at,"next_poll_at":at+180,"last_attempt":at
         })

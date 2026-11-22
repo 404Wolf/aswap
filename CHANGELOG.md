@@ -3,6 +3,14 @@
 ## Unreleased
 
 ### Fixed
+- **Codex usage-limit resets, per the independent audit (asw-bx2, F1-F6).**
+  - F1: an unknown reset-credit count or detail list is unknown, not "none", and defers a redemption that account could outrank.
+  - F2: a request with no answer is paused with its key, never dropped or re-keyed; it ends only with `aswap auto codex reset retry` (same key) or `aswap auto codex reset dismiss`.
+  - F3: every intent, attempt and outcome goes to an fsynced, append-only `codex-resets.journal`, replayed on load. Mode changes wait for a running decision, and the mode is rechecked right before sending.
+  - F4 (Wolf's call): "exhausted" means every usable account (not reserved or signed out) has no usable quota now. Ranking uses the boundary that brings quota back.
+  - F5: a redeemed reset wakes waiting sessions at once and releases a hold on that account.
+  - F6: Codex's `ordinaryUsageAllowed` is honoured: null or false never counts as recovery.
+  - End-to-end tests against a fake app-server; no real reset is ever used.
 - **A newer owner no longer breaks an older follower's sync.** A sync packet with a profile of a provider the follower doesn't know now skips that profile instead of failing the whole packet. And settings only a newer aswap knows stay out of `--json` output.
 - **A rotated login survives a failed write.** When a token refresh succeeded but writing the new login failed (a full disk, EIO), the provider had already invalidated the old refresh token, and the new one was only in memory: the account needed a new login. The new login is now written first to two private pending copies: one beside the login, and one under `$XDG_RUNTIME_DIR` (a tmpfs, so a full or failing data disk keeps one). Each records which login file it replaces. The next refresh installs a copy only over that same file, so a stale copy never rolls back a newer login. `add` and a preserved live login drop any copies. (Audit asw-0ti P2-5.)
 - **state.json written by a newer aswap is kept whole.** Unknown top-level fields, unknown per-provider settings, and the accounts, active labels and settings of providers this version doesn't know were dropped on save, or (an unknown provider) made state.json unreadable. A long-running older supervisor could then undo a newer one's `reserved` accounts or switch interval, and a future provider's account would stop every older aswap. They are now read past and written back unchanged. A known provider's malformed settings are still an error. (Audit asw-0ti P2-3.)

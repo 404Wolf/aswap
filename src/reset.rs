@@ -2,11 +2,14 @@
 //!
 //! A Codex account can hold earned, expiring "usage limit reset" credits (in
 //! the Codex TUI: `/usage`, then "Redeem reset"). Redeeming one resets that
-//! account's eligible windows: the 5-hour and the weekly window together.
-//! The credits are a limited allowance, so aswap spends one only when every
-//! Codex account is out of weekly usage, and then on the account whose weekly
-//! window resets farthest away, the one that would otherwise stay blocked
-//! longest.
+//! account's eligible windows. The credits are a limited allowance, so aswap
+//! spends one only when every usable Codex account is out of usage (see
+//! `guard`), and then on the account whose quota would come back by itself
+//! the latest, the one that would otherwise stay blocked longest.
+//!
+//! Each redemption is journaled (`codex-resets.journal`, append-only, fsynced)
+//! before it is sent, with its idempotency key; a request whose outcome is
+//! unknown is paused, never forgotten or re-keyed (audit asw-bx2, F1-F6).
 //!
 //! [`decide`] is the pure rule. [`step`] runs one decision against a [`Port`]
 //! (usage reads, the redeem call and persistence), which tests replace with a
@@ -76,6 +79,15 @@ pub enum Hold {
     Changed {
         label: String,
     },
+    /// A paused redemption is unresolved; see [`Pending::paused`].
+    Unresolved {
+        label: String,
+    },
+    /// Whether this account has a usable reset credit isn't known (only a
+    /// count, or no count), and it could outrank the best known candidate.
+    AvailabilityUnknown {
+        label: String,
+    },
 }
 
 /// One reset-log entry. Idempotency keys and credit ids are never recorded here.
@@ -99,7 +111,12 @@ impl Record {
     fn may_have_spent(&self) -> bool {
         matches!(
             self.outcome.as_str(),
-            "reset" | "already-redeemed" | "gave-up" | "unconfirmed" | "refused-response"
+            "reset"
+                | "already-redeemed"
+                | "gave-up"
+                | "unconfirmed"
+                | "paused"
+                | "refused-response"
         )
     }
 }
@@ -149,6 +166,93 @@ pub struct Pending {
     pub retry_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre: Option<Snapshot>,
+    /// Why sending stopped while the outcome is still unknown. A paused
+    /// redemption is kept, with its key, until `reset retry` resends it (same
+    /// key) or `reset dismiss` drops it: aswap never forgets a request that
+    /// may have spent a credit, and never replaces it with a new key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<String>,
+}
+
+/// One append-only journal event (`codex-resets.journal`, fsynced per line).
+/// The journal holds keys and credit ids (needed to finish a redemption) and
+/// is never shown; the snapshot log is rebuilt from it on load.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
+pub enum Event {
+    /// A redemption is decided; nothing sent yet.
+    Intent { at: u64, pending: Pending },
+    /// Attempt `n` is about to be sent.
+    Attempt { at: u64, key: String, n: u32 },
+    /// Codex answered: reset, already-redeemed, nothing-to-reset, no-credit
+    /// or refused-response. Final.
+    Outcome {
+        at: u64,
+        key: String,
+        outcome: String,
+    },
+    /// Sending stopped with the outcome unknown; the key is kept.
+    Paused { at: u64, key: String, why: String },
+    /// `reset retry`: sending may resume, with the same key.
+    Resumed { at: u64, key: String },
+    /// Dropped before anything was sent. Final.
+    Dropped { at: u64, key: String, why: String },
+    /// `reset dismiss`: the user dropped an unresolved redemption. Final.
+    Dismissed { at: u64, key: String },
+}
+impl Event {
+    fn key(&self) -> &str {
+        match self {
+            Self::Intent { pending, .. } => &pending.idempotency_key,
+            Self::Attempt { key, .. }
+            | Self::Outcome { key, .. }
+            | Self::Paused { key, .. }
+            | Self::Resumed { key, .. }
+            | Self::Dropped { key, .. }
+            | Self::Dismissed { key, .. } => key,
+        }
+    }
+}
+/// The redemption the journal leaves unresolved, if any: its last intent,
+/// with the attempts and pause since, unless an outcome, a drop or a dismiss
+/// ended it. Lines that don't parse (a torn last write) are skipped.
+pub fn unresolved(journal: &str) -> Option<Pending> {
+    replay(journal).0
+}
+/// The unresolved redemption, and the keys the journal shows ended.
+fn replay(journal: &str) -> (Option<Pending>, std::collections::BTreeSet<String>) {
+    let mut closed = std::collections::BTreeSet::new();
+    let mut open: Option<Pending> = None;
+    for line in journal.lines() {
+        let Ok(event) = serde_json::from_str::<Event>(line) else {
+            continue;
+        };
+        match event {
+            Event::Intent { pending, .. } => open = Some(pending),
+            ref other => {
+                if matches!(
+                    other,
+                    Event::Outcome { .. } | Event::Dropped { .. } | Event::Dismissed { .. }
+                ) {
+                    closed.insert(other.key().to_owned());
+                }
+                let Some(pending) = open.as_mut().filter(|p| p.idempotency_key == other.key())
+                else {
+                    continue;
+                };
+                match other {
+                    Event::Attempt { n, .. } => pending.attempts = pending.attempts.max(*n),
+                    Event::Paused { why, .. } => pending.paused = Some(why.clone()),
+                    Event::Resumed { .. } => pending.paused = None,
+                    _ => {
+                        closed.insert(other.key().to_owned());
+                        open = None;
+                    }
+                }
+            }
+        }
+    }
+    (open, closed)
 }
 
 /// An account not to redeem for again before its weekly window resets.
@@ -203,37 +307,66 @@ impl ResetLog {
     fn prune(&mut self, at: u64) {
         self.skipped.retain(|s| s.until > at);
     }
-    /// Records a dropped pending redemption; see `drop_pending`.
-    fn abandon(&mut self, pending: Pending, why: &str, at: u64) {
-        self.pending = None;
-        let sent = pending.attempts > 0;
-        if sent {
-            self.skip(&pending.label, pending.weekly_resets_at);
+    /// Stops a pending redemption for `why`. One never sent is dropped. One
+    /// that was sent may have spent a credit, so it is kept, paused, with its
+    /// key: only `reset retry` (same key) or `reset dismiss` ends it. Returns
+    /// the journal event for it.
+    fn abandon(&mut self, mut pending: Pending, why: &str, at: u64) -> Event {
+        let key = pending.idempotency_key.clone();
+        if pending.attempts == 0 {
+            self.pending = None;
+            self.push(Record {
+                at,
+                label: pending.label.clone(),
+                outcome: "abandoned".into(),
+                weekly_resets_at: Some(pending.weekly_resets_at),
+                reason: format!("dropped a redeem request before sending it: {why}"),
+                pre: pending.pre.take(),
+                post: None,
+            });
+            return Event::Dropped {
+                at,
+                key,
+                why: why.to_owned(),
+            };
         }
-        self.push(Record {
+        if pending.paused.is_none() {
+            self.push(Record {
+                at,
+                label: pending.label.clone(),
+                outcome: "paused".into(),
+                weekly_resets_at: Some(pending.weekly_resets_at),
+                reason: format!(
+                    "a redeem request got no answer and is kept, with its key, until `reset retry` or `reset dismiss`: {why}"
+                ),
+                pre: pending.pre.clone(),
+                post: None,
+            });
+        }
+        self.skip(&pending.label, pending.weekly_resets_at);
+        pending.paused = Some(why.to_owned());
+        self.pending = Some(pending);
+        Event::Paused {
             at,
-            label: pending.label,
-            outcome: if sent { "unconfirmed" } else { "abandoned" }.into(),
-            weekly_resets_at: Some(pending.weekly_resets_at),
-            reason: if sent {
-                format!("dropped a redeem request that got no answer: {why}")
-            } else {
-                format!("dropped a redeem request before sending it: {why}")
-            },
-            pre: pending.pre,
-            post: None,
-        });
-    }
-    /// `reset off`: clears a halt and drops any pending redemption, recording
-    /// it. Returns whether anything changed.
-    pub fn turn_off(&mut self, at: u64) -> bool {
-        let halted = self.halted.take().is_some();
-        let pending = self.pending.take();
-        let changed = halted || pending.is_some();
-        if let Some(pending) = pending {
-            self.abandon(pending, "usage resets were turned off", at);
+            key,
+            why: why.to_owned(),
         }
-        changed
+    }
+    /// `reset off`: clears a halt and stops any pending redemption (see
+    /// `abandon`). Returns whether anything changed, and the journal event.
+    pub fn turn_off(&mut self, at: u64) -> (bool, Option<Event>) {
+        let halted = self.halted.take().is_some();
+        let event = match self.pending.take() {
+            Some(p) if p.paused.is_none() => {
+                Some(self.abandon(p, "usage resets were turned off", at))
+            }
+            other => {
+                // Already paused: kept as it is.
+                self.pending = other;
+                None
+            }
+        };
+        (halted || event.is_some(), event)
     }
     /// The log without idempotency keys or credit ids, for status output.
     pub fn summary(&self) -> Value {
@@ -243,6 +376,7 @@ impl ResetLog {
                 "attempts": p.attempts,
                 "retry_at": p.retry_at,
                 "started_at": p.started_at,
+                "paused": p.paused,
             })),
             "halted": self.halted,
             "skipped": self.skipped,
@@ -292,30 +426,109 @@ fn response_mentions_money(v: &Value) -> bool {
     }
 }
 
-/// Every Codex account must be known to be out of weekly usage.
-fn guard(entries: &[(Account, Cached)], at: u64) -> std::result::Result<usize, Hold> {
-    let mut count = 0;
-    for (account, cache) in entries
-        .iter()
-        .filter(|(a, _)| a.provider == Provider::Codex)
-    {
-        count += 1;
-        let weekly = cache
-            .used(at)
-            .and_then(|_| cache.usage.weekly(at))
-            .ok_or_else(|| Hold::UsageUnknown {
-                label: account.label.clone(),
-            })?;
-        if weekly.used_percent < 100.0 {
-            return Err(Hold::Headroom {
-                label: account.label.clone(),
-            });
+/// Whether a reading shows an account signed out (its login rejected): such
+/// an account can't use a reset, so it neither blocks one nor gets one.
+fn signed_out(cache: &Cached) -> bool {
+    matches!(
+        cache.error.as_deref(),
+        Some("http-401" | "refresh-invalid-grant" | "refresh-http-401")
+    )
+}
+
+/// When the pool counts as exhausted, and when each account's quota comes
+/// back. **This reading is Wolf's call** (t46r's proposal, audit F4): the
+/// pool is exhausted when every *pool-usable* Codex account (not reserved,
+/// not signed out; those neither block nor get chosen) has no usable quota
+/// now: the backend denies ordinary usage, or some window is used up and
+/// hasn't reset. Unknown usage on a usable account defers the decision.
+///
+/// Returns, for each usable account (an index into `entries`), its recovery
+/// boundary: the next time its quota would come back by itself, i.e. the
+/// latest reset among its used-up windows. For an account out of weekly
+/// usage that is the weekly reset, so 7 days outranks 3 days.
+fn guard(
+    entries: &[(Account, Cached)],
+    settings: &Auto,
+    at: u64,
+) -> std::result::Result<Vec<(usize, u64)>, Hold> {
+    let mut usable = Vec::new();
+    for (index, (account, cache)) in entries.iter().enumerate() {
+        if account.provider != Provider::Codex
+            || !settings.allows(&account.label, None)
+            || signed_out(cache)
+        {
+            continue;
         }
+        let unknown = || Hold::UsageUnknown {
+            label: account.label.clone(),
+        };
+        cache.used(at).ok_or_else(unknown)?;
+        let future = |w: &&crate::usage::Window| w.resets_at.is_some_and(|r| r > at);
+        let used_up = cache
+            .usage
+            .windows
+            .iter()
+            .filter(future)
+            .filter(|w| w.used_percent >= 100.0)
+            .filter_map(|w| w.resets_at)
+            .max();
+        let denied = cache.usage.ordinary_usage == crate::usage::OrdinaryUsage::Denied;
+        let boundary = match (used_up, denied) {
+            (Some(boundary), _) => boundary,
+            // Denied with no window used up: back when its windows reset.
+            (None, true) => cache
+                .usage
+                .windows
+                .iter()
+                .filter(future)
+                .filter_map(|w| w.resets_at)
+                .max()
+                .ok_or_else(unknown)?,
+            (None, false) => {
+                return Err(Hold::Headroom {
+                    label: account.label.clone(),
+                });
+            }
+        };
+        usable.push((index, boundary));
     }
-    if count == 0 {
+    if usable.is_empty() {
         return Err(Hold::NoAccounts);
     }
-    Ok(count)
+    Ok(usable)
+}
+
+/// What an account's reading says about its reset credits.
+enum Credit<'a> {
+    Known(&'a ResetCredit),
+    None,
+    /// Only a count, no count, or a count the listed credits don't explain.
+    Unknown,
+}
+fn credit_of(cache: &Cached, at: u64) -> std::result::Result<Credit<'_>, ()> {
+    let Some(count) = cache.usage.available_usage_resets else {
+        return Ok(Credit::Unknown);
+    };
+    if count == 0 {
+        return Ok(Credit::None);
+    }
+    if !cache.usage.reset_credits_listed {
+        return Ok(Credit::Unknown);
+    }
+    let credits: Vec<&ResetCredit> = cache
+        .usage
+        .reset_credits
+        .iter()
+        .filter(|c| c.available() && c.expires_at.is_none_or(|e| e > at))
+        .collect();
+    if credits.iter().any(|c| credit_mentions_money(c)) {
+        return Err(());
+    }
+    let soonest = |c: &&ResetCredit| (c.expires_at.unwrap_or(u64::MAX), c.id.clone());
+    Ok(credits
+        .into_iter()
+        .min_by(|a, b| soonest(a).cmp(&soonest(b)))
+        .map_or(Credit::Unknown, Credit::Known))
 }
 
 /// The rule, without I/O: redeem nothing unless every Codex account is out of
@@ -343,46 +556,50 @@ pub fn decide(
     if let Some(until) = log.cooldown_until().filter(|until| *until > at) {
         return Err(Hold::Cooldown { until }.into());
     }
-    let accounts = guard(entries, at)?;
+    let usable = guard(entries, settings, at)?;
+    let accounts = usable.len();
+    // (boundary, credit expiry, label, credit) of the best known candidate,
+    // and the best boundary among accounts whose credits aren't known.
     let mut best: Option<(u64, u64, &str, &ResetCredit)> = None;
-    for (account, cache) in entries
-        .iter()
-        .filter(|(a, _)| a.provider == Provider::Codex)
-    {
-        if !settings.allows(&account.label, None) || log.skipped(&account.label, at) {
+    let mut unknown: Option<(u64, &str)> = None;
+    for (index, boundary) in usable {
+        let (account, cache) = &entries[index];
+        if log.skipped(&account.label, at) {
             continue;
         }
-        if cache.usage.available_usage_resets.unwrap_or(0) == 0 {
-            continue;
-        }
-        let credits: Vec<&ResetCredit> = cache
-            .usage
-            .reset_credits
-            .iter()
-            .filter(|c| c.available() && c.expires_at.is_none_or(|e| e > at))
-            .collect();
-        if credits.iter().any(|c| credit_mentions_money(c)) {
-            return Err(Refusal::Money {
-                label: account.label.clone(),
-            });
-        }
-        let soonest = |c: &&ResetCredit| (c.expires_at.unwrap_or(u64::MAX), c.id.clone());
-        let Some(credit) = credits
-            .into_iter()
-            .min_by(|a, b| soonest(a).cmp(&soonest(b)))
-        else {
-            continue;
+        let credit = match credit_of(cache, at) {
+            Ok(Credit::Known(credit)) => credit,
+            Ok(Credit::None) => continue,
+            Ok(Credit::Unknown) => {
+                if unknown.is_none_or(|(b, _)| boundary > b) {
+                    unknown = Some((boundary, account.label.as_str()));
+                }
+                continue;
+            }
+            Err(()) => {
+                return Err(Refusal::Money {
+                    label: account.label.clone(),
+                });
+            }
         };
-        // guard() proved a weekly window with a future reset.
-        let weekly = cache.usage.weekly_reset(at).unwrap_or(0);
         let expires = credit.expires_at.unwrap_or(u64::MAX);
         let better = best.is_none_or(|(w, e, label, _)| {
-            (std::cmp::Reverse(weekly), expires, account.label.as_str())
+            (std::cmp::Reverse(boundary), expires, account.label.as_str())
                 < (std::cmp::Reverse(w), e, label)
         });
         if better {
-            best = Some((weekly, expires, account.label.as_str(), credit));
+            best = Some((boundary, expires, account.label.as_str(), credit));
         }
+    }
+    // An account whose credits aren't known could be the right one: defer
+    // rather than spend on a nearer one (never consume to find out).
+    if let Some((boundary, label)) = unknown
+        && best.is_none_or(|(b, _, _, _)| boundary >= b)
+    {
+        return Err(Hold::AvailabilityUnknown {
+            label: label.to_owned(),
+        }
+        .into());
     }
     let (weekly, _, label, credit) = best.ok_or(Hold::NoCredit)?;
     Ok(ResetDecision {
@@ -391,7 +608,7 @@ pub fn decide(
         weekly_resets_at: weekly,
         credit_expires_at: credit.expires_at,
         reason: format!(
-            "all {accounts} Codex accounts are out of weekly usage; {label}'s weekly window resets farthest away, in {}",
+            "all {accounts} usable Codex accounts are out of usage; {label}'s quota comes back farthest away, in {}",
             crate::display::duration(weekly.saturating_sub(at))
         ),
     })
@@ -425,6 +642,10 @@ pub trait Port {
     ) -> Result<Value>;
     fn save(&mut self, log: &ResetLog) -> Result<()>;
     fn new_key(&mut self) -> Result<String>;
+    /// Appends one journal event durably (fsynced) before going on.
+    fn journal(&mut self, event: &Event) -> Result<()>;
+    /// The reset mode as stored now, rechecked right before a request is sent.
+    fn mode(&mut self) -> Result<AutoReset>;
 }
 
 /// What one step did.
@@ -459,6 +680,12 @@ pub enum Step {
     Waiting {
         label: String,
         retry_at: u64,
+    },
+    /// A redemption that may have spent a credit is kept, paused, until
+    /// `reset retry` or `reset dismiss`; nothing new is decided meanwhile.
+    Paused {
+        label: String,
+        why: String,
     },
     /// A credit or response mentioned money.
     Refused {
@@ -502,6 +729,9 @@ impl Step {
             Self::Failed { label, .. } => format!(
                 "aswap: codex:{label} usage reset failed {MAX_ATTEMPTS} times; giving up until its weekly reset"
             ),
+            Self::Paused { label, why } => format!(
+                "aswap: codex:{label} usage reset paused with its outcome unknown ({why}); its key is kept: `aswap auto codex reset retry` resends it, `reset dismiss` drops it"
+            ),
             Self::Refused { label, halted } => format!(
                 "aswap: refused to reset codex:{label}: the reset offer mentions payment, credits or upgrades{}",
                 if *halted {
@@ -538,6 +768,18 @@ pub fn step(
     log.prune(at);
     if let Some(pending) = log.pending.clone() {
         return resume(port, settings, &entries, log, pending, at);
+    }
+    // A usable account without a fresh reading (one a run just marked
+    // limited, say) is read now, so it's known rather than deferring.
+    for (account, cache) in &mut entries {
+        if account.provider == Provider::Codex
+            && settings.allows(&account.label, None)
+            && !signed_out(cache)
+            && cache.used(at).is_none()
+            && let Ok(fresh) = port.refresh(account)
+        {
+            *cache = fresh;
+        }
     }
     let decision = match decide(provider, settings, &entries, log, at) {
         Ok(decision) => decision,
@@ -601,7 +843,13 @@ pub fn step(
         attempts: 0,
         retry_at: at,
         pre: Some(Snapshot::of(&pre)),
+        paused: None,
     });
+    // The intent is journaled (fsynced) before anything is sent.
+    port.journal(&Event::Intent {
+        at,
+        pending: log.pending.clone().expect("just set"),
+    })?;
     port.save(log)?;
     attempt(port, settings, log, &account, at)
 }
@@ -621,6 +869,13 @@ fn resume(
     pending: Pending,
     at: u64,
 ) -> Result<Step> {
+    if pending.paused.is_some() {
+        return Ok(Step::Held {
+            hold: Hold::Unresolved {
+                label: pending.label,
+            },
+        });
+    }
     let waiting = Step::Waiting {
         label: pending.label.clone(),
         retry_at: pending.retry_at,
@@ -634,8 +889,11 @@ fn resume(
     if !settings.allows(&pending.label, None) {
         return drop_pending(port, log, pending, "its account is reserved", at);
     }
-    if !matches!(guard(entries, at), Ok(_) | Err(Hold::UsageUnknown { .. })) {
-        return drop_pending(port, log, pending, "an account has weekly usage again", at);
+    if !matches!(
+        guard(entries, settings, at),
+        Ok(_) | Err(Hold::UsageUnknown { .. })
+    ) {
+        return drop_pending(port, log, pending, "an account has usable quota again", at);
     }
     if settings.auto_reset != AutoReset::On || at < pending.retry_at || log.halted.is_some() {
         return Ok(waiting);
@@ -646,11 +904,11 @@ fn resume(
     };
     let mut entries = entries.to_vec();
     entries[index].1 = fresh;
-    match guard(&entries, at) {
+    match guard(&entries, settings, at) {
         Ok(_) => {}
         Err(Hold::UsageUnknown { .. }) => return Ok(waiting),
         Err(_) => {
-            return drop_pending(port, log, pending, "an account has weekly usage again", at);
+            return drop_pending(port, log, pending, "an account has usable quota again", at);
         }
     }
     // The credit is sent by id, so only that credit can be spent. A credit
@@ -664,7 +922,8 @@ fn resume(
     {
         if credit_mentions_money(credit) {
             let label = pending.label.clone();
-            log.abandon(pending, "its credit now mentions money", at);
+            let event = log.abandon(pending, "its credit now mentions money", at);
+            port.journal(&event)?;
             return refuse(port, settings, log, label, None, at);
         }
         if credit.expires_at.is_some_and(|e| e <= at) {
@@ -685,10 +944,14 @@ fn drop_pending(
     at: u64,
 ) -> Result<Step> {
     let label = pending.label.clone();
-    log.abandon(pending, why, at);
+    let event = log.abandon(pending, why, at);
+    port.journal(&event)?;
     port.save(log)?;
-    Ok(Step::Held {
-        hold: Hold::Changed { label },
+    Ok(match event {
+        Event::Paused { why, .. } => Step::Paused { label, why },
+        _ => Step::Held {
+            hold: Hold::Changed { label },
+        },
     })
 }
 
@@ -720,10 +983,29 @@ fn attempt(
     at: u64,
 ) -> Result<Step> {
     let mut pending = log.pending.clone().ok_or(Error("no pending reset"))?;
+    // Recheck the authority to send at the last moment: a `reset off` or
+    // `dry-run` stored since the tick began wins (it also takes the reset
+    // lock, so it can't land between this check and the send).
+    if port.mode()? != AutoReset::On {
+        return Ok(Step::Waiting {
+            label: pending.label,
+            retry_at: pending.retry_at,
+        });
+    }
     pending.attempts += 1;
+    port.journal(&Event::Attempt {
+        at,
+        key: pending.idempotency_key.clone(),
+        n: pending.attempts,
+    })?;
     log.pending = Some(pending.clone());
     port.save(log)?;
     let result = port.redeem(account, &pending.idempotency_key, &pending.credit_id);
+    let outcome_of = |outcome: &str| Event::Outcome {
+        at,
+        key: pending.idempotency_key.clone(),
+        outcome: outcome.to_owned(),
+    };
     let decision = ResetDecision {
         label: pending.label.clone(),
         credit_id: pending.credit_id.clone(),
@@ -742,11 +1024,13 @@ fn attempt(
     };
     match result.as_ref().map(classify).unwrap_or(Outcome::Unknown) {
         Outcome::Money => {
+            port.journal(&outcome_of("refused-response"))?;
             log.pending = None;
             let label = pending.label.clone();
             refuse(port, settings, log, label, Some(record), at)
         }
         Outcome::Reset(outcome) => {
+            port.journal(&outcome_of(outcome))?;
             log.pending = None;
             let post = port.refresh(account).ok();
             let available_resets = post.as_ref().and_then(|c| c.usage.available_usage_resets);
@@ -761,6 +1045,7 @@ fn attempt(
             })
         }
         Outcome::Declined(outcome) => {
+            port.journal(&outcome_of(outcome))?;
             log.pending = None;
             record.outcome = outcome.into();
             log.push(record);
@@ -772,16 +1057,13 @@ fn attempt(
             })
         }
         Outcome::Unknown if pending.attempts >= MAX_ATTEMPTS => {
-            log.pending = None;
-            record.outcome = "gave-up".into();
-            log.push(record);
-            log.skip(&pending.label, pending.weekly_resets_at);
+            // Out of attempts with no answer: pause, never forget the key.
+            let why = format!("no answer after {MAX_ATTEMPTS} attempts");
+            let label = pending.label.clone();
+            let event = log.abandon(pending, &why, at);
+            port.journal(&event)?;
             port.save(log)?;
-            Ok(Step::Failed {
-                label: pending.label,
-                attempts: pending.attempts,
-                retry_at: None,
-            })
+            Ok(Step::Paused { label, why })
         }
         Outcome::Unknown => {
             let retry_at = at.saturating_add(RETRY_BASE << (pending.attempts - 1).min(8));
@@ -844,18 +1126,149 @@ fn refuse(
 pub fn log_path(store: &Store) -> PathBuf {
     store.root.join("codex-resets.json")
 }
+/// When each account last had a usage-limit reset redeemed (outcome
+/// `reset` or `already-redeemed`), from the reset log. Read without the store
+/// lock: the log is written atomically.
+pub fn redeemed(store: &Store) -> std::collections::BTreeMap<String, u64> {
+    let mut last = std::collections::BTreeMap::new();
+    if let Ok(log) = store::json_read::<ResetLog>(&log_path(store)) {
+        for record in log.history {
+            if matches!(record.outcome.as_str(), "reset" | "already-redeemed") {
+                let at = last.entry(record.label).or_insert(0);
+                *at = (*at).max(record.at);
+            }
+        }
+    }
+    last
+}
 /// Caller holds the store lock.
 pub fn load(store: &Store) -> Result<ResetLog> {
     let path = log_path(store);
-    if path.exists() {
-        store::json_read(&path)
+    let mut log: ResetLog = if path.exists() {
+        store::json_read(&path)?
     } else {
-        Ok(ResetLog::default())
+        ResetLog::default()
+    };
+    // The journal is the authority on what is unresolved: the snapshot may
+    // be older (a crash between the two writes) or lost.
+    let journal = journal_path(store);
+    if journal.exists() {
+        let text = String::from_utf8(store::read_private(&journal)?)
+            .safe("the reset journal is not UTF-8")?;
+        let (open, closed) = replay(&text);
+        match (&mut log.pending, open) {
+            (Some(pending), Some(open)) if pending.idempotency_key == open.idempotency_key => {
+                pending.attempts = pending.attempts.max(open.attempts);
+                pending.paused = open.paused.or(pending.paused.take());
+            }
+            // The journal holds a newer, unresolved redemption.
+            (slot, Some(open)) => *slot = Some(open),
+            // The journal shows the snapshot's redemption ended.
+            (slot @ Some(_), None)
+                if slot
+                    .as_ref()
+                    .is_some_and(|p| closed.contains(&p.idempotency_key)) =>
+            {
+                *slot = None
+            }
+            // Nothing in the journal about it (an older log): keep it.
+            _ => {}
+        }
+    }
+    Ok(log)
+}
+pub fn journal_path(store: &Store) -> PathBuf {
+    store.root.join("codex-resets.journal")
+}
+/// Appends one event to the journal and fsyncs it (and the directory when the
+/// journal is new). Caller holds the reset lock.
+pub fn append(store: &Store, event: &Event) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = journal_path(store);
+    store::no_links(&path)?;
+    let new = !path.exists();
+    let mut line = serde_json::to_vec(event).safe("cannot encode a reset event")?;
+    line.push(b'\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .safe("cannot open the reset journal")?;
+    file.write_all(&line)
+        .safe("cannot write the reset journal")?;
+    file.sync_all().safe("cannot sync the reset journal")?;
+    if new {
+        std::fs::File::open(&store.root)
+            .and_then(|d| d.sync_all())
+            .safe("cannot sync the store directory")?;
+    }
+    Ok(())
+}
+/// The reset lock, for a mode change: waits (up to 60 s) for a running tick
+/// to finish, so a change never interleaves with a decision or a send. Take
+/// it before the store lock.
+pub fn change_lock(store: &Store) -> Result<std::fs::File> {
+    let end = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(lock) = exclusive(store)? {
+            return Ok(lock);
+        }
+        if std::time::Instant::now() >= end {
+            return Err(Error("a Codex reset is in progress; try again in a minute"));
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
+/// `reset retry`: let a paused redemption be sent again, with the same key.
+/// `reset dismiss`: drop it, accepting that its outcome stays unknown.
+/// Caller holds the reset lock (`change_lock`) and the store lock.
+pub fn settle_paused(store: &Store, dismiss: bool) -> Result<Option<String>> {
+    let mut log = load(store)?;
+    let Some(mut pending) = log.pending.take() else {
+        return Ok(None);
+    };
+    let at = crate::now();
+    let label = pending.label.clone();
+    if dismiss {
+        append(
+            store,
+            &Event::Dismissed {
+                at,
+                key: pending.idempotency_key.clone(),
+            },
+        )?;
+        log.push(Record {
+            at,
+            label: label.clone(),
+            outcome: "dismissed".into(),
+            weekly_resets_at: Some(pending.weekly_resets_at),
+            reason: "the user dropped a redeem request whose outcome is unknown".into(),
+            pre: pending.pre,
+            post: None,
+        });
+    } else {
+        append(
+            store,
+            &Event::Resumed {
+                at,
+                key: pending.idempotency_key.clone(),
+            },
+        )?;
+        pending.paused = None;
+        pending.retry_at = at;
+        log.skipped.retain(|s| s.label != pending.label);
+        log.pending = Some(pending);
+    }
+    store::json_write(&log_path(store), &log)?;
+    Ok(Some(label))
+}
 /// Sets one provider's reset mode. Only Codex has a reset log: `codex reset
-/// off` clears its halt and drops (and records) a pending redemption; other
-/// modes, and every Claude setting, leave the log alone. Caller holds the
+/// off` clears its halt and stops a pending redemption (dropped if never
+/// sent, paused with its key if sent); other modes, and every Claude
+/// setting, leave the log alone. Caller holds the reset lock and the
 /// store lock.
 pub fn set_mode(
     store: &Store,
@@ -869,7 +1282,11 @@ pub fn set_mode(
     settings.auto_reset = mode;
     if provider == Provider::Codex && mode == AutoReset::Off {
         let mut log = load(store)?;
-        if log.turn_off(crate::now()) {
+        let (changed, event) = log.turn_off(crate::now());
+        if let Some(event) = event {
+            append(store, &event)?;
+        }
+        if changed {
             store::json_write(&log_path(store), &log)?;
         }
     }
@@ -908,6 +1325,19 @@ impl Port for StorePort<'_> {
     fn save(&mut self, log: &ResetLog) -> Result<()> {
         let _lock = self.store.lock()?;
         store::json_write(&log_path(self.store), log)
+    }
+    fn journal(&mut self, event: &Event) -> Result<()> {
+        append(self.store, event)
+    }
+    fn mode(&mut self) -> Result<AutoReset> {
+        let _lock = self.store.lock()?;
+        Ok(self
+            .store
+            .load()?
+            .auto
+            .get(&Provider::Codex)
+            .map(|a| a.auto_reset)
+            .unwrap_or_default())
     }
     fn new_key(&mut self) -> Result<String> {
         use ring::rand::SecureRandom;
@@ -1028,6 +1458,7 @@ mod tests {
                 ],
                 available_usage_resets: Some(credits.len() as u64),
                 reset_credits: credits,
+                reset_credits_listed: true,
                 ..Default::default()
             },
             fetched_at: AT,
@@ -1074,7 +1505,11 @@ mod tests {
         assert_eq!(decision.label, "six");
         assert_eq!(decision.credit_id, "c6");
         assert_eq!(decision.weekly_resets_at, AT + 6 * DAY);
-        assert!(decision.reason.contains("all 3 Codex accounts"));
+        assert!(
+            decision.reason.contains("all 3 usable Codex accounts"),
+            "{}",
+            decision.reason
+        );
         // Entry order does not matter.
         let mut reversed = exhausted();
         reversed.reverse();
@@ -1094,32 +1529,60 @@ mod tests {
                 .into())
             );
         }
-        // Headroom on a reserved account still blocks: it is a Codex account with room.
+        // Wolf's call (audit F4): a reserved or signed-out account is not
+        // pool-usable, so its room neither blocks a reset nor gets one.
         let mut entries = exhausted();
         entries[2].1 = cache(10.0, Some(1), vec![]);
         let mut reserved = settings(AutoReset::On);
-        reserved.reserved = vec!["one".into()];
-        assert!(matches!(
-            decide(
-                Provider::Codex,
-                &reserved,
-                &entries,
-                &ResetLog::default(),
-                AT
-            ),
-            Err(Refusal::Hold(Hold::Headroom { .. }))
-        ));
+        reserved.reserved = vec![entries[2].0.label.clone()];
+        let decision = decide(
+            Provider::Codex,
+            &reserved,
+            &entries,
+            &ResetLog::default(),
+            AT,
+        );
+        assert!(decision.is_ok_and(|d| d.label != entries[2].0.label));
+        let mut entries = exhausted();
+        entries[2].1 = cache(10.0, Some(1), vec![]);
+        entries[2].1.error = Some("refresh-invalid-grant".into());
+        assert!(pick(&entries).is_ok_and(|d| d.label != entries[2].0.label));
     }
 
     #[test]
-    fn a_full_session_window_with_weekly_headroom_is_not_out_of_weekly_usage() {
+    fn a_full_session_window_counts_as_out_of_usage_until_it_resets() {
+        // Wolf's call (audit F4): no usable quota now, whichever window is
+        // used up. Its quota comes back when that window resets.
         let mut entries = exhausted();
         entries[0].1.usage.windows[0].used_percent = 100.0;
         entries[0].1.usage.windows[1].used_percent = 70.0;
+        let usable = guard(&entries, &settings(AutoReset::On), AT).unwrap();
+        assert_eq!(usable[0], (0, AT + 3600));
+        // Weekly out beats a near session: 7 days outrank 3 days.
+        let weekly = |d| cache(100.0, Some(d), vec![credit(&format!("w{d}"), None)]);
+        let entries = vec![(codex("three"), weekly(3)), (codex("seven"), weekly(7))];
+        assert_eq!(pick(&entries).unwrap().label, "seven");
+    }
+
+    #[test]
+    fn a_backend_that_denies_ordinary_usage_counts_as_out_of_usage() {
+        use crate::usage::OrdinaryUsage;
+        let mut entries = exhausted();
+        entries[0].1.usage.windows[1].used_percent = 40.0;
         assert!(matches!(
             pick(&entries),
             Err(Refusal::Hold(Hold::Headroom { .. }))
         ));
+        entries[0].1.usage.ordinary_usage = OrdinaryUsage::Denied;
+        assert!(pick(&entries).is_ok());
+        // Allowed or unreported: the percentages decide.
+        for ordinary in [OrdinaryUsage::Allowed, OrdinaryUsage::NotReported] {
+            entries[0].1.usage.ordinary_usage = ordinary;
+            assert!(matches!(
+                pick(&entries),
+                Err(Refusal::Hold(Hold::Headroom { .. }))
+            ));
+        }
     }
 
     #[test]
@@ -1133,15 +1596,6 @@ mod tests {
             label: "three".into(),
         }
         .into());
-        // No weekly reset time.
-        assert_eq!(unknown(&|c| c.usage.windows[1].resets_at = None), expected);
-        // No weekly window at all.
-        assert_eq!(
-            unknown(&|c| {
-                c.usage.windows.remove(1);
-            }),
-            expected
-        );
         // Stale reading, failed reading, and a passed reset.
         assert_eq!(unknown(&|c| c.fetched_at = AT - 601), expected);
         assert_eq!(unknown(&|c| c.error = Some("http-429".into())), expected);
@@ -1194,17 +1648,36 @@ mod tests {
             c.usage.available_usage_resets = Some(0);
         }
         assert_eq!(pick(&entries), Err(Hold::NoCredit.into()));
-        // Count unknown, or a count without an available credit row.
-        let mut entries = exhausted();
-        for (_, c) in &mut entries {
-            c.usage.available_usage_resets = None;
+        // Audit F1: an unknown count, a count without details (null), or a
+        // count the listed rows don't explain is unknown, never "none". It
+        // defers when that account could outrank the best known one.
+        let deferred = |change: &dyn Fn(&mut Cached)| {
+            let mut entries = exhausted();
+            for (_, c) in &mut entries {
+                change(c);
+            }
+            pick(&entries)
+        };
+        let unknown = Err(Hold::AvailabilityUnknown {
+            label: "six".into(),
         }
-        assert_eq!(pick(&entries), Err(Hold::NoCredit.into()));
+        .into());
+        assert_eq!(
+            deferred(&|c| c.usage.available_usage_resets = None),
+            unknown
+        );
+        assert_eq!(deferred(&|c| c.usage.reset_credits_listed = false), unknown);
+        assert_eq!(deferred(&|c| c.usage.reset_credits.clear()), unknown);
+        // Unknown only on a nearer account: the farthest known one goes.
         let mut entries = exhausted();
-        for (_, c) in &mut entries {
-            c.usage.reset_credits.clear();
-        }
-        assert_eq!(pick(&entries), Err(Hold::NoCredit.into()));
+        let near = entries.iter().position(|(a, _)| a.label != "six").unwrap();
+        entries[near].1.usage.available_usage_resets = None;
+        assert_eq!(pick(&entries).unwrap().label, "six");
+        // Unknown on the farthest one: wait for it to be known.
+        let mut entries = exhausted();
+        let six = entries.iter().position(|(a, _)| a.label == "six").unwrap();
+        entries[six].1.usage.reset_credits_listed = false;
+        assert_eq!(pick(&entries), unknown);
         // Redeemed, redeeming, expired and unknown-type credits are not available.
         let mut entries = exhausted();
         entries.truncate(1);
@@ -1219,6 +1692,15 @@ mod tests {
             reset_type: "unknown".into(),
             ..credit("u", None)
         });
+        // The count says one is available but no listed row is: unknown.
+        assert_eq!(
+            pick(&entries),
+            Err(Hold::AvailabilityUnknown {
+                label: "three".into()
+            }
+            .into())
+        );
+        entries[0].1.usage.available_usage_resets = Some(0);
         assert_eq!(pick(&entries), Err(Hold::NoCredit.into()));
         // The farthest account without a credit falls through to the next.
         let mut entries = exhausted();
@@ -1412,6 +1894,9 @@ mod tests {
         keys: u32,
         /// When set, a fresh read is stamped with this time.
         clock: Option<u64>,
+        journal: Vec<Event>,
+        /// The mode as stored, if not the one the step runs with.
+        stored_mode: Option<AutoReset>,
     }
     impl Port for Fake {
         /// `before` until a redeem call, then `after` if given.
@@ -1443,6 +1928,13 @@ mod tests {
         fn new_key(&mut self) -> Result<String> {
             self.keys += 1;
             Ok(format!("synthetic-key-{}", self.keys))
+        }
+        fn journal(&mut self, event: &Event) -> Result<()> {
+            self.journal.push(event.clone());
+            Ok(())
+        }
+        fn mode(&mut self) -> Result<AutoReset> {
+            Ok(self.stored_mode.unwrap_or(AutoReset::On))
         }
     }
     /// One step over `exhausted()`, read just now.
@@ -1592,14 +2084,8 @@ mod tests {
             matches!(second, Step::Failed { attempts: 2, retry_at: Some(r), .. } if r == AT + 3 * RETRY_BASE)
         );
         let third = run(&mut fake, AutoReset::On, &mut log, AT + 3 * RETRY_BASE);
-        assert!(matches!(
-            third,
-            Step::Failed {
-                attempts: 3,
-                retry_at: None,
-                ..
-            }
-        ));
+        // Audit F2: out of attempts, it pauses and keeps its key.
+        assert!(matches!(third, Step::Paused { .. }), "{third:?}");
         assert_eq!(fake.redeemed.len(), 3);
         // Every retry reused the first key and credit.
         assert!(
@@ -1608,19 +2094,37 @@ mod tests {
                 .all(|(l, k, c, _)| l == "six" && k == "synthetic-key-1" && c == "c6")
         );
         assert_eq!(fake.keys, 1);
-        assert!(log.pending.is_none());
+        let kept = log.pending.as_ref().unwrap();
+        assert_eq!(
+            (kept.idempotency_key.as_str(), kept.attempts),
+            ("synthetic-key-1", 3)
+        );
+        assert!(kept.paused.is_some());
         assert!(log.skipped("six", AT + 5 * DAY));
-        // Gave up: the cooldown holds first, then another account is eligible.
+        // Paused: nothing is sent or decided until `reset retry`/`dismiss`.
         assert!(matches!(
             run(&mut fake, AutoReset::On, &mut log, AT + 3 * RETRY_BASE + 1),
             Step::Held {
-                hold: Hold::Cooldown { .. }
+                hold: Hold::Unresolved { .. }
             }
         ));
+        assert_eq!(fake.redeemed.len(), 3);
+        // The journal holds the intent, three attempts and the pause.
+        let kinds: Vec<_> = fake
+            .journal
+            .iter()
+            .map(|e| match e {
+                Event::Intent { .. } => "intent",
+                Event::Attempt { .. } => "attempt",
+                Event::Paused { .. } => "paused",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["intent", "attempt", "attempt", "attempt", "paused"]);
     }
 
     #[test]
-    fn a_pending_reset_whose_accounts_regained_room_is_recorded_unconfirmed() {
+    fn a_sent_reset_whose_accounts_regained_room_is_paused_with_its_key() {
         let mut log = ResetLog {
             pending: Some(Pending {
                 label: "six".into(),
@@ -1632,6 +2136,7 @@ mod tests {
                 attempts: 1,
                 retry_at: AT - 1,
                 pre: None,
+                paused: None,
             }),
             ..Default::default()
         };
@@ -1648,14 +2153,17 @@ mod tests {
             AT,
         )
         .unwrap();
-        assert!(matches!(
-            held,
-            Step::Held {
-                hold: Hold::Changed { .. }
-            }
-        ));
-        assert!(fake.redeemed.is_empty() && log.pending.is_none());
-        assert_eq!(log.history.last().unwrap().outcome, "unconfirmed");
+        // It was sent once and may have spent a credit: kept, paused, with
+        // its key; nothing is sent.
+        assert!(matches!(held, Step::Paused { .. }), "{held:?}");
+        assert!(fake.redeemed.is_empty());
+        let kept = log.pending.as_ref().unwrap();
+        assert_eq!(kept.idempotency_key, "synthetic-key-1");
+        assert!(kept.paused.is_some());
+        assert_eq!(log.history.last().unwrap().outcome, "paused");
+        assert!(
+            matches!(fake.journal.as_slice(), [Event::Paused { key, .. }] if key == "synthetic-key-1")
+        );
     }
 
     #[test]
@@ -1803,6 +2311,7 @@ mod tests {
             attempts,
             retry_at,
             pre: None,
+            paused: None,
         }
     }
     fn resume_with(
@@ -1896,26 +2405,32 @@ mod tests {
                 )
                 .unwrap();
                 assert!(
-                    matches!(
-                        held,
-                        Step::Held {
-                            hold: Hold::Changed { .. }
-                        }
-                    ),
-                    "{why}"
-                );
-                assert!(
                     fake.redeemed.is_empty() && fake.refreshed.is_empty(),
                     "{why}"
                 );
-                assert!(log.pending.is_none(), "{why}");
                 let record = log.history.last().unwrap();
                 assert!(record.reason.contains(why), "{why}: {}", record.reason);
-                // A sent request may have spent its credit: cool down and skip.
+                // A sent request may have spent its credit: it is kept,
+                // paused, with its key (audit F2), with a cooldown and skip.
                 if attempts > 0 {
-                    assert_eq!(record.outcome, "unconfirmed");
+                    assert!(matches!(held, Step::Paused { .. }), "{why}: {held:?}");
+                    assert!(
+                        log.pending.as_ref().is_some_and(|p| p.paused.is_some()),
+                        "{why}"
+                    );
+                    assert_eq!(record.outcome, "paused");
                     assert_eq!(log.cooldown_until(), Some(at + COOLDOWN));
                 } else {
+                    assert!(
+                        matches!(
+                            held,
+                            Step::Held {
+                                hold: Hold::Changed { .. }
+                            }
+                        ),
+                        "{why}"
+                    );
+                    assert!(log.pending.is_none(), "{why}");
                     assert_eq!(record.outcome, "abandoned");
                     assert_eq!(log.cooldown_until(), None);
                 }
@@ -1939,23 +2454,14 @@ mod tests {
             (step, log, fake)
         };
         // The fresh read shows room: the earlier attempt may have worked.
+        // Kept, paused, with its key (audit F2).
         let (held, log, fake) = retry(cache(0.0, Some(7), vec![]));
-        assert!(matches!(
-            held,
-            Step::Held {
-                hold: Hold::Changed { .. }
-            }
-        ));
+        assert!(matches!(held, Step::Paused { .. }), "{held:?}");
         assert!(fake.redeemed.is_empty());
-        assert_eq!(log.history.last().unwrap().outcome, "unconfirmed");
+        assert_eq!(log.history.last().unwrap().outcome, "paused");
         // The credit expired since.
         let (held, log, fake) = retry(cache(100.0, Some(6), vec![credit("c6", Some(AT))]));
-        assert!(matches!(
-            held,
-            Step::Held {
-                hold: Hold::Changed { .. }
-            }
-        ));
+        assert!(matches!(held, Step::Paused { .. }), "{held:?}");
         assert!(fake.redeemed.is_empty());
         assert!(
             log.history
@@ -1975,11 +2481,12 @@ mod tests {
                 halted: true
             }
         );
-        assert!(fake.redeemed.is_empty() && log.pending.is_none() && log.halted.is_some());
-        // The earlier attempt may have spent: recorded unconfirmed, with a
-        // cooldown and a skip, before the refusal.
+        assert!(fake.redeemed.is_empty() && log.halted.is_some());
+        // The earlier attempt may have spent: kept, paused, with its key
+        // (audit F2), with a cooldown and a skip, before the refusal.
+        assert!(log.pending.as_ref().is_some_and(|p| p.paused.is_some()));
         let outcomes: Vec<_> = log.history.iter().map(|r| r.outcome.as_str()).collect();
-        assert_eq!(outcomes, ["unconfirmed", "refused"]);
+        assert_eq!(outcomes, ["paused", "refused"]);
         assert_eq!(log.cooldown_until(), Some(AT + COOLDOWN));
         assert!(log.skipped("six", AT + DAY));
         // The fresh read fails: wait, with the key kept.
@@ -2024,12 +2531,16 @@ mod tests {
             set_mode(&store, Provider::Codex, &mut codex, mode).unwrap();
             assert_eq!(load(&store).unwrap(), halted);
         }
-        // Codex off clears the halt and records the dropped key.
+        // Codex off clears the halt. The sent request is kept, paused, with
+        // its key (audit F2), and journaled.
         set_mode(&store, Provider::Codex, &mut codex, AutoReset::Off).unwrap();
         let log = load(&store).unwrap();
-        assert!(log.halted.is_none() && log.pending.is_none());
+        assert!(log.halted.is_none());
+        let kept = log.pending.as_ref().unwrap();
+        assert_eq!(kept.idempotency_key, "synthetic-key-1");
+        assert!(kept.paused.is_some());
         let record = log.history.last().unwrap();
-        assert_eq!(record.outcome, "unconfirmed");
+        assert_eq!(record.outcome, "paused");
         assert!(record.reason.contains("turned off"));
         assert!(log.cooldown_until().is_some());
         assert!(log.skipped("six", AT + DAY));
@@ -2054,6 +2565,93 @@ mod tests {
         assert!(!log_path(&store).exists());
         drop(held);
         assert!(exclusive(&store).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_journal_rebuilds_an_unresolved_redemption_and_skips_a_torn_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("store")).unwrap();
+        let intent = Event::Intent {
+            at: AT,
+            pending: pending(0, AT),
+        };
+        append(&store, &intent).unwrap();
+        append(
+            &store,
+            &Event::Attempt {
+                at: AT,
+                key: "synthetic-key-1".into(),
+                n: 1,
+            },
+        )
+        .unwrap();
+        // A crash mid-write leaves a torn last line; the snapshot never got
+        // written at all.
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(journal_path(&store))
+            .unwrap();
+        std::io::Write::write_all(&mut journal, br#"{"event":"outcome","at":1,"ke"#).unwrap();
+        let log = load(&store).unwrap();
+        let rebuilt = log.pending.unwrap();
+        assert_eq!(
+            (rebuilt.idempotency_key.as_str(), rebuilt.attempts),
+            ("synthetic-key-1", 1)
+        );
+        // Mode off pauses it (sent once), and the pause survives a reload.
+        let mut codex = settings(AutoReset::On);
+        set_mode(&store, Provider::Codex, &mut codex, AutoReset::Off).unwrap();
+        let paused = load(&store).unwrap().pending.unwrap();
+        assert!(paused.paused.is_some());
+        // `reset retry` resumes it with the same key; `reset dismiss` ends it.
+        assert_eq!(
+            settle_paused(&store, false).unwrap().as_deref(),
+            Some("six")
+        );
+        let resumed = load(&store).unwrap().pending.unwrap();
+        assert!(resumed.paused.is_none());
+        assert_eq!(resumed.idempotency_key, "synthetic-key-1");
+        assert_eq!(settle_paused(&store, true).unwrap().as_deref(), Some("six"));
+        let log = load(&store).unwrap();
+        assert!(log.pending.is_none());
+        assert_eq!(log.history.last().unwrap().outcome, "dismissed");
+        // The journal is append-only: every event is still there.
+        let text = std::fs::read_to_string(journal_path(&store)).unwrap();
+        for kind in ["intent", "attempt", "paused", "resumed", "dismissed"] {
+            assert!(text.contains(&format!(r#""event":"{kind}""#)), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_mode_change_waits_for_a_running_tick_and_a_send_rechecks_the_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("store")).unwrap();
+        let held = exclusive(&store)
+            .unwrap()
+            .expect("a tick holds the reset lock");
+        let root = store.root.clone();
+        let started = std::time::Instant::now();
+        let change = std::thread::spawn(move || {
+            let store = Store::open(root).unwrap();
+            change_lock(&store).map(|_| started.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        drop(held);
+        let waited = change.join().unwrap().unwrap();
+        assert!(waited >= Duration::from_millis(400), "{waited:?}");
+        // A tick that began in `on` sends nothing once `dry-run` is stored.
+        let mut fake = Fake {
+            before: Some(cache(100.0, Some(6), vec![credit("c6", None)])),
+            responses: vec![Ok(serde_json::json!({"outcome": "reset"}))],
+            stored_mode: Some(AutoReset::DryRun),
+            ..Default::default()
+        };
+        let mut log = ResetLog::default();
+        let step = run(&mut fake, AutoReset::On, &mut log, AT);
+        assert!(matches!(step, Step::Waiting { .. }), "{step:?}");
+        assert!(fake.redeemed.is_empty());
+        // The intent stays journaled, unsent, for the next tick.
+        assert!(matches!(fake.journal.as_slice(), [Event::Intent { .. }]));
     }
 
     #[test]
