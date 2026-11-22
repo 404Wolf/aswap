@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.2-preview.agy.1 (2026-11-22)
+
+A preview of #44 (agy) for the VM, on main c0ff893. Not a release.
 
 ### Added
 - **Antigravity CLI (agy) accounts.** `aswap add agy <label>` and `aswap run agy --auto` pool personal Google sign-ins of Google's agy. Each run gets its own `--gemini_dir`, config home and no D-Bus, so logins never share a keyring. Conversations, plugins, hooks and MCP servers are shared. agy refreshes its own login and aswap writes the newer one back; aswap never calls Google's token endpoint. A failover resumes the conversation by id, and quota notices are agy's own. Billed sign-ins and paid credits are refused. agy accounts are never synced, and adding one refuses while an older aswap build runs. See README, "Antigravity CLI (agy) accounts".
