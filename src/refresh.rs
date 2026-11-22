@@ -237,6 +237,8 @@ where
     recover_pending(store, account, &path).map_err(|_| Failure::new("usage-unavailable"))?;
     // Re-read only after acquiring the identity lock; another refresher may have won.
     let old: Value = store::json_read(&path).map_err(|_| Failure::new("usage-unavailable"))?;
+    // What a pending copy of a rotation replaces (see write_pending).
+    let replaces = file_hash(&path);
     if account.provider == Provider::Codex
         && old.get("tokens").is_none_or(Value::is_null)
         && old.get("OPENAI_API_KEY").and_then(Value::as_str).is_some()
@@ -297,10 +299,9 @@ where
     )
     .map_err(|_| Failure::new("refresh-invalid-response"))?;
     // The provider has already invalidated the old refresh token, so the
-    // new login must survive a failed write: it goes to a private sidecar
-    // first, and the next refresh installs it if the main write fails.
-    let pending = pending_path(&path);
-    store::json_write(&pending, &auth).map_err(|_| Failure::new("usage-unavailable"))?;
+    // new login must survive a failed write: it goes to pending copies
+    // first, and the next refresh installs one if the main write fails.
+    write_pending(store, account, replaces, &auth);
     install(store, account, &path, &auth).map_err(|_| Failure::new("usage-unavailable"))?;
     // A token that lives under twice the margin would be due again soon, or
     // on every check: the next unforced refresh waits half its lifetime, and
@@ -320,15 +321,82 @@ where
     }
     Ok(true)
 }
-/// `<auth file>.pending`: private by name (shared::private), never linked
-/// into a view.
+/// `<auth file>.pending` beside the login: private by name
+/// (shared::private), never linked into a view.
 fn pending_path(path: &std::path::Path) -> std::path::PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_owned();
     name.push(".pending");
     path.with_file_name(name)
 }
+/// A second pending copy in `$XDG_RUNTIME_DIR` (a tmpfs on systemd hosts),
+/// so a full or failing data disk can't lose both. Named per store, so
+/// two stores (a test's and the real one) never share it.
+fn runtime_pending_path(store: &Store, account: &Account) -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_absolute() && dir.is_dir())?;
+    let root = ring::digest::digest(
+        &ring::digest::SHA256,
+        store.root.as_os_str().as_encoded_bytes(),
+    );
+    let root: String = root.as_ref()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Some(dir.join("aswap").join(format!(
+        "{root}-{}-{}.pending.json",
+        account.provider, account.label
+    )))
+}
+fn pending_paths(store: &Store, account: &Account) -> Vec<std::path::PathBuf> {
+    let profile = store.profile(account.provider, &account.label).ok();
+    profile
+        .map(|p| pending_path(&p.join(account.provider.auth_file())))
+        .into_iter()
+        .chain(runtime_pending_path(store, account))
+        .collect()
+}
+/// A pending login: the rotated login and a hash of the login file it
+/// replaces, so it is installed only over that file, never over a newer one.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Pending {
+    replaces: String,
+    auth: Value,
+}
+fn file_hash(path: &std::path::Path) -> Option<String> {
+    let bytes = store::read_private(path).ok()?;
+    Some(
+        ring::digest::digest(&ring::digest::SHA256, &bytes)
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
+}
+/// Write both pending copies; either one is enough. `replaces` is the hash
+/// of the login file the rotation started from.
+fn write_pending(store: &Store, account: &Account, replaces: Option<String>, auth: &Value) {
+    let Some(replaces) = replaces else {
+        return;
+    };
+    let pending = Pending {
+        replaces,
+        auth: auth.clone(),
+    };
+    for copy in pending_paths(store, account) {
+        let _ = store::json_write(&copy, &pending);
+    }
+}
+/// Drop an account's pending logins: its login file is being replaced
+/// (a new rotation, `add`, a live login preserved), so they are stale.
+pub(crate) fn discard_pending(store: &Store, account: &Account) {
+    for copy in pending_paths(store, account) {
+        let _ = std::fs::remove_file(copy);
+    }
+}
 /// Write a rotated login, hand it to every live run and alias, then drop
-/// its pending copy.
+/// its pending copies (a failure to remove them is harmless: they no
+/// longer match the login file).
 fn install(
     store: &Store,
     account: &Account,
@@ -341,25 +409,31 @@ fn install(
     crate::shared::hand_out(store, account, auth);
     propagate(store, account, auth)?;
     crate::usage::credentials_changed(store, account)?;
-    match std::fs::remove_file(pending_path(path)) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            Err(crate::Error("cannot remove the pending login"))
-        }
-        _ => Ok(()),
-    }
+    discard_pending(store, account);
+    Ok(())
 }
-/// Install a pending login left by a rotation whose final write failed.
+/// Install a pending login left by a rotation whose final write failed,
+/// if the login file is still the one it replaces; drop it otherwise.
 fn recover_pending(store: &Store, account: &Account, path: &std::path::Path) -> crate::Result<()> {
-    let pending = pending_path(path);
-    if !pending.exists() {
-        return Ok(());
+    let current = file_hash(path);
+    for copy in pending_paths(store, account) {
+        if !copy.exists() {
+            continue;
+        }
+        let pending: Option<Pending> = store::json_read(&copy).ok();
+        let usable = pending.filter(|p| {
+            Some(&p.replaces) == current.as_ref()
+                && serde_json::to_vec(&p.auth)
+                    .is_ok_and(|bytes| provider::validate_auth(account.provider, &bytes).is_ok())
+        });
+        match usable {
+            Some(pending) => return install(store, account, path, &pending.auth),
+            None => {
+                let _ = std::fs::remove_file(&copy);
+            }
+        }
     }
-    let auth: Value = store::json_read(&pending)?;
-    provider::validate_auth(
-        account.provider,
-        &serde_json::to_vec(&auth).map_err(|_| crate::Error("invalid pending login"))?,
-    )?;
-    install(store, account, path, &auth)
+    Ok(())
 }
 /// An active local run may refresh even when inactive-profile monitoring is off.
 /// Followers still only pull from the designated owner.

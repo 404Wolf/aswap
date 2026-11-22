@@ -179,6 +179,14 @@ pub fn add(store: &Store, provider: Provider, name: &str) -> Result<Account> {
     }
     store::private_dir(&target)?;
     let result = (|| {
+        // A pending login left under this label by an earlier account is stale.
+        crate::refresh::discard_pending(
+            store,
+            &Account {
+                provider,
+                label: name.to_owned(),
+            },
+        );
         store::atomic(&target.join(provider.auth_file()), &bytes)?;
         if provider == Provider::Claude {
             let path = global_config(&source, true)?;
@@ -289,6 +297,7 @@ fn preserve_live(
         };
         if matched {
             let _refresh = store.refresh_lock(&candidate)?;
+            crate::refresh::discard_pending(store, &candidate);
             store::atomic(&profile.join(candidate.provider.auth_file()), bytes)?;
             target_is_live |= candidate.label == target.label;
         }

@@ -321,6 +321,7 @@ fn a_rotated_login_survives_a_failed_write_and_is_installed_next_time() {
         .profile(a.provider, &a.label)
         .unwrap()
         .join(a.provider.auth_file());
+    let original = std::fs::read(&path).unwrap();
     // The token endpoint rotates the login; then the disk refuses the write
     // (here: the auth file's place is taken by a directory).
     let failed = refresh::refresh_with(&store, &a, 1000, false, |_, _| {
@@ -334,13 +335,13 @@ fn a_rotated_login_survives_a_failed_write_and_is_installed_next_time() {
     let pending = path.with_file_name(".credentials.json.pending");
     let kept: Value = store::json_read(&pending).unwrap();
     assert_eq!(
-        kept["claudeAiOauth"]["refreshToken"],
+        kept["auth"]["claudeAiOauth"]["refreshToken"],
         "synthetic-refresh-rotated"
     );
     // The disk recovers. The next refresh installs the pending login first,
     // so it needn't (and can't) refresh with the invalidated old token.
     std::fs::remove_dir(&path).unwrap();
-    std::fs::write(&path, b"{}").unwrap();
+    std::fs::write(&path, &original).unwrap();
     assert!(
         !refresh::refresh_with(&store, &a, 1001, false, |_, _| panic!(
             "the old refresh token is no longer valid"
@@ -359,4 +360,120 @@ fn a_rotated_login_survives_a_failed_write_and_is_installed_next_time() {
     })
     .unwrap());
     assert!(!pending.exists());
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[test]
+fn a_stale_pending_login_never_replaces_a_newer_one() {
+    let (_t, store, a) = seed();
+    coordination::owner(&store).unwrap();
+    let _lock = store.lock().unwrap();
+    let path = store
+        .profile(a.provider, &a.label)
+        .unwrap()
+        .join(a.provider.auth_file());
+    // A rotation crashed after its main write (or couldn't remove its
+    // pending copy): the copy remains, made for the login file before.
+    let pending = path.with_file_name(".credentials.json.pending");
+    store::json_write(
+        &pending,
+        &json!({"replaces": sha256_hex(&std::fs::read(&path).unwrap()),
+                "auth": {"claudeAiOauth":{"accessToken":"synthetic-stale","refreshToken":"synthetic-refresh-stale","expiresAt":999000}}}),
+    )
+    .unwrap();
+    // Since then the login file holds a newer login (another rotation, or
+    // `add` over the label).
+    store::json_write(
+        &path,
+        &json!({"claudeAiOauth":{"accessToken":"synthetic-newer","refreshToken":"synthetic-refresh-newer","expiresAt":9_999_999_000u64}}),
+    )
+    .unwrap();
+    assert!(!refresh::refresh_with(&store, &a, 1000, false, |_, _| panic!("not due")).unwrap());
+    let now: Value = store::json_read(&path).unwrap();
+    assert_eq!(
+        now["claudeAiOauth"]["refreshToken"],
+        "synthetic-refresh-newer"
+    );
+    assert!(!pending.exists(), "the stale pending login is dropped");
+}
+
+/// Runs `name` in a child test process with its own XDG_RUNTIME_DIR.
+fn with_runtime_dir(name: &str) {
+    let t = tempfile::tempdir().unwrap();
+    let runtime = t.path().join("run");
+    std::fs::create_dir(&runtime).unwrap();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env("ASWAP_REFRESH_CHILD", name)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_rotation_survives_when_its_disk_refuses_the_pending_copy_too() {
+    with_runtime_dir("pending_runtime_copy_child");
+}
+#[test]
+fn pending_runtime_copy_child() {
+    if std::env::var("ASWAP_REFRESH_CHILD").as_deref() != Ok("pending_runtime_copy_child") {
+        return;
+    }
+    let (_t, store, a) = seed();
+    coordination::owner(&store).unwrap();
+    let _lock = store.lock().unwrap();
+    let path = store
+        .profile(a.provider, &a.label)
+        .unwrap()
+        .join(a.provider.auth_file());
+    let original = std::fs::read(&path).unwrap();
+    // The data disk refuses both the pending copy beside the login and the
+    // login itself (each place taken by a directory).
+    let pending = path.with_file_name(".credentials.json.pending");
+    std::fs::create_dir(&pending).unwrap();
+    let failed = refresh::refresh_with(&store, &a, 1000, false, |_, _| {
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        Ok(
+            json!({"access_token":"synthetic-new","refresh_token":"synthetic-refresh-rotated","expires_in":3600}),
+        )
+    });
+    assert!(failed.is_err());
+    // The copy under XDG_RUNTIME_DIR has it.
+    let runtime = std::fs::read_dir(
+        std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join("aswap"),
+    )
+    .unwrap()
+    .map(|e| e.unwrap().path())
+    .find(|p| p.to_string_lossy().ends_with("-claude-one.pending.json"))
+    .unwrap();
+    let kept: Value = store::json_read(&runtime).unwrap();
+    assert_eq!(
+        kept["auth"]["claudeAiOauth"]["refreshToken"],
+        "synthetic-refresh-rotated"
+    );
+    // The disk recovers; the next refresh installs it.
+    std::fs::remove_dir(&pending).unwrap();
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, &original).unwrap();
+    assert!(!refresh::refresh_with(&store, &a, 1001, false, |_, _| panic!("no request")).unwrap());
+    let installed: Value = store::json_read(&path).unwrap();
+    assert_eq!(
+        installed["claudeAiOauth"]["refreshToken"],
+        "synthetic-refresh-rotated"
+    );
+    assert!(!runtime.exists());
 }
