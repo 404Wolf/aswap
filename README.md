@@ -111,11 +111,16 @@ Read this before you enable it:
   says "eligible", not which ones) and **spends one earned credit**. Credits
   are limited and expire; a spent credit can't be returned.
 - **When.** aswap redeems only when every *usable* Codex account has no
-  usable quota now: some window used up and not yet reset, or Codex's
+  usable quota now: its weekly window used up and not yet reset, or Codex's
   backend denying ordinary use (`ordinaryUsageAllowed: false`). Reserved and
   signed-out accounts are not usable, so they neither block a reset nor get
   one. Unknown usage on a usable account means no redemption; aswap reads it
   first. *(This reading of "exhausted" is Wolf's call; see the PR.)*
+- **Weekly only, by default.** A used-up 5-hour window alone never spends a
+  reset: every usable account must be out of weekly usage. To also redeem
+  when accounts are only 5-hour-limited, opt in with
+  `aswap auto codex reset-session-windows on` (Home Manager
+  `programs.aswap.autoswitch.codex.resetSessionWindows = true`).
 - **Which account.** The usable account whose quota would come back by itself
   the latest, i.e. the latest reset among its used-up windows. For accounts
   out of weekly usage that is the weekly reset, so 7 days outranks 3 days.

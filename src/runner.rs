@@ -1485,7 +1485,8 @@ impl Wake {
         if provider != Provider::Codex {
             return;
         }
-        let now_stamp = crate::shared::stamp(&crate::reset::log_path(store));
+        // The journal changes with every reset event, before the snapshot.
+        let now_stamp = crate::shared::stamp(&crate::reset::journal_path(store));
         if log.as_ref().is_some_and(|seen| *seen != now_stamp) {
             self.next = 0;
         }

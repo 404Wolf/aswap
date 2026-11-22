@@ -24,6 +24,11 @@ let
         default = "weekly-reset";
         description = "Rank eligible accounts by the soonest weekly reset (the default; new launches also move to an account whose weekly quota resets sooner), or by most headroom.";
       };
+      resetSessionWindows = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Codex only, with autoReset: also redeem a reset when every usable account is out of its 5-hour window but still has weekly usage. Off: a reset needs every usable account out of weekly usage.";
+      };
       autoReset = mkOption {
         type = types.enum [ "off" "dry-run" "on" ];
         default = "off";
@@ -102,7 +107,10 @@ let
         "${cfg.package}/bin/aswap auto ${provider} threshold ${toString settings.threshold}"
         "${cfg.package}/bin/aswap auto ${provider} resume-prompt -- ${escapeExecArg (if settings.resumePrompt == null then "off" else settings.resumePrompt)}"
         "${cfg.package}/bin/aswap auto ${provider} prefer ${settings.prefer}"
-      ] ++ (lib.optional (provider == "codex") "${cfg.package}/bin/aswap auto ${provider} reset ${settings.autoReset}")
+      ] ++ (lib.optionals (provider == "codex") [
+        "${cfg.package}/bin/aswap auto ${provider} reset ${settings.autoReset}"
+        "${cfg.package}/bin/aswap auto ${provider} reset-session-windows ${if settings.resetSessionWindows then "on" else "off"}"
+      ])
         ++ [
         "${cfg.package}/bin/aswap auto switch-interval ${toString cfg.switchIntervalSeconds}"
         "${cfg.package}/bin/aswap auto ${provider} on"

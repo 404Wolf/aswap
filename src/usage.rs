@@ -213,7 +213,17 @@ impl Usage {
         {
             return None;
         }
-        self.windows.iter().map(|w| w.used_percent).reduce(f64::max)
+        // Where Codex reports the backend's permission it decides: denied is
+        // out of usage whatever the percentages say, and unknown (null) is
+        // not a usable reading (upstream: "clients must not infer recovery
+        // from percentages or reset times").
+        match self.ordinary_usage {
+            OrdinaryUsage::Denied => Some(100.0),
+            OrdinaryUsage::Unknown => None,
+            OrdinaryUsage::Allowed | OrdinaryUsage::NotReported => {
+                self.windows.iter().map(|w| w.used_percent).reduce(f64::max)
+            }
+        }
     }
     /// When the account-wide weekly window resets; model-specific weekly
     /// windows only stand in when no account-wide one was observed.
@@ -1545,5 +1555,50 @@ mod read_contract_tests {
         let none = read(serde_json::json!({}));
         assert_eq!(none.available_usage_resets, None);
         assert!(!none.reset_credits_listed);
+    }
+}
+#[cfg(test)]
+mod permission_selection_tests {
+    use super::*;
+
+    #[test]
+    fn a_denied_or_unknown_permission_is_never_chosen() {
+        let at = 1_800_000_000;
+        let reading = |used: f64, ordinary: OrdinaryUsage| Cached {
+            usage: Usage {
+                windows: vec![Window {
+                    name: "weekly".into(),
+                    used_percent: used,
+                    resets_at: Some(at + 86_400),
+                    duration_minutes: Some(10080),
+                    codex_slot: Some(1),
+                }],
+                ordinary_usage: ordinary,
+                ..Default::default()
+            },
+            fetched_at: at,
+            ..Default::default()
+        };
+        let account = |label: &str| Account {
+            provider: Provider::Codex,
+            label: label.into(),
+        };
+        let settings = store::Auto::default();
+        for (ordinary, chosen) in [
+            (OrdinaryUsage::Allowed, true),
+            (OrdinaryUsage::NotReported, true),
+            (OrdinaryUsage::Denied, false),
+            (OrdinaryUsage::Unknown, false),
+        ] {
+            let entries = vec![
+                (
+                    account("current"),
+                    reading(100.0, OrdinaryUsage::NotReported),
+                ),
+                (account("other"), reading(5.0, ordinary)),
+            ];
+            let pick = choose("current", &entries, &settings, at, true, None);
+            assert_eq!(pick.is_some(), chosen, "{ordinary:?}");
+        }
     }
 }

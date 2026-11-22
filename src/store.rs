@@ -29,6 +29,11 @@ pub struct Auto {
     /// Opt-in redemption of Codex usage-limit reset credits; see `crate::reset`.
     #[serde(default)]
     pub auto_reset: AutoReset,
+    /// Also redeem when accounts are only out of their 5-hour (session)
+    /// windows, with weekly usage left. Off by default: a reset is then spent
+    /// only when every usable account is out of weekly usage.
+    #[serde(default)]
+    pub reset_session_windows: bool,
     /// Settings a newer aswap wrote, kept as they are so this one doesn't
     /// drop them when it saves (docs/COMPATIBILITY.md: data directory).
     #[serde(flatten)]
@@ -81,6 +86,7 @@ impl Default for Auto {
             prefer: Prefer::WeeklyReset,
             reserved: Vec::new(),
             auto_reset: AutoReset::Off,
+            reset_session_windows: false,
             extra: Default::default(),
         }
     }

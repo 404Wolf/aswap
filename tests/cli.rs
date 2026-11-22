@@ -440,6 +440,8 @@ fn codex_reset_mode_is_opt_in_shown_and_codex_only() {
         &["auto", "claude", "reset", "on"][..],
         &["auto", "claude", "reset", "dry-run"],
         &["auto", "codex", "reset", "yes"],
+        &["auto", "claude", "reset", "retry"],
+        &["auto", "claude", "reset", "dismiss"],
         &["auto", "codex", "reset"],
     ] {
         assert!(!t.invoke(bad).status.success(), "{bad:?}");

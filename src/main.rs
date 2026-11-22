@@ -150,6 +150,9 @@ enum AutoAction {
     /// Codex: redeem a usage-limit reset credit when every account is out of
     /// weekly usage (off, dry-run or on; default off).
     Reset,
+    /// Codex: also redeem when accounts are only out of their 5-hour
+    /// windows, with weekly usage left (on or off; default off).
+    ResetSessionWindows,
     /// Keep this account available for runs pinned to it.
     Reserve,
     /// Make this account available to automatic selection again.
@@ -548,6 +551,7 @@ fn execute(cli: Cli) -> Result<i32> {
                     | AutoAction::ResumePrompt
                     | AutoAction::Prefer
                     | AutoAction::Reset
+                    | AutoAction::ResetSessionWindows
                     | AutoAction::Reserve
                     | AutoAction::Unreserve
             ) != value.is_some()
@@ -581,16 +585,21 @@ fn execute(cli: Cli) -> Result<i32> {
                 | AutoAction::Threshold
                 | AutoAction::Prefer
                 | AutoAction::Reset
+                | AutoAction::ResetSessionWindows
                 | AutoAction::ResumePrompt => {
                     // A reset mode change waits for a running reset tick and
                     // holds it off: the reset lock first, then the store lock.
-                    let _reset = matches!(action, AutoAction::Reset)
-                        .then(|| aswap::reset::change_lock(&store))
-                        .transpose()?;
+                    let _reset =
+                        matches!(action, AutoAction::Reset | AutoAction::ResetSessionWindows)
+                            .then(|| aswap::reset::change_lock(&store))
+                            .transpose()?;
                     let value_ref = value.as_deref();
                     if matches!(action, AutoAction::Reset)
                         && matches!(value_ref, Some("retry" | "dismiss"))
                     {
+                        if provider != Provider::Codex {
+                            return Err(Error("usage-limit resets are only supported for Codex"));
+                        }
                         let _lock = store.lock()?;
                         let dismiss = value_ref == Some("dismiss");
                         let label = aswap::reset::settle_paused(&store, dismiss)?;
@@ -635,6 +644,18 @@ fn execute(cli: Cli) -> Result<i32> {
                                     Error("reset must be off, dry-run, on, retry or dismiss")
                                 })?;
                             aswap::reset::set_mode(&store, provider, settings, mode)?;
+                        }
+                        AutoAction::ResetSessionWindows => {
+                            if provider != Provider::Codex {
+                                return Err(Error(
+                                    "usage-limit resets are only supported for Codex",
+                                ));
+                            }
+                            settings.reset_session_windows = match value.as_deref() {
+                                Some("on") => true,
+                                Some("off") => false,
+                                _ => return Err(Error("reset-session-windows must be on or off")),
+                            };
                         }
                         AutoAction::ResumePrompt => {
                             let prompt = value.unwrap();

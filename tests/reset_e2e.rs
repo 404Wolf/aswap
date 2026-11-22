@@ -62,6 +62,7 @@ if 'app-server' in args:
             append('consumes.jsonl',{'key':key,'label':label,'credit':req['params']['creditId']})
             if os.environ.get('ASWAP_TEST_HANG')=='1' and not seen:
                 time.sleep(120)
+            spent_before_hang = os.environ.get('ASWAP_TEST_HANG')=='after-spend' and not seen
             if any(s['key']==key for s in lines('spends.jsonl')):
                 result={'outcome':'alreadyRedeemed'}
             else:
@@ -69,6 +70,9 @@ if 'app-server' in args:
                 state[label]='reset'
                 (dir/'state.json').write_text(json.dumps(state))
                 result={'outcome':'reset'}
+                if spent_before_hang:
+                    # Spent, then the reply is lost.
+                    time.sleep(120)
         else: continue
         print(json.dumps({'id':req['id'],'result':result}),flush=True)
     sys.exit(0)
@@ -117,7 +121,7 @@ impl Fixture {
     fn dir(&self) -> &Path {
         self.t.path()
     }
-    fn command(&self, child: &str, hang: bool) -> Command {
+    fn command(&self, child: &str, hang: &str) -> Command {
         let farthest = if self.dir().join("farthest-one").exists() {
             "one"
         } else {
@@ -138,12 +142,12 @@ impl Fixture {
             .env("ASWAP_TEST_DIR", self.dir())
             .env("ASWAP_TEST_ID", ID)
             .env("ASWAP_RESET_CHILD", child)
-            .env("ASWAP_TEST_HANG", if hang { "1" } else { "0" })
+            .env("ASWAP_TEST_HANG", hang)
             .env("ASWAP_TEST_FARTHEST", farthest)
             .stdin(Stdio::null());
         command
     }
-    fn run(&self, child: &str, hang: bool) {
+    fn run(&self, child: &str, hang: &str) {
         let out = self.command(child, hang).output().unwrap();
         assert!(
             out.status.success(),
@@ -162,7 +166,7 @@ impl Fixture {
     /// Starts the supervisor and waits until it waits on the limit.
     fn waiting_supervisor(&self) -> (Supervisor, std::sync::mpsc::Receiver<String>) {
         let mut child = Supervisor(
-            self.command("supervisor_child", false)
+            self.command("supervisor_child", "0")
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -271,16 +275,16 @@ fn resumed_on(fixture: &Fixture, mut supervisor: Supervisor, label: &str) {
 #[test]
 fn an_exhausted_pool_redeems_one_reset_and_the_waiting_session_resumes() {
     let fixture = Fixture::new();
-    fixture.run("setup_child", false);
+    fixture.run("setup_child", "0");
     let (supervisor, _) = fixture.waiting_supervisor();
-    fixture.run("tick_child", false);
+    fixture.run("tick_child", "0");
     // One reset, on the account whose weekly window resets farthest away.
     let spends = fixture.lines("spends.jsonl");
     assert_eq!(spends.len(), 1, "{spends:?}");
     assert_eq!(spends[0]["label"], "two");
     resumed_on_two(&fixture, supervisor);
     // Another tick spends nothing: there is room now, and a cooldown.
-    fixture.run("tick_child", false);
+    fixture.run("tick_child", "0");
     assert_eq!(fixture.lines("spends.jsonl").len(), 1);
     assert_eq!(fixture.lines("consumes.jsonl").len(), 1);
 }
@@ -288,10 +292,10 @@ fn an_exhausted_pool_redeems_one_reset_and_the_waiting_session_resumes() {
 #[test]
 fn a_monitor_that_dies_mid_request_resends_the_same_key_and_spends_once() {
     let fixture = Fixture::new();
-    fixture.run("setup_child", false);
+    fixture.run("setup_child", "0");
     let (supervisor, _) = fixture.waiting_supervisor();
     // The first tick sends its request and dies before any reply.
-    let mut tick = fixture.command("tick_child", true).spawn().unwrap();
+    let mut tick = fixture.command("tick_child", "1").spawn().unwrap();
     let end = Instant::now() + Duration::from_secs(30);
     while fixture.lines("consumes.jsonl").is_empty() {
         assert!(
@@ -304,7 +308,7 @@ fn a_monitor_that_dies_mid_request_resends_the_same_key_and_spends_once() {
     tick.wait().unwrap();
     assert!(fixture.lines("spends.jsonl").is_empty());
     // The next tick picks the saved request up and sends the same key.
-    fixture.run("tick_child", false);
+    fixture.run("tick_child", "0");
     let consumes = fixture.lines("consumes.jsonl");
     assert_eq!(consumes.len(), 2, "{consumes:?}");
     assert_eq!(consumes[0]["key"], consumes[1]["key"]);
@@ -319,11 +323,63 @@ fn a_reset_redeemed_on_the_waiting_sessions_own_account_releases_its_hold() {
     // rejection at once, instead of after its 15-minute hold.
     let fixture = Fixture::new();
     fs::write(fixture.dir().join("farthest-one"), "").unwrap();
-    fixture.run("setup_child", false);
+    fixture.run("setup_child", "0");
     let (supervisor, _) = fixture.waiting_supervisor();
-    fixture.run("tick_child", false);
+    fixture.run("tick_child", "0");
     let spends = fixture.lines("spends.jsonl");
     assert_eq!(spends.len(), 1, "{spends:?}");
     assert_eq!(spends[0]["label"], "one");
     resumed_on(&fixture, supervisor, "one");
+}
+
+#[test]
+fn retry_child() {
+    if !is_child("retry_child") {
+        return;
+    }
+    let store = Store::from_env().unwrap();
+    let _reset = aswap::reset::change_lock(&store).unwrap();
+    let _lock = store.lock().unwrap();
+    aswap::reset::settle_paused(&store, false)
+        .unwrap()
+        .expect("a paused request");
+}
+
+#[test]
+fn a_spend_whose_reply_is_lost_is_reconciled_without_a_second_send() {
+    let fixture = Fixture::new();
+    fixture.run("setup_child", "0");
+    let (supervisor, _) = fixture.waiting_supervisor();
+    // The first tick's request is spent by Codex, and its reply is lost.
+    let mut tick = fixture
+        .command("tick_child", "after-spend")
+        .spawn()
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(30);
+    while fixture.lines("spends.jsonl").is_empty() {
+        assert!(Instant::now() < end, "the first tick never spent");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    tick.kill().unwrap();
+    tick.wait().unwrap();
+    // The next tick finds quota back: it pauses the request, sending nothing.
+    fixture.run("tick_child", "0");
+    assert_eq!(fixture.lines("consumes.jsonl").len(), 1);
+    // `reset retry` reconciles it: usable quota means it worked; no resend.
+    fixture.run("retry_child", "0");
+    fixture.run("tick_child", "0");
+    assert_eq!(fixture.lines("consumes.jsonl").len(), 1, "no second send");
+    assert_eq!(fixture.lines("spends.jsonl").len(), 1);
+    resumed_on_two(&fixture, supervisor);
+    let log: Value = serde_json::from_slice(
+        &fs::read(fixture.dir().join("data/aswap/codex-resets.json")).unwrap(),
+    )
+    .unwrap();
+    let outcomes: Vec<_> = log["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["outcome"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(outcomes.contains(&"reconciled".to_owned()), "{outcomes:?}");
 }

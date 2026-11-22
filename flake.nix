@@ -154,6 +154,8 @@
             # Codex usage resets are opt-in (default off); Claude has none.
             assert pkgs.lib.hasSuffix " auto codex reset off" (builtins.elemAt hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre 4);
             assert pkgs.lib.hasSuffix " auto codex reset dry-run" (builtins.elemAt hmPeer.config.systemd.user.services.aswap-codex.Service.ExecStartPre 4);
+            # 5-hour-only exhaustion never spends a reset unless opted in.
+            assert pkgs.lib.hasSuffix " auto codex reset-session-windows off" (builtins.elemAt hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre 5);
             assert !(builtins.any (pkgs.lib.hasInfix " reset ") hm.config.systemd.user.services.aswap-claude.Service.ExecStartPre);
             assert pkgs.lib.hasSuffix " auto codex on" (pkgs.lib.last hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre);
             assert builtins.any (pkgs.lib.hasSuffix " auto switch-interval 0") hm.config.systemd.user.services.aswap-codex.Service.ExecStartPre;
