@@ -406,3 +406,30 @@ fn a_slow_post_reset_read_still_wakes_the_waiting_session_promptly() {
     assert_eq!(fixture.lines("spends.jsonl").len(), 1);
     resumed_within(&fixture, supervisor, "one", 10);
 }
+
+#[test]
+fn a_monitor_that_dies_before_the_post_reset_read_resumes_it_next_tick() {
+    // The outcome is durable but the tick dies during its slow post-reset
+    // read: the next tick must resume that read (and journal Recovered), so
+    // the waiting session wakes promptly, not at its next long poll.
+    let fixture = Fixture::new();
+    fs::write(fixture.dir().join("farthest-one"), "").unwrap();
+    fs::write(fixture.dir().join("slow-post-read"), "").unwrap();
+    fixture.run("setup_child", "0");
+    let (supervisor, _) = fixture.waiting_supervisor();
+    let mut tick = fixture.command("tick_child", "0").spawn().unwrap();
+    let end = Instant::now() + Duration::from_secs(30);
+    while !fixture.dir().join("slow-read-done").exists() {
+        assert!(
+            Instant::now() < end,
+            "the tick never reached its post-reset read"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    tick.kill().unwrap();
+    tick.wait().unwrap();
+    assert_eq!(fixture.lines("spends.jsonl").len(), 1);
+    fixture.run("tick_child", "0");
+    assert_eq!(fixture.lines("spends.jsonl").len(), 1, "no second spend");
+    resumed_within(&fixture, supervisor, "one", 10);
+}

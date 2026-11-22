@@ -215,6 +215,9 @@ pub enum Event {
     Halted { at: u64, why: String },
     /// `reset off` cleared a halt.
     Unhalted { at: u64 },
+    /// Post-reset re-reads stopped without a usable reading (out of tries,
+    /// or the weekly window ended). Waiters keep their own schedule.
+    Unverified { at: u64, key: String },
 }
 impl Event {
     fn key(&self) -> &str {
@@ -226,7 +229,8 @@ impl Event {
             | Self::Resumed { key, .. }
             | Self::Dropped { key, .. }
             | Self::Dismissed { key, .. }
-            | Self::Recovered { key, .. } => key,
+            | Self::Recovered { key, .. }
+            | Self::Unverified { key, .. } => key,
             Self::Halted { .. } | Self::Unhalted { .. } => "",
         }
     }
@@ -272,7 +276,10 @@ fn replay(journal: &str) -> (Option<Pending>, Closed) {
                         pending.paused = None;
                         pending.reconcile = true;
                     }
-                    Event::Recovered { .. } | Event::Halted { .. } | Event::Unhalted { .. } => {}
+                    Event::Recovered { .. }
+                    | Event::Unverified { .. }
+                    | Event::Halted { .. }
+                    | Event::Unhalted { .. } => {}
                     _ => open = None,
                 }
             }
@@ -713,6 +720,8 @@ const VERIFY_PAUSES: [u64; 2] = [2, 5];
 /// Later ticks re-read at most this often, doubling up to the cap.
 const VERIFY_BACKOFF: u64 = 15;
 const VERIFY_BACKOFF_CAP: u64 = 300;
+/// Re-read ticks before giving up (about half an hour).
+const VERIFY_TRIES: u32 = 8;
 
 /// Reads `label` until it shows usable quota, then journals Recovered so
 /// waiting supervisors wake on a fresh reading. Returns the last reading.
@@ -748,7 +757,15 @@ fn verify(
     }
     let tries = log.verifying.as_ref().map_or(0, |v| v.tries) + 1;
     let delay = (VERIFY_BACKOFF << (tries - 1).min(5)).min(VERIFY_BACKOFF_CAP);
-    log.verifying = (at < until).then(|| Verifying {
+    if tries > VERIFY_TRIES || at >= until {
+        port.journal(&Event::Unverified {
+            at,
+            key: key.to_owned(),
+        })?;
+        log.verifying = None;
+        return Ok(last);
+    }
+    log.verifying = Some(Verifying {
         label: account.label.clone(),
         key: key.to_owned(),
         next_at: at.saturating_add(delay),
@@ -1063,6 +1080,28 @@ fn resume(
                     .iter()
                     .any(|(i, _)| entries[*i].0.label == pending.label) =>
             {
+                // A same-key resend may be a first spend: the credit's own checks
+                // apply too (money wording halts, an expired credit waits).
+                if let Some(credit) = entries
+                    .iter()
+                    .find(|(a, _)| a.label == pending.label)
+                    .and_then(|(_, c)| {
+                        c.usage
+                            .reset_credits
+                            .iter()
+                            .find(|c| c.id == pending.credit_id)
+                    })
+                {
+                    if credit_mentions_money(credit) {
+                        let label = pending.label.clone();
+                        let event = log.abandon(pending, "its credit now mentions money", at);
+                        port.journal(&event)?;
+                        return refuse(port, settings, log, label, None, at);
+                    }
+                    if credit.expires_at.is_some_and(|e| e <= at) {
+                        return repause(port, log, pending, "its credit has expired", at);
+                    }
+                }
                 return attempt(port, settings, log, &account, at);
             }
             Err(Hold::UsageUnknown { .. }) => {
@@ -1363,6 +1402,23 @@ fn refuse(
     Ok(Step::Refused { label, halted })
 }
 
+/// When a pending post-reset re-read is due, if any (Codex only).
+pub fn verify_due(store: &Store, provider: Provider) -> Option<u64> {
+    if provider != Provider::Codex {
+        return None;
+    }
+    let _lock = store.lock().ok()?;
+    load(store).ok()?.verifying.map(|v| v.next_at)
+}
+
+/// Seconds the monitor sleeps before its next tick: its usual interval, or
+/// less when a post-reset re-read is due sooner.
+pub fn monitor_wait(store: &Store, provider: Provider, at: u64) -> u64 {
+    verify_due(store, provider).map_or(usage::TTL, |due| {
+        due.saturating_sub(at).clamp(1, usage::TTL)
+    })
+}
+
 pub fn log_path(store: &Store) -> PathBuf {
     store.root.join("codex-resets.json")
 }
@@ -1438,6 +1494,51 @@ pub fn load(store: &Store) -> Result<ResetLog> {
                 reason: "rebuilt from the reset journal after an interrupted save".into(),
                 pre: None,
                 post: None,
+            });
+        }
+        // A redemption whose Recovered never came (a crash after its outcome,
+        // before a usable post-reset read) is verified again; a Recovered
+        // that a lost save missed ends the verification.
+        let recovered: std::collections::BTreeSet<String> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+            .filter_map(|e| match e {
+                Event::Recovered { key, .. } | Event::Unverified { key, .. } => Some(key),
+                _ => None,
+            })
+            .collect();
+        if log
+            .verifying
+            .as_ref()
+            .is_some_and(|v| recovered.contains(&v.key))
+        {
+            log.verifying = None;
+        }
+        if log.verifying.is_none()
+            && let Some((key, intent, _)) = closed
+                .iter()
+                .filter_map(|(key, (intent, end))| match end {
+                    Event::Outcome { at, outcome, .. }
+                        if matches!(
+                            outcome.as_str(),
+                            "reset" | "already-redeemed" | "reconciled"
+                        ) =>
+                    {
+                        Some((*at, key, intent))
+                    }
+                    _ => None,
+                })
+                .max_by_key(|(at, _, _)| *at)
+                .map(|(_, key, intent)| (key.clone(), intent.clone(), ()))
+            && !recovered.contains(&key)
+            && crate::now() < intent.weekly_resets_at
+        {
+            log.verifying = Some(Verifying {
+                label: intent.label.clone(),
+                key,
+                next_at: 0,
+                tries: 0,
+                until: intent.weekly_resets_at,
             });
         }
         // The journal's last halt event decides: a halt survives a lost
@@ -3226,6 +3327,71 @@ mod tests {
         assert_eq!(kinds(&fake), ["intent", "attempt", "outcome", "recovered"]);
         assert!(log.verifying.is_none());
         assert_eq!(fake.redeemed.len(), 1, "never a second spend");
+        // A reading that never comes back usable: re-reads stop after
+        // VERIFY_TRIES ticks with Unverified, still with one redeem.
+        let mut fake = Fake {
+            before: Some(cache(100.0, Some(6), vec![credit("c6", None)])),
+            after: Some(cache(100.0, Some(6), vec![])),
+            responses: vec![Ok(serde_json::json!({"outcome": "reset"}))],
+            ..Default::default()
+        };
+        let mut log = ResetLog::default();
+        run(&mut fake, AutoReset::On, &mut log, AT);
+        let mut ticks = 0;
+        while let Some(v) = log.verifying.clone() {
+            ticks += 1;
+            assert!(ticks <= VERIFY_TRIES, "never gives up");
+            run(&mut fake, AutoReset::On, &mut log, v.next_at);
+        }
+        assert_eq!(kinds(&fake).last().unwrap(), "unverified");
+        assert_eq!(fake.redeemed.len(), 1);
+    }
+
+    #[test]
+    fn a_crash_before_the_post_reset_read_resumes_verifying() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("store")).unwrap();
+        let now = crate::now();
+        let mut intent = pending(0, now);
+        intent.weekly_resets_at = now + 6 * DAY;
+        let key = "synthetic-key-1".to_owned();
+        for event in [
+            Event::Intent {
+                at: now,
+                pending: intent,
+            },
+            Event::Attempt {
+                at: now,
+                key: key.clone(),
+                n: 1,
+            },
+            Event::Outcome {
+                at: now,
+                key: key.clone(),
+                outcome: "reset".into(),
+            },
+        ] {
+            append(&store, &event).unwrap();
+        }
+        let v = load(&store)
+            .unwrap()
+            .verifying
+            .expect("verification resumes");
+        assert_eq!((v.label.as_str(), v.next_at), ("six", 0));
+        assert_eq!(verify_due(&store, Provider::Codex), Some(0));
+        assert_eq!(monitor_wait(&store, Provider::Codex, now), 1);
+        assert_eq!(monitor_wait(&store, Provider::Claude, now), usage::TTL);
+        append(
+            &store,
+            &Event::Recovered {
+                at: now,
+                key,
+                label: "six".into(),
+            },
+        )
+        .unwrap();
+        assert!(load(&store).unwrap().verifying.is_none());
+        assert_eq!(monitor_wait(&store, Provider::Codex, now), usage::TTL);
     }
 
     #[test]
@@ -3372,6 +3538,34 @@ mod tests {
             log.pending.as_ref().unwrap().idempotency_key,
             "synthetic-key-1"
         );
+        // A credit whose wording now mentions money halts: nothing sent.
+        let mut money = credit("c6", None);
+        money.title = Some("Purchase credits".into());
+        let (halted, log, fake) = retry(
+            cache(100.0, Some(6), vec![money]),
+            AT + 2,
+            vec![Ok(serde_json::json!({"outcome": "reset"}))],
+        );
+        assert!(
+            matches!(halted, Step::Refused { halted: true, .. }),
+            "{halted:?}"
+        );
+        assert!(fake.redeemed.is_empty());
+        assert!(log.halted.is_some());
+        assert!(
+            fake.journal
+                .iter()
+                .any(|e| matches!(e, Event::Halted { .. }))
+        );
+        // An expired credit: paused again, key kept, nothing sent.
+        let (held, log, fake) = retry(
+            cache(100.0, Some(6), vec![credit("c6", Some(AT))]),
+            AT + 2,
+            vec![Ok(serde_json::json!({"outcome": "reset"}))],
+        );
+        assert!(matches!(held, Step::Paused { .. }), "{held:?}");
+        assert!(fake.redeemed.is_empty());
+        assert!(log.pending.is_some());
         // Without the retry, the same state stays paused-unresolved: no send.
         let mut paused = pending(1, AT);
         paused.paused = Some("synthetic".into());

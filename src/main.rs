@@ -729,7 +729,9 @@ fn execute(cli: Cli) -> Result<i32> {
                         if matches!(action, AutoAction::Once) {
                             break;
                         }
-                        std::thread::sleep(Duration::from_secs(usage::TTL));
+                        // A post-reset re-read due sooner wakes the monitor for it.
+                        let wait = aswap::reset::monitor_wait(&store, provider, now());
+                        std::thread::sleep(Duration::from_secs(wait));
                     }
                 }
             }

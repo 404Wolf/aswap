@@ -149,7 +149,8 @@ Read this before you enable it:
   usable, aswap journals that (`recovered`) and waiting `run --auto` sessions
   check at once (not at their next scheduled check); a session held on that
   very account is released. A failed or still-full post-reset read is
-  retried on a short backoff, never with a new spend. Where Codex reports `ordinaryUsageAllowed`, only
+  retried on a short backoff (the monitor wakes for it; a crash before it
+  resumes it), never with a new spend, for about half an hour. Where Codex reports `ordinaryUsageAllowed`, only
   a grant counts as recovery.
 - **Money.** It uses only credits Codex lists as available. If a credit's
   title or description, or Codex's answer, mentions payment, purchase,
