@@ -260,6 +260,62 @@ pub struct Cached {
     /// Previously exhausted windows missing from the latest usable observation.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unverified_limits: Vec<UnverifiedLimit>,
+    /// When the quota observation in `usage` was started, on the store's
+    /// monotonic observation counter (`next_observation`). One real account
+    /// is read by several programs: the later-started observation wins, even
+    /// within one second, and an older fetch never overwrites a newer one.
+    /// 0: written by a version without it (then `fetched_at` orders).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub observation: u64,
+}
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+impl Cached {
+    /// Whether this quota observation is newer than `other`'s.
+    pub(crate) fn newer_than(&self, other: &Self) -> bool {
+        if self.observation != 0 && other.observation != 0 {
+            self.observation > other.observation
+        } else {
+            self.fetched_at > other.fetched_at
+        }
+    }
+    /// This account's quota observation from `shared` (another login of the
+    /// same account), keeping what belongs to this login: an auth failure, a
+    /// server backoff, its own poll schedule. Only the account-level limit
+    /// mark (`provider-limit`) gives way to a newer observation.
+    pub(crate) fn adopt(&self, shared: &Self) -> Self {
+        let mut next = self.clone();
+        next.usage = shared.usage.clone();
+        next.fetched_at = shared.fetched_at;
+        next.observation = shared.observation;
+        next.unverified_limits = shared.unverified_limits.clone();
+        // Not due again before the observation it now holds would be; an
+        // own backoff that runs later stays.
+        next.next_poll_at = self.next_poll_at.max(shared.next_poll_at);
+        next.preserve_limits(self);
+        if self.error.as_deref() == Some("provider-limit") {
+            next.error = None;
+        }
+        next
+    }
+    /// Whether this login's own state (an auth failure, a server backoff)
+    /// keeps a shared observation from making it usable.
+    fn own_failure(&self) -> bool {
+        self.error.as_deref().is_some_and(|e| e != "provider-limit") || self.retry_after.is_some()
+    }
+}
+/// The store's next quota observation number (see `Cached::observation`).
+/// Caller holds the store lock.
+fn next_observation(store: &Store) -> Result<u64> {
+    let path = store.root.join("usage-observations");
+    let last: u64 = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let next = last.max(now()).saturating_add(1);
+    store::atomic(&path, next.to_string().as_bytes())?;
+    Ok(next)
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -930,6 +986,10 @@ where
         Decision::Cached(cached) => return Ok(cached),
         Decision::Fetch { path, .. } => (read_cache(&path, force)?, path),
     };
+    let observation = {
+        let _lock = store.lock()?;
+        next_observation(store)?
+    };
     let result = fetcher(&profile);
     let _lock = store.lock()?;
     // The account may have been removed or renamed during the fetch; writing
@@ -942,7 +1002,15 @@ where
         return Ok(updated(snapshot, result, at));
     }
     let latest = read_cache(&path, force)?;
-    let entry = merged(&snapshot, latest, result, at);
+    // Compare-and-set: another program's later-started observation of this
+    // account landed here during the fetch. This one is older: it loses.
+    if latest.observation > observation {
+        return Ok(latest);
+    }
+    let mut entry = merged(&snapshot, latest, result, at);
+    if entry.fetched_at == at && entry.error.is_none() {
+        entry.observation = observation;
+    }
     store::json_write(&path, &entry)?;
     share_reading(store, account, &state.accounts, &entry, at)?;
     Ok(entry)
@@ -966,12 +1034,10 @@ fn share_reading(
             .profile(other.provider, &other.label)?
             .join("usage-cache.json");
         let old = read_cache(&path, false).unwrap_or_default();
-        if old.fetched_at >= entry.fetched_at {
+        if !entry.newer_than(&old) {
             continue;
         }
-        let mut shared = entry.clone();
-        shared.preserve_limits(&old);
-        store::json_write(&path, &shared)?;
+        store::json_write(&path, &old.adopt(entry))?;
     }
     Ok(())
 }
@@ -1049,18 +1115,19 @@ fn fresh_enough(store: &Store, account: &Account, at: u64, force: bool) -> Resul
             if !sibling.exists() {
                 continue;
             }
-            let mut other: Cached = store::json_read(&sibling)?;
+            let other: Cached = store::json_read(&sibling)?;
             if other.error.is_none()
-                && other.fetched_at > old.fetched_at
+                && other.newer_than(&old)
                 && at < other.fetched_at.saturating_add(TTL)
                 && other.used(at).is_some()
+                && !old.own_failure()
             {
-                other.preserve_limits(&old);
-                if other.used(at).is_none() {
+                let adopted = old.adopt(&other);
+                if adopted.used(at).is_none() {
                     continue;
                 }
-                store::json_write(&path, &other)?;
-                return Ok(Decision::Cached(other));
+                store::json_write(&path, &adopted)?;
+                return Ok(Decision::Cached(adopted));
             }
         }
     }
