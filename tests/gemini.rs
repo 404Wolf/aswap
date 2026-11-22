@@ -335,3 +335,190 @@ fn a_gemini_launch_is_isolated_and_claude_and_codex_launches_are_unchanged() {
     );
     assert_eq!(Provider::Gemini.command(view).get_args().count(), 0);
 }
+
+/// A fake provider (named by argv[0]) for supervised runs. Every launch is
+/// logged with its account and arguments. Gemini's first account prints
+/// `ASWAP_TEST_NOTICE` and then holds the session open, as a CLI that hit
+/// its quota does; anything else prints it and exits cleanly.
+const FAKE_PROVIDER: &str = r##"import json, os, pathlib, sys, time
+provider=pathlib.Path(sys.argv[0]).name
+args=sys.argv[1:]
+if provider=='gemini':
+    home=pathlib.Path(os.environ['GEMINI_CLI_HOME'])/'.gemini'
+    auth=json.loads((home/'oauth_creds.json').read_text())['access_token']
+else:
+    home=pathlib.Path(os.environ['CODEX_HOME'])
+    if args[:1]==['-c']: args=args[2:]
+    if args[:1]==['app-server']:
+        # Codex's model list, so both synthetic accounts can serve the model.
+        for line in sys.stdin:
+            req=json.loads(line)
+            if req.get('method')=='initialize': result={}
+            elif req.get('method')=='model/list': result={'data':[{'model':'synthetic-model','id':'synthetic-model','isDefault':True}]}
+            else: continue
+            print(json.dumps({'id':req['id'],'result':result}),flush=True)
+        sys.exit(0)
+    auth=json.loads((home/'auth.json').read_text())['tokens']['access_token']
+log=pathlib.Path(os.environ['ASWAP_TEST_LAUNCHES'])
+with log.open('a') as f: f.write(json.dumps({'provider':provider,'auth':auth,'args':args})+'\n')
+assert os.isatty(1)
+if provider=='gemini' and '--resume' in args: sys.exit(0)
+print(os.environ['ASWAP_TEST_NOTICE'],flush=True)
+if provider=='gemini' and auth=='synthetic-g-one':
+    time.sleep(30)
+    sys.exit(9)
+time.sleep(.5)
+sys.exit(0)
+"##;
+
+fn supervised(provider: Provider, notice: &str) -> (Vec<Value>, String) {
+    let t = tempfile::tempdir().unwrap();
+    let cli = fake_install(t.path());
+    let bin = t.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|p| p.join("python3"))
+        .find(|p| p.is_file())
+        .unwrap();
+    // The Gemini CLI install itself is the fake, so its client still reads.
+    for path in [cli.clone(), bin.join("codex")] {
+        fs::write(&path, format!("#!{}\n{FAKE_PROVIDER}", python.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let launches = t.path().join("launches.jsonl");
+    let project = t.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "supervised_child", "--nocapture"])
+        .current_dir(&project)
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", t.path().join("home"))
+        .env("XDG_DATA_HOME", t.path().join("data"))
+        .env("XDG_CONFIG_HOME", t.path().join("config"))
+        .env("CODEX_HOME", t.path().join("codex"))
+        .env("ASWAP_GEMINI_CHILD", "supervised_child")
+        .env("ASWAP_GEMINI_BIN", &cli)
+        .env("ASWAP_TEST_PROVIDER", provider.as_str())
+        .env("ASWAP_TEST_NOTICE", notice)
+        .env("ASWAP_TEST_LAUNCHES", &launches)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let launches = fs::read_to_string(&launches)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    (launches, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+#[test]
+fn supervised_child() {
+    if !is_child("supervised_child") {
+        return;
+    }
+    use aswap::usage::{Cached, Usage, Window};
+    let store = Store::from_env().unwrap();
+    let provider = match std::env::var("ASWAP_TEST_PROVIDER").unwrap().as_str() {
+        "gemini" => Provider::Gemini,
+        _ => Provider::Codex,
+    };
+    let home = provider.current_home().unwrap();
+    fs::create_dir_all(&home).unwrap();
+    // Far-off expiry and a fresh usage cache: nothing is refreshed or fetched.
+    let expiry = (aswap::now() + 86_400) * 1000;
+    for (label, used) in [("one", 20.0), ("two", 10.0)] {
+        if provider == Provider::Gemini {
+            fs::create_dir_all(home.join("tmp")).unwrap();
+            store::json_write(
+                &home.join("oauth_creds.json"),
+                &login(expiry, &format!("synthetic-g-{label}")),
+            )
+            .unwrap();
+            store::json_write(
+                &home.join("google_accounts.json"),
+                &json!({"active":format!("{label}@example.com"),"old":[]}),
+            )
+            .unwrap();
+        } else {
+            store::json_write(
+                &home.join("auth.json"),
+                &json!({"tokens":{"access_token":format!("synthetic-g-{label}")}}),
+            )
+            .unwrap();
+        }
+        provider::add(&store, provider, label).unwrap();
+        let cached = Cached {
+            usage: Usage {
+                windows: vec![Window {
+                    name: "gemini-2.5-pro".into(),
+                    used_percent: used,
+                    resets_at: None,
+                    duration_minutes: Some(1440),
+                    codex_slot: None,
+                }],
+                ..Default::default()
+            },
+            fetched_at: aswap::now(),
+            last_attempt: aswap::now() + 3600,
+            next_poll_at: aswap::now() + 3600,
+            ..Default::default()
+        };
+        store::json_write(
+            &store
+                .profile(provider, label)
+                .unwrap()
+                .join("usage-cache.json"),
+            &cached,
+        )
+        .unwrap();
+    }
+    let args = match provider {
+        Provider::Codex => vec!["--model".to_owned(), "synthetic-model".to_owned()],
+        _ => Vec::new(),
+    };
+    let code = aswap::runner::run(&store, provider, Some("one"), &args, true).unwrap();
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn a_gemini_limit_notice_fails_over_and_resumes_the_same_session() {
+    for notice in [
+        "Usage limit reached for gemini-2.5-pro.",
+        "You have exhausted your daily quota on this model.",
+    ] {
+        let (launches, _) = supervised(Provider::Gemini, notice);
+        assert_eq!(launches.len(), 2, "{notice}: {launches:?}");
+        assert_eq!(launches[0]["auth"], "synthetic-g-one");
+        assert_eq!(launches[1]["auth"], "synthetic-g-two", "{notice}");
+        let first: Vec<String> = serde_json::from_value(launches[0]["args"].clone()).unwrap();
+        let second: Vec<String> = serde_json::from_value(launches[1]["args"].clone()).unwrap();
+        let at = first.iter().position(|a| a == "--session-id").unwrap();
+        assert_eq!(second[..2], ["--resume".to_owned(), first[at + 1].clone()]);
+    }
+}
+
+#[test]
+fn a_codex_terminal_ignores_geminis_limit_notices() {
+    for notice in [
+        "Usage limit reached for gemini-2.5-pro.",
+        "You have exhausted your daily quota on this model.",
+    ] {
+        let (launches, stderr) = supervised(Provider::Codex, notice);
+        assert!(!stderr.contains("usage limit"), "{notice}: {stderr}");
+        assert_eq!(launches.len(), 1, "{notice}: {launches:?}");
+        assert_eq!(launches[0]["auth"], "synthetic-g-one");
+    }
+}
