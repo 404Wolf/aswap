@@ -843,7 +843,7 @@ where
     // The decision and the cache writes happen under the store lock; the
     // fetch itself does not. Every supervisor takes the store lock on its
     // terminal thread, so a network call under it would stall typing in
-    // every session. A per-account usage lock keeps it one fetch at a time.
+    // every session. A usage lock per login keeps it one fetch at a time.
     let (old, path, profile) = match fresh_enough(store, account, at, force)? {
         Decision::Cached(cached) => return Ok(cached),
         Decision::Fetch { old, path, profile } => (old, path, profile),
@@ -853,22 +853,68 @@ where
     } else {
         std::time::Duration::ZERO
     };
+    let waiting = std::time::Instant::now();
     let Some(_fetching) = store.usage_lock(account, wait)? else {
-        // Another process is fetching this account: use what it leaves.
+        // Another process is fetching this login: use what it leaves.
         let _lock = store.lock()?;
         return read_cache(&path, force).or(Ok(old));
     };
+    // Time moved on while waiting for another fetch.
+    let at = at.saturating_add(waiting.elapsed().as_secs());
     // It may have just finished: decide again before fetching.
-    let path = match fresh_enough(store, account, at, force)? {
+    let (snapshot, path) = match fresh_enough(store, account, at, force)? {
         Decision::Cached(cached) => return Ok(cached),
-        Decision::Fetch { path, .. } => path,
+        Decision::Fetch { path, .. } => (read_cache(&path, force)?, path),
     };
     let result = fetcher(&profile);
     let _lock = store.lock()?;
+    // The account may have been removed or renamed during the fetch; writing
+    // would recreate its old profile directory and block that label.
+    let state = store.load()?;
+    if store
+        .account(&state, account.provider, Some(&account.label))
+        .is_err()
+    {
+        return Ok(updated(snapshot, result, at));
+    }
     let latest = read_cache(&path, force)?;
-    let entry = updated(latest, result, at);
+    let entry = merged(&snapshot, latest, result, at);
     store::json_write(&path, &entry)?;
     Ok(entry)
+}
+/// The cache after a fetch that started from `snapshot`, when `latest` is
+/// what is stored now. Writes made during the fetch win where they carry
+/// news the fetch can't have seen: a limit the provider reported
+/// (mark_limited), and a rotated login that clears an auth backoff
+/// (credentials_changed).
+pub(crate) fn merged(
+    snapshot: &Cached,
+    latest: Cached,
+    result: std::result::Result<Usage, Failure>,
+    at: u64,
+) -> Cached {
+    let changed = serde_json::to_value(snapshot).ok() != serde_json::to_value(&latest).ok();
+    let marked = (changed && latest.error.as_deref() == Some("provider-limit")).then(|| {
+        (
+            latest.error.clone(),
+            latest.http_status,
+            latest.retry_after,
+            latest.next_poll_at,
+        )
+    });
+    let retry_now = changed && latest.next_poll_at < snapshot.next_poll_at;
+    let failed = result.is_err();
+    let mut entry = updated(latest, result, at);
+    if let Some((error, http_status, retry_after, next_poll_at)) = marked {
+        entry.error = error;
+        entry.http_status = http_status;
+        entry.retry_after = retry_after;
+        entry.next_poll_at = entry.next_poll_at.max(next_poll_at);
+    } else if failed && retry_now {
+        // The failure may have used the login that was just replaced.
+        entry.next_poll_at = at;
+    }
+    entry
 }
 enum Decision {
     Cached(Cached),
@@ -1240,5 +1286,55 @@ mod reason_tests {
                 "no-windows"
             ]
         );
+    }
+}
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn reading(used: f64) -> Usage {
+        Usage {
+            windows: vec![Window {
+                name: "five_hour".into(),
+                used_percent: used,
+                resets_at: None,
+                duration_minutes: Some(300),
+                codex_slot: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn writes_made_during_a_fetch_are_kept() {
+        let at = 10_000;
+        let snapshot = Cached {
+            next_poll_at: at,
+            ..Cached::default()
+        };
+        // Nothing changed meanwhile: the fetch's result as is.
+        let plain = merged(&snapshot, snapshot.clone(), Ok(reading(5.0)), at);
+        assert_eq!(plain.used(at), Some(5.0));
+        assert_eq!(plain.next_poll_at, at + TTL);
+        // The provider reported a limit meanwhile (mark_limited): kept over
+        // a reading that predates it.
+        let mut limited = snapshot.clone();
+        limited.error = Some("provider-limit".into());
+        limited.next_poll_at = at + 2 * TTL;
+        let kept = merged(&snapshot, limited, Ok(reading(5.0)), at);
+        assert_eq!(kept.error.as_deref(), Some("provider-limit"));
+        assert_eq!(kept.next_poll_at, at + 2 * TTL);
+        // The login rotated meanwhile (credentials_changed lowered the next
+        // poll): a failure, possibly with the old token, retries at once.
+        let mut stale = snapshot.clone();
+        stale.error = Some("http-401".into());
+        stale.next_poll_at = at + 900;
+        let mut rotated = stale.clone();
+        rotated.next_poll_at = at;
+        let retried = merged(&stale, rotated, Err(Failure::http(401, 0)), at);
+        assert_eq!(retried.next_poll_at, at);
+        // Without that, a failure backs off as usual.
+        let backed = merged(&stale, stale.clone(), Err(Failure::http(401, 0)), at);
+        assert!(backed.next_poll_at > at);
     }
 }

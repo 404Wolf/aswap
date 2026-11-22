@@ -1181,3 +1181,22 @@ fn a_run_asks_about_a_refresh_without_the_store_lock_when_none_is_due() {
     );
     drop(held);
 }
+
+#[test]
+fn a_fetch_never_recreates_an_account_removed_meanwhile() {
+    let (_t, store, a) = store_with_one();
+    let profile = store.profile(a.provider, &a.label).unwrap();
+    std::fs::create_dir_all(&profile).unwrap();
+    let c = usage::cached_mode_with(&store, &a, 1000, true, |_| {
+        // `aswap remove` (or a rename) runs while the fetch is in flight.
+        let _lock = store.lock().unwrap();
+        let mut state = store.load().unwrap();
+        state.accounts.clear();
+        store.save(&state).unwrap();
+        std::fs::remove_dir_all(&profile).unwrap();
+        Ok(observation(10.0, 1000).usage)
+    })
+    .unwrap();
+    assert_eq!(c.used(1000), Some(10.0));
+    assert!(!profile.exists(), "the removed profile came back");
+}

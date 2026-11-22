@@ -524,7 +524,7 @@ impl Store {
             .safe("cannot open sync watch lock")?;
         Ok(f.try_lock_exclusive().is_ok().then_some(Guard(f, false)))
     }
-    /// One usage fetch per account at a time, taken without the store lock
+    /// One usage fetch per login at a time, taken without the store lock
     /// so no supervisor waits on the network. None while another process
     /// fetches; `wait` bounds how long to keep trying.
     pub(crate) fn usage_lock(
@@ -532,10 +532,17 @@ impl Store {
         account: &Account,
         wait: std::time::Duration,
     ) -> Result<Option<Guard>> {
-        label(&account.label)?;
+        // Keyed like the refresh lock: aliases of one login share one quota,
+        // so they share one fetch.
+        let identity = crate::identity::read(
+            account.provider,
+            &self.profile(account.provider, &account.label)?,
+        )
+        .unwrap_or_default();
+        let key = identity.lock_key().unwrap_or_else(|| account.label.clone());
         let path = self
             .root
-            .join(format!("{}-{}.usage.lock", account.provider, account.label));
+            .join(format!("{}-{key}.usage.lock", account.provider));
         no_links(&path)?;
         let f = OpenOptions::new()
             .create(true)
