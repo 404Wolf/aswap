@@ -169,7 +169,12 @@ fn a_limit_in_one_program_holds_the_account_in_the_other() {
     assert!(!marked(&teammate));
 }
 
-// t479's review probes for #48 (failing before the fix).
+fn cache_path(pool: &Pool, a: &Account) -> std::path::PathBuf {
+    pool.store
+        .profile(a.provider, &a.label)
+        .unwrap()
+        .join("usage-cache.json")
+}
 #[test]
 fn review_rotations_never_write_the_other_programs_auth() {
     let pool = Pool::new();
@@ -293,6 +298,13 @@ fn review_inflight_pi_poll_must_not_reopen_newer_backend_denial() {
 
 #[test]
 fn review_real_pi_waiter_resumes_from_a_codex_redemption() {
+    review_live_case(false, false);
+}
+#[test]
+fn review_same_second_live_pi_waiter_must_resume_after_codex_redemption() {
+    review_live_case(true, false);
+}
+fn review_live_case(same_stamp: bool, legacy_stamp: bool) {
     use std::{
         fs,
         io::{BufRead, BufReader},
@@ -346,7 +358,7 @@ sys.exit(1)
     fs::set_permissions(bin.join("pi"), fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(bin.join("codex"), "#!/bin/sh\nexit 87\n").unwrap();
     fs::set_permissions(bin.join("codex"), fs::Permissions::from_mode(0o700)).unwrap();
-    let at = aswap::now();
+    let at = aswap::now() + if same_stamp { 5 } else { 0 };
     usage::cached_mode_with(&pool.store, &pi, at, true, |_| Ok(reading(20.0))).unwrap();
     let path = std::env::join_paths(
         std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
@@ -391,7 +403,12 @@ sys.exit(1)
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(pool.cache(&codex).error.as_deref(), Some("provider-limit"));
-    let redeemed = aswap::now() + 2;
+    if legacy_stamp {
+        let mut old = pool.cache(&pi);
+        old.observation = 0;
+        store::json_write(&cache_path(&pool, &pi), &old).unwrap();
+    }
+    let redeemed = if same_stamp { at } else { aswap::now() + 2 };
     usage::cached_mode_with(&pool.store, &codex, redeemed, true, |_| Ok(reading(95.0))).unwrap();
     store::json_write(&aswap::reset::log_path(&pool.store),&json!({"history":[{"at":redeemed,"label":"native","outcome":"reset","reason":"synthetic"}]})).unwrap();
     aswap::reset::append(
@@ -449,4 +466,357 @@ fn review_pi_reset_mode_and_tick_cannot_redeem() {
             .is_none()
     );
     assert!(!aswap::reset::journal_path(&pool.store).exists());
+}
+
+#[test]
+fn review_ordering_counter_worker() {
+    let Some(root) = std::env::var_os("ASWAP_REVIEW_COUNTER_STORE") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let label = std::env::var("ASWAP_REVIEW_COUNTER_LABEL").unwrap();
+    let store = Store::open(root.clone()).unwrap();
+    let account = Account {
+        provider: Provider::Codex,
+        label: label.clone(),
+    };
+    std::fs::write(root.join(format!("ready-{label}")), "synthetic").unwrap();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !root.join("go").exists() {
+        assert!(std::time::Instant::now() < end);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let seen = usage::cached_mode_with(&store, &account, aswap::now(), true, |_| {
+        std::fs::write(root.join(format!("fetch-{label}")), "synthetic").unwrap();
+        while !(root.join("fetch-one").exists() && root.join("fetch-two").exists()) {
+            assert!(
+                std::time::Instant::now() < end,
+                "both independent fetches must overlap"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Ok(reading(20.0))
+    })
+    .unwrap();
+    std::fs::write(
+        root.join(format!("number-{label}")),
+        seen.observation.to_string(),
+    )
+    .unwrap();
+}
+#[test]
+fn review_ordering_two_processes_allocate_distinct_monotonic_numbers() {
+    struct Guard(std::process::Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let pool = Pool::new();
+    for label in ["one", "two"] {
+        let a = pool.add(Provider::Codex, label, &format!("synthetic-member-{label}"));
+        // Distinct workspaces avoid the legacy per-workspace usage lock.
+        let claims = json!({"https://api.openai.com/auth":{"chatgpt_account_id":label,"chatgpt_account_user_id":format!("synthetic-member-{label}")}});
+        let token = format!(
+            "synthetic.{}.synthetic",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        );
+        store::json_write(
+            &pool
+                .store
+                .profile(a.provider, &a.label)
+                .unwrap()
+                .join("auth.json"),
+            &json!({"tokens":{"account_id":label,"access_token":token}}),
+        )
+        .unwrap();
+    }
+    let seed = aswap::now() + 10_000;
+    std::fs::write(pool.store.root.join("usage-observations"), seed.to_string()).unwrap();
+    let mut workers: Vec<_> = ["one", "two"]
+        .iter()
+        .map(|label| {
+            Guard(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "review_ordering_counter_worker", "--nocapture"])
+                    .env_clear()
+                    .env("HOME", pool._temp.path())
+                    .env("ASWAP_REVIEW_COUNTER_STORE", &pool.store.root)
+                    .env("ASWAP_REVIEW_COUNTER_LABEL", label)
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    while !(pool.store.root.join("ready-one").exists()
+        && pool.store.root.join("ready-two").exists())
+    {
+        assert!(std::time::Instant::now() < end);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    std::fs::write(pool.store.root.join("go"), "synthetic").unwrap();
+    for w in &mut workers {
+        loop {
+            if let Some(status) = w.0.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(std::time::Instant::now() < end);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    let mut numbers: Vec<u64> = ["one", "two"]
+        .iter()
+        .map(|label| {
+            std::fs::read_to_string(pool.store.root.join(format!("number-{label}")))
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    numbers.sort_unstable();
+    assert_eq!(numbers, vec![seed + 1, seed + 2]);
+    assert_eq!(
+        std::fs::read_to_string(pool.store.root.join("usage-observations")).unwrap(),
+        (seed + 2).to_string()
+    );
+}
+#[test]
+fn review_ordering_mixed_legacy_new_cache_reuses_by_timestamp() {
+    let pool = Pool::new();
+    let codex = pool.add(Provider::Codex, "native", "synthetic-member-a");
+    let pi = pool.add(Provider::Pi, "pi", "synthetic-member-a");
+    let at = aswap::now();
+    let legacy = Cached {
+        usage: reading(17.0),
+        fetched_at: at,
+        next_poll_at: at + 180,
+        ..Default::default()
+    };
+    store::json_write(&cache_path(&pool, &codex), &legacy).unwrap();
+    let seen = usage::cached_mode_with(&pool.store, &pi, at + 1, false, |_| {
+        panic!("legacy quota should be reused")
+    })
+    .unwrap();
+    assert_eq!(seen.used(at + 1), Some(17.0));
+    assert_eq!(seen.observation, 0);
+    let newer =
+        usage::cached_mode_with(&pool.store, &codex, at + 2, true, |_| Ok(reading(20.0))).unwrap();
+    assert!(newer.observation > 0);
+    assert_eq!(pool.cache(&pi).observation, newer.observation);
+}
+#[test]
+fn review_ordering_inflight_fetch_must_respect_later_legacy_cache() {
+    let pool = Pool::new();
+    let pi = pool.add(Provider::Pi, "pi", "synthetic-member-a");
+    let at = aswap::now();
+    let seen = usage::cached_mode_with(&pool.store, &pi, at, true, |_| {
+        let mut denied = reading(40.0);
+        denied.ordinary_usage = usage::OrdinaryUsage::Denied;
+        let legacy = Cached {
+            usage: denied,
+            fetched_at: at + 1,
+            next_poll_at: at + 181,
+            ..Default::default()
+        };
+        store::json_write(&cache_path(&pool, &pi), &legacy).unwrap();
+        let mut stale = reading(10.0);
+        stale.ordinary_usage = usage::OrdinaryUsage::Allowed;
+        Ok(stale)
+    })
+    .unwrap();
+    assert_eq!(
+        seen.used(at + 1),
+        Some(100.0),
+        "a later legacy observation must win by fetched_at when no observation number exists"
+    );
+}
+#[test]
+fn review_ordering_imported_observation_must_not_defeat_a_new_forced_fetch() {
+    let pool = Pool::new();
+    let codex = pool.add(Provider::Codex, "native", "synthetic-member-a");
+    let at = aswap::now();
+    // Sync carries Cached::observation but not the source store's counter.
+    let imported = Cached {
+        usage: reading(100.0),
+        fetched_at: at,
+        next_poll_at: at + 180,
+        observation: at + 10_000,
+        ..Default::default()
+    };
+    store::json_write(&cache_path(&pool, &codex), &imported).unwrap();
+    assert!(!pool.store.root.join("usage-observations").exists());
+    let seen =
+        usage::cached_mode_with(&pool.store, &codex, at + 1, true, |_| Ok(reading(10.0))).unwrap();
+    assert_eq!(
+        seen.used(at + 1),
+        Some(10.0),
+        "newly requested native quota must supersede an imported old observation"
+    );
+    assert!(seen.observation > imported.observation);
+}
+
+#[test]
+fn review_ordering_legacy_same_second_live_pi_waiter_must_resume() {
+    review_live_case(true, true);
+}
+
+#[test]
+fn review_ordering_imported_counter_must_not_defeat_reset_guard_freshness() {
+    struct Port<'a> {
+        store: &'a Store,
+        at: u64,
+        spends: usize,
+    }
+    impl aswap::reset::Port for Port<'_> {
+        fn refresh(&mut self, a: &Account) -> aswap::Result<Cached> {
+            usage::cached_mode_with(self.store, a, self.at, true, |_| Ok(reading(10.0)))
+        }
+        fn redeem(&mut self, _: &Account, _: &str, _: &str) -> aswap::Result<serde_json::Value> {
+            self.spends += 1;
+            Ok(json!({"outcome":"reset"}))
+        }
+        fn save(&mut self, _: &aswap::reset::ResetLog) -> aswap::Result<()> {
+            Ok(())
+        }
+        fn new_key(&mut self) -> aswap::Result<String> {
+            Ok("synthetic-key".into())
+        }
+        fn journal(&mut self, _: &aswap::reset::Event) -> aswap::Result<()> {
+            Ok(())
+        }
+        fn mode(&mut self) -> aswap::Result<aswap::store::AutoReset> {
+            Ok(aswap::store::AutoReset::On)
+        }
+        fn pause(&mut self, _: u64) {}
+    }
+    let pool = Pool::new();
+    let codex = pool.add(Provider::Codex, "native", "synthetic-member-a");
+    let at = aswap::now();
+    let mut full = reading(100.0);
+    full.available_usage_resets = Some(1);
+    full.reset_credits_listed = true;
+    full.reset_credits = vec![usage::ResetCredit {
+        id: "synthetic-credit".into(),
+        status: "available".into(),
+        reset_type: "codexRateLimits".into(),
+        expires_at: Some(at + 86400),
+        title: Some("Full reset (Weekly + 5 hr)".into()),
+        description: Some("Ready to redeem".into()),
+    }];
+    let imported = Cached {
+        usage: full,
+        fetched_at: at,
+        next_poll_at: at + 180,
+        observation: at + 10_000,
+        ..Default::default()
+    };
+    store::json_write(&cache_path(&pool, &codex), &imported).unwrap();
+    let mut port = Port {
+        store: &pool.store,
+        at: at + 1,
+        spends: 0,
+    };
+    let settings = aswap::store::Auto {
+        auto_reset: aswap::store::AutoReset::On,
+        ..Default::default()
+    };
+    let result = aswap::reset::step(
+        &mut port,
+        Provider::Codex,
+        &settings,
+        vec![(codex, imported)],
+        &mut aswap::reset::ResetLog::default(),
+        false,
+        at + 1,
+    )
+    .unwrap();
+    assert_eq!(
+        port.spends, 0,
+        "every native quota fetch returned 10% used, yet reset step sent a consumption: {result:?}"
+    );
+}
+
+#[test]
+fn review_ordering_imported_counter_floor_control_prevents_reset_spend() {
+    struct Port<'a> {
+        store: &'a Store,
+        at: u64,
+        spends: usize,
+    }
+    impl aswap::reset::Port for Port<'_> {
+        fn refresh(&mut self, a: &Account) -> aswap::Result<Cached> {
+            usage::cached_mode_with(self.store, a, self.at, true, |_| Ok(reading(10.0)))
+        }
+        fn redeem(&mut self, _: &Account, _: &str, _: &str) -> aswap::Result<serde_json::Value> {
+            self.spends += 1;
+            Ok(json!({"outcome":"reset"}))
+        }
+        fn save(&mut self, _: &aswap::reset::ResetLog) -> aswap::Result<()> {
+            Ok(())
+        }
+        fn new_key(&mut self) -> aswap::Result<String> {
+            Ok("synthetic-key".into())
+        }
+        fn journal(&mut self, _: &aswap::reset::Event) -> aswap::Result<()> {
+            Ok(())
+        }
+        fn mode(&mut self) -> aswap::Result<aswap::store::AutoReset> {
+            Ok(aswap::store::AutoReset::On)
+        }
+        fn pause(&mut self, _: u64) {}
+    }
+    let pool = Pool::new();
+    let codex = pool.add(Provider::Codex, "native", "synthetic-member-a");
+    let at = aswap::now();
+    let mut full = reading(100.0);
+    full.available_usage_resets = Some(1);
+    full.reset_credits_listed = true;
+    full.reset_credits = vec![usage::ResetCredit {
+        id: "synthetic-credit".into(),
+        status: "available".into(),
+        reset_type: "codexRateLimits".into(),
+        expires_at: Some(at + 86400),
+        title: Some("Full reset (Weekly + 5 hr)".into()),
+        description: Some("Ready to redeem".into()),
+    }];
+    let imported = Cached {
+        usage: full,
+        fetched_at: at,
+        next_poll_at: at + 180,
+        observation: at + 10_000,
+        ..Default::default()
+    };
+    store::json_write(&cache_path(&pool, &codex), &imported).unwrap();
+    std::fs::write(
+        pool.store.root.join("usage-observations"),
+        (at + 10_000).to_string(),
+    )
+    .unwrap();
+    let mut port = Port {
+        store: &pool.store,
+        at: at + 1,
+        spends: 0,
+    };
+    let settings = aswap::store::Auto {
+        auto_reset: aswap::store::AutoReset::On,
+        ..Default::default()
+    };
+    let result = aswap::reset::step(
+        &mut port,
+        Provider::Codex,
+        &settings,
+        vec![(codex, imported)],
+        &mut aswap::reset::ResetLog::default(),
+        false,
+        at + 1,
+    )
+    .unwrap();
+    assert_eq!(
+        port.spends, 0,
+        "every native quota fetch returned 10% used, yet reset step sent a consumption: {result:?}"
+    );
 }

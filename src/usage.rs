@@ -274,10 +274,14 @@ fn is_zero(n: &u64) -> bool {
 impl Cached {
     /// Whether this quota observation is newer than `other`'s.
     pub(crate) fn newer_than(&self, other: &Self) -> bool {
-        if self.observation != 0 && other.observation != 0 {
-            self.observation > other.observation
-        } else {
-            self.fetched_at > other.fetched_at
+        match (self.observation, other.observation) {
+            (0, 0) => self.fetched_at > other.fetched_at,
+            // A numbered observation beats a legacy one of the same second
+            // (it can only have been started then or later); otherwise
+            // time decides.
+            (_, 0) => self.fetched_at >= other.fetched_at,
+            (0, _) => self.fetched_at > other.fetched_at,
+            (mine, theirs) => mine > theirs,
         }
     }
     /// This account's quota observation from `shared` (another login of the
@@ -305,15 +309,17 @@ impl Cached {
         self.error.as_deref().is_some_and(|e| e != "provider-limit") || self.retry_after.is_some()
     }
 }
-/// The store's next quota observation number (see `Cached::observation`).
-/// Caller holds the store lock.
-fn next_observation(store: &Store) -> Result<u64> {
+/// The store's next quota observation number (see `Cached::observation`),
+/// above `floor` too: an observation already present (synced in from
+/// another store, whose counter this one doesn't have) never outranks a
+/// fetch started now. Caller holds the store lock.
+fn next_observation(store: &Store, floor: u64) -> Result<u64> {
     let path = store.root.join("usage-observations");
     let last: u64 = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
-    let next = last.max(now()).saturating_add(1);
+    let next = last.max(now()).max(floor).saturating_add(1);
     store::atomic(&path, next.to_string().as_bytes())?;
     Ok(next)
 }
@@ -988,7 +994,21 @@ where
     };
     let observation = {
         let _lock = store.lock()?;
-        next_observation(store)?
+        let state = store.load()?;
+        let floor = crate::identity::siblings(store, account, &state.accounts)
+            .iter()
+            .filter_map(|other| {
+                let path = store
+                    .profile(other.provider, &other.label)
+                    .ok()?
+                    .join("usage-cache.json");
+                read_cache(&path, false).ok()
+            })
+            .chain(read_cache(&path, false).ok())
+            .map(|cache| cache.observation)
+            .max()
+            .unwrap_or(0);
+        next_observation(store, floor)?
     };
     let result = fetcher(&profile);
     let _lock = store.lock()?;
@@ -1002,9 +1022,15 @@ where
         return Ok(updated(snapshot, result, at));
     }
     let latest = read_cache(&path, force)?;
-    // Compare-and-set: another program's later-started observation of this
-    // account landed here during the fetch. This one is older: it loses.
-    if latest.observation > observation {
+    // Compare-and-set: an observation started after this fetch landed here
+    // during it (another program's, or an older aswap's, which has no
+    // number and is ordered by time). This one is older: it loses.
+    let started = Cached {
+        fetched_at: at,
+        observation,
+        ..Cached::default()
+    };
+    if latest.newer_than(&snapshot) && latest.newer_than(&started) {
         return Ok(latest);
     }
     let mut entry = merged(&snapshot, latest, result, at);
