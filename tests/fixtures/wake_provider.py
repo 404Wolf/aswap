@@ -46,7 +46,7 @@ if mode=='race':
         value=json.loads(cache.read_text())
         value['error']='provider-limit'
         value['usage']['windows'][0]['used_percent']=100
-        draft=cache.with_suffix('.new')
+        draft=cache.with_name(cache.name+'.new.'+str(os.getpid()))
         draft.write_text(json.dumps(value));draft.replace(cache)
         (log/'revoked').write_text('quota revoked before commit')
         sys.exit(1)
@@ -56,7 +56,7 @@ if provider=='codex':
     cache=pathlib.Path(os.environ['XDG_DATA_HOME'])/'aswap'/'profiles'/provider/label/'usage-cache.json'
     value=json.loads(cache.read_text())
     value['usage']['windows'][0]['used_percent']=100
-    draft=cache.with_suffix('.limit')
+    draft=cache.with_name(cache.name+'.limit.'+str(os.getpid()))
     draft.write_text(json.dumps(value));draft.replace(cache)
 print("You've hit your weekly limit" if provider=='claude' else 'usage_limit_reached',flush=True)
 (log/(id+'-initial')).write_text('limited')

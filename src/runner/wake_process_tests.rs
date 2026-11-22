@@ -269,10 +269,15 @@ fn scenario(
     if let Some(index) = closed {
         // Keep what the supervisor said and how it ended: this is the
         // failure to diagnose, not a redemption wake.
-        let status = workers[index].child.try_wait().ok().flatten();
+        let worker = &mut workers[index];
+        let status = worker.child.wait().ok();
+        let mut stdout = String::new();
+        if let Some(mut out) = worker.child.stdout.take() {
+            let _ = out.read_to_string(&mut stdout);
+        }
         panic!(
-            "supervisor {index} exited before recovery was published (status {status:?}); its trace:\n{}",
-            workers[index].trace.lock().unwrap()
+            "supervisor {index} exited before recovery was published (status {status:?}); its trace:\n{}\nits stdout (the provider's output):\n{stdout}",
+            worker.trace.lock().unwrap()
         );
     }
     assert!(CLOCK.with(|clock| clock.borrow().is_none()));
