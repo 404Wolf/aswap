@@ -122,6 +122,7 @@ impl Spec for Codex {
             .access_token(auth)
             .and_then(jwt_claims)
             .unwrap_or(Value::Null);
+        let selected = text(auth, &["/tokens/account_id"]);
         Claims {
             email: text(&id, &["/email"]).or_else(|| text(auth, &["/email"])),
             plan: text(&id, &[PLAN]).or_else(|| text(&access, &[PLAN])),
@@ -136,6 +137,8 @@ impl Spec for Codex {
                 )
             }),
             organization: None,
+            member: crate::identity::openai_member(&access, selected.as_deref()),
+            person: crate::identity::openai_person(&[&access, &id], selected.as_deref()),
         }
     }
     fn capture(&self, _source: &Path, profile: &Path) -> Result<()> {

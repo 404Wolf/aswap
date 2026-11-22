@@ -1634,9 +1634,15 @@ fn the_gc_lock_waits_out_a_brief_holder_but_not_another_gc() {
             std::thread::sleep(Duration::from_millis(200));
             fs2::FileExt::unlock(&other).unwrap();
         });
-        lock_runtimes(&ours, Duration::from_secs(5)).unwrap();
+        let held = lock_runtimes(&ours, Duration::from_secs(5)).unwrap();
+        // A forked child would share the description; dropping the guard
+        // releases the lock anyway.
+        let shared = ours.try_clone().unwrap();
+        drop(held);
+        fs2::FileExt::try_lock_exclusive(&other).unwrap();
+        fs2::FileExt::unlock(&other).unwrap();
+        drop(shared);
     });
-    fs2::FileExt::unlock(&ours).unwrap();
     // Another GC holds it throughout.
     fs2::FileExt::lock_exclusive(&other).unwrap();
     let failure = lock_runtimes(&ours, Duration::from_millis(200)).unwrap_err();

@@ -85,7 +85,7 @@ enum Action {
         #[arg(value_enum, required = true)]
         action: Option<AutoAction>,
         #[arg(
-            help = "Percentage for threshold; text or off for resume-prompt; headroom or weekly-reset for prefer; off, dry-run or on for reset (Codex only); account label for reserve or unreserve"
+            help = "Percentage for threshold; text or off for resume-prompt; headroom or weekly-reset for prefer; off, dry-run, on, retry or dismiss for reset (Codex only); account label for reserve or unreserve"
         )]
         value: Option<String>,
         #[arg(
@@ -163,6 +163,9 @@ enum AutoAction {
     /// Codex: redeem a usage-limit reset credit when every account is out of
     /// weekly usage (off, dry-run or on; default off).
     Reset,
+    /// Codex: also redeem when accounts are only out of their 5-hour
+    /// windows, with weekly usage left (on or off; default off).
+    ResetSessionWindows,
     /// Keep this account available for runs pinned to it.
     Reserve,
     /// Make this account available to automatic selection again.
@@ -226,7 +229,7 @@ fn snapshot(store: &Store, filter: Option<Provider>, refresh: bool) -> Result<Va
             .unwrap_or_else(|err| json!({"error": err.to_string()}))
     };
     Ok(
-        json!({"schema_version":1,"accounts":rows,"auto":settings,"codex_usage_resets":usage_resets,"switch_interval_seconds":switch_interval,"credential_mode":if coordination.owner {"refresh-owner"}else if coordination.host.is_some(){"access-only-follower"}else{"refresh-disabled"},"last_sync":coordination.last_sync,"sync":aswap::coordination::status(store)?}),
+        json!({"schema_version":1,"accounts":rows,"auto":settings.iter().map(|(p, a)| (p.as_str().to_owned(), a.public_json())).collect::<serde_json::Map<_, _>>(),"codex_usage_resets":usage_resets,"switch_interval_seconds":switch_interval,"credential_mode":if coordination.owner {"refresh-owner"}else if coordination.host.is_some(){"access-only-follower"}else{"refresh-disabled"},"last_sync":coordination.last_sync,"sync":aswap::coordination::status(store)?}),
     )
 }
 fn duplicate_labels(store: &Store, account: &store::Account) -> Result<Vec<String>> {
@@ -571,12 +574,13 @@ fn execute(cli: Cli) -> Result<i32> {
                     | AutoAction::ResumePrompt
                     | AutoAction::Prefer
                     | AutoAction::Reset
+                    | AutoAction::ResetSessionWindows
                     | AutoAction::Reserve
                     | AutoAction::Unreserve
             ) != value.is_some()
             {
                 return Err(Error(
-                    "threshold requires a percentage; resume-prompt requires text or off; prefer requires headroom or weekly-reset; reset requires off, dry-run or on; reserve and unreserve require an account label; other actions take no value",
+                    "threshold requires a percentage; resume-prompt requires text or off; prefer requires headroom or weekly-reset; reset requires off, dry-run, on, retry or dismiss; reserve and unreserve require an account label; other actions take no value",
                 ));
             }
             match action {
@@ -594,7 +598,7 @@ fn execute(cli: Cli) -> Result<i32> {
                     } else {
                         settings.reserved.retain(|item| item != &label);
                     }
-                    let v = json!({"provider":provider,"label":label,"reserved":reserved,"auto":settings});
+                    let v = json!({"provider":provider,"label":label,"reserved":reserved,"auto":settings.public_json()});
                     store.save(&state)?;
                     let action = if reserved { "Reserved" } else { "Unreserved" };
                     output(&v, cli.json, format!("{action} {provider}:{label}"))?;
@@ -604,7 +608,38 @@ fn execute(cli: Cli) -> Result<i32> {
                 | AutoAction::Threshold
                 | AutoAction::Prefer
                 | AutoAction::Reset
+                | AutoAction::ResetSessionWindows
                 | AutoAction::ResumePrompt => {
+                    // A reset mode change waits for a running reset tick and
+                    // holds it off: the reset lock first, then the store lock.
+                    let _reset =
+                        matches!(action, AutoAction::Reset | AutoAction::ResetSessionWindows)
+                            .then(|| aswap::reset::change_lock(&store))
+                            .transpose()?;
+                    let value_ref = value.as_deref();
+                    if matches!(action, AutoAction::Reset)
+                        && matches!(value_ref, Some("retry" | "dismiss"))
+                    {
+                        if provider != Provider::Codex {
+                            return Err(Error("usage-limit resets are only supported for Codex"));
+                        }
+                        let _lock = store.lock()?;
+                        let dismiss = value_ref == Some("dismiss");
+                        let label = aswap::reset::settle_paused(&store, dismiss)?;
+                        let verb = if dismiss { "dropped" } else { "will resend" };
+                        let pretty = match &label {
+                            Some(label) => format!(
+                                "codex:{label}: {verb} the unresolved usage reset (same key)"
+                            ),
+                            None => "no unresolved Codex usage reset".into(),
+                        };
+                        output(
+                            &json!({"provider":provider,"pending":label,"dismissed":dismiss}),
+                            cli.json,
+                            pretty,
+                        )?;
+                        return Ok(0);
+                    }
                     let _lock = store.lock()?;
                     let mut state = store.load()?;
                     let settings = state.auto.entry(provider).or_default();
@@ -628,8 +663,22 @@ fn execute(cli: Cli) -> Result<i32> {
                         }
                         AutoAction::Reset => {
                             let mode = store::AutoReset::from_str(value.as_deref().unwrap(), false)
-                                .map_err(|_| Error("reset must be off, dry-run or on"))?;
+                                .map_err(|_| {
+                                    Error("reset must be off, dry-run, on, retry or dismiss")
+                                })?;
                             aswap::reset::set_mode(&store, provider, settings, mode)?;
+                        }
+                        AutoAction::ResetSessionWindows => {
+                            if provider != Provider::Codex {
+                                return Err(Error(
+                                    "usage-limit resets are only supported for Codex",
+                                ));
+                            }
+                            settings.reset_session_windows = match value.as_deref() {
+                                Some("on") => true,
+                                Some("off") => false,
+                                _ => return Err(Error("reset-session-windows must be on or off")),
+                            };
                         }
                         AutoAction::ResumePrompt => {
                             let prompt = value.unwrap();
@@ -642,7 +691,7 @@ fn execute(cli: Cli) -> Result<i32> {
                         }
                         _ => unreachable!(),
                     }
-                    let v = json!({"provider":provider,"auto":settings});
+                    let v = json!({"provider":provider,"auto":settings.public_json()});
                     let pretty = format!(
                         "{provider}  {}",
                         aswap::display::policy_text(&aswap::display::Policy {
@@ -703,7 +752,9 @@ fn execute(cli: Cli) -> Result<i32> {
                         if matches!(action, AutoAction::Once) {
                             break;
                         }
-                        std::thread::sleep(Duration::from_secs(usage::TTL));
+                        // A post-reset re-read due sooner wakes the monitor for it.
+                        let wait = aswap::reset::monitor_wait(&store, provider, now());
+                        std::thread::sleep(Duration::from_secs(wait));
                     }
                 }
             }

@@ -396,7 +396,8 @@ fn write_codex_cache(t: &Sandbox, label: &str, weekly: f64, reset: u64, credits:
                     {"name":"weekly","used_percent":weekly,"resets_at":reset,"duration_minutes":10080,"codex_slot":1}
                 ],
                 "available_usage_resets":count,
-                "reset_credits":credits
+                "reset_credits":credits,
+                "reset_credits_listed":true
             },
             "fetched_at":at,"next_poll_at":at+180,"last_attempt":at
         })
@@ -439,6 +440,8 @@ fn codex_reset_mode_is_opt_in_shown_and_codex_only() {
         &["auto", "claude", "reset", "on"][..],
         &["auto", "claude", "reset", "dry-run"],
         &["auto", "codex", "reset", "yes"],
+        &["auto", "claude", "reset", "retry"],
+        &["auto", "claude", "reset", "dismiss"],
         &["auto", "codex", "reset"],
     ] {
         assert!(!t.invoke(bad).status.success(), "{bad:?}");

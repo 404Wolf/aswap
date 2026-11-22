@@ -141,6 +141,15 @@ impl Spec for Claude {
                 &["/oauthAccount/accountUuid", "/oauthAccount/emailAddress"],
             ),
             organization: text(config, &["/oauthAccount/organizationUuid"]),
+            // Claude's account in its organization, never the email.
+            member: text(config, &["/oauthAccount/accountUuid"]).map(|a| {
+                crate::identity::digest(&(
+                    "anthropic",
+                    a,
+                    text(config, &["/oauthAccount/organizationUuid"]),
+                ))
+            }),
+            person: None,
         }
     }
     fn account_config(&self) -> Option<&'static str> {

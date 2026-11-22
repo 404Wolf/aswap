@@ -149,8 +149,13 @@ where
         .profile(account.provider, &account.label)
         .map_err(|_| Failure::new("usage-unavailable"))?
         .join(account.provider.auth_file());
+    // A rotation whose final write failed left the only valid refresh token
+    // in the pending sidecar: install it before anything else.
+    recover_pending(store, account, &path).map_err(|_| Failure::new("usage-unavailable"))?;
     // Re-read only after acquiring the identity lock; another refresher may have won.
     let old: Value = store::json_read(&path).map_err(|_| Failure::new("usage-unavailable"))?;
+    // What a pending copy of a rotation replaces (see write_pending).
+    let replaces = file_hash(&path);
     if !account.provider.spec().refreshable(&old) {
         return Ok(false);
     }
@@ -207,13 +212,11 @@ where
         &serde_json::to_vec(&auth).map_err(|_| Failure::new("refresh-invalid-response"))?,
     )
     .map_err(|_| Failure::new("refresh-invalid-response"))?;
-    store::json_write(&path, &auth).map_err(|_| Failure::new("usage-unavailable"))?;
-    // The old access token is already revoked: hand the new one to every
-    // live run now, before anything else, rather than on each run's tick.
-    crate::shared::hand_out(store, account, &auth);
-    propagate(store, account, &auth).map_err(|_| Failure::new("usage-unavailable"))?;
-    crate::usage::credentials_changed(store, account)
-        .map_err(|_| Failure::new("usage-unavailable"))?;
+    // The provider has already invalidated the old refresh token, so the
+    // new login must survive a failed write: it goes to pending copies
+    // first, and the next refresh installs one if the main write fails.
+    write_pending(store, account, replaces, &auth);
+    install(store, account, &path, &auth).map_err(|_| Failure::new("usage-unavailable"))?;
     // A token that lives under twice the margin would be due again soon, or
     // on every check: the next unforced refresh waits half its lifetime, and
     // never less than a minute, even for a token that is already expired.
@@ -232,13 +235,166 @@ where
     }
     Ok(true)
 }
+/// `<auth file>.pending` beside the login: private by name
+/// (shared::private), never linked into a view.
+fn pending_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(".pending");
+    path.with_file_name(name)
+}
+/// A second pending copy in `$XDG_RUNTIME_DIR` (a tmpfs on systemd hosts),
+/// so a full or failing data disk can't lose both. Named per store, so
+/// two stores (a test's and the real one) never share it.
+fn runtime_pending_path(store: &Store, account: &Account) -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_absolute() && dir.is_dir())?;
+    let root = ring::digest::digest(
+        &ring::digest::SHA256,
+        store.root.as_os_str().as_encoded_bytes(),
+    );
+    let root: String = root.as_ref()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Some(dir.join("aswap").join(format!(
+        "{root}-{}-{}.pending.json",
+        account.provider, account.label
+    )))
+}
+fn pending_paths(store: &Store, account: &Account) -> Vec<std::path::PathBuf> {
+    let profile = store.profile(account.provider, &account.label).ok();
+    profile
+        .map(|p| pending_path(&p.join(account.provider.auth_file())))
+        .into_iter()
+        .chain(runtime_pending_path(store, account))
+        .collect()
+}
+/// A pending login: the rotated login and a hash of the login file it
+/// replaces, so it is installed only over that file, never over a newer one.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Pending {
+    replaces: String,
+    auth: Value,
+}
+fn file_hash(path: &std::path::Path) -> Option<String> {
+    let bytes = store::read_private(path).ok()?;
+    Some(
+        ring::digest::digest(&ring::digest::SHA256, &bytes)
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
+}
+/// Write both pending copies; either one is enough. `replaces` is the hash
+/// of the login file the rotation started from.
+fn write_pending(store: &Store, account: &Account, replaces: Option<String>, auth: &Value) {
+    let Some(replaces) = replaces else {
+        return;
+    };
+    let pending = Pending {
+        replaces,
+        auth: auth.clone(),
+    };
+    for copy in pending_paths(store, account) {
+        let _ = store::json_write(&copy, &pending);
+    }
+}
+/// Drop an account's pending logins: its login file is being replaced
+/// (a new rotation, `add`, a live login preserved), so they are stale.
+pub(crate) fn discard_pending(store: &Store, account: &Account) {
+    for copy in pending_paths(store, account) {
+        let _ = std::fs::remove_file(copy);
+    }
+}
+/// Write a rotated login, hand it to every live run and alias, then drop
+/// its pending copies (a failure to remove them is harmless: they no
+/// longer match the login file).
+fn install(
+    store: &Store,
+    account: &Account,
+    path: &std::path::Path,
+    auth: &Value,
+) -> crate::Result<()> {
+    store::json_write(path, auth)?;
+    // The old access token is already revoked: hand the new one to every
+    // live run now, before anything else, rather than on each run's tick.
+    crate::shared::hand_out(store, account, auth);
+    propagate(store, account, auth)?;
+    crate::usage::credentials_changed(store, account)?;
+    discard_pending(store, account);
+    Ok(())
+}
+/// Install or drop an account's pending logins now, under its refresh lock
+/// (the caller holds the store lock): before a rename moves the account.
+pub(crate) fn settle_pending(store: &Store, account: &Account) -> crate::Result<()> {
+    let _refresh = store.refresh_lock(account)?;
+    let path = store
+        .profile(account.provider, &account.label)?
+        .join(account.provider.auth_file());
+    recover_pending(store, account, &path)
+}
+/// Install a pending login left by a rotation whose final write failed,
+/// if the login file is still the one it replaces; drop it otherwise.
+fn recover_pending(store: &Store, account: &Account, path: &std::path::Path) -> crate::Result<()> {
+    let copies: Vec<_> = pending_paths(store, account)
+        .into_iter()
+        .filter(|copy| copy.exists())
+        .collect();
+    if copies.is_empty() {
+        return Ok(());
+    }
+    // A login file that can't be read (the disk still failing) proves
+    // nothing: keep every copy, the tmpfs one above all, and retry later.
+    let Some(current) = file_hash(path) else {
+        return Err(crate::Error(
+            "cannot read the login to recover its pending copy",
+        ));
+    };
+    let current = Some(current);
+    for copy in copies {
+        let pending: Option<Pending> = store::json_read(&copy).ok();
+        let usable = pending.filter(|p| {
+            Some(&p.replaces) == current.as_ref()
+                && serde_json::to_vec(&p.auth)
+                    .is_ok_and(|bytes| provider::validate_auth(account.provider, &bytes).is_ok())
+        });
+        match usable {
+            Some(pending) => return install(store, account, path, &pending.auth),
+            None => {
+                let _ = std::fs::remove_file(&copy);
+            }
+        }
+    }
+    Ok(())
+}
 /// An active local run may refresh even when inactive-profile monitoring is off.
 /// Followers still only pull from the designated owner.
 pub fn for_run(store: &Store, account: &Account) -> std::result::Result<bool, Failure> {
+    let at = crate::now();
+    // Every supervisor asks on its terminal thread every 30 s. Answer "not
+    // due" without the store lock, so a slow lock holder never stalls
+    // typing; refresh_inner decides again under the lock when it may be due.
+    if !may_be_due(store, account, at) {
+        return Ok(false);
+    }
     let _lock = store
         .lock()
         .map_err(|_| Failure::new("usage-unavailable"))?;
-    refresh_inner(store, account, crate::now(), false, true, request)
+    refresh_inner(store, account, at, false, true, request)
+}
+/// False only when an unforced refresh_inner would certainly do nothing:
+/// the stored login (written atomically, so safe to read unlocked) has a
+/// known expiry beyond the margin, or none at all.
+fn may_be_due(store: &Store, account: &Account, at: u64) -> bool {
+    let Ok(profile) = store.profile(account.provider, &account.label) else {
+        return true;
+    };
+    let Ok(auth) = store::json_read::<Value>(&profile.join(account.provider.auth_file())) else {
+        return true;
+    };
+    expires_at(account.provider, &auth).is_some_and(|expiry| expiry <= at.saturating_add(MARGIN))
 }
 pub fn refresh(
     store: &Store,
@@ -305,4 +461,40 @@ pub(crate) fn propagate(store: &Store, account: &Account, auth: &Value) -> crate
         crate::usage::credentials_changed(store, &other)?;
     }
     Ok(())
+}
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+
+    #[test]
+    fn an_unreadable_login_keeps_its_pending_copy() {
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let account = Account {
+            provider: Provider::Claude,
+            label: "one".into(),
+        };
+        let path = store
+            .profile(account.provider, &account.label)
+            .unwrap()
+            .join(account.provider.auth_file());
+        // The login file can't be read (here: a directory in its place).
+        std::fs::create_dir_all(&path).unwrap();
+        let copy = pending_path(&path);
+        store::json_write(
+            &copy,
+            &Pending {
+                replaces: "synthetic-hash".into(),
+                auth: serde_json::json!({"claudeAiOauth":{"accessToken":"synthetic"}}),
+            },
+        )
+        .unwrap();
+        assert!(recover_pending(&store, &account, &path).is_err());
+        assert!(copy.exists(), "the pending copy was dropped");
+        // Once the file reads and differs, the copy is stale and dropped.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"{}").unwrap();
+        recover_pending(&store, &account, &path).unwrap();
+        assert!(!copy.exists());
+    }
 }

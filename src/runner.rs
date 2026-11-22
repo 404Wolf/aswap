@@ -242,7 +242,13 @@ pub fn launch(
             provider, args, &help,
         )?);
     }
-    let mut terminal = if auto { Some(Terminal::open()?) } else { None };
+    let mut terminal = if auto {
+        let mut terminal = Terminal::open()?;
+        terminal.codex = provider == Provider::Codex;
+        Some(terminal)
+    } else {
+        None
+    };
     let mut launch_args = auto_args
         .as_ref()
         .map_or_else(|| args.to_vec(), |a| a.initial.clone());
@@ -372,6 +378,8 @@ pub fn launch(
         let mut rotated = false;
         let mut reported_resume = false;
         let mut wake = Wake::new(wake_seed);
+        let mut reset_log = None;
+        wake.poke(&mut reset_log, store, provider);
         let status = loop {
             // Whether the screen showed a limit this tick; for Claude, its
             // transcript decides whether that is live (see `limit_seen`).
@@ -445,7 +453,10 @@ pub fn launch(
                     tracker.as_ref(),
                     screen_limit,
                     terminal.as_ref(),
-                    false,
+                    Moment {
+                        exited: None,
+                        launched: launched.as_deref(),
+                    },
                 );
             }
             if let Some(terminal) = &mut terminal {
@@ -474,6 +485,7 @@ pub fn launch(
                     syncing = immediate_poll(store);
                 }
             }
+            wake.poke(&mut reset_log, store, provider);
             let quota_rotation = limited
                 && !auth_failed
                 && !expired
@@ -623,7 +635,10 @@ pub fn launch(
                     tracker.as_ref(),
                     screen_limit,
                     Some(terminal),
-                    true,
+                    Moment {
+                        exited: Some(!status.success()),
+                        launched: launched.as_deref(),
+                    },
                 );
             }
             quiet.apply(terminal, tracker.as_ref());
@@ -763,6 +778,11 @@ pub fn launch(
                 if let Some(choice) = hiccups.note("choosing another account", decided) {
                     target = choice.or(target);
                 }
+                // A limit first confirmed by the exit (an early Codex notice)
+                // explains a missing model fit here, as a live one does above.
+                if target.is_none() && limited && !reported_none {
+                    models.report_none();
+                }
             }
         }
         // Resume the same interactive history; never replay command arguments.
@@ -788,6 +808,7 @@ pub fn launch(
         // the supervisor and exact resume argv until any account recovers.
         let (next, next_lease, fallback) = loop {
             while quota_wait && (target.is_none() || restarts.capped()) {
+                wake.poke(&mut reset_log, store, provider);
                 if wake.due(now()) {
                     let decided = (|| -> Result<Option<Account>> {
                         if rejected_as.is_none() {
@@ -987,6 +1008,12 @@ fn launch_seed(
 /// records them again. Claude's active limit menu and failed compaction can
 /// also be corroborated by the account's fresh quota. Other providers, and
 /// one whose transcript is unknown, go by the screen.
+/// When a limit check happens: while the provider runs (`exited` None) or
+/// after it exited (`Some(failed)`), with the login it was launched with.
+struct Moment<'a> {
+    exited: Option<bool>,
+    launched: Option<&'a [u8]>,
+}
 fn limit_seen(
     store: &Store,
     account: &Account,
@@ -994,8 +1021,32 @@ fn limit_seen(
     tracker: Option<&crate::session::Tracker>,
     screen: crate::terminal::ScreenLimits,
     terminal: Option<&Terminal>,
-    fresh: bool,
+    moment: Moment,
 ) -> bool {
+    let fresh = moment.exited.is_some();
+    if account.provider == Provider::Codex {
+        // An early notice needs the quota to agree (single-flight reads).
+        return limits.check_codex(
+            screen.notice,
+            moment.exited == Some(true),
+            || rotated_since(store, account, moment.launched),
+            || usage::cached(store, account).ok(),
+            || {
+                // Off the terminal thread: a forced read can wait for
+                // another fetch, or for the owner on a follower.
+                let (tx, rx) = std::sync::mpsc::channel();
+                let (root, account) = (store.root.clone(), account.clone());
+                std::thread::spawn(move || {
+                    let reading = Store::open(root)
+                        .and_then(|store| usage::cached_force(&store, &account, true))
+                        .ok();
+                    let _ = tx.send(reading);
+                });
+                rx
+            },
+            now,
+        );
+    }
     if !account.provider.spec().records_limits() || tracker.is_none() {
         return screen.notice;
     }

@@ -45,6 +45,9 @@ pub struct Terminal {
     started: bool,
     childless: bool,
     diagnostics: Diagnostics,
+    /// A Codex terminal matches only Codex's own limit notices (see
+    /// `diagnostic_line`); Claude's rules would misread its tool output.
+    pub codex: bool,
     last_input: Option<std::time::Instant>,
     pub auth_expired: bool,
     pub model_unsupported: bool,
@@ -117,6 +120,7 @@ impl Terminal {
             started: false,
             childless: true,
             diagnostics: Diagnostics::default(),
+            codex: false,
             last_input: None,
             auth_expired: false,
             model_unsupported: false,
@@ -175,7 +179,10 @@ impl Terminal {
                 return Err(Error("cannot clear provider input before resume"));
             }
         }
-        self.diagnostics = Diagnostics::default();
+        self.diagnostics = Diagnostics {
+            codex: self.codex,
+            ..Diagnostics::default()
+        };
         self.last_input = None;
         self.auth_expired = false;
         self.model_unsupported = false;
@@ -386,6 +393,7 @@ struct Diagnostics {
     escape: u8,
     truncated: bool,
     menu_header: bool,
+    codex: bool,
 }
 impl Diagnostics {
     fn feed(&mut self, bytes: &[u8]) -> (ScreenLimits, bool, bool) {
@@ -454,10 +462,13 @@ impl Diagnostics {
         let decoded = normalize(&self.line);
         self.line.clear();
         let line = decoded.as_str();
-        let (limit, auth, model) = diagnostic_line(line);
+        let (limit, auth, model) = diagnostic_line(line, self.codex);
         signals.0.notice |= limit;
         signals.1 |= auth;
         signals.2 |= model;
+        if self.codex {
+            return;
+        }
         signals.0.claude_compaction |= claude_compaction_limit(line);
         const HEADER: &str = "what do you want to do?";
         let option = line
@@ -483,14 +494,29 @@ fn normalize(line: &[u8]) -> String {
 }
 const CODEX_LIMIT: &str = "you've hit your usage limit";
 
-fn diagnostic_line(line: &str) -> (bool, bool, bool) {
+/// One normalized row: (usage limit, login failure, unsupported model).
+/// On a Codex terminal (`on_codex`) only Codex's own notices count as a limit:
+/// its "you've hit your usage limit" line and the bare error codes. Claude's
+/// rules ("error: 429 ...", "you've hit your weekly limit", ...) would also
+/// match tool output Codex draws, such as `└ Error: 429 Too Many Requests`
+/// from curl, and switch a healthy account away.
+fn diagnostic_line(line: &str, on_codex: bool) -> (bool, bool, bool) {
     // The square is Codex's diagnostic marker. Strip it only for the exact
     // usage error, so other output with a square keeps its existing meaning.
+    let marked = line.starts_with('■');
     let codex = line.strip_prefix('■').unwrap_or(line).trim_start();
     let codex = codex
         .strip_prefix("error running remote compact task:")
         .map_or(codex, str::trim_start);
-    if codex_limit_notice(codex) {
+    // A narrow pane wraps Codex's longer wordings: the marked first row
+    // starts with the notice and breaks off inside its second sentence
+    // (no sentence ends on that row; a finished one is checked whole).
+    let wrapped = marked
+        && codex
+            .strip_prefix(CODEX_LIMIT)
+            .and_then(|rest| rest.strip_prefix(". "))
+            .is_some_and(|rest| !rest.is_empty() && !rest.contains(". ") && !rest.ends_with('.'));
+    if wrapped || codex_limit_notice(codex) {
         return (true, false, false);
     }
     let api = line
@@ -506,45 +532,98 @@ fn diagnostic_line(line: &str) -> (bool, bool, bool) {
     let Some(text) = api.or(standalone.then_some(line)) else {
         return (false, false, false);
     };
-    (
+    let limit = if on_codex {
+        matches!(line, "usage_limit_reached" | "rate_limit_exceeded")
+    } else {
         limit_message(text)
             || text.trim_start().starts_with("429 ")
             || notice
-            || line.contains("out of extra usage"),
+            || line.contains("out of extra usage")
+    };
+    (
+        limit,
         auth_message(text) || text.trim_start().starts_with("401 "),
         unsupported_model_message(text),
     )
 }
 
+/// Codex's usage-limit notice in each wording its plans get, as normalize()
+/// leaves it: "you've hit your usage limit", then optionally " · resets ..."
+/// or one sentence that ends in a retry time ("try again later", "at 4:31
+/// pm", "in 2 hours 15 minutes"), led by an upgrade, credits or admin offer.
+/// Free plans get only the upgrade ("upgrade to plus to continue using
+/// codex ..."). Anything else after the notice is prose, not a notice.
 fn codex_limit_notice(line: &str) -> bool {
     let Some(suffix) = line.strip_prefix(CODEX_LIMIT) else {
         return false;
     };
-    if matches!(suffix, "" | ".") {
+    if matches!(suffix, "" | ".") || suffix.starts_with(" · resets ") {
         return true;
     }
-    if suffix.starts_with(" · resets ") {
+    let Some(sentence) = suffix.strip_prefix(". ") else {
+        return false;
+    };
+    if sentence.starts_with("upgrade to plus to continue using codex") && sentence.ends_with('.') {
         return true;
     }
-    const SETTINGS: &str = ". visit https://chatgpt.com/settings/usage to purchase more credits";
-    let reset = suffix.strip_prefix(". try again ").or_else(|| {
-        suffix
-            .strip_prefix(SETTINGS)?
-            .strip_prefix(" or try again ")
-    });
-    reset.is_some_and(|reset| {
-        reset == "later."
-            || reset.strip_prefix("at ").is_some_and(|at| {
-                let at = at.strip_suffix('.').unwrap_or(at);
-                let mut parts = at.rsplitn(3, ' ');
-                let (Some(period), Some(time)) = (parts.next(), parts.next()) else {
-                    return false;
-                };
-                matches!(period, "am" | "pm")
-                    && chrono::NaiveTime::parse_from_str(&format!("{time} {period}"), "%I:%M %P")
-                        .is_ok()
-            })
-    })
+    const OFFERS: [&str; 4] = [
+        "visit https://chatgpt.com/settings/usage to purchase more credits or ",
+        "visit https://chatgpt.com/codex/settings/usage to purchase more credits or ",
+        "to get more access now, send a request to your admin or ",
+        "",
+    ];
+    // "upgrade to pro (<link>) or ...", "upgrade to pro (<link>), visit ...".
+    let offer = match sentence.strip_prefix("upgrade to ") {
+        Some(upgrade) => {
+            let Some((_, rest)) = upgrade.split_once(')') else {
+                return false;
+            };
+            let rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
+            rest.strip_prefix("or ").unwrap_or(rest)
+        }
+        None => sentence,
+    };
+    let Some(retry) = OFFERS.iter().find_map(|o| {
+        offer
+            .strip_prefix(o)
+            .and_then(|r| r.strip_prefix("try again "))
+    }) else {
+        return false;
+    };
+    retry_time(retry)
+}
+
+/// "later.", "at 4:31 pm.", "at nov 21st, 2026 4:31 pm." or "in 2 hours 15
+/// minutes." (also "1 day, 3 hours and 5 minutes").
+fn retry_time(retry: &str) -> bool {
+    if retry == "later." {
+        return true;
+    }
+    if let Some(at) = retry.strip_prefix("at ") {
+        let at = at.strip_suffix('.').unwrap_or(at);
+        let mut parts = at.rsplitn(3, ' ');
+        let (Some(period), Some(time)) = (parts.next(), parts.next()) else {
+            return false;
+        };
+        return matches!(period, "am" | "pm")
+            && chrono::NaiveTime::parse_from_str(&format!("{time} {period}"), "%I:%M %P").is_ok();
+    }
+    let Some(span) = retry.strip_prefix("in ").and_then(|s| s.strip_suffix('.')) else {
+        return false;
+    };
+    let words: Vec<&str> = span
+        .split([' ', ','])
+        .filter(|w| !w.is_empty() && *w != "and")
+        .collect();
+    !words.is_empty()
+        && words.len().is_multiple_of(2)
+        && words.chunks(2).all(|pair| {
+            pair[0].parse::<u64>().is_ok()
+                && matches!(
+                    pair[1],
+                    "day" | "days" | "hour" | "hours" | "minute" | "minutes" | "second" | "seconds"
+                )
+        })
 }
 
 pub(crate) fn claude_compaction_limit(line: &str) -> bool {
@@ -601,6 +680,117 @@ pub fn limit_message(text: &str) -> bool {
 }
 #[cfg(test)]
 mod tests {
+    fn codex_feed(text: &str) -> super::ScreenLimits {
+        let mut detector = super::Diagnostics {
+            codex: true,
+            ..Default::default()
+        };
+        let mut seen = detector.feed(text.as_bytes()).0;
+        seen.merge(detector.finish().0);
+        seen
+    }
+
+    #[test]
+    fn a_codex_terminal_counts_only_codex_limit_notices() {
+        for notice in [
+            "\u{25a0} You've hit your usage limit. Try again at Nov 21st, 2026 4:31 PM.\r\n",
+            "\u{25a0} You've hit your usage limit\r\n",
+            "\u{25a0} Error running remote compact task: You've hit your usage limit. Try again later.\r\n",
+            "usage_limit_reached\r\n",
+            // Each plan's wording.
+            "\u{25a0} You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing) or try again in 2 hours 15 minutes.\r\n",
+            "\u{25a0} You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:31 PM.\r\n",
+            "\u{25a0} You've hit your usage limit. Upgrade to Plus to continue using Codex (https://openai.com/chatgpt/pricing).\r\n",
+            "\u{25a0} You've hit your usage limit. To get more access now, send a request to your admin or try again in 1 day, 3 hours and 5 minutes.\r\n",
+            "\u{25a0} You've hit your usage limit. Try again in 5 hours.\r\n",
+            "\u{25a0} You've hit your usage limit. Try again in 1 minute.\r\n",
+            // Wrapped onto two rows by a narrow pane.
+            "\u{25a0} You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing), visit\r\nhttps://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:31 PM.\r\n",
+        ] {
+            assert!(codex_feed(notice).notice, "{notice:?}");
+        }
+        for prose in [
+            "You've hit your usage limit. Try again in a bit, I guess.\r\n",
+            "You've hit your usage limit. Upgrade to Pro, they said.\r\n",
+            "You've hit your usage limit. Try again in 5 hours\r\n",
+            "You've hit your usage limit, apparently. Try again later.\r\n",
+        ] {
+            assert_eq!(codex_feed(prose), Default::default(), "{prose:?}");
+        }
+        // Tool output and Claude's wording, as Codex's TUI draws them.
+        for other in [
+            "  \u{2514} Error: 429 Too Many Requests\r\n",
+            "\u{2502} error: http 429 from the test server\r\n",
+            "  \u{2514} API Error: 429 {\"error\":{\"type\":\"rate_limit_error\"}}\r\n",
+            "Error: rate limit reached for requests\r\n",
+            "You've hit your weekly limit \u{b7} resets Nov 20, 3am\r\n",
+            "\u{23bf} Prompt is too long \u{b7} automatic compaction failed: You've hit your weekly limit \u{b7} resets tomorrow\r\n",
+            "What do you want to do?\r\n1. Stop and wait for limit to reset\r\n",
+            "You're out of extra usage\r\n",
+        ] {
+            assert_eq!(codex_feed(other), Default::default(), "{other:?}");
+        }
+        // Login and model failures still count on Codex.
+        assert!(super::diagnostic_line("error: 401 unauthorized", true).1);
+        assert!(super::diagnostic_line("error: model_not_found", true).2);
+    }
+
+    /// `diagnostic_line` as it was before Codex terminals were scoped
+    /// (main 48195be), for Claude's unchanged behaviour.
+    fn before(line: &str) -> (bool, bool, bool) {
+        use super::*;
+        let codex = line.strip_prefix('\u{25a0}').unwrap_or(line).trim_start();
+        let codex = codex
+            .strip_prefix("error running remote compact task:")
+            .map_or(codex, str::trim_start);
+        if codex_limit_notice(codex) {
+            return (true, false, false);
+        }
+        let api = line
+            .strip_prefix("api error:")
+            .or_else(|| line.strip_prefix("error:"));
+        let notice = !line.starts_with(CODEX_LIMIT) && hit_limit_notice(line);
+        let standalone = matches!(line, "usage_limit_reached" | "rate_limit_exceeded")
+            || (line.starts_with("the ") && unsupported_model_message(line))
+            || line.starts_with("oauth token revoked \u{b7} please run /login")
+            || line.starts_with("login expired \u{b7} please run /login")
+            || notice
+            || line.starts_with("you're out of extra usage");
+        let Some(text) = api.or(standalone.then_some(line)) else {
+            return (false, false, false);
+        };
+        (
+            limit_message(text)
+                || text.trim_start().starts_with("429 ")
+                || notice
+                || line.contains("out of extra usage"),
+            auth_message(text) || text.trim_start().starts_with("401 "),
+            unsupported_model_message(text),
+        )
+    }
+
+    #[test]
+    fn claude_detection_is_unchanged() {
+        let source = include_str!("terminal.rs");
+        let lines: Vec<String> = source
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(|q| {
+                q.replace("\\u{b7}", "\u{b7}")
+                    .replace("\\u{2019}", "\u{2019}")
+            })
+            .collect();
+        assert!(lines.len() > 50);
+        for line in &lines {
+            let line = super::normalize(line.as_bytes());
+            assert_eq!(
+                super::diagnostic_line(&line, false),
+                before(&line),
+                "{line}"
+            );
+        }
+    }
     #[test]
     fn limit_signals_do_not_match_arbitrary_numbers() {
         assert!(!super::limit_message("processed 429 items"));

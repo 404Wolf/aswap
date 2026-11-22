@@ -103,6 +103,26 @@ impl Wake {
     pub(super) fn retry(&mut self, at: u64) {
         self.next = at.saturating_add(6 + self.stagger % 5);
     }
+    /// Check now: the Codex reset journal changed (a reset may have been
+    /// redeemed), so waiting for the next scheduled check would only delay
+    /// the resume.
+    /// `log`: the journal's stamp as last seen (None before the first look).
+    pub(super) fn poke(
+        &mut self,
+        log: &mut Option<Option<crate::shared::Stamp>>,
+        store: &Store,
+        provider: Provider,
+    ) {
+        if provider != Provider::Codex {
+            return;
+        }
+        // The journal changes with every reset event, before the snapshot.
+        let now_stamp = crate::shared::stamp(&crate::reset::journal_path(store));
+        if log.as_ref().is_some_and(|seen| *seen != now_stamp) {
+            self.next = 0;
+        }
+        *log = Some(now_stamp);
+    }
     pub(super) fn report(&mut self, provider: Provider, current: &str, at: u64) {
         if self.reported != Some(self.next) {
             eprintln!(
@@ -146,12 +166,27 @@ impl Lapse {
     pub(super) fn hold(&self) -> u64 {
         (LIMIT_HOLD << self.count.saturating_sub(1).min(8)).min(LIMIT_HOLD_MAX)
     }
-    pub(super) fn lapsed(&self, cache: &usage::Cached, threshold: f64, at: u64) -> bool {
-        let reset = self
-            .reset
-            .is_some_and(|reset| at >= reset && cache.fetched_at >= reset);
+    /// `redeemed`: when a usage-limit reset was last redeemed on this
+    /// account (crate::reset), which counts like the window resetting.
+    pub(super) fn lapsed(
+        &self,
+        cache: &usage::Cached,
+        threshold: f64,
+        at: u64,
+        redeemed: Option<u64>,
+    ) -> bool {
+        // A reading taken after the redemption is fresh enough even within
+        // the second the account was rejected in.
+        let redeemed = redeemed.is_some_and(|when| when >= self.at && cache.fetched_at >= when);
+        let reset = redeemed
+            || self
+                .reset
+                .is_some_and(|reset| at >= reset && cache.fetched_at >= reset);
         (at >= self.at.saturating_add(self.hold()) || reset)
-            && cache.fetched_at > self.at
+            && (cache.fetched_at > self.at || redeemed)
+            // A Codex that reports the backend's permission must grant it:
+            // percentages alone never prove recovery there.
+            && cache.usage.ordinary_usage.permits_recovery()
             && cache
                 .used(at)
                 .is_some_and(|used| used < if reset { 100.0 } else { threshold })
@@ -247,7 +282,9 @@ impl Rejected {
             &store.profile(account.provider, &account.label).ok()?,
         )
         .ok()?
-        .lock_key()
+        // The real account, not the legacy key: that is Codex's workspace,
+        // and one member's limit must not hold a teammate's account.
+        .account_key()
     }
     pub(super) fn filter(
         &self,
@@ -275,17 +312,26 @@ impl Rejected {
         entries: Vec<(Account, usage::Cached)>,
         at: u64,
     ) -> Vec<(Account, usage::Cached)> {
-        let held = |rejection: Option<&Option<Lapse>>, cache: &usage::Cached| match rejection {
-            None => false,
-            Some(None) => true,
-            Some(Some(lapse)) => !lapse.lapsed(cache, threshold, at),
+        let redeemed = if entries.iter().any(|(a, _)| a.provider == Provider::Codex) {
+            crate::reset::redeemed(store)
+        } else {
+            Default::default()
         };
+        let held =
+            |rejection: Option<&Option<Lapse>>, cache: &usage::Cached, label: &str| match rejection
+            {
+                None => false,
+                Some(None) => true,
+                Some(Some(lapse)) => {
+                    !lapse.lapsed(cache, threshold, at, redeemed.get(label).copied())
+                }
+            };
         entries
             .into_iter()
             .filter_map(|(a, mut cache)| {
-                let rejected = held(self.labels.get(&a.label), &cache)
+                let rejected = held(self.labels.get(&a.label), &cache, &a.label)
                     || Self::key(store, &a)
-                        .is_some_and(|key| held(self.identities.get(&key), &cache));
+                        .is_some_and(|key| held(self.identities.get(&key), &cache, &a.label));
                 if rejected && super::trace::trace_selection_enabled() {
                     eprintln!(
                         "aswap: candidate={}:{} reason=run-rejected",
@@ -360,15 +406,15 @@ mod rejection_tests {
         };
         let later = 10_000 + LIMIT_HOLD;
         // Held for the hold, however good the reading.
-        assert!(!lapse.lapsed(&cache(5.0, later - 10), 90.0, later - 1));
-        assert!(lapse.lapsed(&cache(5.0, later - 10), 90.0, later));
+        assert!(!lapse.lapsed(&cache(5.0, later - 10), 90.0, later - 1, None));
+        assert!(lapse.lapsed(&cache(5.0, later - 10), 90.0, later, None));
         // Only a reading taken after the rejection, below the threshold, and
         // without an error counts.
-        assert!(!lapse.lapsed(&cache(5.0, 9_999), 90.0, 10_500 + LIMIT_HOLD));
-        assert!(!lapse.lapsed(&cache(95.0, later), 90.0, later));
+        assert!(!lapse.lapsed(&cache(5.0, 9_999), 90.0, 10_500 + LIMIT_HOLD, None));
+        assert!(!lapse.lapsed(&cache(95.0, later), 90.0, later, None));
         let mut failed = cache(5.0, later);
         failed.error = Some("provider-limit".into());
-        assert!(!lapse.lapsed(&failed, 90.0, later));
+        assert!(!lapse.lapsed(&failed, 90.0, later, None));
     }
 
     #[test]
@@ -406,7 +452,84 @@ mod rejection_tests {
             (1_031, 2, 2 * LIMIT_HOLD)
         );
         assert_eq!(next.reset, None);
-        assert!(!next.lapsed(&cache(2.0, 1_032), 90.0, 1_032));
+        assert!(!next.lapsed(&cache(2.0, 1_032), 90.0, 1_032, None));
+        // A reset redeemed after the rejection, with a fresh reading after it,
+        // releases the hold at once (below 100%, like a window reset).
+        assert!(next.lapsed(&cache(95.0, 1_040), 90.0, 1_041, Some(1_035)));
+        assert!(
+            !next.lapsed(&cache(95.0, 1_034), 90.0, 1_041, Some(1_035)),
+            "reading predates it"
+        );
+        assert!(
+            !next.lapsed(&cache(95.0, 1_040), 90.0, 1_041, Some(1_030)),
+            "redeemed before"
+        );
+        assert!(
+            !next.lapsed(&cache(100.0, 1_040), 90.0, 1_041, Some(1_035)),
+            "still full"
+        );
+        // Audit F6: where Codex reports the backend's permission, only a
+        // grant counts as recovery; percentages alone never do.
+        for (ordinary, recovers) in [
+            (usage::OrdinaryUsage::Allowed, true),
+            (usage::OrdinaryUsage::NotReported, true),
+            (usage::OrdinaryUsage::Unknown, false),
+            (usage::OrdinaryUsage::Denied, false),
+        ] {
+            let mut reading = cache(5.0, 1_040);
+            reading.usage.ordinary_usage = ordinary;
+            assert_eq!(
+                next.lapsed(&reading, 90.0, 1_041, Some(1_035)),
+                recovers,
+                "{ordinary:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_limit_on_one_workspace_member_does_not_hold_a_teammate() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let mut state = store.load().unwrap();
+        let account = |label: &str, member: &str| {
+            let account = Account {
+                provider: Provider::Codex,
+                label: label.into(),
+            };
+            let claims = serde_json::json!({"https://api.openai.com/auth":{
+                "chatgpt_account_id":"synthetic-workspace","chatgpt_account_user_id":member}});
+            let jwt = format!(
+                "synthetic.{}.synthetic",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+            );
+            let profile = store.profile(account.provider, label).unwrap();
+            std::fs::create_dir_all(&profile).unwrap();
+            store::json_write(
+                &profile.join("auth.json"),
+                &serde_json::json!({"tokens":{"account_id":"synthetic-workspace","access_token":jwt}}),
+            )
+            .unwrap();
+            account
+        };
+        let alice = account("alice", "synthetic-member-a");
+        let bob = account("bob", "synthetic-member-b");
+        state.accounts.extend([alice.clone(), bob.clone()]);
+        store.save(&state).unwrap();
+        let mut rejected = Rejected::default();
+        rejected.reject(&store, &alice, true).unwrap();
+        let at = now();
+        let kept: Vec<_> = rejected
+            .filter(
+                &store,
+                "other",
+                90.0,
+                vec![(alice, cache(100.0, at)), (bob, cache(10.0, at))],
+            )
+            .into_iter()
+            .map(|(a, _)| a.label)
+            .collect();
+        assert_eq!(kept, ["bob"]);
     }
 
     #[test]
@@ -665,7 +788,7 @@ mod wake_tests {
         assert_eq!(select(&held).as_deref(), Some("chatgpt1"));
         let verified_session_reset = usage::updated(full, Ok(partial.clone()), AT);
         write_cache(&third, &verified_session_reset);
-        assert!(!lapse.lapsed(&verified_session_reset, 90.0, AT));
+        assert!(!lapse.lapsed(&verified_session_reset, 90.0, AT, None));
         assert_eq!(select(&held).as_deref(), Some("chatgpt1"));
         assert_eq!(select(&rejected).as_deref(), Some("chatgpt1"));
 
@@ -790,17 +913,17 @@ mod wake_tests {
             resumed: false,
         };
         let (_, mut fresh) = entry(Provider::Claude, "a", 4.0, Some(AT + 3600), AT + 30);
-        assert!(lapse.lapsed(&fresh, 90.0, AT + 30));
+        assert!(lapse.lapsed(&fresh, 90.0, AT + 30, None));
         fresh.fetched_at = AT + 29;
-        assert!(!lapse.lapsed(&fresh, 90.0, AT + 30));
+        assert!(!lapse.lapsed(&fresh, 90.0, AT + 30, None));
         fresh.fetched_at = AT + 30;
         fresh.usage.windows[0].used_percent = 95.0;
-        assert!(lapse.lapsed(&fresh, 90.0, AT + 30));
+        assert!(lapse.lapsed(&fresh, 90.0, AT + 30, None));
         fresh.usage.windows[0].used_percent = 100.0;
-        assert!(!lapse.lapsed(&fresh, 90.0, AT + 30));
+        assert!(!lapse.lapsed(&fresh, 90.0, AT + 30, None));
         fresh.usage.windows[0].used_percent = 4.0;
         fresh.error = Some("network".into());
-        assert!(!lapse.lapsed(&fresh, 90.0, AT + 30));
+        assert!(!lapse.lapsed(&fresh, 90.0, AT + 30, None));
     }
 
     #[test]

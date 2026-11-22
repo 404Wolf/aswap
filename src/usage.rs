@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     io::{BufRead, BufReader, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Stdio},
     sync::mpsc,
     time::Duration,
@@ -35,6 +35,48 @@ pub struct Usage {
     /// Codex usage-limit reset credits as the app-server lists them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reset_credits: Vec<ResetCredit>,
+    /// Whether the read listed credit details (`credits` was an array). When
+    /// only the count is known (`credits` null), or the cache predates this
+    /// field, availability stays unknown rather than "none".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset_credits_listed: bool,
+    /// Codex's `ordinaryUsageAllowed`, the backend's permission for ordinary
+    /// usage (see [`OrdinaryUsage`]).
+    #[serde(default, skip_serializing_if = "OrdinaryUsage::not_reported")]
+    pub ordinary_usage: OrdinaryUsage,
+}
+/// Codex's `ordinaryUsageAllowed` (app-server protocol v2): the backend's
+/// permission for ordinary included usage. Upstream: "Null means
+/// unavailable; clients must not infer recovery from percentages or reset
+/// times." Older Codex versions don't report it at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OrdinaryUsage {
+    /// The read has no such field: an older Codex. Percentages decide.
+    #[default]
+    NotReported,
+    /// Reported as null: permission unknown.
+    Unknown,
+    Allowed,
+    Denied,
+}
+impl OrdinaryUsage {
+    fn not_reported(&self) -> bool {
+        *self == Self::NotReported
+    }
+    pub fn from_read(v: &Value) -> Self {
+        match v.get("ordinaryUsageAllowed") {
+            None => Self::NotReported,
+            Some(Value::Bool(true)) => Self::Allowed,
+            Some(Value::Bool(false)) => Self::Denied,
+            Some(_) => Self::Unknown,
+        }
+    }
+    /// Whether this reading may count as recovered usage: not denied, and
+    /// not unknown on a Codex that reports the permission.
+    pub fn permits_recovery(self) -> bool {
+        matches!(self, Self::NotReported | Self::Allowed)
+    }
 }
 /// One Codex usage-limit reset credit. Redeeming it resets the account's
 /// eligible windows (5-hour and weekly together); it is an earned, expiring
@@ -171,7 +213,17 @@ impl Usage {
         {
             return None;
         }
-        self.windows.iter().map(|w| w.used_percent).reduce(f64::max)
+        // Where Codex reports the backend's permission it decides: denied is
+        // out of usage whatever the percentages say, and unknown (null) is
+        // not a usable reading (upstream: "clients must not infer recovery
+        // from percentages or reset times").
+        match self.ordinary_usage {
+            OrdinaryUsage::Denied => Some(100.0),
+            OrdinaryUsage::Unknown => None,
+            OrdinaryUsage::Allowed | OrdinaryUsage::NotReported => {
+                self.windows.iter().map(|w| w.used_percent).reduce(f64::max)
+            }
+        }
     }
     /// When the account-wide weekly window resets; model-specific weekly
     /// windows only stand in when no account-wide one was observed.
@@ -478,6 +530,10 @@ pub fn parse_codex(v: &Value) -> Result<Usage> {
         credits,
         available_usage_resets,
         reset_credits: parse_reset_credits(v),
+        reset_credits_listed: v
+            .pointer("/rateLimitResetCredits/credits")
+            .is_some_and(Value::is_array),
+        ordinary_usage: OrdinaryUsage::from_read(v),
     })
 }
 #[derive(Clone, Copy, Debug)]
@@ -834,6 +890,10 @@ fn read_cache(path: &Path, ignore_invalid_json: bool) -> Result<Cached> {
     store::json_read(path)
 }
 
+/// How long an explicit (forced) read waits for another process's fetch of
+/// the same account before returning the cache as it is.
+const FORCED_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub fn cached_mode_with<F>(
     store: &Store,
     account: &Account,
@@ -844,8 +904,93 @@ pub fn cached_mode_with<F>(
 where
     F: FnOnce(&Path) -> std::result::Result<Usage, Failure>,
 {
-    // A cross-process store lock serializes the cache claim and fetch; timeout
-    // bounds are deliberately short. This prevents CLI/Waybar/auto stampedes.
+    // The decision and the cache writes happen under the store lock; the
+    // fetch itself does not. Every supervisor takes the store lock on its
+    // terminal thread, so a network call under it would stall typing in
+    // every session. A usage lock per login keeps it one fetch at a time.
+    let (old, path, profile) = match fresh_enough(store, account, at, force)? {
+        Decision::Cached(cached) => return Ok(cached),
+        Decision::Fetch { old, path, profile } => (old, path, profile),
+    };
+    let wait = if force {
+        FORCED_WAIT
+    } else {
+        std::time::Duration::ZERO
+    };
+    let waiting = std::time::Instant::now();
+    let Some(_fetching) = store.usage_lock(account, wait)? else {
+        // Another process is fetching this login: use what it leaves.
+        let _lock = store.lock()?;
+        return read_cache(&path, force).or(Ok(old));
+    };
+    // Time moved on while waiting for another fetch.
+    let at = at.saturating_add(waiting.elapsed().as_secs());
+    // It may have just finished: decide again before fetching.
+    let (snapshot, path) = match fresh_enough(store, account, at, force)? {
+        Decision::Cached(cached) => return Ok(cached),
+        Decision::Fetch { path, .. } => (read_cache(&path, force)?, path),
+    };
+    let result = fetcher(&profile);
+    let _lock = store.lock()?;
+    // The account may have been removed or renamed during the fetch; writing
+    // would recreate its old profile directory and block that label.
+    let state = store.load()?;
+    if store
+        .account(&state, account.provider, Some(&account.label))
+        .is_err()
+    {
+        return Ok(updated(snapshot, result, at));
+    }
+    let latest = read_cache(&path, force)?;
+    let entry = merged(&snapshot, latest, result, at);
+    store::json_write(&path, &entry)?;
+    Ok(entry)
+}
+/// The cache after a fetch that started from `snapshot`, when `latest` is
+/// what is stored now. Writes made during the fetch win where they carry
+/// news the fetch can't have seen: a limit the provider reported
+/// (mark_limited), and a rotated login that clears an auth backoff
+/// (credentials_changed).
+pub(crate) fn merged(
+    snapshot: &Cached,
+    latest: Cached,
+    result: std::result::Result<Usage, Failure>,
+    at: u64,
+) -> Cached {
+    let changed = serde_json::to_value(snapshot).ok() != serde_json::to_value(&latest).ok();
+    let marked = (changed && latest.error.as_deref() == Some("provider-limit")).then(|| {
+        (
+            latest.error.clone(),
+            latest.http_status,
+            latest.retry_after,
+            latest.next_poll_at,
+        )
+    });
+    let retry_now = changed && latest.next_poll_at < snapshot.next_poll_at;
+    let failed = result.is_err();
+    let mut entry = updated(latest, result, at);
+    if let Some((error, http_status, retry_after, next_poll_at)) = marked {
+        entry.error = error;
+        entry.http_status = http_status;
+        entry.retry_after = retry_after;
+        entry.next_poll_at = entry.next_poll_at.max(next_poll_at);
+    } else if failed && retry_now {
+        // The failure may have used the login that was just replaced.
+        entry.next_poll_at = at;
+    }
+    entry
+}
+enum Decision {
+    Cached(Cached),
+    Fetch {
+        old: Cached,
+        path: PathBuf,
+        profile: PathBuf,
+    },
+}
+/// Under the store lock: the cache if it is still good (or a fresh alias's
+/// reading, which it adopts), else what a fetch needs.
+fn fresh_enough(store: &Store, account: &Account, at: u64, force: bool) -> Result<Decision> {
     let _lock = store.lock()?;
     let state = store.load()?;
     store.account(&state, account.provider, Some(&account.label))?;
@@ -861,7 +1006,7 @@ where
         .reset_times()
         .any(|r| r <= at && old.last_attempt.max(old.fetched_at) < r);
     if !force && !reset_due && at < old.next_poll_at {
-        return Ok(old);
+        return Ok(Decision::Cached(old));
     }
     // Aliases of one login share one quota: reuse a fresh sibling observation
     // instead of fetching again, which would double the provider's rate limit.
@@ -884,13 +1029,11 @@ where
                     continue;
                 }
                 store::json_write(&path, &other)?;
-                return Ok(other);
+                return Ok(Decision::Cached(other));
             }
         }
     }
-    let entry = updated(old, fetcher(&profile), at);
-    store::json_write(&path, &entry)?;
-    Ok(entry)
+    Ok(Decision::Fetch { old, path, profile })
 }
 pub fn cached(store: &Store, account: &Account) -> Result<Cached> {
     cached_force(store, account, false)
@@ -910,20 +1053,61 @@ pub fn cached_force(store: &Store, account: &Account, force: bool) -> Result<Cac
         return Ok(cached);
     }
 
+    // A refresh rewrites shared state (views, aliases), so it runs under
+    // the store lock; it is due rarely, unlike the fetch around it.
+    let refresh = |force: bool| {
+        let _lock = store
+            .lock()
+            .map_err(|_| Failure::new("usage-unavailable"))?;
+        crate::refresh::refresh(store, account, now(), force)
+    };
     cached_mode_with(store, account, now(), force, |p| {
-        crate::refresh::refresh(store, account, now(), false)?;
-        let first = fetch(account, p);
-        if first
-            .as_ref()
-            .err()
-            .is_some_and(|e| e.status == Some(401) || e.kind == "codex-rpc-unavailable")
-            && crate::refresh::refresh(store, account, now(), true)?
-        {
-            fetch(account, p)
-        } else {
-            first
-        }
+        fetch_refreshing(account, p, refresh, |p| fetch(account, p))
     })
+}
+/// One usage fetch, refreshing the login first when it is due and forcing
+/// one retry after a refresh only when `refresh_warranted` says the failure
+/// was about auth.
+fn fetch_refreshing(
+    account: &Account,
+    profile: &Path,
+    refresh: impl Fn(bool) -> std::result::Result<bool, Failure>,
+    fetch: impl Fn(&Path) -> std::result::Result<Usage, Failure>,
+) -> std::result::Result<Usage, Failure> {
+    refresh(false)?;
+    let first = fetch(profile);
+    if first
+        .as_ref()
+        .err()
+        .is_some_and(|e| refresh_warranted(account.provider, profile, e, now()))
+        && refresh(true)?
+    {
+        fetch(profile)
+    } else {
+        first
+    }
+}
+/// Whether a failed fetch justifies forcing a token refresh. A forced
+/// refresh skips the backoff gate and rotates the login, which revokes the
+/// access token of every running view of it, so only an auth failure counts:
+/// an explicit 401, or a Codex app-server that failed while the stored access
+/// token had expired. A changed response shape, an app-server that exits
+/// early, or any other transport failure never rotates.
+pub(crate) fn refresh_warranted(
+    provider: Provider,
+    profile: &Path,
+    failure: &Failure,
+    at: u64,
+) -> bool {
+    if failure.status == Some(401) {
+        return true;
+    }
+    provider == Provider::Codex
+        && failure.kind == "codex-rpc-unavailable"
+        && store::json_read::<Value>(&profile.join(provider.auth_file()))
+            .ok()
+            .and_then(|auth| crate::refresh::expires_at(provider, &auth))
+            .is_some_and(|expiry| expiry <= at)
 }
 /// Ranks two eligible accounts: soonest weekly reset first under
 /// `WeeklyReset` (unknown resets last), then most headroom.
@@ -1334,5 +1518,230 @@ mod reason_tests {
                 "no-windows"
             ]
         );
+    }
+}
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn reading(used: f64) -> Usage {
+        Usage {
+            windows: vec![Window {
+                name: "five_hour".into(),
+                used_percent: used,
+                resets_at: None,
+                duration_minutes: Some(300),
+                codex_slot: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn writes_made_during_a_fetch_are_kept() {
+        let at = 10_000;
+        let snapshot = Cached {
+            next_poll_at: at,
+            ..Cached::default()
+        };
+        // Nothing changed meanwhile: the fetch's result as is.
+        let plain = merged(&snapshot, snapshot.clone(), Ok(reading(5.0)), at);
+        assert_eq!(plain.used(at), Some(5.0));
+        assert_eq!(plain.next_poll_at, at + TTL);
+        // The provider reported a limit meanwhile (mark_limited): kept over
+        // a reading that predates it.
+        let mut limited = snapshot.clone();
+        limited.error = Some("provider-limit".into());
+        limited.next_poll_at = at + 2 * TTL;
+        let kept = merged(&snapshot, limited, Ok(reading(5.0)), at);
+        assert_eq!(kept.error.as_deref(), Some("provider-limit"));
+        assert_eq!(kept.next_poll_at, at + 2 * TTL);
+        // The login rotated meanwhile (credentials_changed lowered the next
+        // poll): a failure, possibly with the old token, retries at once.
+        let mut stale = snapshot.clone();
+        stale.error = Some("http-401".into());
+        stale.next_poll_at = at + 900;
+        let mut rotated = stale.clone();
+        rotated.next_poll_at = at;
+        let retried = merged(&stale, rotated, Err(Failure::http(401, 0)), at);
+        assert_eq!(retried.next_poll_at, at);
+        // Without that, a failure backs off as usual.
+        let backed = merged(&stale, stale.clone(), Err(Failure::http(401, 0)), at);
+        assert!(backed.next_poll_at > at);
+    }
+}
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    /// A profile whose Codex access token (a synthetic JWT) expires at `exp`.
+    fn codex_profile(exp: u64) -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        let payload = URL_SAFE_NO_PAD.encode(format!("{{\"exp\":{exp}}}"));
+        store::json_write(
+            &t.path().join("auth.json"),
+            &serde_json::json!({"tokens":{"access_token":format!("e30.{payload}.sig"),"refresh_token":"synthetic-r"}}),
+        )
+        .unwrap();
+        t
+    }
+
+    #[test]
+    fn only_auth_failures_force_a_rotation() {
+        let at = 10_000;
+        let live = codex_profile(at + 3600);
+        let expired = codex_profile(at - 1);
+        let unavailable = Failure::new("codex-rpc-unavailable");
+        let warranted = |p: &tempfile::TempDir, f: &Failure| {
+            refresh_warranted(Provider::Codex, p.path(), f, at)
+        };
+        // A new response shape, an early exit or "too many notifications"
+        // all surface as codex-rpc-unavailable: no rotation while the
+        // token is still valid.
+        assert!(!warranted(&live, &unavailable));
+        assert!(warranted(&expired, &unavailable));
+        assert!(warranted(&live, &Failure::http(401, 0)));
+        for kind in [
+            "codex-rpc-timeout",
+            "codex-rpc-start-failed",
+            "usage-unavailable",
+        ] {
+            assert!(!warranted(&expired, &Failure::new(kind)), "{kind}");
+        }
+        assert!(!warranted(&live, &Failure::http(429, 60)));
+        assert!(!warranted(&live, &Failure::http(500, 0)));
+        // No readable login: nothing to judge by, so no rotation.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!warranted(&empty, &unavailable));
+        // Claude: only an explicit 401.
+        assert!(refresh_warranted(
+            Provider::Claude,
+            empty.path(),
+            &Failure::http(401, 0),
+            at
+        ));
+        assert!(!refresh_warranted(
+            Provider::Claude,
+            empty.path(),
+            &unavailable,
+            at
+        ));
+    }
+
+    #[test]
+    fn a_fetch_forces_a_refresh_only_when_warranted() {
+        let codex = Account {
+            provider: Provider::Codex,
+            label: "synthetic".into(),
+        };
+        // (stored token expiry, the fetch's failure) -> forced refreshes.
+        let forced = |exp: u64, failure: Failure| {
+            let profile = codex_profile(exp);
+            let forced = std::cell::Cell::new(0);
+            let _ = fetch_refreshing(
+                &codex,
+                profile.path(),
+                |force| {
+                    forced.set(forced.get() + u32::from(force));
+                    Ok(force)
+                },
+                |_| Err(failure),
+            );
+            forced.get()
+        };
+        let live = now() + 3600;
+        assert_eq!(forced(live, Failure::new("codex-rpc-unavailable")), 0);
+        assert_eq!(forced(live, Failure::new("codex-rpc-timeout")), 0);
+        assert_eq!(forced(now() - 1, Failure::new("codex-rpc-unavailable")), 1);
+        assert_eq!(forced(live, Failure::http(401, 0)), 1);
+    }
+}
+#[cfg(test)]
+mod read_contract_tests {
+    use super::*;
+
+    fn read(extra: serde_json::Value) -> Usage {
+        let mut v = serde_json::json!({"rateLimits":{"primary":{"usedPercent":10,"windowDurationMins":300,"resetsAt":2000000000}}});
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        parse_codex(&v).unwrap()
+    }
+
+    #[test]
+    fn ordinary_usage_permission_is_kept_as_reported() {
+        assert_eq!(
+            read(serde_json::json!({})).ordinary_usage,
+            OrdinaryUsage::NotReported
+        );
+        let null = read(serde_json::json!({"ordinaryUsageAllowed": null}));
+        assert_eq!(null.ordinary_usage, OrdinaryUsage::Unknown);
+        assert!(!null.ordinary_usage.permits_recovery());
+        let denied = read(serde_json::json!({"ordinaryUsageAllowed": false}));
+        assert_eq!(denied.ordinary_usage, OrdinaryUsage::Denied);
+        assert!(!denied.ordinary_usage.permits_recovery());
+        let allowed = read(serde_json::json!({"ordinaryUsageAllowed": true}));
+        assert!(allowed.ordinary_usage.permits_recovery());
+        assert!(OrdinaryUsage::NotReported.permits_recovery());
+    }
+
+    #[test]
+    fn credit_details_null_and_empty_stay_distinct() {
+        let counted =
+            read(serde_json::json!({"rateLimitResetCredits":{"availableCount":2,"credits":null}}));
+        assert_eq!(counted.available_usage_resets, Some(2));
+        assert!(!counted.reset_credits_listed);
+        let empty =
+            read(serde_json::json!({"rateLimitResetCredits":{"availableCount":0,"credits":[]}}));
+        assert!(empty.reset_credits_listed && empty.reset_credits.is_empty());
+        let none = read(serde_json::json!({}));
+        assert_eq!(none.available_usage_resets, None);
+        assert!(!none.reset_credits_listed);
+    }
+}
+#[cfg(test)]
+mod permission_selection_tests {
+    use super::*;
+
+    #[test]
+    fn a_denied_or_unknown_permission_is_never_chosen() {
+        let at = 1_800_000_000;
+        let reading = |used: f64, ordinary: OrdinaryUsage| Cached {
+            usage: Usage {
+                windows: vec![Window {
+                    name: "weekly".into(),
+                    used_percent: used,
+                    resets_at: Some(at + 86_400),
+                    duration_minutes: Some(10080),
+                    codex_slot: Some(1),
+                }],
+                ordinary_usage: ordinary,
+                ..Default::default()
+            },
+            fetched_at: at,
+            ..Default::default()
+        };
+        let account = |label: &str| Account {
+            provider: Provider::Codex,
+            label: label.into(),
+        };
+        let settings = store::Auto::default();
+        for (ordinary, chosen) in [
+            (OrdinaryUsage::Allowed, true),
+            (OrdinaryUsage::NotReported, true),
+            (OrdinaryUsage::Denied, false),
+            (OrdinaryUsage::Unknown, false),
+        ] {
+            let entries = vec![
+                (
+                    account("current"),
+                    reading(100.0, OrdinaryUsage::NotReported),
+                ),
+                (account("other"), reading(5.0, ordinary)),
+            ];
+            let pick = choose("current", &entries, &settings, at, true, None);
+            assert_eq!(pick.is_some(), chosen, "{ordinary:?}");
+        }
     }
 }

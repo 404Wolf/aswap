@@ -447,7 +447,7 @@ impl Retention<'_> {
         };
         // Serializes concurrent GC, including old views without a lock file.
         // Flocking the existing directory leaves dry-run entirely read-only.
-        lock_runtimes(&root.0, Duration::from_secs(2))?;
+        let _gc = lock_runtimes(&root.0, Duration::from_secs(2))?;
         let mounts = (self.mounts)()?;
         let mut backups = codex_index::Backups::default();
         // Every provider's views (pi's too); only Codex has an index to repair.
@@ -881,11 +881,11 @@ fn try_lock(dir: &Dir, name: &OsStr) -> Result<Option<File>> {
 /// child, say) briefly shares the descriptor of a lock just released, until
 /// it execs; a short wait rides that out. Another GC keeps it for its whole
 /// run, so it still fails.
-fn lock_runtimes(dir: &std::fs::File, patience: Duration) -> Result<()> {
+fn lock_runtimes(dir: &std::fs::File, patience: Duration) -> Result<RuntimesLock<'_>> {
     let deadline = Instant::now() + patience;
     loop {
         match fs2::FileExt::try_lock_exclusive(dir) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(RuntimesLock(dir)),
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
             Err(_) => {
                 return Err(Error(
@@ -893,6 +893,17 @@ fn lock_runtimes(dir: &std::fs::File, patience: Duration) -> Result<()> {
                 ));
             }
         }
+    }
+}
+
+/// The held GC lock. It is released explicitly when dropped: a flock
+/// belongs to the open file description, which a child forked meanwhile
+/// (not yet exec'd) still shares after this process closes its descriptor.
+#[derive(Debug)]
+struct RuntimesLock<'a>(&'a std::fs::File);
+impl Drop for RuntimesLock<'_> {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(self.0);
     }
 }
 

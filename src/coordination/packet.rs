@@ -135,7 +135,28 @@ mod packet_cache {
 pub(super) struct Packet {
     pub(super) protocol: u8,
     pub(super) issued_at: u64,
+    /// Profiles of providers this version doesn't know are skipped, so a
+    /// newer owner never breaks an older follower's whole sync.
+    #[serde(deserialize_with = "known_profiles")]
     pub(super) profiles: Vec<Profile>,
+}
+fn known_profiles<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<Profile>, D::Error> {
+    use serde::de::Error as _;
+    let raw: Vec<Value> = Vec::deserialize(deserializer)?;
+    let mut profiles = Vec::new();
+    for profile in raw {
+        let provider = profile.pointer("/account/provider").and_then(Value::as_str);
+        let known = provider.is_none_or(|name| {
+            serde_json::from_value::<crate::provider::Provider>(Value::String(name.to_owned()))
+                .is_ok()
+        });
+        if known {
+            profiles.push(serde_json::from_value(profile).map_err(D::Error::custom)?);
+        }
+    }
+    Ok(profiles)
 }
 pub(super) fn packet(store: &Store, request: &Request) -> Result<Packet> {
     if request.protocol != 1 {
@@ -312,4 +333,37 @@ pub(super) fn duplicate_count_permitted(packet: &Packet, policy: &SyncPolicy) ->
         }
     }
     count
+}
+
+#[cfg(test)]
+mod packet_compat_tests {
+    use super::*;
+
+    #[test]
+    fn a_packet_profile_of_an_unknown_provider_is_skipped() {
+        let known = Profile {
+            account: Account {
+                provider: crate::provider::Provider::Codex,
+                label: "work".into(),
+            },
+            auth: json!({"tokens":{"access_token":"synthetic"}}),
+            config: json!({}),
+            cache: Cached::default(),
+        };
+        let mut value = serde_json::to_value(Packet {
+            protocol: 1,
+            issued_at: 1,
+            profiles: vec![known],
+        })
+        .unwrap();
+        let mut newer = value["profiles"][0].clone();
+        newer["account"]["provider"] = "agy".into();
+        value["profiles"].as_array_mut().unwrap().insert(0, newer);
+        let packet: Packet = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(packet.profiles.len(), 1);
+        assert_eq!(packet.profiles[0].account.label, "work");
+        // A known provider's broken profile still fails the packet.
+        value["profiles"][1]["account"]["label"] = 7.into();
+        assert!(serde_json::from_value::<Packet>(value).is_err());
+    }
 }

@@ -209,3 +209,111 @@ fn legacy_auto_settings_load_with_no_reservations() {
     assert!(settings.enabled);
     assert!(settings.reserved.is_empty());
 }
+
+/// state.json as a newer aswap might write it: a provider this version
+/// doesn't know (its account, active label and auto settings), a new
+/// top-level field and a new Auto field.
+const NEWER: &str = r#"{
+  "accounts": [
+    {"provider": "claude", "label": "personal"},
+    {"provider": "agy", "label": "personal", "since": "0.3.0"},
+    {"provider": "codex", "label": "work"}
+  ],
+  "active": {"claude": "personal", "agy": "personal"},
+  "auto": {
+    "claude": {"resume_prompt": null, "enabled": true, "threshold": 90.0, "last_switch": 5,
+               "reserved": ["work"], "future_knob": {"level": 3}},
+    "agy": {"enabled": true, "threshold": 80.0, "last_switch": 0, "quota_groups": ["flash"]}
+  },
+  "switch_interval_seconds": 7,
+  "future_top_level": [1, 2, 3]
+}"#;
+
+#[test]
+fn state_written_by_a_newer_version_is_read_and_kept_whole() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("store")).unwrap();
+    let path = temp.path().join("store/state.json");
+    store::atomic(&path, NEWER.as_bytes()).unwrap();
+    let mut state = store.load().unwrap();
+    // This version sees its own providers, settings and fields...
+    let labels: Vec<_> = state
+        .accounts
+        .iter()
+        .map(|a| format!("{}:{}", a.provider, a.label))
+        .collect();
+    assert_eq!(labels, ["claude:personal", "codex:work"]);
+    assert_eq!(
+        state.active.get(&Provider::Claude).map(String::as_str),
+        Some("personal")
+    );
+    let claude = &state.auto[&Provider::Claude];
+    assert!(claude.enabled && claude.reserved == ["work"]);
+    assert_eq!(state.switch_interval_seconds, 7);
+    // ...changes one, and saves: nothing it doesn't know is lost.
+    state.auto.get_mut(&Provider::Claude).unwrap().last_switch = 99;
+    store.save(&state).unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut expected: serde_json::Value = serde_json::from_str(NEWER).unwrap();
+    expected["auto"]["claude"]["last_switch"] = 99.into();
+    for (key, value) in serde_json::to_value(&state.auto[&Provider::Claude])
+        .unwrap()
+        .as_object()
+        .unwrap()
+    {
+        // Defaults this version fills in for fields the file left out.
+        expected["auto"]["claude"]
+            .as_object_mut()
+            .unwrap()
+            .entry(key.clone())
+            .or_insert(value.clone());
+    }
+    let set = |v: &serde_json::Value| {
+        let mut accounts: Vec<String> = v["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        accounts.sort();
+        accounts
+    };
+    assert_eq!(set(&saved), set(&expected));
+    for key in [
+        "active",
+        "auto",
+        "switch_interval_seconds",
+        "future_top_level",
+    ] {
+        assert_eq!(saved[key], expected[key], "{key}");
+    }
+}
+
+#[test]
+fn a_known_provider_with_bad_settings_is_still_an_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("store")).unwrap();
+    let path = temp.path().join("store/state.json");
+    for bad in [
+        r#"{"accounts":[{"provider":"claude"}],"active":{},"auto":{}}"#,
+        r#"{"accounts":[],"active":{"codex":7},"auto":{}}"#,
+        r#"{"accounts":[],"active":{},"auto":{"claude":{"enabled":"yes"}}}"#,
+    ] {
+        store::atomic(&path, bad.as_bytes()).unwrap();
+        assert!(store.load().is_err(), "{bad}");
+    }
+    // An older file without the newer fields still loads.
+    store::atomic(&path, br#"{"accounts":[],"active":{},"auto":{}}"#).unwrap();
+    assert!(store.load().unwrap().switch_interval_seconds > 0);
+}
+
+#[test]
+fn newer_auto_settings_stay_out_of_json_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("store")).unwrap();
+    store::atomic(&temp.path().join("store/state.json"), NEWER.as_bytes()).unwrap();
+    let state = store.load().unwrap();
+    let json = state.auto[&Provider::Claude].public_json();
+    assert!(json.get("future_knob").is_none(), "{json}");
+    assert_eq!(json["reserved"], serde_json::json!(["work"]));
+}

@@ -181,31 +181,61 @@ of weekly usage, so supervised sessions don't sit blocked for days.
 
 Read this before you enable it:
 
-- **One redemption resets the account's 5-hour and weekly windows together**,
-  and **spends one earned credit**. Credits are limited and expire; a spent
-  credit can't be returned.
-- aswap redeems only when **every** Codex account is known to be out of weekly
-  usage. It never redeems for an account that still has weekly usage left, or
-  while any Codex account has, or while any account's usage is unknown or stale.
-- It redeems on the unreserved account whose weekly window resets **farthest**
-  away (the one that would stay blocked longest). Ties go to the account whose
-  credit expires soonest, then to the label.
-- At most one credit per decision, then an hour's cooldown. A failed request is
-  retried twice with backoff, reusing its idempotency key so a retry can't
-  spend a second credit, then not again before that account's weekly reset.
-- It uses only credits Codex lists as available. If a credit's title or
-  description, or Codex's answer, mentions payment, purchase, billing,
-  upgrades, credits or extra usage, aswap refuses and stops redeeming until you
-  run `aswap auto codex reset off`.
-- Only the monitor (`aswap auto codex watch`, the `aswap-codex` service) on
-  the refresh owner redeems; sync followers never do. With Home Manager,
-  `autoReset` needs `autoswitch.codex.enable = true`.
-- Right after a session hits its limit, that account's usage counts as unknown
-  until the next successful usage read (up to 3 minutes), so the first reset
-  decision can come a few minutes after the last account runs out.
-- `aswap auto codex reset off` also drops a redemption that is waiting to be
-  retried. If that request may already have spent a credit, it is recorded as
-  unconfirmed and the hour's cooldown applies.
+- **A redemption resets the account's eligible windows** (Codex's contract
+  says "eligible", not which ones) and **spends one earned credit**. Credits
+  are limited and expire; a spent credit can't be returned.
+- **When.** aswap redeems only when every *usable* Codex account has no
+  usable quota now: its weekly window used up and not yet reset. (A backend
+  denial, `ordinaryUsageAllowed: false`, with weekly room left is a hold, not
+  a spend, unless the session-window opt-in below is on.) Reserved and
+  signed-out accounts are not usable, so they neither block a reset nor get
+  one. Unknown usage on a usable account means no redemption; aswap reads it
+  first. *(This reading of "exhausted" is Wolf's call; see the PR.)*
+- **Weekly only, by default.** A used-up 5-hour window alone never spends a
+  reset: every usable account must be out of weekly usage. To also redeem
+  when accounts are only 5-hour-limited, opt in with
+  `aswap auto codex reset-session-windows on` (Home Manager
+  `programs.aswap.autoswitch.codex.resetSessionWindows = true`).
+- **Which account.** The usable account whose quota would come back by itself
+  the latest, i.e. the latest reset among its used-up windows. For accounts
+  out of weekly usage that is the weekly reset, so 7 days outranks 3 days.
+  Ties go to the soonest-expiring credit, then to the label.
+- **Unknown is not "none".** If an account's credits aren't known (only a
+  count, or no count) and it could be the right one, aswap waits rather than
+  spend on another.
+- **Once only.**
+  - Each redemption gets an idempotency key, journaled (fsynced,
+    append-only `codex-resets.journal`) before anything is sent.
+  - Retries and a restart after a crash resend the same key, so Codex
+    answers `alreadyRedeemed` instead of spending again.
+  - At most one credit per decision, then an hour's cooldown.
+  - Mode changes wait for a running decision, and the mode is rechecked
+    right before sending.
+- **Never forgotten.** A request that got no answer (three tries, a mode
+  change, quota coming back) may have spent its credit. It is paused, with
+  its key, never replaced by a new one. `aswap auto codex reset retry`
+  settles it: if the account reads usable again, the request evidently
+  worked and is recorded as redeemed, with nothing sent; if it is still out
+  of usage and the pool still qualifies (the same checks as a new spend),
+  the same key is resent; otherwise it stays paused. `aswap auto codex reset
+  dismiss` drops it.
+- **Resuming.** Once a reset is redeemed and a fresh read shows the account
+  usable, aswap journals that (`recovered`) and waiting `run --auto` sessions
+  check at once (not at their next scheduled check); a session held on that
+  very account is released. A failed or still-full post-reset read is
+  retried on a short backoff (the monitor wakes for it; a crash before it
+  resumes it), never with a new spend, for about half an hour. Where Codex reports `ordinaryUsageAllowed`, only
+  a grant counts as recovery.
+- **Money.** It uses only credits Codex lists as available. If a credit's
+  title or description, or Codex's answer, mentions payment, purchase,
+  billing, upgrades, credits or extra usage, aswap refuses and stops
+  redeeming until you run `aswap auto codex reset off`. The halt is
+  journaled first, so it survives a crash.
+- **Who.** Only the monitor (`aswap auto codex watch`, the `aswap-codex`
+  service) on the refresh owner redeems; sync followers never do. The
+  guarantees hold within that one data directory; nothing coordinates across
+  machines beyond the single refresh owner. With Home Manager, `autoReset`
+  needs `autoswitch.codex.enable = true`.
 
 Try the dry run first. It logs `would reset codex:LABEL (weekly resets in …)`
 to the monitor's output and to the reset log, and spends nothing:
@@ -215,6 +245,8 @@ aswap auto codex reset dry-run   # log what it would redeem
 aswap list --json | jq .codex_usage_resets
 aswap auto codex reset on        # redeem for real
 aswap auto codex reset off       # the default; also clears a halt
+aswap auto codex reset retry     # resend a paused request (same key)
+aswap auto codex reset dismiss   # drop a paused request
 ```
 
 With the Home Manager module, set
@@ -224,7 +256,9 @@ With the Home Manager module, set
 aswap redeems with the same `account/rateLimitResetCredit/consume` request the
 Codex TUI sends through `codex app-server`, using the account's own login. It
 records each attempt, with the account's usage before and after, in
-`codex-resets.json` in the aswap data directory (the last 50 entries).
+`codex-resets.json` in the aswap data directory (the last 50 entries), and
+every intent, attempt and outcome in the append-only `codex-resets.journal`,
+which is the authority after a crash.
 
 `aswap sessions --json` shows, for each running session, whether its account
 is held by a usage limit (`limit_blocked`) and, when Codex or Claude said,

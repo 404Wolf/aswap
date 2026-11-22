@@ -29,6 +29,15 @@ pub struct Auto {
     /// Opt-in redemption of Codex usage-limit reset credits; see `crate::reset`.
     #[serde(default)]
     pub auto_reset: AutoReset,
+    /// Also redeem when accounts are only out of their 5-hour (session)
+    /// windows, with weekly usage left. Off by default: a reset is then spent
+    /// only when every usable account is out of weekly usage.
+    #[serde(default)]
+    pub reset_session_windows: bool,
+    /// Settings a newer aswap wrote, kept as they are so this one doesn't
+    /// drop them when it saves (docs/COMPATIBILITY.md: data directory).
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 /// Whether the monitor may spend a Codex usage-limit reset credit.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
@@ -77,23 +86,144 @@ impl Default for Auto {
             prefer: Prefer::WeeklyReset,
             reserved: Vec::new(),
             auto_reset: AutoReset::Off,
+            reset_session_windows: false,
+            extra: Default::default(),
         }
     }
 }
 impl Auto {
+    /// These settings for --json output: without the fields only a newer
+    /// aswap knows (kept in `extra` for state.json, not part of the output).
+    pub fn public_json(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).unwrap_or_default();
+        if let Some(object) = value.as_object_mut() {
+            for key in self.extra.keys() {
+                object.remove(key);
+            }
+        }
+        value
+    }
     pub fn allows(&self, label: &str, pinned: Option<&str>) -> bool {
         pinned == Some(label) || !self.reserved.iter().any(|reserved| reserved == label)
     }
 }
+/// state.json. Everything this version doesn't know is kept and written
+/// back unchanged: top-level fields, Auto fields, and the accounts, active
+/// labels and auto settings of providers it doesn't know. So a running
+/// older supervisor never drops what a newer aswap added, and an account of
+/// a newer provider never stops this version from reading the file.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(try_from = "RawState", into = "RawState")]
 pub struct State {
     pub accounts: Vec<Account>,
     pub active: BTreeMap<Provider, String>,
     pub auto: BTreeMap<Provider, Auto>,
     /// Machine-wide minimum spacing of supervisor account switches, across
     /// every provider (see `switch_gate`); 0 turns the gate off.
-    #[serde(default = "default_switch_interval")]
     pub switch_interval_seconds: u64,
+    /// What a newer aswap wrote that this one doesn't know.
+    pub(crate) foreign: Foreign,
+}
+#[derive(Clone, Default)]
+pub(crate) struct Foreign {
+    accounts: Vec<serde_json::Value>,
+    active: serde_json::Map<String, serde_json::Value>,
+    auto: serde_json::Map<String, serde_json::Value>,
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+/// state.json as written, before providers are recognized.
+#[derive(Serialize, Deserialize)]
+struct RawState {
+    #[serde(default)]
+    accounts: Vec<serde_json::Value>,
+    #[serde(default)]
+    active: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    auto: serde_json::Map<String, serde_json::Value>,
+    #[serde(default = "default_switch_interval")]
+    switch_interval_seconds: u64,
+    #[serde(flatten)]
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+/// A provider name this version knows, or None.
+fn known_provider(name: &str) -> Option<Provider> {
+    serde_json::from_value(serde_json::Value::String(name.to_owned())).ok()
+}
+impl TryFrom<RawState> for State {
+    type Error = serde_json::Error;
+    fn try_from(raw: RawState) -> std::result::Result<Self, Self::Error> {
+        use serde::de::Error as _;
+        let mut state = Self {
+            accounts: Vec::new(),
+            active: BTreeMap::new(),
+            auto: BTreeMap::new(),
+            switch_interval_seconds: raw.switch_interval_seconds,
+            foreign: Foreign {
+                fields: raw.fields,
+                ..Foreign::default()
+            },
+        };
+        for account in raw.accounts {
+            let provider = account.get("provider").and_then(serde_json::Value::as_str);
+            match provider {
+                Some(name) if known_provider(name).is_none() => {
+                    state.foreign.accounts.push(account)
+                }
+                _ => state.accounts.push(serde_json::from_value(account)?),
+            }
+        }
+        for (name, label) in raw.active {
+            match known_provider(&name) {
+                Some(provider) => {
+                    let label = label
+                        .as_str()
+                        .ok_or_else(|| serde_json::Error::custom("active label is not a string"))?;
+                    state.active.insert(provider, label.to_owned());
+                }
+                None => {
+                    state.foreign.active.insert(name, label);
+                }
+            }
+        }
+        for (name, auto) in raw.auto {
+            match known_provider(&name) {
+                Some(provider) => {
+                    state.auto.insert(provider, serde_json::from_value(auto)?);
+                }
+                None => {
+                    state.foreign.auto.insert(name, auto);
+                }
+            }
+        }
+        Ok(state)
+    }
+}
+impl From<State> for RawState {
+    fn from(state: State) -> Self {
+        let mut accounts: Vec<serde_json::Value> = state
+            .accounts
+            .iter()
+            .filter_map(|a| serde_json::to_value(a).ok())
+            .collect();
+        accounts.extend(state.foreign.accounts);
+        let mut active = state.foreign.active;
+        for (provider, label) in state.active {
+            active.insert(provider.as_str().to_owned(), label.into());
+        }
+        let mut auto = state.foreign.auto;
+        for (provider, settings) in state.auto {
+            if let Ok(value) = serde_json::to_value(settings) {
+                auto.insert(provider.as_str().to_owned(), value);
+            }
+        }
+        Self {
+            accounts,
+            active,
+            auto,
+            switch_interval_seconds: state.switch_interval_seconds,
+            fields: state.foreign.fields,
+        }
+    }
 }
 fn default_switch_interval() -> u64 {
     crate::switch_gate::DEFAULT_INTERVAL_SECONDS
@@ -105,6 +235,7 @@ impl Default for State {
             active: BTreeMap::new(),
             auto: BTreeMap::new(),
             switch_interval_seconds: default_switch_interval(),
+            foreign: Foreign::default(),
         }
     }
 }
@@ -523,6 +654,45 @@ impl Store {
             .open(path)
             .safe("cannot open sync watch lock")?;
         Ok(f.try_lock_exclusive().is_ok().then_some(Guard(f, false)))
+    }
+    /// One usage fetch per login at a time, taken without the store lock
+    /// so no supervisor waits on the network. None while another process
+    /// fetches; `wait` bounds how long to keep trying.
+    pub(crate) fn usage_lock(
+        &self,
+        account: &Account,
+        wait: std::time::Duration,
+    ) -> Result<Option<Guard>> {
+        // Keyed like the refresh lock: aliases of one login share one quota,
+        // so they share one fetch.
+        let identity = crate::identity::read(
+            account.provider,
+            &self.profile(account.provider, &account.label)?,
+        )
+        .unwrap_or_default();
+        let key = identity.lock_key().unwrap_or_else(|| account.label.clone());
+        let path = self
+            .root
+            .join(format!("{}-{key}.usage.lock", account.provider));
+        no_links(&path)?;
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .safe("cannot open usage lock")?;
+        let start = std::time::Instant::now();
+        loop {
+            if f.try_lock_exclusive().is_ok() {
+                return Ok(Some(Guard(f, false)));
+            }
+            if start.elapsed() >= wait {
+                return Ok(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
     pub(crate) fn legacy_lock(&self, account: &Account) -> Result<Guard> {
         let path = self

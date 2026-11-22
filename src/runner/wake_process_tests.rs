@@ -80,6 +80,11 @@ fn set_clock(path: &Path, at: u64) {
     store::atomic(path, at.to_string().as_bytes()).unwrap();
 }
 
+/// These scenarios each run several supervisor processes for up to a minute;
+/// run them one at a time so they don't starve each other (or time out)
+/// under load. Other tests still run alongside.
+static PROCESS_SUITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn scenario(
     provider: Provider,
     recovered: &str,
@@ -87,6 +92,7 @@ fn scenario(
     recovered_usage: f64,
     pinned: bool,
 ) {
+    let _serial = PROCESS_SUITE.lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let store = Store::open(temp.path().join("data/aswap")).unwrap();
     let base = crate::now();
@@ -246,18 +252,34 @@ fn scenario(
     }
 
     let mut waiting = BTreeSet::new();
+    let mut closed = None;
     barrier(&rx, &workers, "rejection acknowledgement", |event| {
         match event {
             Event::Line(index, line) if line.contains("watching all accounts") => {
                 waiting.insert(index);
             }
             Event::Closed(index) => {
-                panic!("supervisor {index} exited before recovery was published")
+                closed = Some(index);
+                return true;
             }
             _ => {}
         }
         waiting.len() == count
     });
+    if let Some(index) = closed {
+        // Keep what the supervisor said and how it ended: this is the
+        // failure to diagnose, not a redemption wake.
+        let worker = &mut workers[index];
+        let status = worker.child.wait().ok();
+        let mut stdout = String::new();
+        if let Some(mut out) = worker.child.stdout.take() {
+            let _ = out.read_to_string(&mut stdout);
+        }
+        panic!(
+            "supervisor {index} exited before recovery was published (status {status:?}); its trace:\n{}\nits stdout (the provider's output):\n{stdout}",
+            worker.trace.lock().unwrap()
+        );
+    }
     assert!(CLOCK.with(|clock| clock.borrow().is_none()));
     assert_eq!(fs::read_to_string(&clock).unwrap(), base.to_string());
     assert!(

@@ -223,6 +223,12 @@ impl Spec for Pi {
             return Claims::default();
         };
         let access = jwt_claims(login.oauth.access.expose()).unwrap_or(Value::Null);
+        let selected = login
+            .oauth
+            .account_id
+            .as_ref()
+            .map(|a| a.as_str().to_owned());
+        let codex = login.kind == Kind::Codex;
         Claims {
             email: text(&access, &[EMAIL, "/email"]),
             plan: text(&access, &[PLAN]),
@@ -232,6 +238,16 @@ impl Spec for Pi {
                 .map(|a| a.as_str().to_owned())
                 .or_else(|| text(&access, &[ACCOUNT, "/sub", "/email"])),
             organization: None,
+            // The `openai-codex` login's access token is a Codex token (see
+            // `codex_auth`): the same membership claim, scoped to its
+            // selected workspace (`accountId`). Sign in with ChatGPT tokens
+            // are for api.openai.com and are not matched.
+            member: codex
+                .then(|| crate::identity::openai_member(&access, selected.as_deref()))
+                .flatten(),
+            person: codex
+                .then(|| crate::identity::openai_person(&[&access], selected.as_deref()))
+                .flatten(),
         }
     }
     fn shared_dirs(&self) -> &'static [&'static str] {

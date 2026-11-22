@@ -1084,3 +1084,119 @@ fn limit_block_reports_blocked_accounts_and_when_they_free_up() {
     limited.error = Some("provider-limit".into());
     assert_eq!(limited.limit_block(at), Some(None));
 }
+
+/// A store with one Claude account, `one`, and no usable reading.
+fn store_with_one() -> (tempfile::TempDir, Store, Account) {
+    let t = tempfile::tempdir().unwrap();
+    let store = Store::open(t.path().join("store")).unwrap();
+    let a = account("one");
+    let mut state = store.load().unwrap();
+    state.accounts.push(a.clone());
+    store.save(&state).unwrap();
+    (t, store, a)
+}
+
+#[test]
+fn a_usage_fetch_never_holds_the_store_lock() {
+    let (_t, store, a) = store_with_one();
+    let root = store.root.clone();
+    let c = usage::cached_mode_with(&store, &a, 1000, true, |_| {
+        // Another process (here: another open of the lock) must get the
+        // store lock while the fetch is in flight.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let other = Store::open(root).unwrap();
+            let _lock = other.lock().unwrap();
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(3))
+            .expect("the store lock was held during the fetch");
+        Ok(observation(10.0, 1000).usage)
+    })
+    .unwrap();
+    assert_eq!(c.used(1000), Some(10.0));
+}
+
+#[test]
+fn concurrent_reads_of_one_account_fetch_once() {
+    let (_t, store, a) = store_with_one();
+    let fetches = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let slow = scope.spawn(|| {
+            usage::cached_mode_with(&store, &a, 1000, false, |_| {
+                fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                Ok(observation(10.0, 1000).usage)
+            })
+            .unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // While the first fetch runs, an unforced read returns at once with
+        // the cache as it is, instead of fetching again or waiting.
+        let started = std::time::Instant::now();
+        let other = usage::cached_mode_with(&store, &a, 1000, false, |_| {
+            fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(observation(99.0, 1000).usage)
+        })
+        .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(300));
+        assert_eq!(other.used(1000), None);
+        assert_eq!(slow.join().unwrap().used(1000), Some(10.0));
+    });
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // A forced read waits for it, then fetches itself.
+    let forced =
+        usage::cached_mode_with(
+            &store,
+            &a,
+            1001,
+            true,
+            |_| Ok(observation(20.0, 1001).usage),
+        )
+        .unwrap();
+    assert_eq!(forced.used(1001), Some(20.0));
+}
+
+#[test]
+fn a_run_asks_about_a_refresh_without_the_store_lock_when_none_is_due() {
+    let (_t, store, a) = store_with_one();
+    let far = (aswap::now() + 86_400) * 1000;
+    aswap::store::json_write(
+        &store.profile(a.provider, &a.label).unwrap().join(a.provider.auth_file()),
+        &serde_json::json!({"claudeAiOauth":{"accessToken":"synthetic","refreshToken":"synthetic-r","expiresAt":far}}),
+    )
+    .unwrap();
+    let held = store.lock().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let root = store.root.clone();
+    let account = a.clone();
+    std::thread::spawn(move || {
+        let other = Store::open(root).unwrap();
+        tx.send(aswap::refresh::for_run(&other, &account).is_ok_and(|r| !r))
+            .unwrap();
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap(),
+        "for_run waited on the store lock or refreshed"
+    );
+    drop(held);
+}
+
+#[test]
+fn a_fetch_never_recreates_an_account_removed_meanwhile() {
+    let (_t, store, a) = store_with_one();
+    let profile = store.profile(a.provider, &a.label).unwrap();
+    std::fs::create_dir_all(&profile).unwrap();
+    let c = usage::cached_mode_with(&store, &a, 1000, true, |_| {
+        // `aswap remove` (or a rename) runs while the fetch is in flight.
+        let _lock = store.lock().unwrap();
+        let mut state = store.load().unwrap();
+        state.accounts.clear();
+        store.save(&state).unwrap();
+        std::fs::remove_dir_all(&profile).unwrap();
+        Ok(observation(10.0, 1000).usage)
+    })
+    .unwrap();
+    assert_eq!(c.used(1000), Some(10.0));
+    assert!(!profile.exists(), "the removed profile came back");
+}

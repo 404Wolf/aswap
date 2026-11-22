@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (wolf/pi-support)
+## Unreleased
 
 ### Added
 - **pi as a third provider.** `aswap add pi` stores pi's ChatGPT login; launches get access-only views with shared settings, sessions and extensions. `run pi --auto` resumes the same pi session on another account at a usage limit. pi shows in list, status, usage, waybar and sessions, and has the Home Manager option `autoswitch.pi`.
@@ -10,6 +10,24 @@
 ### Changed
 - **Launch views are kept after a run**, as on main, for runtime retention (`aswap gc`) to retire. Only the one-shot views of `run --pick` are removed when the call ends. Retention is off by default. Enable it (Home Manager `programs.aswap.retention.enable`, then `aswap gc`), or views and their access-only logins pile up. pi users of earlier builds of this branch had them removed at run end.
 - Retention covers pi views. Its liveness check also follows `PI_CODING_AGENT_DIR`.
+
+### Fixed
+- **Two members of one ChatGPT workspace are no longer one account.** aswap keyed a Codex login on its workspace (`account_id`), so two labels of different members of one workspace were treated as duplicates: a refresh of one overwrote the other's login, their usage readings were shared, and a limit on one held the other. Accounts now match on the workspace membership Codex itself reads (`chatgpt_account_user_id` in the access token, for the selected workspace), or on the user in that workspace for older tokens; Claude accounts on account and organization, never email. Lock file names are unchanged, so older supervisors stay compatible.
+- **Codex usage-limit resets, per the independent audit (asw-bx2, F1-F6).**
+  - F1: an unknown reset-credit count or detail list is unknown, not "none", and defers a redemption that account could outrank.
+  - F2: a request with no answer is paused with its key, never dropped or re-keyed; it ends only with `aswap auto codex reset retry` (same key) or `aswap auto codex reset dismiss`.
+  - F3: every intent, attempt and outcome goes to an fsynced, append-only `codex-resets.journal`, replayed on load. Mode changes wait for a running decision, and the mode is rechecked right before sending.
+  - F4 (Wolf's call): "exhausted" means every usable account (not reserved or signed out) has no usable quota now. Ranking uses the boundary that brings quota back.
+  - F5: a redeemed reset wakes waiting sessions at once and releases a hold on that account.
+  - F6: Codex's `ordinaryUsageAllowed` is honoured: null or false never counts as recovery.
+  - Review rounds: weekly-only by default (a 5-hour-only or denied-with-weekly-room pool never spends; `reset-session-windows on` opts in); the journal rebuilds every ended request, the money halt and a retry even with a lost or missing snapshot; `reset retry` reconciles a lost reply without sending, and resends only under the new-spend checks; waiting sessions wake on a fresh post-reset reading (`recovered`); `reset retry|dismiss` are Codex-only.
+  - End-to-end tests against a fake app-server; no real reset is ever used.
+- **A newer owner no longer breaks an older follower's sync.** A sync packet with a profile of a provider the follower doesn't know now skips that profile instead of failing the whole packet. And settings only a newer aswap knows stay out of `--json` output.
+- **A rotated login survives a failed write.** When a token refresh succeeded but writing the new login failed (a full disk, EIO), the provider had already invalidated the old refresh token, and the new one was only in memory: the account needed a new login. The new login is now written first to two private pending copies: one beside the login, and one under `$XDG_RUNTIME_DIR` (a tmpfs, so a full or failing data disk keeps one). Each records which login file it replaces. The next refresh installs a copy only over that same file, so a stale copy never rolls back a newer login. `add` and a preserved live login drop any copies. (Audit asw-0ti P2-5.)
+- **state.json written by a newer aswap is kept whole.** Unknown top-level fields, unknown per-provider settings, and the accounts, active labels and settings of providers this version doesn't know were dropped on save, or (an unknown provider) made state.json unreadable. A long-running older supervisor could then undo a newer one's `reserved` accounts or switch interval, and a future provider's account would stop every older aswap. They are now read past and written back unchanged. A known provider's malformed settings are still an error. (Audit asw-0ti P2-3.)
+- **Codex usage failures no longer rotate the login.** A failed Codex usage read forced a token refresh for nearly any failure: a changed response shape, an app-server that exited early, too many notifications. Each refresh revoked the access token of every running Codex session and restarted them, on every poll. Now only an explicit 401, or an app-server failure while the stored access token has expired, forces one. (Audit asw-0ti P2-2.)
+- **A slow usage poll no longer freezes every session's typing.** Usage fetches (a Claude HTTP call or a Codex app-server request, up to 10–20 s) ran under the store lock that every supervisor takes on its terminal thread. They now run outside it, one at a time per account under a per-account usage lock. A second reader returns the cache at once; an explicit `--refresh` waits up to 20 s for it. A supervisor's 30-second refresh check also no longer takes the store lock unless the login is close to expiry. (Audit asw-0ti P2-1.)
+- **A Codex session no longer fails over on someone else's 429.** On a Codex terminal, Claude's limit wording also matched: `error: ... 429`, `rate limit reached`, `you've hit your weekly limit`, and Claude's compaction and limit dialog. So tool output Codex draws, such as `└ Error: 429 Too Many Requests` from curl, switched a healthy account away. Codex terminals now count only Codex's own notices (`■ You've hit your usage limit ...` and the bare `usage_limit_reached` / `rate_limit_exceeded`). Claude terminals are unchanged. A Codex notice in the first 15 s after a launch or resume counts only when the account's quota reads exhausted (the cached reading, or one fresh read if that predates the launch), when the login rotated since launch (aswap then reloads the same account with it), or when Codex then exits with a failure. A redrawn old notice on resume no longer switches accounts. (Audit asw-0ti P2-4.)
 
 ## 0.2.1 (2026-11-21)
 

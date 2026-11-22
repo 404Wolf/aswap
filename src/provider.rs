@@ -42,6 +42,12 @@ pub struct Claims {
     /// Stable account identity (hashed before it is compared or stored).
     pub account: Option<String>,
     pub organization: Option<String>,
+    /// The real account, vendor-scoped and hashed (see
+    /// `identity::same_account`), only when the login names it with
+    /// authority.
+    pub member: Option<Vec<u8>>,
+    /// Older ChatGPT tokens without the membership claim: the workspace user.
+    pub person: Option<Vec<u8>>,
 }
 /// How a refresh request is encoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -466,6 +472,8 @@ fn add_with(
         let bytes = serde_json::to_vec(&login).safe("cannot encode credentials")?;
         validate_auth(provider, &bytes)?;
         store::private_dir(&target)?;
+        // A pending login left under this label by an earlier account is stale.
+        crate::refresh::discard_pending(store, &account);
         let path = target.join(provider.auth_file());
         store::atomic(&path, &bytes)?;
         // Verify before anything can take the login out of its source.
@@ -545,6 +553,7 @@ fn preserve_live(
                 .same_login(&current, config, &saved, &profile)?;
         if matched {
             let _refresh = store.refresh_lock(&candidate)?;
+            crate::refresh::discard_pending(store, &candidate);
             store::atomic(&profile.join(candidate.provider.auth_file()), bytes)?;
             target_is_live |= candidate.label == target.label;
         }
@@ -635,6 +644,8 @@ pub fn remove(store: &Store, provider: Provider, name: &str) -> Result<Vec<Strin
         settings.reserved.retain(|label| label != name);
     }
     store.save(&state)?;
+    // Including the copy under $XDG_RUNTIME_DIR, a refresh-capable login.
+    crate::refresh::discard_pending(store, &account);
     if profile.exists() {
         std::fs::remove_dir_all(profile).safe("cannot remove private profile")?;
     }
