@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **A newer-version notice.** Interactive commands (`status`, `list`, `usage`, ...) say on stderr when a newer aswap release exists, and how to update. A background check, started at most once a day from a terminal, reads the public GitHub mirror's release tags anonymously. It fails silently and backs off; it never writes to stdout, `--json`, or a wrapped agent's terminal; and it never updates anything. Opt out with `ASWAP_NO_UPDATE_CHECK=1`, `[updates] check = false` in config.toml, or Home Manager `programs.aswap.updateCheck = false`.
+
 ## 0.2.1 (2026-11-21)
 
 ### Added

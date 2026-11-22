@@ -199,6 +199,11 @@ in {
       '';
     };
     waybar.enable = mkEnableOption "the custom/aswap Waybar module in mainBar";
+    updateCheck = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Check once a day, in the background, whether a newer aswap release exists, and say so on stderr in interactive commands. Nothing is ever updated; false turns the check and the notice off.";
+    };
   };
   config = mkIf cfg.enable {
     assertions = [
@@ -210,8 +215,10 @@ in {
     xdg.configFile."aswap/sync-policy.json" = mkIf (cfg.syncProfiles != null) {
       text = builtins.toJSON cfg.syncProfiles;
     };
-    xdg.configFile."aswap/config.toml" = mkIf cfg.retention.enable {
-      source = (pkgs.formats.toml {}).generate "aswap-config.toml" {
+    xdg.configFile."aswap/config.toml" = mkIf (cfg.retention.enable || !cfg.updateCheck) {
+      source = (pkgs.formats.toml {}).generate "aswap-config.toml" (lib.optionalAttrs (!cfg.updateCheck) {
+        updates.check = false;
+      } // lib.optionalAttrs cfg.retention.enable {
         retention = {
           enabled = true;
           min_age = cfg.retention.minAge;
@@ -222,7 +229,7 @@ in {
         } // lib.optionalAttrs (cfg.retention.legacyHomes != {}) {
           legacy_homes = cfg.retention.legacyHomes;
         };
-      };
+      });
     };
     systemd.user.services = lib.mapAttrs' (provider: settings:
       lib.nameValuePair "aswap-${provider}" (serviceFor provider settings)

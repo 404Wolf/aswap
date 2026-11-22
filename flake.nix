@@ -108,7 +108,7 @@
               home.username = "synthetic";
               home.homeDirectory = "/home/synthetic";
               home.stateVersion = "26.05";
-              programs.aswap = { enable = true; syncProfiles.allow = []; };
+              programs.aswap = { enable = true; syncProfiles.allow = []; updateCheck = false; };
             } ];
           };
         in {
@@ -160,8 +160,11 @@
             assert builtins.any (pkgs.lib.hasSuffix " auto switch-interval 4") hmPeer.config.systemd.user.services.aswap-claude.Service.ExecStartPre;
             assert hm.config.programs.waybar.settings.mainBar."custom/aswap".return-type == "json";
             pkgs.runCommand "aswap-home-manager" { nativeBuildInputs = [ pkgs.python3 ]; } ''
-              python3 - ${hmPeer.config.xdg.configFile."aswap/config.toml".source} <<'PY'
+              python3 - ${hmPeer.config.xdg.configFile."aswap/config.toml".source} ${hmPolicyOnly.config.xdg.configFile."aswap/config.toml".source} <<'PY'
               import sys, tomllib
+              # updateCheck = false writes only the opt-out.
+              with open(sys.argv[2], "rb") as config:
+                  assert tomllib.load(config) == {"updates": {"check": False}}
               with open(sys.argv[1], "rb") as config:
                   assert tomllib.load(config)["retention"] == {
                       "enabled": True, "min_age": 3600, "archive_dir": "/home/synthetic/retained",

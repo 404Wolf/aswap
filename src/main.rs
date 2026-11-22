@@ -122,6 +122,10 @@ enum Action {
         #[arg(long, hide = true, requires = "serve")]
         watch: bool,
     },
+    /// Check once for a newer release and cache the answer (started in the
+    /// background by interactive commands; see src/update.rs).
+    #[command(hide = true)]
+    UpdateCheck,
     /// Stream Waybar custom/aswap JSON lines, at a relaxed cadence.
     Waybar {
         #[arg(long)]
@@ -375,9 +379,14 @@ fn execute(cli: Cli) -> Result<i32> {
         output(&value, cli.json, report.text())?;
         return Ok(i32::from(report.incomplete()));
     }
+    if let Action::UpdateCheck = cli.command {
+        // Detached and silent: a failure only backs the next check off.
+        let _ = aswap::update::check();
+        return Ok(0);
+    }
     let store = Store::from_env()?;
     match cli.command {
-        Action::Gc { .. } => unreachable!(),
+        Action::Gc { .. } | Action::UpdateCheck => unreachable!(),
         Action::Sessions { provider } => {
             let rows: Vec<_> = aswap::live::sessions(&store)?
                 .into_iter()
@@ -744,11 +753,36 @@ fn execute(cli: Cli) -> Result<i32> {
     }
     Ok(0)
 }
+/// Where the newer-version notice may go (stderr): `status` always, the
+/// other interactive commands only on a terminal, and never with --json or
+/// from run, auto, sync, waybar, gc or update-check.
+fn notice_allowed(cli: &Cli) -> bool {
+    if cli.json {
+        return false;
+    }
+    match cli.command {
+        Action::Status { .. } => true,
+        Action::List { .. }
+        | Action::Usage { .. }
+        | Action::Sessions { .. }
+        | Action::Add { .. }
+        | Action::Switch { .. }
+        | Action::Remove { .. }
+        | Action::Rename { .. } => io::stderr().is_terminal(),
+        _ => false,
+    }
+}
 fn main() {
     let cli = Cli::parse();
     let structured = cli.json;
+    let notice = notice_allowed(&cli);
     let code = match execute(cli) {
-        Ok(code) => code,
+        Ok(code) => {
+            if notice && let Some(text) = aswap::update::notice(io::stderr().is_terminal()) {
+                eprintln!("{text}");
+            }
+            code
+        }
         Err(err) => {
             if structured {
                 eprintln!("{}", json!({"error":err.to_string()}));

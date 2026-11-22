@@ -156,6 +156,24 @@ records each attempt, with the account's usage before and after, in
 is held by a usage limit (`limit_blocked`) and, when Codex or Claude said,
 when it frees up (`blocked_until`, Unix seconds).
 
+## Newer versions
+
+Once a day, a command you run on a terminal checks in the background
+whether a newer aswap release exists. If one does, `aswap status`, `list`,
+`usage` and the other interactive commands say so on stderr, with how to
+update (for a Nix install: update the flake's aswap input and switch).
+Nothing is ever updated, and no command waits for the check.
+
+- The release list is the public GitHub mirror's `v<version>` tags, read
+  anonymously; prereleases are ignored. Nothing about you is sent.
+- Offline or on any error the check stays silent and backs off (1, 2, 4,
+  then 7 days).
+- The notice never goes to stdout, `--json` output, `run`, `auto`, `sync`,
+  `waybar` or `gc`, so it never reaches an agent's terminal or a parser.
+- Turn it off with `ASWAP_NO_UPDATE_CHECK=1`, `[updates] check = false` in
+  `~/.config/aswap/config.toml`, or Home Manager
+  `programs.aswap.updateCheck = false`.
+
 ## Reading usage from another program
 
 `aswap list --json` is the stable, cache-only interface: it makes no network
