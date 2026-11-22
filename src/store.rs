@@ -29,6 +29,10 @@ pub struct Auto {
     /// Opt-in redemption of Codex usage-limit reset credits; see `crate::reset`.
     #[serde(default)]
     pub auto_reset: AutoReset,
+    /// Settings a newer aswap wrote, kept as they are so this one doesn't
+    /// drop them when it saves (docs/COMPATIBILITY.md: data directory).
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 /// Whether the monitor may spend a Codex usage-limit reset credit.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
@@ -77,6 +81,7 @@ impl Default for Auto {
             prefer: Prefer::WeeklyReset,
             reserved: Vec::new(),
             auto_reset: AutoReset::Off,
+            extra: Default::default(),
         }
     }
 }
@@ -85,15 +90,123 @@ impl Auto {
         pinned == Some(label) || !self.reserved.iter().any(|reserved| reserved == label)
     }
 }
-#[derive(Serialize, Deserialize)]
+/// state.json. Everything this version doesn't know is kept and written
+/// back unchanged: top-level fields, Auto fields, and the accounts, active
+/// labels and auto settings of providers it doesn't know. So a running
+/// older supervisor never drops what a newer aswap added, and an account of
+/// a newer provider never stops this version from reading the file.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(try_from = "RawState", into = "RawState")]
 pub struct State {
     pub accounts: Vec<Account>,
     pub active: BTreeMap<Provider, String>,
     pub auto: BTreeMap<Provider, Auto>,
     /// Machine-wide minimum spacing of supervisor account switches, across
     /// every provider (see `switch_gate`); 0 turns the gate off.
-    #[serde(default = "default_switch_interval")]
     pub switch_interval_seconds: u64,
+    /// What a newer aswap wrote that this one doesn't know.
+    pub(crate) foreign: Foreign,
+}
+#[derive(Clone, Default)]
+pub(crate) struct Foreign {
+    accounts: Vec<serde_json::Value>,
+    active: serde_json::Map<String, serde_json::Value>,
+    auto: serde_json::Map<String, serde_json::Value>,
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+/// state.json as written, before providers are recognized.
+#[derive(Serialize, Deserialize)]
+struct RawState {
+    #[serde(default)]
+    accounts: Vec<serde_json::Value>,
+    #[serde(default)]
+    active: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    auto: serde_json::Map<String, serde_json::Value>,
+    #[serde(default = "default_switch_interval")]
+    switch_interval_seconds: u64,
+    #[serde(flatten)]
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+/// A provider name this version knows, or None.
+fn known_provider(name: &str) -> Option<Provider> {
+    serde_json::from_value(serde_json::Value::String(name.to_owned())).ok()
+}
+impl TryFrom<RawState> for State {
+    type Error = serde_json::Error;
+    fn try_from(raw: RawState) -> std::result::Result<Self, Self::Error> {
+        use serde::de::Error as _;
+        let mut state = Self {
+            accounts: Vec::new(),
+            active: BTreeMap::new(),
+            auto: BTreeMap::new(),
+            switch_interval_seconds: raw.switch_interval_seconds,
+            foreign: Foreign {
+                fields: raw.fields,
+                ..Foreign::default()
+            },
+        };
+        for account in raw.accounts {
+            let provider = account.get("provider").and_then(serde_json::Value::as_str);
+            match provider {
+                Some(name) if known_provider(name).is_none() => {
+                    state.foreign.accounts.push(account)
+                }
+                _ => state.accounts.push(serde_json::from_value(account)?),
+            }
+        }
+        for (name, label) in raw.active {
+            match known_provider(&name) {
+                Some(provider) => {
+                    let label = label
+                        .as_str()
+                        .ok_or_else(|| serde_json::Error::custom("active label is not a string"))?;
+                    state.active.insert(provider, label.to_owned());
+                }
+                None => {
+                    state.foreign.active.insert(name, label);
+                }
+            }
+        }
+        for (name, auto) in raw.auto {
+            match known_provider(&name) {
+                Some(provider) => {
+                    state.auto.insert(provider, serde_json::from_value(auto)?);
+                }
+                None => {
+                    state.foreign.auto.insert(name, auto);
+                }
+            }
+        }
+        Ok(state)
+    }
+}
+impl From<State> for RawState {
+    fn from(state: State) -> Self {
+        let mut accounts: Vec<serde_json::Value> = state
+            .accounts
+            .iter()
+            .filter_map(|a| serde_json::to_value(a).ok())
+            .collect();
+        accounts.extend(state.foreign.accounts);
+        let mut active = state.foreign.active;
+        for (provider, label) in state.active {
+            active.insert(provider.as_str().to_owned(), label.into());
+        }
+        let mut auto = state.foreign.auto;
+        for (provider, settings) in state.auto {
+            if let Ok(value) = serde_json::to_value(settings) {
+                auto.insert(provider.as_str().to_owned(), value);
+            }
+        }
+        Self {
+            accounts,
+            active,
+            auto,
+            switch_interval_seconds: state.switch_interval_seconds,
+            fields: state.foreign.fields,
+        }
+    }
 }
 fn default_switch_interval() -> u64 {
     crate::switch_gate::DEFAULT_INTERVAL_SECONDS
@@ -105,6 +218,7 @@ impl Default for State {
             active: BTreeMap::new(),
             auto: BTreeMap::new(),
             switch_interval_seconds: default_switch_interval(),
+            foreign: Foreign::default(),
         }
     }
 }
