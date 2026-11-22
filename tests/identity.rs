@@ -126,6 +126,24 @@ fn a_membership_counts_only_for_the_selected_workspace_and_never_from_guesses() 
         &json!({}),
     );
     assert!(id_only.account_key().is_none());
+    // An envelope Codex rejects (not exactly three non-empty segments).
+    let claim =
+        json!({"chatgpt_account_id":"synthetic-a","chatgpt_account_user_id":"synthetic-member"});
+    let good = jwt(claim.clone());
+    let payload = good.split('.').nth(1).unwrap().to_owned();
+    for envelope in [
+        format!("synthetic.{payload}.synthetic.extra"),
+        format!(".{payload}.synthetic"),
+        format!("synthetic.{payload}."),
+        format!("synthetic.{payload}"),
+    ] {
+        let id = from_values(
+            Provider::Codex,
+            &json!({"tokens":{"account_id":"synthetic-a","access_token":envelope}}),
+            &json!({}),
+        );
+        assert!(id.account_key().is_none(), "{envelope}");
+    }
     // A workspace alone, `sub` or email: never one account.
     let bare = from_values(
         Provider::Codex,

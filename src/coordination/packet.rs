@@ -249,7 +249,15 @@ pub(super) fn install_permitted(
         if path.join(p.account.provider.auth_file()).exists() {
             let local = crate::identity::read(p.account.provider, &path).unwrap_or_default();
             let remote = crate::identity::from_values(p.account.provider, &p.auth, &p.config);
-            if local.known() && remote.known() && !crate::identity::same(&local, &remote) {
+            // The legacy key is Codex's workspace, which teammates share; the
+            // account key (where both logins carry it) tells them apart.
+            let other_member = matches!(
+                (local.account_key(), remote.account_key()),
+                (Some(a), Some(b)) if a != b
+            );
+            if local.known() && remote.known() && !crate::identity::same(&local, &remote)
+                || other_member
+            {
                 return Err(Error(
                     "sync: identity-conflict; same label has a different account; align labels first",
                 ));
@@ -325,7 +333,7 @@ pub(super) fn duplicate_count_permitted(packet: &Packet, policy: &SyncPolicy) ->
     {
         let identity = crate::identity::from_values(p.account.provider, &p.auth, &p.config);
         if seen.iter().any(|(provider, prior)| {
-            *provider == p.account.provider && crate::identity::same(prior, &identity)
+            *provider == p.account.provider && crate::identity::same_account(prior, &identity)
         }) {
             count += 1;
         } else {

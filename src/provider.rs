@@ -279,7 +279,14 @@ pub(crate) fn text(v: &Value, paths: &[&str]) -> Option<String> {
 /// The claims of an unverified JWT, for hints and expiry only.
 pub(crate) fn jwt_claims(token: &str) -> Option<Value> {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    let bytes = URL_SAFE_NO_PAD.decode(token.split('.').nth(1)?).ok()?;
+    // Codex's envelope (`decode_jwt_payload`): exactly three non-empty
+    // segments; anything else has no claims.
+    let mut parts = token.split('.');
+    let payload = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(h), Some(p), Some(s), None) if !h.is_empty() && !p.is_empty() && !s.is_empty() => p,
+        _ => return None,
+    };
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 fn response_access(response: &Value) -> std::result::Result<&str, Failure> {
