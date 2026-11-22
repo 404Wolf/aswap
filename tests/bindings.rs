@@ -936,3 +936,59 @@ fn a_far_future_or_poisoned_counter_is_ignored_and_recovers() {
         assert_eq!(b.used(at), Some(12.0));
     }
 }
+
+#[test]
+fn review_clock_invalid_sibling_must_not_mask_a_valid_skewed_floor() {
+    let pool = Pool::new();
+    let native = pool.add(Provider::Codex, "native", "synthetic-member-a");
+    let pi = pool.add(Provider::Pi, "pi", "synthetic-member-a");
+    let bad = pool.add(Provider::Pi, "bad-alias", "synthetic-member-a");
+    let at = aswap::now();
+    let remote = review_wall_us() + 600_000_000;
+    let valid = Cached {
+        usage: reading(20.0),
+        fetched_at: at + 600,
+        next_poll_at: at + 780,
+        observation: remote,
+        ..Default::default()
+    };
+    let corrupt = Cached {
+        usage: reading(30.0),
+        fetched_at: at - 1,
+        next_poll_at: at + 179,
+        observation: u64::MAX,
+        ..Default::default()
+    };
+    store::json_write(&cache_path(&pool, &native), &valid).unwrap();
+    store::json_write(&cache_path(&pool, &bad), &corrupt).unwrap();
+    let fresh = usage::cached_mode_with(&pool.store, &pi, at, true, |_| Ok(reading(10.0))).unwrap();
+    assert!(
+        fresh.observation > remote,
+        "invalid MAX sibling hid the valid ten-minute-ahead observation; allocated {} <= {}",
+        fresh.observation,
+        remote
+    );
+    assert_eq!(pool.cache(&native).used(at), Some(10.0));
+}
+
+fn review_wall_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
+}
+#[test]
+fn review_clock_small_backward_jump_keeps_numbers_monotonic() {
+    let pool = Pool::new();
+    let a = pool.add(Provider::Codex, "native", "synthetic-member-a");
+    let prior = review_wall_us() + 300_000_000;
+    // The persisted number was issued before the local wall clock moved back 5 min.
+    std::fs::write(
+        pool.store.root.join("usage-observations"),
+        prior.to_string(),
+    )
+    .unwrap();
+    let fresh = usage::cached_mode_with(&pool.store, &a, aswap::now(), true, |_| Ok(reading(10.0)))
+        .unwrap();
+    assert!(fresh.observation > prior);
+}

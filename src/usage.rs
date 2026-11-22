@@ -1033,7 +1033,7 @@ where
                 read_cache(&path, false).ok()
             })
             .chain(read_cache(&path, false).ok())
-            .map(|cache| cache.observation)
+            .map(|cache| cache.valid_observation())
             .max()
             .unwrap_or(0);
         next_observation(store, floor)?
