@@ -998,19 +998,52 @@ pub fn cached_force(store: &Store, account: &Account, force: bool) -> Result<Cac
         crate::refresh::refresh(store, account, now(), force)
     };
     cached_mode_with(store, account, now(), force, |p| {
-        refresh(false)?;
-        let first = fetch(account, p);
-        if first
-            .as_ref()
-            .err()
-            .is_some_and(|e| e.status == Some(401) || e.kind == "codex-rpc-unavailable")
-            && refresh(true)?
-        {
-            fetch(account, p)
-        } else {
-            first
-        }
+        fetch_refreshing(account, p, refresh, |p| fetch(account, p))
     })
+}
+/// One usage fetch, refreshing the login first when it is due and forcing
+/// one retry after a refresh only when `refresh_warranted` says the failure
+/// was about auth.
+fn fetch_refreshing(
+    account: &Account,
+    profile: &Path,
+    refresh: impl Fn(bool) -> std::result::Result<bool, Failure>,
+    fetch: impl Fn(&Path) -> std::result::Result<Usage, Failure>,
+) -> std::result::Result<Usage, Failure> {
+    refresh(false)?;
+    let first = fetch(profile);
+    if first
+        .as_ref()
+        .err()
+        .is_some_and(|e| refresh_warranted(account.provider, profile, e, now()))
+        && refresh(true)?
+    {
+        fetch(profile)
+    } else {
+        first
+    }
+}
+/// Whether a failed fetch justifies forcing a token refresh. A forced
+/// refresh skips the backoff gate and rotates the login, which revokes the
+/// access token of every running view of it, so only an auth failure counts:
+/// an explicit 401, or a Codex app-server that failed while the stored access
+/// token had expired. A changed response shape, an app-server that exits
+/// early, or any other transport failure never rotates.
+pub(crate) fn refresh_warranted(
+    provider: Provider,
+    profile: &Path,
+    failure: &Failure,
+    at: u64,
+) -> bool {
+    if failure.status == Some(401) {
+        return true;
+    }
+    provider == Provider::Codex
+        && failure.kind == "codex-rpc-unavailable"
+        && store::json_read::<Value>(&profile.join(provider.auth_file()))
+            .ok()
+            .and_then(|auth| crate::refresh::expires_at(provider, &auth))
+            .is_some_and(|expiry| expiry <= at)
 }
 /// Ranks two eligible accounts: soonest weekly reset first under
 /// `WeeklyReset` (unknown resets last), then most headroom.
@@ -1336,5 +1369,92 @@ mod merge_tests {
         // Without that, a failure backs off as usual.
         let backed = merged(&stale, stale.clone(), Err(Failure::http(401, 0)), at);
         assert!(backed.next_poll_at > at);
+    }
+}
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    /// A profile whose Codex access token (a synthetic JWT) expires at `exp`.
+    fn codex_profile(exp: u64) -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        let payload = URL_SAFE_NO_PAD.encode(format!("{{\"exp\":{exp}}}"));
+        store::json_write(
+            &t.path().join("auth.json"),
+            &serde_json::json!({"tokens":{"access_token":format!("e30.{payload}.sig"),"refresh_token":"synthetic-r"}}),
+        )
+        .unwrap();
+        t
+    }
+
+    #[test]
+    fn only_auth_failures_force_a_rotation() {
+        let at = 10_000;
+        let live = codex_profile(at + 3600);
+        let expired = codex_profile(at - 1);
+        let unavailable = Failure::new("codex-rpc-unavailable");
+        let warranted = |p: &tempfile::TempDir, f: &Failure| {
+            refresh_warranted(Provider::Codex, p.path(), f, at)
+        };
+        // A new response shape, an early exit or "too many notifications"
+        // all surface as codex-rpc-unavailable: no rotation while the
+        // token is still valid.
+        assert!(!warranted(&live, &unavailable));
+        assert!(warranted(&expired, &unavailable));
+        assert!(warranted(&live, &Failure::http(401, 0)));
+        for kind in [
+            "codex-rpc-timeout",
+            "codex-rpc-start-failed",
+            "usage-unavailable",
+        ] {
+            assert!(!warranted(&expired, &Failure::new(kind)), "{kind}");
+        }
+        assert!(!warranted(&live, &Failure::http(429, 60)));
+        assert!(!warranted(&live, &Failure::http(500, 0)));
+        // No readable login: nothing to judge by, so no rotation.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!warranted(&empty, &unavailable));
+        // Claude: only an explicit 401.
+        assert!(refresh_warranted(
+            Provider::Claude,
+            empty.path(),
+            &Failure::http(401, 0),
+            at
+        ));
+        assert!(!refresh_warranted(
+            Provider::Claude,
+            empty.path(),
+            &unavailable,
+            at
+        ));
+    }
+
+    #[test]
+    fn a_fetch_forces_a_refresh_only_when_warranted() {
+        let codex = Account {
+            provider: Provider::Codex,
+            label: "synthetic".into(),
+        };
+        // (stored token expiry, the fetch's failure) -> forced refreshes.
+        let forced = |exp: u64, failure: Failure| {
+            let profile = codex_profile(exp);
+            let forced = std::cell::Cell::new(0);
+            let _ = fetch_refreshing(
+                &codex,
+                profile.path(),
+                |force| {
+                    forced.set(forced.get() + u32::from(force));
+                    Ok(force)
+                },
+                |_| Err(failure),
+            );
+            forced.get()
+        };
+        let live = now() + 3600;
+        assert_eq!(forced(live, Failure::new("codex-rpc-unavailable")), 0);
+        assert_eq!(forced(live, Failure::new("codex-rpc-timeout")), 0);
+        assert_eq!(forced(now() - 1, Failure::new("codex-rpc-unavailable")), 1);
+        assert_eq!(forced(live, Failure::http(401, 0)), 1);
     }
 }

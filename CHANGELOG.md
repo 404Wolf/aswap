@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- **Codex usage failures no longer rotate the login.** A failed Codex usage read forced a token refresh for nearly any failure: a changed response shape, an app-server that exited early, too many notifications. Each refresh revoked the access token of every running Codex session and restarted them, on every poll. Now only an explicit 401, or an app-server failure while the stored access token has expired, forces one. (Audit asw-0ti P2-2.)
 - **A slow usage poll no longer freezes every session's typing.** Usage fetches (a Claude HTTP call or a Codex app-server request, up to 10–20 s) ran under the store lock that every supervisor takes on its terminal thread. They now run outside it, one at a time per account under a per-account usage lock. A second reader returns the cache at once; an explicit `--refresh` waits up to 20 s for it. A supervisor's 30-second refresh check also no longer takes the store lock unless the login is close to expiry. (Audit asw-0ti P2-1.)
 
 ## 0.2.1 (2026-11-21)
