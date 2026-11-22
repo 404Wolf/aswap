@@ -85,10 +85,21 @@ fn text(v: &Value, paths: &[&str]) -> Option<String> {
             .map(str::to_owned)
     })
 }
+/// A JWT's payload segment, as Codex accepts the envelope
+/// (`decode_jwt_payload`): exactly three non-empty segments.
+fn jwt_payload(jwt: &str) -> Option<&str> {
+    let mut parts = jwt.split('.');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(h), Some(p), Some(s), None) if !h.is_empty() && !p.is_empty() && !s.is_empty() => {
+            Some(p)
+        }
+        _ => None,
+    }
+}
 fn claims(auth: &Value, key: &str) -> Value {
     auth.pointer(key)
         .and_then(Value::as_str)
-        .and_then(|s| s.split('.').nth(1))
+        .and_then(jwt_payload)
         .and_then(|s| URL_SAFE_NO_PAD.decode(s).ok())
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(Value::Null)

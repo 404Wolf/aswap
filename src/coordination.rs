@@ -502,7 +502,15 @@ fn install_permitted(
         if path.join(p.account.provider.auth_file()).exists() {
             let local = crate::identity::read(p.account.provider, &path).unwrap_or_default();
             let remote = crate::identity::from_values(p.account.provider, &p.auth, &p.config);
-            if local.known() && remote.known() && !crate::identity::same(&local, &remote) {
+            // The legacy key is Codex's workspace, which teammates share; the
+            // account key (where both logins carry it) tells them apart.
+            let other_member = matches!(
+                (local.account_key(), remote.account_key()),
+                (Some(a), Some(b)) if a != b
+            );
+            if local.known() && remote.known() && !crate::identity::same(&local, &remote)
+                || other_member
+            {
                 return Err(Error(
                     "sync: identity-conflict; same label has a different account; align labels first",
                 ));
@@ -720,7 +728,7 @@ fn duplicate_count_permitted(packet: &Packet, policy: &SyncPolicy) -> usize {
     {
         let identity = crate::identity::from_values(p.account.provider, &p.auth, &p.config);
         if seen.iter().any(|(provider, prior)| {
-            *provider == p.account.provider && crate::identity::same(prior, &identity)
+            *provider == p.account.provider && crate::identity::same_account(prior, &identity)
         }) {
             count += 1;
         } else {
@@ -1441,6 +1449,106 @@ mod tests {
         let (_t, store) = seed();
         assert!(serve(&store, false).is_err());
         assert!(serve(&store, true).is_err());
+    }
+    #[test]
+    fn teammates_in_one_chatgpt_workspace_are_not_counted_as_duplicate_logins() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let profile = |label: &str, member: &str| {
+            let claims = json!({"https://api.openai.com/auth":{
+                "chatgpt_account_id":"synthetic-workspace","chatgpt_account_user_id":member}});
+            let jwt = format!(
+                "synthetic.{}.synthetic",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+            );
+            Profile {
+                account: Account {
+                    provider: Provider::Codex,
+                    label: label.into(),
+                },
+                auth: json!({"tokens":{"account_id":"synthetic-workspace","access_token":jwt}}),
+                config: json!({}),
+                cache: Cached::default(),
+            }
+        };
+        let packet = |profiles| Packet {
+            protocol: 1,
+            issued_at: 1,
+            profiles,
+        };
+        assert_eq!(
+            duplicate_count(&packet(vec![
+                profile("alice", "synthetic-member-a"),
+                profile("bob", "synthetic-member-b")
+            ])),
+            0
+        );
+        assert_eq!(
+            duplicate_count(&packet(vec![
+                profile("alice", "synthetic-member-a"),
+                profile("alice-too", "synthetic-member-a")
+            ])),
+            1
+        );
+    }
+    #[test]
+    fn a_teammates_login_under_the_same_label_is_an_identity_conflict() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let auth = |member: Option<&str>| {
+            let mut claims = json!({"chatgpt_account_id":"synthetic-workspace","chatgpt_user_id":"synthetic-user"});
+            if let Some(member) = member {
+                claims["chatgpt_account_user_id"] = member.into();
+            }
+            let jwt = format!(
+                "synthetic.{}.synthetic",
+                URL_SAFE_NO_PAD.encode(
+                    serde_json::to_vec(&json!({"https://api.openai.com/auth": claims})).unwrap()
+                )
+            );
+            json!({"tokens":{"account_id":"synthetic-workspace","access_token":jwt,"refresh_token":"synthetic-refresh"}})
+        };
+        let install_over = |local: Value, remote: Value| {
+            let peer_dir = tempfile::tempdir().unwrap();
+            let peer = Store::open(peer_dir.path().join("peer")).unwrap();
+            let account = Account {
+                provider: Provider::Codex,
+                label: "work".into(),
+            };
+            let profile = peer.profile(account.provider, &account.label).unwrap();
+            store::private_dir(&profile).unwrap();
+            store::json_write(&profile.join("auth.json"), &local).unwrap();
+            let mut state = peer.load().unwrap();
+            state.accounts.push(account.clone());
+            peer.save(&state).unwrap();
+            let packet = Packet {
+                protocol: 1,
+                issued_at: crate::now(),
+                profiles: vec![Profile {
+                    account,
+                    auth: remote,
+                    config: json!({}),
+                    cache: Cached::default(),
+                }],
+            };
+            let result = install(&peer, packet, &mut Settings::default()).map(|_| ());
+            let kept: Value = store::json_read(&profile.join("auth.json")).unwrap();
+            (result, kept == local)
+        };
+        // Both carry the membership and it differs: refused, local kept.
+        let (result, kept) = install_over(
+            auth(Some("synthetic-member-a")),
+            auth(Some("synthetic-member-b")),
+        );
+        assert!(result.is_err_and(|e| e.to_string().contains("identity-conflict")));
+        assert!(kept);
+        // The same member: installed as before.
+        let (result, _) = install_over(
+            auth(Some("synthetic-member-a")),
+            auth(Some("synthetic-member-a")),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        // Without the claim on one side: today's behaviour.
+        let (result, _) = install_over(auth(None), auth(Some("synthetic-member-b")));
+        assert!(result.is_ok(), "{result:?}");
     }
     #[test]
     fn duplicate_identities_are_aliases_but_duplicate_labels_and_identity_changes_are_conflicts() {
