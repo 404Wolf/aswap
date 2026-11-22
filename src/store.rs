@@ -86,6 +86,17 @@ impl Default for Auto {
     }
 }
 impl Auto {
+    /// These settings for --json output: without the fields only a newer
+    /// aswap knows (kept in `extra` for state.json, not part of the output).
+    pub fn public_json(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).unwrap_or_default();
+        if let Some(object) = value.as_object_mut() {
+            for key in self.extra.keys() {
+                object.remove(key);
+            }
+        }
+        value
+    }
     pub fn allows(&self, label: &str, pinned: Option<&str>) -> bool {
         pinned == Some(label) || !self.reserved.iter().any(|reserved| reserved == label)
     }

@@ -306,3 +306,14 @@ fn a_known_provider_with_bad_settings_is_still_an_error() {
     store::atomic(&path, br#"{"accounts":[],"active":{},"auto":{}}"#).unwrap();
     assert!(store.load().unwrap().switch_interval_seconds > 0);
 }
+
+#[test]
+fn newer_auto_settings_stay_out_of_json_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("store")).unwrap();
+    store::atomic(&temp.path().join("store/state.json"), NEWER.as_bytes()).unwrap();
+    let state = store.load().unwrap();
+    let json = state.auto[&Provider::Claude].public_json();
+    assert!(json.get("future_knob").is_none(), "{json}");
+    assert_eq!(json["reserved"], serde_json::json!(["work"]));
+}

@@ -213,7 +213,7 @@ fn snapshot(store: &Store, filter: Option<Provider>, refresh: bool) -> Result<Va
             .unwrap_or_else(|err| json!({"error": err.to_string()}))
     };
     Ok(
-        json!({"schema_version":1,"accounts":rows,"auto":settings,"codex_usage_resets":usage_resets,"switch_interval_seconds":switch_interval,"credential_mode":if coordination.owner {"refresh-owner"}else if coordination.host.is_some(){"access-only-follower"}else{"refresh-disabled"},"last_sync":coordination.last_sync,"sync":aswap::coordination::status(store)?}),
+        json!({"schema_version":1,"accounts":rows,"auto":settings.iter().map(|(p, a)| (p.as_str().to_owned(), a.public_json())).collect::<serde_json::Map<_, _>>(),"codex_usage_resets":usage_resets,"switch_interval_seconds":switch_interval,"credential_mode":if coordination.owner {"refresh-owner"}else if coordination.host.is_some(){"access-only-follower"}else{"refresh-disabled"},"last_sync":coordination.last_sync,"sync":aswap::coordination::status(store)?}),
     )
 }
 fn duplicate_labels(store: &Store, account: &store::Account) -> Result<Vec<String>> {
@@ -571,7 +571,7 @@ fn execute(cli: Cli) -> Result<i32> {
                     } else {
                         settings.reserved.retain(|item| item != &label);
                     }
-                    let v = json!({"provider":provider,"label":label,"reserved":reserved,"auto":settings});
+                    let v = json!({"provider":provider,"label":label,"reserved":reserved,"auto":settings.public_json()});
                     store.save(&state)?;
                     let action = if reserved { "Reserved" } else { "Unreserved" };
                     output(&v, cli.json, format!("{action} {provider}:{label}"))?;
@@ -619,7 +619,7 @@ fn execute(cli: Cli) -> Result<i32> {
                         }
                         _ => unreachable!(),
                     }
-                    let v = json!({"provider":provider,"auto":settings});
+                    let v = json!({"provider":provider,"auto":settings.public_json()});
                     let pretty = format!(
                         "{provider}  {}",
                         aswap::display::policy_text(&aswap::display::Policy {
