@@ -1407,7 +1407,21 @@ pub fn verify_due(store: &Store, provider: Provider) -> Option<u64> {
     if provider != Provider::Codex {
         return None;
     }
+    // Only when a tick would run it: not with resets off, nor on a follower.
+    if crate::coordination::follower(store).ok()? {
+        return None;
+    }
     let _lock = store.lock().ok()?;
+    let mode = store
+        .load()
+        .ok()?
+        .auto
+        .get(&provider)
+        .map(|a| a.auto_reset)
+        .unwrap_or_default();
+    if mode == AutoReset::Off {
+        return None;
+    }
     load(store).ok()?.verifying.map(|v| v.next_at)
 }
 
@@ -3378,9 +3392,27 @@ mod tests {
             .verifying
             .expect("verification resumes");
         assert_eq!((v.label.as_str(), v.next_at), ("six", 0));
+        // Resets off: no tick would run it, so the usual interval.
+        assert_eq!(verify_due(&store, Provider::Codex), None);
+        assert_eq!(monitor_wait(&store, Provider::Codex, now), usage::TTL);
+        {
+            let _lock = store.lock().unwrap();
+            let mut state = store.load().unwrap();
+            state.auto.entry(Provider::Codex).or_default().auto_reset = AutoReset::DryRun;
+            store.save(&state).unwrap();
+        }
         assert_eq!(verify_due(&store, Provider::Codex), Some(0));
         assert_eq!(monitor_wait(&store, Provider::Codex, now), 1);
         assert_eq!(monitor_wait(&store, Provider::Claude, now), usage::TTL);
+        // A follower doesn't run it either.
+        let coordination = store.root.join("coordination.json");
+        store::json_write(
+            &coordination,
+            &serde_json::json!({"host": "synthetic-owner"}),
+        )
+        .unwrap();
+        assert_eq!(monitor_wait(&store, Provider::Codex, now), usage::TTL);
+        std::fs::remove_file(&coordination).unwrap();
         append(
             &store,
             &Event::Recovered {
