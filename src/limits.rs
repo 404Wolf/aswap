@@ -187,6 +187,10 @@ impl Limits {
     /// never stalls, and a redraw over a healthy account is ignored. A failed
     /// exit (`gone`) after an early notice counts too (that includes a
     /// Ctrl-C'd Codex, as on main).
+    ///
+    /// Accepted trade-off: where a read can't show room, a redraw counts as
+    /// a limit. That is a follower whose owner poll takes over `LATE_WAIT`,
+    /// or a Codex account whose reading has no windows.
     pub fn check_codex(
         &mut self,
         notice: bool,

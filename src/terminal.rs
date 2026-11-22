@@ -503,11 +503,20 @@ const CODEX_LIMIT: &str = "you've hit your usage limit";
 fn diagnostic_line(line: &str, on_codex: bool) -> (bool, bool, bool) {
     // The square is Codex's diagnostic marker. Strip it only for the exact
     // usage error, so other output with a square keeps its existing meaning.
+    let marked = line.starts_with('■');
     let codex = line.strip_prefix('■').unwrap_or(line).trim_start();
     let codex = codex
         .strip_prefix("error running remote compact task:")
         .map_or(codex, str::trim_start);
-    if codex_limit_notice(codex) {
+    // A narrow pane wraps Codex's longer wordings: the marked first row
+    // starts with the notice and breaks off inside its second sentence
+    // (no sentence ends on that row; a finished one is checked whole).
+    let wrapped = marked
+        && codex
+            .strip_prefix(CODEX_LIMIT)
+            .and_then(|rest| rest.strip_prefix(". "))
+            .is_some_and(|rest| !rest.is_empty() && !rest.contains(". ") && !rest.ends_with('.'));
+    if wrapped || codex_limit_notice(codex) {
         return (true, false, false);
     }
     let api = line
@@ -695,6 +704,8 @@ mod tests {
             "\u{25a0} You've hit your usage limit. To get more access now, send a request to your admin or try again in 1 day, 3 hours and 5 minutes.\r\n",
             "\u{25a0} You've hit your usage limit. Try again in 5 hours.\r\n",
             "\u{25a0} You've hit your usage limit. Try again in 1 minute.\r\n",
+            // Wrapped onto two rows by a narrow pane.
+            "\u{25a0} You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing), visit\r\nhttps://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:31 PM.\r\n",
         ] {
             assert!(codex_feed(notice).notice, "{notice:?}");
         }
