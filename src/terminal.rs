@@ -45,6 +45,9 @@ pub struct Terminal {
     started: bool,
     childless: bool,
     diagnostics: Diagnostics,
+    /// Gemini's limit notices count only on a Gemini terminal, so a Claude
+    /// or Codex session that prints the same words never fails over.
+    pub gemini: bool,
     last_input: Option<std::time::Instant>,
     pub auth_expired: bool,
     pub model_unsupported: bool,
@@ -117,6 +120,7 @@ impl Terminal {
             started: false,
             childless: true,
             diagnostics: Diagnostics::default(),
+            gemini: false,
             last_input: None,
             auth_expired: false,
             model_unsupported: false,
@@ -175,7 +179,7 @@ impl Terminal {
                 return Err(Error("cannot clear provider input before resume"));
             }
         }
-        self.diagnostics = Diagnostics::default();
+        self.diagnostics = Diagnostics::new(self.gemini);
         self.last_input = None;
         self.auth_expired = false;
         self.model_unsupported = false;
@@ -386,8 +390,16 @@ struct Diagnostics {
     escape: u8,
     truncated: bool,
     menu_header: bool,
+    gemini: bool,
 }
 impl Diagnostics {
+    fn new(gemini: bool) -> Self {
+        Self {
+            gemini,
+            ..Self::default()
+        }
+    }
+
     fn feed(&mut self, bytes: &[u8]) -> (ScreenLimits, bool, bool) {
         let mut signals = (ScreenLimits::default(), false, false);
         for &byte in bytes {
@@ -454,7 +466,7 @@ impl Diagnostics {
         let decoded = normalize(&self.line);
         self.line.clear();
         let line = decoded.as_str();
-        let (limit, auth, model) = diagnostic_line(line);
+        let (limit, auth, model) = diagnostic_line(line, self.gemini);
         signals.0.notice |= limit;
         signals.1 |= auth;
         signals.2 |= model;
@@ -483,7 +495,8 @@ fn normalize(line: &[u8]) -> String {
 }
 const CODEX_LIMIT: &str = "you've hit your usage limit";
 
-fn diagnostic_line(line: &str) -> (bool, bool, bool) {
+fn diagnostic_line(line: &str, gemini: bool) -> (bool, bool, bool) {
+    let gemini = gemini && crate::gemini::limit_notice(line);
     // The square is Codex's diagnostic marker. Strip it only for the exact
     // usage error, so other output with a square keeps its existing meaning.
     let codex = line.strip_prefix('■').unwrap_or(line).trim_start();
@@ -503,7 +516,7 @@ fn diagnostic_line(line: &str) -> (bool, bool, bool) {
         || line.starts_with("login expired \u{b7} please run /login")
         || notice
         || line.starts_with("you're out of extra usage")
-        || crate::gemini::limit_notice(line);
+        || gemini;
     let Some(text) = api.or(standalone.then_some(line)) else {
         return (false, false, false);
     };
@@ -511,7 +524,7 @@ fn diagnostic_line(line: &str) -> (bool, bool, bool) {
         limit_message(text)
             || text.trim_start().starts_with("429 ")
             || notice
-            || crate::gemini::limit_notice(line)
+            || gemini
             || line.contains("out of extra usage"),
         auth_message(text) || text.trim_start().starts_with("401 "),
         unsupported_model_message(text),
@@ -603,16 +616,113 @@ pub fn limit_message(text: &str) -> bool {
 }
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn geminis_limit_notices_count_as_limits() {
+    const GEMINI_NOTICES: [&str; 3] = [
         // gemini-cli 0.47.0 and 0.70.0, as normalize() leaves them.
-        for line in [
-            "usage limit reached for gemini-2.5-pro.",
-            "you have exhausted your daily quota on this model.",
-        ] {
-            assert!(super::diagnostic_line(line).0, "{line}");
+        "usage limit reached for gemini-2.5-pro.",
+        "you have exhausted your daily quota on this model.",
+        "you have exhausted your daily quota on this model. try again later.",
+    ];
+    #[test]
+    fn geminis_limit_notices_count_only_on_a_gemini_terminal() {
+        for line in GEMINI_NOTICES {
+            assert!(super::diagnostic_line(line, true).0, "{line}");
+            assert_eq!(
+                super::diagnostic_line(line, false),
+                (false, false, false),
+                "{line}"
+            );
+            assert!(
+                super::Diagnostics::new(true)
+                    .feed(format!("{line}\n").as_bytes())
+                    .0
+                    .any()
+            );
+            assert!(
+                !super::Diagnostics::new(false)
+                    .feed(format!("{line}\n").as_bytes())
+                    .0
+                    .any()
+            );
+            assert!(
+                !super::Diagnostics::default()
+                    .feed(format!("{line}\n").as_bytes())
+                    .0
+                    .any()
+            );
         }
-        assert!(!super::diagnostic_line("you have exhausted your patience").0);
+        assert!(!super::diagnostic_line("you have exhausted your patience", true).0);
+    }
+
+    /// `diagnostic_line` exactly as it was before Gemini (main 48195be).
+    fn before_gemini(line: &str) -> (bool, bool, bool) {
+        use super::*;
+        let codex = line.strip_prefix('\u{25a0}').unwrap_or(line).trim_start();
+        let codex = codex
+            .strip_prefix("error running remote compact task:")
+            .map_or(codex, str::trim_start);
+        if codex_limit_notice(codex) {
+            return (true, false, false);
+        }
+        let api = line
+            .strip_prefix("api error:")
+            .or_else(|| line.strip_prefix("error:"));
+        let notice = !line.starts_with(CODEX_LIMIT) && hit_limit_notice(line);
+        let standalone = matches!(line, "usage_limit_reached" | "rate_limit_exceeded")
+            || (line.starts_with("the ") && unsupported_model_message(line))
+            || line.starts_with("oauth token revoked \u{b7} please run /login")
+            || line.starts_with("login expired \u{b7} please run /login")
+            || notice
+            || line.starts_with("you're out of extra usage");
+        let Some(text) = api.or(standalone.then_some(line)) else {
+            return (false, false, false);
+        };
+        (
+            limit_message(text)
+                || text.trim_start().starts_with("429 ")
+                || notice
+                || line.contains("out of extra usage"),
+            auth_message(text) || text.trim_start().starts_with("401 "),
+            unsupported_model_message(text),
+        )
+    }
+
+    #[test]
+    fn claude_and_codex_detection_is_unchanged_by_gemini() {
+        // Every quoted line in this file (the Claude/Codex fixtures), plus
+        // Gemini's notices and Gemini-ish prose a Claude/Codex pane may show.
+        let source = include_str!("terminal.rs");
+        let mut lines: Vec<String> = source
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(|quoted| {
+                quoted
+                    .replace("\\u{b7}", "\u{b7}")
+                    .replace("\\u{2019}", "\u{2019}")
+            })
+            .collect();
+        lines.extend(GEMINI_NOTICES.map(String::from));
+        lines.extend(
+            [
+                "usage limit reached for claude-opus.",
+                "error: usage limit reached for gemini-2.5-pro.",
+                "api error: you have exhausted your daily quota on this model.",
+            ]
+            .map(String::from),
+        );
+        assert!(
+            lines.len() > 50,
+            "fixture corpus too small: {}",
+            lines.len()
+        );
+        for line in &lines {
+            let line = super::normalize(line.as_bytes());
+            assert_eq!(
+                super::diagnostic_line(&line, false),
+                before_gemini(&line),
+                "{line}"
+            );
+        }
     }
     #[test]
     fn limit_signals_do_not_match_arbitrary_numbers() {

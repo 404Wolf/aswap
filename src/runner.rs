@@ -164,7 +164,13 @@ pub fn run(
             provider, args, &help,
         )?);
     }
-    let mut terminal = if auto { Some(Terminal::open()?) } else { None };
+    let mut terminal = if auto {
+        let mut terminal = Terminal::open()?;
+        terminal.gemini = provider == Provider::Gemini;
+        Some(terminal)
+    } else {
+        None
+    };
     let mut launch_args = auto_args
         .as_ref()
         .map_or_else(|| args.to_vec(), |a| a.initial.clone());
