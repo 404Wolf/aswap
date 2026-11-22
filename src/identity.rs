@@ -142,3 +142,48 @@ pub fn duplicates(
         })
         .collect()
 }
+/// The same real account in other programs (Codex and pi's ChatGPT login,
+/// say): accounts of other providers with this one's account key. Only the
+/// authoritative key links programs, never the older-token fallback. These
+/// share quota, limits and resets, never credentials: each program keeps
+/// its own login and refreshes it itself (`duplicates` stays per program).
+/// Caller holds the store lock.
+pub fn bindings(
+    store: &crate::store::Store,
+    account: &crate::store::Account,
+    accounts: &[crate::store::Account],
+) -> Vec<crate::store::Account> {
+    let key = |a: &crate::store::Account| {
+        store
+            .profile(a.provider, &a.label)
+            .ok()
+            .and_then(|p| read(a.provider, &p).ok())
+            .and_then(|id| id.account_key())
+    };
+    let Some(own) = key(account) else {
+        return Vec::new();
+    };
+    accounts
+        .iter()
+        .filter(|other| other.provider != account.provider)
+        .filter(|other| key(other).as_ref() == Some(&own))
+        .cloned()
+        .collect()
+}
+/// Every other account that is this one's real account: aliases in the
+/// same program (`duplicates`) and bindings in others (`bindings`).
+/// Caller holds the store lock.
+pub fn siblings(
+    store: &crate::store::Store,
+    account: &crate::store::Account,
+    accounts: &[crate::store::Account],
+) -> Vec<crate::store::Account> {
+    duplicates(store, account, accounts)
+        .into_iter()
+        .map(|label| crate::store::Account {
+            provider: account.provider,
+            label,
+        })
+        .chain(bindings(store, account, accounts))
+        .collect()
+}

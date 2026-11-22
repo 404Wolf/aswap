@@ -944,7 +944,36 @@ where
     let latest = read_cache(&path, force)?;
     let entry = merged(&snapshot, latest, result, at);
     store::json_write(&path, &entry)?;
+    share_reading(store, account, &state.accounts, &entry, at)?;
     Ok(entry)
+}
+/// A good reading is the real account's: hand it to the same account in
+/// other programs whose reading is older, so a waiter there sees a reset
+/// (or a limit) now rather than at its own next poll, and no program polls
+/// for what another just read. Caller holds the store lock.
+fn share_reading(
+    store: &Store,
+    account: &Account,
+    accounts: &[Account],
+    entry: &Cached,
+    at: u64,
+) -> Result<()> {
+    if entry.error.is_some() || entry.used(at).is_none() {
+        return Ok(());
+    }
+    for other in crate::identity::bindings(store, account, accounts) {
+        let path = store
+            .profile(other.provider, &other.label)?
+            .join("usage-cache.json");
+        let old = read_cache(&path, false).unwrap_or_default();
+        if old.fetched_at >= entry.fetched_at {
+            continue;
+        }
+        let mut shared = entry.clone();
+        shared.preserve_limits(&old);
+        store::json_write(&path, &shared)?;
+    }
+    Ok(())
 }
 /// The cache after a fetch that started from `snapshot`, when `latest` is
 /// what is stored now. Writes made during the fetch win where they carry
@@ -1008,12 +1037,14 @@ fn fresh_enough(store: &Store, account: &Account, at: u64, force: bool) -> Resul
     if !force && !reset_due && at < old.next_poll_at {
         return Ok(Decision::Cached(old));
     }
-    // Aliases of one login share one quota: reuse a fresh sibling observation
-    // instead of fetching again, which would double the provider's rate limit.
+    // One real account has one quota, whichever program or label reads it:
+    // reuse a fresh sibling observation (an alias, or the same account in
+    // another program) instead of fetching again, which would double the
+    // provider's rate limit.
     if !force {
-        for alias in crate::identity::duplicates(store, account, &state.accounts) {
+        for sibling in crate::identity::siblings(store, account, &state.accounts) {
             let sibling = store
-                .profile(account.provider, &alias)?
+                .profile(sibling.provider, &sibling.label)?
                 .join("usage-cache.json");
             if !sibling.exists() {
                 continue;
@@ -1261,6 +1292,16 @@ pub fn mark_auth_expired(store: &Store, account: &Account) -> Result<()> {
 
 pub fn mark_limited(store: &Store, account: &Account) -> Result<()> {
     let _lock = store.lock()?;
+    mark_limited_unlocked(store, account)?;
+    // One real account, one quota: the same account in another program hit
+    // the same limit (its own aliases are covered by its own run).
+    let state = store.load()?;
+    for other in crate::identity::bindings(store, account, &state.accounts) {
+        mark_limited_unlocked(store, &other)?;
+    }
+    Ok(())
+}
+fn mark_limited_unlocked(store: &Store, account: &Account) -> Result<()> {
     let path = store
         .profile(account.provider, &account.label)?
         .join("usage-cache.json");

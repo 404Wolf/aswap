@@ -113,7 +113,8 @@ impl Wake {
         store: &Store,
         provider: Provider,
     ) {
-        if provider != Provider::Codex {
+        // Codex redeems; pi's ChatGPT logins can be the same accounts.
+        if !matches!(provider, Provider::Codex | Provider::Pi) {
             return;
         }
         // The journal changes with every reset event, before the snapshot.
@@ -312,11 +313,37 @@ impl Rejected {
         entries: Vec<(Account, usage::Cached)>,
         at: u64,
     ) -> Vec<(Account, usage::Cached)> {
-        let redeemed = if entries.iter().any(|(a, _)| a.provider == Provider::Codex) {
+        // Redemptions are Codex's (by Codex label); another program's binding
+        // of that account (pi's ChatGPT login) is released by them too.
+        let redeemed_codex = if entries
+            .iter()
+            .any(|(a, _)| matches!(a.provider, Provider::Codex | Provider::Pi))
+        {
             crate::reset::redeemed(store)
         } else {
             Default::default()
         };
+        let accounts = if redeemed_codex.is_empty() {
+            Vec::new()
+        } else {
+            store.load().map(|s| s.accounts).unwrap_or_default()
+        };
+        let redeemed: std::collections::BTreeMap<String, u64> = entries
+            .iter()
+            .filter_map(|(a, _)| {
+                if a.provider == Provider::Codex {
+                    return redeemed_codex
+                        .get(&a.label)
+                        .map(|at| (a.label.clone(), *at));
+                }
+                crate::identity::bindings(store, a, &accounts)
+                    .iter()
+                    .filter(|b| b.provider == Provider::Codex)
+                    .filter_map(|b| redeemed_codex.get(&b.label).copied())
+                    .max()
+                    .map(|at| (a.label.clone(), at))
+            })
+            .collect();
         let held =
             |rejection: Option<&Option<Lapse>>, cache: &usage::Cached, label: &str| match rejection
             {
@@ -378,6 +405,75 @@ impl Restarts {
 #[cfg(test)]
 mod rejection_tests {
     use super::*;
+
+    #[test]
+    fn a_codex_redemption_releases_the_same_accounts_pi_binding() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let jwt = |member: &str| {
+            let claims = serde_json::json!({"https://api.openai.com/auth":{
+                "chatgpt_account_id":"synthetic-workspace","chatgpt_account_user_id":member}});
+            format!(
+                "synthetic.{}.synthetic",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+            )
+        };
+        let add = |provider: Provider, label: &str, member: &str| {
+            let account = Account {
+                provider,
+                label: label.into(),
+            };
+            let profile = store.profile(provider, label).unwrap();
+            std::fs::create_dir_all(&profile).unwrap();
+            let auth = if provider == Provider::Pi {
+                serde_json::json!({"openai-codex":{"type":"oauth","access":jwt(member),
+                    "refresh":"synthetic","expires":4_000_000_000_000u64,"accountId":"synthetic-workspace"}})
+            } else {
+                serde_json::json!({"tokens":{"account_id":"synthetic-workspace","access_token":jwt(member)}})
+            };
+            store::json_write(&profile.join(provider.auth_file()), &auth).unwrap();
+            let mut state = store.load().unwrap();
+            state.accounts.push(account.clone());
+            store.save(&state).unwrap();
+            account
+        };
+        add(Provider::Codex, "work", "synthetic-member-a");
+        let pi = add(Provider::Pi, "work-pi", "synthetic-member-a");
+        let teammate = add(Provider::Pi, "bob", "synthetic-member-b");
+        let at = now();
+        // Both pi accounts were rejected for a limit just now; then Codex
+        // redeemed a reset on "work" and a fresh reading shows 95%.
+        store::json_write(
+            &crate::reset::log_path(&store),
+            &serde_json::json!({"history":[{"at":at,"label":"work","outcome":"reset","reason":"synthetic"}]}),
+        )
+        .unwrap();
+        let mut rejected = Rejected::default();
+        for account in [&pi, &teammate] {
+            rejected.labels.insert(
+                account.label.clone(),
+                Some(Lapse {
+                    at,
+                    count: 1,
+                    reset: None,
+                    resumed: false,
+                }),
+            );
+        }
+        let kept: Vec<_> = rejected
+            .filter_at(
+                &store,
+                "other",
+                90.0,
+                vec![(pi, cache(95.0, at)), (teammate, cache(95.0, at))],
+                at + 1,
+            )
+            .into_iter()
+            .map(|(a, _)| a.label)
+            .collect();
+        assert_eq!(kept, ["work-pi"], "the teammate wasn't redeemed for");
+    }
 
     fn cache(used: f64, fetched_at: u64) -> usage::Cached {
         usage::Cached {
@@ -609,6 +705,25 @@ mod wake_tests {
     use crate::runner::monitor::entries_from_cache;
 
     const AT: u64 = 10_000;
+
+    #[test]
+    fn a_reset_journal_change_wakes_pi_waiters_too_but_not_claude() {
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        for (provider, woken) in [
+            (Provider::Codex, true),
+            (Provider::Pi, true),
+            (Provider::Claude, false),
+        ] {
+            let mut wake = Wake::new(1);
+            wake.next = AT;
+            let mut seen = None;
+            wake.poke(&mut seen, &store, provider);
+            crate::reset::append(&store, &crate::reset::Event::Unhalted { at: AT }).unwrap();
+            wake.poke(&mut seen, &store, provider);
+            assert_eq!(wake.next == 0, woken, "{provider}");
+        }
+    }
 
     fn entry(
         provider: Provider,
