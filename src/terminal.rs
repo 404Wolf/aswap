@@ -45,6 +45,9 @@ pub struct Terminal {
     started: bool,
     childless: bool,
     diagnostics: Diagnostics,
+    /// A Codex terminal matches only Codex's own limit notices (see
+    /// `diagnostic_line`); Claude's rules would misread its tool output.
+    pub codex: bool,
     last_input: Option<std::time::Instant>,
     pub auth_expired: bool,
     pub model_unsupported: bool,
@@ -117,6 +120,7 @@ impl Terminal {
             started: false,
             childless: true,
             diagnostics: Diagnostics::default(),
+            codex: false,
             last_input: None,
             auth_expired: false,
             model_unsupported: false,
@@ -175,7 +179,10 @@ impl Terminal {
                 return Err(Error("cannot clear provider input before resume"));
             }
         }
-        self.diagnostics = Diagnostics::default();
+        self.diagnostics = Diagnostics {
+            codex: self.codex,
+            ..Diagnostics::default()
+        };
         self.last_input = None;
         self.auth_expired = false;
         self.model_unsupported = false;
@@ -386,6 +393,7 @@ struct Diagnostics {
     escape: u8,
     truncated: bool,
     menu_header: bool,
+    codex: bool,
 }
 impl Diagnostics {
     fn feed(&mut self, bytes: &[u8]) -> (ScreenLimits, bool, bool) {
@@ -454,10 +462,13 @@ impl Diagnostics {
         let decoded = normalize(&self.line);
         self.line.clear();
         let line = decoded.as_str();
-        let (limit, auth, model) = diagnostic_line(line);
+        let (limit, auth, model) = diagnostic_line(line, self.codex);
         signals.0.notice |= limit;
         signals.1 |= auth;
         signals.2 |= model;
+        if self.codex {
+            return;
+        }
         signals.0.claude_compaction |= claude_compaction_limit(line);
         const HEADER: &str = "what do you want to do?";
         let option = line
@@ -483,7 +494,13 @@ fn normalize(line: &[u8]) -> String {
 }
 const CODEX_LIMIT: &str = "you've hit your usage limit";
 
-fn diagnostic_line(line: &str) -> (bool, bool, bool) {
+/// One normalized row: (usage limit, login failure, unsupported model).
+/// On a Codex terminal (`on_codex`) only Codex's own notices count as a limit:
+/// its "you've hit your usage limit" line and the bare error codes. Claude's
+/// rules ("error: 429 ...", "you've hit your weekly limit", ...) would also
+/// match tool output Codex draws, such as `└ Error: 429 Too Many Requests`
+/// from curl, and switch a healthy account away.
+fn diagnostic_line(line: &str, on_codex: bool) -> (bool, bool, bool) {
     // The square is Codex's diagnostic marker. Strip it only for the exact
     // usage error, so other output with a square keeps its existing meaning.
     let codex = line.strip_prefix('■').unwrap_or(line).trim_start();
@@ -506,11 +523,16 @@ fn diagnostic_line(line: &str) -> (bool, bool, bool) {
     let Some(text) = api.or(standalone.then_some(line)) else {
         return (false, false, false);
     };
-    (
+    let limit = if on_codex {
+        matches!(line, "usage_limit_reached" | "rate_limit_exceeded")
+    } else {
         limit_message(text)
             || text.trim_start().starts_with("429 ")
             || notice
-            || line.contains("out of extra usage"),
+            || line.contains("out of extra usage")
+    };
+    (
+        limit,
         auth_message(text) || text.trim_start().starts_with("401 "),
         unsupported_model_message(text),
     )
@@ -601,6 +623,100 @@ pub fn limit_message(text: &str) -> bool {
 }
 #[cfg(test)]
 mod tests {
+    fn codex_feed(text: &str) -> super::ScreenLimits {
+        let mut detector = super::Diagnostics {
+            codex: true,
+            ..Default::default()
+        };
+        let mut seen = detector.feed(text.as_bytes()).0;
+        seen.merge(detector.finish().0);
+        seen
+    }
+
+    #[test]
+    fn a_codex_terminal_counts_only_codex_limit_notices() {
+        for notice in [
+            "\u{25a0} You've hit your usage limit. Try again at Nov 21st, 2026 4:31 PM.\r\n",
+            "\u{25a0} You've hit your usage limit\r\n",
+            "\u{25a0} Error running remote compact task: You've hit your usage limit. Try again later.\r\n",
+            "usage_limit_reached\r\n",
+        ] {
+            assert!(codex_feed(notice).notice, "{notice:?}");
+        }
+        // Tool output and Claude's wording, as Codex's TUI draws them.
+        for other in [
+            "  \u{2514} Error: 429 Too Many Requests\r\n",
+            "\u{2502} error: http 429 from the test server\r\n",
+            "  \u{2514} API Error: 429 {\"error\":{\"type\":\"rate_limit_error\"}}\r\n",
+            "Error: rate limit reached for requests\r\n",
+            "You've hit your weekly limit \u{b7} resets Nov 20, 3am\r\n",
+            "\u{23bf} Prompt is too long \u{b7} automatic compaction failed: You've hit your weekly limit \u{b7} resets tomorrow\r\n",
+            "What do you want to do?\r\n1. Stop and wait for limit to reset\r\n",
+            "You're out of extra usage\r\n",
+        ] {
+            assert_eq!(codex_feed(other), Default::default(), "{other:?}");
+        }
+        // Login and model failures still count on Codex.
+        assert!(super::diagnostic_line("error: 401 unauthorized", true).1);
+        assert!(super::diagnostic_line("error: model_not_found", true).2);
+    }
+
+    /// `diagnostic_line` as it was before Codex terminals were scoped
+    /// (main 48195be), for Claude's unchanged behaviour.
+    fn before(line: &str) -> (bool, bool, bool) {
+        use super::*;
+        let codex = line.strip_prefix('\u{25a0}').unwrap_or(line).trim_start();
+        let codex = codex
+            .strip_prefix("error running remote compact task:")
+            .map_or(codex, str::trim_start);
+        if codex_limit_notice(codex) {
+            return (true, false, false);
+        }
+        let api = line
+            .strip_prefix("api error:")
+            .or_else(|| line.strip_prefix("error:"));
+        let notice = !line.starts_with(CODEX_LIMIT) && hit_limit_notice(line);
+        let standalone = matches!(line, "usage_limit_reached" | "rate_limit_exceeded")
+            || (line.starts_with("the ") && unsupported_model_message(line))
+            || line.starts_with("oauth token revoked \u{b7} please run /login")
+            || line.starts_with("login expired \u{b7} please run /login")
+            || notice
+            || line.starts_with("you're out of extra usage");
+        let Some(text) = api.or(standalone.then_some(line)) else {
+            return (false, false, false);
+        };
+        (
+            limit_message(text)
+                || text.trim_start().starts_with("429 ")
+                || notice
+                || line.contains("out of extra usage"),
+            auth_message(text) || text.trim_start().starts_with("401 "),
+            unsupported_model_message(text),
+        )
+    }
+
+    #[test]
+    fn claude_detection_is_unchanged() {
+        let source = include_str!("terminal.rs");
+        let lines: Vec<String> = source
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(|q| {
+                q.replace("\\u{b7}", "\u{b7}")
+                    .replace("\\u{2019}", "\u{2019}")
+            })
+            .collect();
+        assert!(lines.len() > 50);
+        for line in &lines {
+            let line = super::normalize(line.as_bytes());
+            assert_eq!(
+                super::diagnostic_line(&line, false),
+                before(&line),
+                "{line}"
+            );
+        }
+    }
     #[test]
     fn limit_signals_do_not_match_arbitrary_numbers() {
         assert!(!super::limit_message("processed 429 items"));
