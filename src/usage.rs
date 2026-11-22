@@ -274,7 +274,7 @@ fn is_zero(n: &u64) -> bool {
 impl Cached {
     /// Whether this quota observation is newer than `other`'s.
     pub(crate) fn newer_than(&self, other: &Self) -> bool {
-        match (self.observation, other.observation) {
+        match (self.valid_observation(), other.valid_observation()) {
             (0, 0) => self.fetched_at > other.fetched_at,
             // A numbered observation beats a legacy one of the same second
             // (it can only have been started then or later); otherwise
@@ -303,6 +303,13 @@ impl Cached {
         }
         next
     }
+    /// `observation`, or 0 (ordered by time, like a legacy reading) when it
+    /// can't be one this store's counter issued or will soon: numbers track
+    /// the clock (see `next_observation`), so one far ahead of it is
+    /// corrupt or foreign and must not outrank, or poison, real ones.
+    pub(crate) fn valid_observation(&self) -> u64 {
+        valid_observation(self.observation)
+    }
     /// Whether this login's own state (an auth failure, a server backoff)
     /// keeps a shared observation from making it usable.
     fn own_failure(&self) -> bool {
@@ -319,9 +326,30 @@ fn next_observation(store: &Store, floor: u64) -> Result<u64> {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
-    let next = last.max(now()).max(floor).saturating_add(1);
+    // A poisoned counter or floor (far ahead of the clock) is ignored, so
+    // the counter recovers instead of staying stuck at the top.
+    let next = (valid_observation(last).max(valid_observation(floor)) + 1).max(now_us());
     store::atomic(&path, next.to_string().as_bytes())?;
     Ok(next)
+}
+/// Observation numbers are anchored to the clock in microseconds: the next
+/// one is max(last + 1, now). One more than this far ahead of the clock
+/// (an hour) is corrupt or foreign: its number is ignored, it is ordered
+/// by time like a legacy reading, and it never raises the counter. A
+/// counter already beyond it starts again from valid observations and now.
+const OBSERVATION_LEAD_US: u64 = 3_600_000_000;
+fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros().min(u128::from(u64::MAX / 2)) as u64)
+        .unwrap_or(0)
+}
+fn valid_observation(observation: u64) -> u64 {
+    if observation > now_us().saturating_add(OBSERVATION_LEAD_US) {
+        0
+    } else {
+        observation
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]

@@ -532,7 +532,12 @@ fn review_ordering_two_processes_allocate_distinct_monotonic_numbers() {
         )
         .unwrap();
     }
-    let seed = aswap::now() + 10_000;
+    // Observation numbers are microseconds since the epoch (bounded to an hour ahead).
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
+        + 10_000_000;
     std::fs::write(pool.store.root.join("usage-observations"), seed.to_string()).unwrap();
     let mut workers: Vec<_> = ["one", "two"]
         .iter()
@@ -819,4 +824,115 @@ fn review_ordering_imported_counter_floor_control_prevents_reset_spend() {
         port.spends, 0,
         "every native quota fetch returned 10% used, yet reset step sent a consumption: {result:?}"
     );
+}
+
+#[test]
+fn review_bad_synced_maximum_must_not_poison_store_ordering() {
+    let pool = Pool::new();
+    let codex = pool.add(Provider::Codex, "native", "synthetic-member-a");
+    let pi = pool.add(Provider::Pi, "pi", "synthetic-member-a");
+    let at = aswap::now();
+    let poisoned = Cached {
+        usage: reading(100.0),
+        fetched_at: at,
+        next_poll_at: at + 180,
+        observation: u64::MAX,
+        ..Default::default()
+    };
+    store::json_write(&cache_path(&pool, &codex), &poisoned).unwrap();
+    // Importing one bad observation must not saturate the store's counter.
+    let first = usage::cached_mode_with(&pool.store, &codex, at + 1, true, |_| Ok(reading(20.0)));
+    let counter =
+        std::fs::read_to_string(pool.store.root.join("usage-observations")).unwrap_or_default();
+    assert_ne!(
+        counter,
+        u64::MAX.to_string(),
+        "bad synced observation saturated a store-wide counter: first={first:?}"
+    );
+    // Even if the import is rejected, healthy local state must remain usable.
+    std::fs::remove_file(cache_path(&pool, &codex)).unwrap();
+    let a =
+        usage::cached_mode_with(&pool.store, &codex, at + 2, true, |_| Ok(reading(25.0))).unwrap();
+    let b = usage::cached_mode_with(&pool.store, &pi, at + 2, true, |_| Ok(reading(30.0))).unwrap();
+    assert!(b.observation > a.observation);
+}
+#[test]
+fn review_bad_synced_counter_must_not_revive_a_newer_denial() {
+    let pool = Pool::new();
+    let codex = pool.add(Provider::Codex, "native", "synthetic-member-a");
+    let pi = pool.add(Provider::Pi, "pi", "synthetic-member-a");
+    let at = aswap::now();
+    let imported = Cached {
+        usage: reading(20.0),
+        fetched_at: at,
+        next_poll_at: at + 180,
+        observation: u64::MAX,
+        ..Default::default()
+    };
+    store::json_write(&cache_path(&pool, &codex), &imported).unwrap();
+    usage::cached_mode_with(&pool.store, &codex, at + 1, true, |_| Ok(reading(20.0))).unwrap();
+    // Discard the bad imported cache; the poisoned shared counter remains.
+    std::fs::remove_file(cache_path(&pool, &codex)).unwrap();
+    let result = usage::cached_mode_with(&pool.store, &pi, at + 2, true, |_| {
+        let mut denied = reading(40.0);
+        denied.ordinary_usage = usage::OrdinaryUsage::Denied;
+        usage::cached_mode_with(&pool.store, &codex, at + 3, true, |_| Ok(denied)).unwrap();
+        let mut stale = reading(10.0);
+        stale.ordinary_usage = usage::OrdinaryUsage::Allowed;
+        Ok(stale)
+    })
+    .unwrap();
+    assert_ne!(
+        result.used(at + 3),
+        Some(10.0),
+        "counter saturation revived the stale usable quota after a newer denial even after deleting the imported cache"
+    );
+}
+
+#[test]
+fn a_far_future_or_poisoned_counter_is_ignored_and_recovers() {
+    let us = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64
+    };
+    let counter = |pool: &Pool| -> u64 {
+        std::fs::read_to_string(pool.store.root.join("usage-observations"))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    for bad in [u64::MAX, us() + 2 * 3_600_000_000] {
+        // A far-future number in a stored cache: never a floor.
+        let pool = Pool::new();
+        let codex = pool.add(Provider::Codex, "native", "synthetic-member-a");
+        let at = aswap::now();
+        let imported = Cached {
+            usage: reading(100.0),
+            fetched_at: at,
+            next_poll_at: at + 180,
+            observation: bad,
+            ..Default::default()
+        };
+        store::json_write(&cache_path(&pool, &codex), &imported).unwrap();
+        let fresh =
+            usage::cached_mode_with(&pool.store, &codex, at + 1, true, |_| Ok(reading(10.0)))
+                .unwrap();
+        assert_eq!(fresh.used(at + 1), Some(10.0), "{bad}");
+        assert!(counter(&pool) < us() + 3_600_000_000, "{bad}");
+        // An already poisoned counter starts again from now.
+        let pool = Pool::new();
+        let codex = pool.add(Provider::Codex, "native", "synthetic-member-a");
+        std::fs::write(pool.store.root.join("usage-observations"), bad.to_string()).unwrap();
+        let a =
+            usage::cached_mode_with(&pool.store, &codex, at, true, |_| Ok(reading(10.0))).unwrap();
+        let b =
+            usage::cached_mode_with(&pool.store, &codex, at, true, |_| Ok(reading(12.0))).unwrap();
+        assert!(
+            a.observation < us() + 3_600_000_000 && b.observation > a.observation,
+            "{bad}"
+        );
+        assert_eq!(b.used(at), Some(12.0));
+    }
 }
