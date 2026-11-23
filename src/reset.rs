@@ -179,6 +179,11 @@ pub struct Pending {
     /// key that already succeeded only answers `alreadyRedeemed`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reconcile: bool,
+    /// The real account it redeems for (`Port::account_key`), recorded with
+    /// the intent so a skip rebuilt from the journal still knows it after
+    /// the label was renamed or removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 /// One append-only journal event (`codex-resets.journal`, fsynced per line).
@@ -298,6 +303,11 @@ fn replay(journal: &str) -> (Option<Pending>, Closed) {
 pub struct Skip {
     pub label: String,
     pub until: u64,
+    /// The real account (`identity::Identity::account_key`), so the skip
+    /// follows a rename and covers every label of the account. The label
+    /// stays for display and for logins without a key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -348,11 +358,12 @@ impl ResetLog {
             .iter()
             .any(|s| s.label == label && s.until > at)
     }
-    fn skip(&mut self, label: &str, until: u64) {
+    fn skip(&mut self, label: &str, account: Option<String>, until: u64) {
         self.skipped.retain(|s| s.label != label);
         self.skipped.push(Skip {
             label: label.to_owned(),
             until,
+            account,
         });
     }
     fn prune(&mut self, at: u64) {
@@ -394,7 +405,11 @@ impl ResetLog {
                 post: None,
             });
         }
-        self.skip(&pending.label, pending.weekly_resets_at);
+        self.skip(
+            &pending.label,
+            pending.account.clone(),
+            pending.weekly_resets_at,
+        );
         pending.paused = Some(why.to_owned());
         self.pending = Some(pending);
         Event::Paused {
@@ -719,6 +734,11 @@ pub trait Port {
     fn aliases(&mut self, _account: &Account) -> Vec<String> {
         Vec::new()
     }
+    /// The real account's key (`identity::Identity::account_key`), if the
+    /// login names one.
+    fn account_key(&mut self, _account: &Account) -> Option<String> {
+        None
+    }
     /// Waits before re-reading an account after a redemption.
     fn pause(&mut self, secs: u64) {
         std::thread::sleep(std::time::Duration::from_secs(secs));
@@ -893,7 +913,7 @@ pub fn step(
     port: &mut impl Port,
     provider: Provider,
     settings: &Auto,
-    mut entries: Vec<(Account, Cached)>,
+    entries: Vec<(Account, Cached)>,
     log: &mut ResetLog,
     follower: bool,
     at: u64,
@@ -926,6 +946,8 @@ pub fn step(
         }
         port.save(log)?;
     }
+    // One account, one place (see `one_per_account`), for a retry too.
+    let (mut entries, view) = one_per_account(port, settings, log, entries, at);
     if let Some(pending) = log.pending.clone() {
         return resume(port, settings, &entries, log, pending, at);
     }
@@ -941,41 +963,6 @@ pub fn step(
             *cache = fresh;
         }
     }
-    // One account, one place: aliases (labels of the same login) count once
-    // in the guard and the ranking, and a skip of any of them skips all.
-    // The account is represented by its label with a usable reading, if any.
-    let mut view = log.clone();
-    let mut kept: Vec<(Account, Cached)> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
-    let all = entries;
-    for (account, cache) in &all {
-        if seen.contains(&account.label) {
-            continue;
-        }
-        let aliases = port.aliases(account);
-        let group: Vec<&(Account, Cached)> = all
-            .iter()
-            .filter(|(a, _)| a.label == account.label || aliases.contains(&a.label))
-            .collect();
-        let chosen = group
-            .iter()
-            .find(|(_, c)| c.used(at).is_some())
-            .copied()
-            .unwrap_or(&(account.clone(), cache.clone()))
-            .clone();
-        if let Some(until) = log
-            .skipped
-            .iter()
-            .filter(|s| s.until > at && group.iter().any(|(a, _)| a.label == s.label))
-            .map(|s| s.until)
-            .max()
-        {
-            view.skip(&chosen.0.label, until);
-        }
-        seen.extend(group.iter().map(|(a, _)| a.label.clone()));
-        kept.push(chosen);
-    }
-    let mut entries = kept;
     let decision = match decide(provider, settings, &entries, &view, at) {
         Ok(decision) => decision,
         Err(Refusal::Hold(hold)) => return held(hold),
@@ -1040,6 +1027,7 @@ pub fn step(
         pre: Some(Snapshot::of(&pre)),
         paused: None,
         reconcile: false,
+        account: port.account_key(&account),
     });
     // The intent is journaled (fsynced) before anything is sent.
     port.journal(&Event::Intent {
@@ -1224,6 +1212,62 @@ fn resume(
     attempt(port, settings, log, &account, at)
 }
 
+/// Aliases (labels of the same login, `Port::aliases`) are one account:
+/// they count once in the guard and the ranking, represented by the label
+/// a decision may use (the pending one, else one that is allowed, not
+/// signed out and read), and a skip of the account (by its key, or by any
+/// of its labels) skips it. Returns the entries and the log as `decide`
+/// should see it.
+fn one_per_account(
+    port: &mut impl Port,
+    settings: &Auto,
+    log: &ResetLog,
+    entries: Vec<(Account, Cached)>,
+    at: u64,
+) -> (Vec<(Account, Cached)>, ResetLog) {
+    let pending = log.pending.as_ref().map(|p| p.label.clone());
+    let mut view = log.clone();
+    let mut kept: Vec<(Account, Cached)> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for (account, _) in &entries {
+        if seen.contains(&account.label) {
+            continue;
+        }
+        let aliases = port.aliases(account);
+        let group: Vec<&(Account, Cached)> = entries
+            .iter()
+            .filter(|(a, _)| a.label == account.label || aliases.contains(&a.label))
+            .collect();
+        let usable = |entry: &&&(Account, Cached)| {
+            let (a, c) = **entry;
+            settings.allows(&a.label, None) && !signed_out(c) && c.used(at).is_some()
+        };
+        let chosen = (*group
+            .iter()
+            .find(|(a, _)| Some(&a.label) == pending.as_ref())
+            .or_else(|| group.iter().find(usable))
+            .or_else(|| group.iter().find(|(a, _)| settings.allows(&a.label, None)))
+            .unwrap_or(&group[0]))
+        .clone();
+        let key = port.account_key(&chosen.0);
+        if let Some(until) = log
+            .skipped
+            .iter()
+            .filter(|s| s.until > at)
+            .filter(|s| {
+                group.iter().any(|(a, _)| a.label == s.label) || (key.is_some() && s.account == key)
+            })
+            .map(|s| s.until)
+            .max()
+        {
+            view.skip(&chosen.0.label, key.clone(), until);
+        }
+        seen.extend(group.iter().map(|(a, _)| a.label.clone()));
+        kept.push(chosen);
+    }
+    (kept, view)
+}
+
 /// A `reset retry` that may not send now: paused again, key kept, until the
 /// next `reset retry` or `reset dismiss`.
 fn repause(
@@ -1375,9 +1419,13 @@ fn attempt(
             log.pending = None;
             record.outcome = outcome.into();
             log.push(record);
-            log.skip(&pending.label, pending.weekly_resets_at);
+            log.skip(
+                &pending.label,
+                pending.account.clone(),
+                pending.weekly_resets_at,
+            );
             for alias in port.aliases(account) {
-                log.skip(&alias, pending.weekly_resets_at);
+                log.skip(&alias, pending.account.clone(), pending.weekly_resets_at);
             }
             port.save(log)?;
             Ok(Step::Declined {
@@ -1558,7 +1606,11 @@ pub fn load(store: &Store) -> Result<ResetLog> {
         endings.sort_by_key(|(at, _, _)| *at);
         for (at, intent, outcome) in endings {
             if matches!(outcome.as_str(), "nothing-to-reset" | "no-credit") {
-                log.skip(&intent.label, intent.weekly_resets_at);
+                log.skip(
+                    &intent.label,
+                    intent.account.clone(),
+                    intent.weekly_resets_at,
+                );
                 // Its aliases are the same account.
                 if let Ok(state) = store.load() {
                     let account = Account {
@@ -1566,7 +1618,7 @@ pub fn load(store: &Store) -> Result<ResetLog> {
                         label: intent.label.clone(),
                     };
                     for alias in crate::identity::duplicates(store, &account, &state.accounts) {
-                        log.skip(&alias, intent.weekly_resets_at);
+                        log.skip(&alias, intent.account.clone(), intent.weekly_resets_at);
                     }
                 }
             }
@@ -1808,6 +1860,12 @@ struct StorePort<'a> {
 impl Port for StorePort<'_> {
     fn refresh(&mut self, account: &Account) -> Result<Cached> {
         usage::cached_force(self.store, account, true)
+    }
+    fn account_key(&mut self, account: &Account) -> Option<String> {
+        let profile = self.store.profile(account.provider, &account.label).ok()?;
+        crate::identity::read(account.provider, &profile)
+            .ok()?
+            .account_key()
     }
     fn aliases(&mut self, account: &Account) -> Vec<String> {
         let Ok(_lock) = self.store.lock() else {
@@ -2285,7 +2343,7 @@ mod tests {
             "three"
         );
         let mut log = ResetLog::default();
-        log.skip("six", AT + 6 * DAY);
+        log.skip("six", None, AT + 6 * DAY);
         assert_eq!(
             decide(
                 Provider::Codex,
@@ -2721,6 +2779,7 @@ mod tests {
                 pre: None,
                 paused: None,
                 reconcile: false,
+                account: None,
             }),
             ..Default::default()
         };
@@ -2897,6 +2956,7 @@ mod tests {
             pre: None,
             paused: None,
             reconcile: false,
+            account: None,
         }
     }
     fn resume_with(
@@ -2935,7 +2995,7 @@ mod tests {
         // "six-b" is the same login as "six"; Codex said nothing-to-reset to
         // it, so "six" (the same account) is skipped too.
         let mut log = ResetLog::default();
-        log.skip("six-b", AT + 6 * DAY);
+        log.skip("six-b", None, AT + 6 * DAY);
         let entries = with_alias(
             exhausted_at(AT),
             cache(100.0, Some(6), vec![credit("c6", None)]),
