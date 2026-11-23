@@ -293,17 +293,18 @@ fn switch_once(store: &Store, provider: Provider, name: &str, activate: bool) ->
     store.save(&state)?;
     Ok(account)
 }
-/// Preserve the outgoing default login, including provider token rotations.
-/// Identity matching never guesses from the currently selected label.
+/// Back up the outgoing default login (live-backups). It is never saved
+/// over a profile's login: nothing here can prove it newer than the
+/// profile's (it may be the login a rotation just replaced, however it is
+/// formatted or whatever its expiry), so this fails closed; a login made
+/// outside aswap stays recoverable from the backup.
 fn preserve_live(
     store: &Store,
     target: &Account,
     bytes: &[u8],
     config: Option<&Value>,
-) -> Result<bool> {
+) -> Result<()> {
     validate_auth(target.provider, bytes)?;
-    let current: Value =
-        serde_json::from_slice(bytes).safe("invalid live credential JSON; contents redacted")?;
     let backups = store
         .root
         .join("live-backups")
@@ -318,72 +319,7 @@ fn preserve_live(
         store::json_write(&backup.path().join(".claude.json"), config)?;
     }
     let _ = backup.keep();
-    let mut target_is_live = false;
-    for candidate in store
-        .load()?
-        .accounts
-        .into_iter()
-        .filter(|a| a.provider == target.provider)
-    {
-        let profile = store.profile(candidate.provider, &candidate.label)?;
-        let saved: Value = store::json_read(&profile.join(candidate.provider.auth_file()))?;
-        let matched = if saved == current {
-            true
-        } else if target.provider == Provider::Codex {
-            let identity = current
-                .pointer("/tokens/account_id")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty());
-            identity.is_some()
-                && identity == saved.pointer("/tokens/account_id").and_then(Value::as_str)
-        } else {
-            let path = profile.join(".claude.json");
-            let saved_config: Value = if path.exists() {
-                store::json_read(&path)?
-            } else {
-                serde_json::json!({})
-            };
-            let identity = config.and_then(|c| c.get("oauthAccount")).filter(|v| {
-                ["accountUuid", "emailAddress"].iter().any(|key| {
-                    v.get(key)
-                        .and_then(Value::as_str)
-                        .is_some_and(|s| !s.is_empty())
-                })
-            });
-            identity.is_some() && identity == saved_config.get("oauthAccount")
-        };
-        if matched {
-            // Under the store lock: only try (lock order; switch retries).
-            let _refresh = store
-                .try_refresh_lock(&candidate)?
-                .ok_or(Error(crate::refresh::BUSY))?;
-            // The outgoing default may still hold the revoked login. Leave
-            // the profile bytes and pending copy for normal rotation recovery.
-            let path = profile.join(candidate.provider.auth_file());
-            // Is the outgoing default newer than the profile's login? Only
-            // when that is provable: it is a different credential (by token
-            // identity, never bytes), not one the profile held before
-            // (generations), and the profile's own login was rejected. In
-            // every other case (no history, an older generation, a profile
-            // that still works) it fails closed: the default stays only in
-            // live-backups.
-            let saved_now: Value = store::json_read(&path)?;
-            let provider = candidate.provider;
-            let differs = crate::refresh::credential_id(provider, &current)
-                != crate::refresh::credential_id(provider, &saved_now);
-            let older = crate::refresh::older_generation(provider, &path, &current);
-            let rejected = crate::usage::login_rejected(store, &candidate);
-            let newer = differs && !older && rejected;
-            if !crate::refresh::has_pending(store, &candidate)
-                && newer
-                && crate::refresh::retire_generation(provider, &path).is_ok()
-            {
-                store::atomic(&path, bytes)?;
-                target_is_live |= candidate.label == target.label;
-            }
-        }
-    }
-    Ok(target_is_live)
+    Ok(())
 }
 pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
     let provider = account.provider;
@@ -396,7 +332,7 @@ pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
             .ok_or(Error(crate::refresh::BUSY))?;
         crate::refresh::recover_pending(store, account, &profile.join(provider.auth_file()))?;
     }
-    let mut bytes = store::read_private(&profile.join(provider.auth_file()))?;
+    let bytes = store::read_private(&profile.join(provider.auth_file()))?;
     validate_auth(provider, &bytes)?;
     let dest = provider.current_home()?;
     let auth_path = dest.join(provider.auth_file());
@@ -435,10 +371,8 @@ pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
     } else {
         None
     };
-    if let Some(old) = &old_auth
-        && preserve_live(store, account, old, old_config.as_ref())?
-    {
-        bytes = old.clone();
+    if let Some(old) = &old_auth {
+        preserve_live(store, account, old, old_config.as_ref())?;
     }
     store::atomic(&auth_path, &bytes)?;
     if let Some((path, value)) = config

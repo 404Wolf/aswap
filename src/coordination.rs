@@ -428,6 +428,14 @@ fn known_profiles<'de, D: serde::Deserializer<'de>>(
     Ok(profiles)
 }
 fn packet(store: &Store, request: &Request) -> Result<Packet> {
+    packet_with(store, request, |account| usage::fresh_read(store, account))
+}
+/// `packet` with the provider read for a nonce request given (tests).
+fn packet_with(
+    store: &Store,
+    request: &Request,
+    fresh_read: impl Fn(&Account) -> Option<usage::Usage>,
+) -> Result<Packet> {
     if request.protocol != 1 {
         return Err(Error("sync: version-mismatch"));
     }
@@ -451,14 +459,24 @@ fn packet(store: &Store, request: &Request) -> Result<Packet> {
             .is_some_and(|a| a.provider == account.provider && a.label == account.label);
         // A follower asking with a nonce gets a reading made for its request
         // or none: a provider read now, never a cache.
-        let answered = match (&request.nonce, force) {
-            (Some(nonce), true) => usage::fresh_read(store, &account).map(|_| nonce.clone()),
+        let fresh = match (&request.nonce, force) {
+            (Some(nonce), true) => fresh_read(&account).map(|u| (nonce.clone(), u)),
             _ => None,
         };
-        let cache = if answered.is_some() {
-            usage::cached(store, &account)?
-        } else {
-            usage::cached_force(store, &account, force)?
+        // The provider's own answer for this request goes out as it came,
+        // labelled with the request's id; never a second, cached reading.
+        let (answered, cache) = match fresh {
+            Some((nonce, usage)) => (
+                Some(nonce),
+                Cached {
+                    usage,
+                    fetched_at: now(),
+                    last_attempt: now(),
+                    next_poll_at: now().saturating_add(usage::TTL),
+                    ..Cached::default()
+                },
+            ),
+            None => (None, usage::cached_force(store, &account, force)?),
         };
         let _lock = store.lock()?;
         let path = store.profile(account.provider, &account.label)?;
@@ -1664,6 +1682,49 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.0, "sync: version-mismatch");
+    }
+    #[test]
+    fn the_owner_sends_the_providers_answer_for_the_request_never_its_cache() {
+        // agy.6 review: the nonce labels the provider's own answer.
+        let (_t, owner) = seed();
+        let account = owner.load().unwrap().accounts[0].clone();
+        // The owner's cache says 100%, the provider answers 20% now.
+        let path = owner
+            .profile(account.provider, &account.label)
+            .unwrap()
+            .join("usage-cache.json");
+        let mut stale: Cached = store::json_read(&path).unwrap_or_default();
+        stale.usage.windows = vec![usage::Window {
+            name: "weekly".into(),
+            used_percent: 100.0,
+            resets_at: Some(now() + 3600),
+            duration_minutes: Some(10080),
+            codex_slot: None,
+        }];
+        store::json_write(&path, &stale).unwrap();
+        let mut answer = stale.usage.clone();
+        answer.windows[0].used_percent = 20.0;
+        let request = Request {
+            protocol: 1,
+            force: Some(account.clone()),
+            nonce: Some("synthetic-request".into()),
+        };
+        let sent = packet_with(&owner, &request, |_| Some(answer.clone())).unwrap();
+        let profile = sent
+            .profiles
+            .iter()
+            .find(|p| p.account.label == account.label && p.account.provider == account.provider)
+            .unwrap();
+        assert_eq!(profile.answered.as_deref(), Some("synthetic-request"));
+        assert_eq!(profile.cache.usage.windows[0].used_percent, 20.0);
+        // No provider answer (or no commit): no label, whatever the cache.
+        let sent = packet_with(&owner, &request, |_| None).unwrap();
+        let profile = sent
+            .profiles
+            .iter()
+            .find(|p| p.account.label == account.label && p.account.provider == account.provider)
+            .unwrap();
+        assert!(profile.answered.is_none());
     }
     #[test]
     fn a_follower_takes_only_the_owners_reading_for_its_own_request() {

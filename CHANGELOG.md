@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.2-preview.agy.7 (2026-11-23)
+
+agy.6 with its review's changes (t4hf; t2kg's rulings). Not a release.
+
+### Fixed
+- **The owner sends the provider's own answer for a follower's request,** labelled with that request's id, never a second, cached reading. A read whose cache commit fails confirms nothing.
+- **A confirming read never replaces a newer reading,** and doesn't confirm anything when a newer one landed while it ran.
+- **`switch --activate-live` never saves the outgoing live login over a profile's login.** Nothing can prove it newer (an old cached 401 isn't bound to the current login), so this fails closed. The live login stays in live-backups. The generation history from agy.5 and agy.6 is gone.
+
 ## 0.2.2-preview.agy.6 (2026-11-23)
 
 agy.5 with its review's changes (t4hf; t2kg's rulings). Not a release.

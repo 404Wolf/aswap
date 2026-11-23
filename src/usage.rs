@@ -1046,29 +1046,21 @@ where
     };
     let result = fetcher(&profile);
     let fresh = result.as_ref().ok().cloned();
-    if let Ok(_lock) = store.lock()
-        && let Ok(state) = store.load()
-        && store
-            .account(&state, account.provider, Some(&account.label))
-            .is_ok()
-        && let Ok(latest) = read_cache(&path, true)
-    {
-        let _ = store::json_write(&path, &merged(&snapshot, latest, result, at));
+    // The answer is the provider's, returned as it came; storing it is
+    // required too (a failed commit means no confirming answer).
+    let _lock = store.lock().ok()?;
+    let state = store.load().ok()?;
+    store
+        .account(&state, account.provider, Some(&account.label))
+        .ok()?;
+    let latest = read_cache(&path, true).ok()?;
+    // Newest observation wins: another reading stored while this one ran
+    // is newer, and this one must not replace it, nor confirm anything.
+    if latest.fetched_at > snapshot.fetched_at || latest.last_attempt > snapshot.last_attempt {
+        return None;
     }
+    store::json_write(&path, &merged(&snapshot, latest, result, at)).ok()?;
     fresh
-}
-/// Whether this account's own login was rejected on its last use (its
-/// usage reading failed on authorization). Caller holds the store lock.
-pub fn login_rejected(store: &Store, account: &Account) -> bool {
-    let Ok(profile) = store.profile(account.provider, &account.label) else {
-        return false;
-    };
-    read_cache(&profile.join("usage-cache.json"), true).is_ok_and(|cache| {
-        matches!(
-            cache.error.as_deref(),
-            Some("http-401" | "refresh-invalid-grant" | "refresh-http-401")
-        )
-    })
 }
 pub fn cached(store: &Store, account: &Account) -> Result<Cached> {
     cached_force(store, account, false)
@@ -1601,5 +1593,60 @@ mod fresh_read_tests {
         });
         assert_eq!(fresh.unwrap().windows[0].used_percent, 100.0);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod fresh_commit_tests {
+    use super::*;
+
+    #[test]
+    fn a_confirming_read_never_replaces_a_newer_reading() {
+        // agy.6 review: an older confirming read finishing after a newer
+        // 20% reading was stored neither replaces it nor confirms.
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let account = Account {
+            provider: crate::provider::Provider::Codex,
+            label: "one".into(),
+        };
+        let mut state = store.load().unwrap();
+        state.accounts.push(account.clone());
+        store.save(&state).unwrap();
+        let profile = store.profile(account.provider, &account.label).unwrap();
+        store::private_dir(&profile).unwrap();
+        let path = profile.join("usage-cache.json");
+        let at = now();
+        let window = |used: f64| Window {
+            name: "weekly".into(),
+            used_percent: used,
+            resets_at: Some(at + 3600),
+            duration_minutes: Some(10080),
+            codex_slot: None,
+        };
+        let newer = Cached {
+            usage: Usage {
+                windows: vec![window(20.0)],
+                ..Default::default()
+            },
+            fetched_at: at + 5,
+            last_attempt: at + 5,
+            next_poll_at: at + 185,
+            ..Default::default()
+        };
+        let fresh = fresh_read_with(&store, &account, at, |_| {
+            // A newer reading lands while this read runs.
+            store::json_write(&path, &newer).unwrap();
+            Ok(Usage {
+                windows: vec![window(100.0)],
+                ..Default::default()
+            })
+        });
+        assert!(fresh.is_none(), "no confirmation from the older read");
+        let kept: Cached = store::json_read(&path).unwrap();
+        assert_eq!(
+            kept.usage.windows[0].used_percent, 20.0,
+            "the newer reading stays"
+        );
     }
 }

@@ -238,7 +238,7 @@ fn a_rotation_with_a_shorter_expiry_is_still_the_newer_login() {
 }
 
 #[test]
-fn the_outgoing_login_is_saved_only_when_provably_newer() {
+fn the_outgoing_login_is_never_saved_over_the_profiles() {
     use aswap::{
         coordination, refresh,
         store::{Account, Store},
@@ -280,42 +280,16 @@ fn the_outgoing_login_is_saved_only_when_provably_newer() {
             "{provider}: (a)"
         );
 
-        // (b) A history that can't be written: the install fails closed
-        // (the new login stays pending), never a stale restoration.
-        let case = Case::new(provider);
-        let store = Store::open(case.root.join("data/aswap")).unwrap();
-        coordination::owner(&store).unwrap();
-        let saved = case.saved("outgoing");
-        let before = fs::read(&saved).unwrap();
-        fs::create_dir(saved.with_file_name(format!("{}.generations", case.auth_file))).unwrap();
-        {
-            let _lock = store.lock().unwrap();
-            assert!(
-                refresh::refresh_with(&store, &account, aswap::now(), true, |_, _| Ok(json!({
-                    "access_token": "synthetic-rotated-access",
-                    "refresh_token": "synthetic-rotated-refresh",
-                    "expires_in": 3600,
-                })))
-                .is_err()
-            );
-        }
-        assert_eq!(
-            fs::read(&saved).unwrap(),
-            before,
-            "{provider}: (b) not installed"
-        );
-        assert!(
-            saved
-                .with_file_name(format!("{}.pending", case.auth_file))
-                .exists(),
-            "{provider}: (b) kept pending"
-        );
-
-        // (c) No history (an older version's store) and a working profile:
-        // a different live login is not provably newer, so not saved.
+        // (c) A different live login (an older store, a sign-in elsewhere):
+        // nothing proves it newer, so it is not saved, even with an old
+        // cached 401 on the profile (unbound to its current login).
         let case = Case::new(provider);
         let saved = case.saved("outgoing");
         let before = fs::read(&saved).unwrap();
+        write(
+            &saved.with_file_name("usage-cache.json"),
+            &json!({"error": "http-401", "fetched_at": 1, "last_attempt": 1, "usage": {"windows": []}}),
+        );
         write(
             &case.default(),
             &login(provider, "outgoing", "outgoing-elsewhere"),
