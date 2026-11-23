@@ -9,6 +9,13 @@ if 'app-server' in args:
         req=json.loads(line)
         if req.get('method')=='initialize': result={}
         elif req.get('method')=='model/list': result={'data':[] if mode=='model' and 'synthetic-other' in (p/'auth.json').read_text() else [{'id':'synthetic-model','model':'synthetic-model'}]}
+        elif req.get('method')=='account/rateLimits/read':
+            # The quota the account's cache holds (the coordinator and the
+            # limited fake write it): a supervisor confirms a notice by it.
+            label='current' if 'synthetic-current' in (p/'auth.json').read_text() else 'other'
+            cache=pathlib.Path(os.environ['XDG_DATA_HOME'])/'aswap'/'profiles'/'codex'/label/'usage-cache.json'
+            window=json.loads(cache.read_text())['usage']['windows'][0]
+            result={'rateLimits':{'secondary':{'usedPercent':window['used_percent'],'windowDurationMins':window.get('duration_minutes') or 10080,'resetsAt':window.get('resets_at')}}}
         else: continue
         print(json.dumps({'id':req['id'],'result':result}),flush=True)
     sys.exit(0)

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.2-preview.agy.3 (2026-11-23)
+
+0.2.2-preview.agy.2 (#44 plus the wake fixture fix) with fixes for two bugs it inherited from main. Server-ops found both in their review of agy.2. Not a release.
+
+### Fixed
+- **A Codex session no longer switches accounts on text that looks like a limit notice.** A marked "■ You've hit your usage limit" row followed by any text counted as a limit, and 15 s after launch it was believed without a quota check. A healthy session that showed such text, a redraw or a model-specific bucket therefore failed over. A Codex notice is now only a trigger. It counts once a fresh quota read taken after it shows the account exhausted. The read runs off the terminal thread and is retried for up to 5 minutes, because a reading can lag the limit. The trigger is lenient: any marked row with the phrase, wrapped or split anywhere, with any promo copy, so no real limit is missed. Codex's wording no longer counts on a Claude terminal at all. After a failed exit the account is re-read for up to 30 s. A failed read then counts the limit, so a session is never left on an account that can't be checked.
+- **`switch --activate-live` no longer loses a rotated login.** It deleted a pending rotated-login copy and wrote stale bytes over the outgoing profile. It now leaves both for normal rotation recovery. This is server-ops' option-B fix, reviewed as correct in all four of its review rounds.
+- Tests: every fixture from option B's four independent reviews is replayed one byte at a time on Codex and Claude terminals. The confirmation gate covers a lagging read, a failed read, a stale cache and a failed exit. The pending-login test is option B's.
+
 ## 0.2.2-preview.agy.2 (2026-11-22)
 
 The same product as 0.2.2-preview.agy.1 (#44 at 1c627b8). Only a test fixture changed: each fake provider in the wake tests writes its own temp file (from #45), so a shared-path race no longer fails them. Not a release.

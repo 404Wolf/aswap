@@ -399,6 +399,9 @@ struct Diagnostics {
     menu_header: bool,
     codex: bool,
     agy: bool,
+    /// Codex: the rows of a marked diagnostic so far, whitespace removed,
+    /// and how many rows that is (see `codex_notice`).
+    codex_rows: Option<(String, u8)>,
 }
 impl Diagnostics {
     fn feed(&mut self, bytes: &[u8]) -> (ScreenLimits, bool, bool) {
@@ -416,6 +419,12 @@ impl Diagnostics {
                 2 => {
                     if (0x40..=0x7e).contains(&byte) {
                         self.escape = 0;
+                        // Codex draws its notice cell and then moves the
+                        // cursor (or clears): that ends the row too.
+                        if self.codex && matches!(byte, b'H' | b'f' | b'J') && !self.line.is_empty()
+                        {
+                            self.finish_row(&mut signals);
+                        }
                     }
                     continue;
                 }
@@ -440,6 +449,7 @@ impl Diagnostics {
                 }
                 _ => {
                     // Preserve UTF-8 bytes until the diagnostic is inspected.
+                    // A longer row (a terminal-wrapped one) keeps its start.
                     if self.line.len() < 4096 {
                         self.line.push(byte);
                     } else {
@@ -460,9 +470,11 @@ impl Diagnostics {
     fn finish_row(&mut self, signals: &mut (ScreenLimits, bool, bool)) {
         if self.truncated {
             self.menu_header = false;
-            self.line.clear();
             self.truncated = false;
-            return;
+            if !self.codex {
+                self.line.clear();
+                return;
+            }
         }
         let decoded = normalize(&self.line);
         self.line.clear();
@@ -478,6 +490,7 @@ impl Diagnostics {
         signals.1 |= auth;
         signals.2 |= model;
         if self.codex {
+            signals.0.notice |= self.codex_notice(line);
             return;
         }
         signals.0.claude_compaction |= claude_compaction_limit(line);
@@ -493,6 +506,46 @@ impl Diagnostics {
         }
     }
 }
+impl Diagnostics {
+    /// Codex: whether a marked diagnostic (`■ ...`, the cell Codex draws its
+    /// errors in) says the usage limit was hit, on its first row or wrapped
+    /// over the next few (at any width, split anywhere, with or without the
+    /// remote-compaction prefix or a plan offer). Only a TRIGGER: the
+    /// supervisor counts it once a fresh quota read confirms the account is
+    /// exhausted (`limits::Limits::check_codex`), so prose that quotes the
+    /// notice, a redraw or a model bucket never switches a healthy account,
+    /// and no wording or promo copy of a real notice is ever missed.
+    fn codex_notice(&mut self, line: &str) -> bool {
+        const ROWS: u8 = 8;
+        let squashed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        if line.starts_with('\u{25a0}') {
+            self.codex_rows = Some((squashed, 1));
+        } else if let Some((rows, count)) = &mut self.codex_rows {
+            if squashed.is_empty() {
+                return false;
+            }
+            *count += 1;
+            if *count > ROWS {
+                self.codex_rows = None;
+                return false;
+            }
+            rows.push_str(&squashed);
+        } else {
+            return false;
+        }
+        let hit = self
+            .codex_rows
+            .as_ref()
+            .is_some_and(|(rows, _)| rows.contains(CODEX_LIMIT_SQUASHED));
+        if hit {
+            self.codex_rows = None;
+        }
+        hit
+    }
+}
+/// "you've hit your usage limit" with whitespace removed (rows may split it).
+const CODEX_LIMIT_SQUASHED: &str = "you'vehityourusagelimit";
+
 /// Box-drawing and quote characters Claude's dialogs and notices may wrap a
 /// diagnostic in; they carry no meaning for the match.
 fn normalize(line: &[u8]) -> String {
@@ -512,24 +565,6 @@ const CODEX_LIMIT: &str = "you've hit your usage limit";
 /// match tool output Codex draws, such as `└ Error: 429 Too Many Requests`
 /// from curl, and switch a healthy account away.
 fn diagnostic_line(line: &str, on_codex: bool) -> (bool, bool, bool) {
-    // The square is Codex's diagnostic marker. Strip it only for the exact
-    // usage error, so other output with a square keeps its existing meaning.
-    let marked = line.starts_with('■');
-    let codex = line.strip_prefix('■').unwrap_or(line).trim_start();
-    let codex = codex
-        .strip_prefix("error running remote compact task:")
-        .map_or(codex, str::trim_start);
-    // A narrow pane wraps Codex's longer wordings: the marked first row
-    // starts with the notice and breaks off inside its second sentence
-    // (no sentence ends on that row; a finished one is checked whole).
-    let wrapped = marked
-        && codex
-            .strip_prefix(CODEX_LIMIT)
-            .and_then(|rest| rest.strip_prefix(". "))
-            .is_some_and(|rest| !rest.is_empty() && !rest.contains(". ") && !rest.ends_with('.'));
-    if wrapped || codex_limit_notice(codex) {
-        return (true, false, false);
-    }
     let api = line
         .strip_prefix("api error:")
         .or_else(|| line.strip_prefix("error:"));
@@ -556,85 +591,6 @@ fn diagnostic_line(line: &str, on_codex: bool) -> (bool, bool, bool) {
         auth_message(text) || text.trim_start().starts_with("401 "),
         unsupported_model_message(text),
     )
-}
-
-/// Codex's usage-limit notice in each wording its plans get, as normalize()
-/// leaves it: "you've hit your usage limit", then optionally " · resets ..."
-/// or one sentence that ends in a retry time ("try again later", "at 4:31
-/// pm", "in 2 hours 15 minutes"), led by an upgrade, credits or admin offer.
-/// Free plans get only the upgrade ("upgrade to plus to continue using
-/// codex ..."). Anything else after the notice is prose, not a notice.
-fn codex_limit_notice(line: &str) -> bool {
-    let Some(suffix) = line.strip_prefix(CODEX_LIMIT) else {
-        return false;
-    };
-    if matches!(suffix, "" | ".") || suffix.starts_with(" · resets ") {
-        return true;
-    }
-    let Some(sentence) = suffix.strip_prefix(". ") else {
-        return false;
-    };
-    if sentence.starts_with("upgrade to plus to continue using codex") && sentence.ends_with('.') {
-        return true;
-    }
-    const OFFERS: [&str; 4] = [
-        "visit https://chatgpt.com/settings/usage to purchase more credits or ",
-        "visit https://chatgpt.com/codex/settings/usage to purchase more credits or ",
-        "to get more access now, send a request to your admin or ",
-        "",
-    ];
-    // "upgrade to pro (<link>) or ...", "upgrade to pro (<link>), visit ...".
-    let offer = match sentence.strip_prefix("upgrade to ") {
-        Some(upgrade) => {
-            let Some((_, rest)) = upgrade.split_once(')') else {
-                return false;
-            };
-            let rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
-            rest.strip_prefix("or ").unwrap_or(rest)
-        }
-        None => sentence,
-    };
-    let Some(retry) = OFFERS.iter().find_map(|o| {
-        offer
-            .strip_prefix(o)
-            .and_then(|r| r.strip_prefix("try again "))
-    }) else {
-        return false;
-    };
-    retry_time(retry)
-}
-
-/// "later.", "at 4:31 pm.", "at nov 21st, 2026 4:31 pm." or "in 2 hours 15
-/// minutes." (also "1 day, 3 hours and 5 minutes").
-fn retry_time(retry: &str) -> bool {
-    if retry == "later." {
-        return true;
-    }
-    if let Some(at) = retry.strip_prefix("at ") {
-        let at = at.strip_suffix('.').unwrap_or(at);
-        let mut parts = at.rsplitn(3, ' ');
-        let (Some(period), Some(time)) = (parts.next(), parts.next()) else {
-            return false;
-        };
-        return matches!(period, "am" | "pm")
-            && chrono::NaiveTime::parse_from_str(&format!("{time} {period}"), "%I:%M %P").is_ok();
-    }
-    let Some(span) = retry.strip_prefix("in ").and_then(|s| s.strip_suffix('.')) else {
-        return false;
-    };
-    let words: Vec<&str> = span
-        .split([' ', ','])
-        .filter(|w| !w.is_empty() && *w != "and")
-        .collect();
-    !words.is_empty()
-        && words.len().is_multiple_of(2)
-        && words.chunks(2).all(|pair| {
-            pair[0].parse::<u64>().is_ok()
-                && matches!(
-                    pair[1],
-                    "day" | "days" | "hour" | "hours" | "minute" | "minutes" | "second" | "seconds"
-                )
-        })
 }
 
 pub(crate) fn claude_compaction_limit(line: &str) -> bool {
@@ -702,32 +658,41 @@ mod tests {
     }
 
     #[test]
-    fn a_codex_terminal_counts_only_codex_limit_notices() {
+    fn a_codex_terminal_triggers_on_any_marked_usage_limit_notice() {
+        // Triggers only: the supervisor counts one once a fresh quota read
+        // confirms it (limits::Limits::check_codex).
         for notice in [
             "\u{25a0} You've hit your usage limit. Try again at Nov 21st, 2026 4:31 PM.\r\n",
             "\u{25a0} You've hit your usage limit\r\n",
             "\u{25a0} Error running remote compact task: You've hit your usage limit. Try again later.\r\n",
             "usage_limit_reached\r\n",
-            // Each plan's wording.
             "\u{25a0} You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing) or try again in 2 hours 15 minutes.\r\n",
-            "\u{25a0} You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:31 PM.\r\n",
             "\u{25a0} You've hit your usage limit. Upgrade to Plus to continue using Codex (https://openai.com/chatgpt/pricing).\r\n",
-            "\u{25a0} You've hit your usage limit. To get more access now, send a request to your admin or try again in 1 day, 3 hours and 5 minutes.\r\n",
-            "\u{25a0} You've hit your usage limit. Try again in 5 hours.\r\n",
-            "\u{25a0} You've hit your usage limit. Try again in 1 minute.\r\n",
-            // Wrapped onto two rows by a narrow pane.
+            // Wrapped by a narrow pane, split inside the phrase, with promo copy.
             "\u{25a0} You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing), visit\r\nhttps://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:31 PM.\r\n",
+            "\u{25a0} Error running remote compact task: You've hit\r\nyour usage\r\nlimit. Try again later.\r\n",
+            "\u{25a0} Error running remote compact task: You've hit your usa\r\nge limit.\r\n",
+            "\u{25a0} You've hit your usage limit. Start a free trial of whatever the server says today, or try again in 5 hours.\r\n",
+            // Quoting the notice in a marked cell triggers too: harmless, the
+            // quota read then shows room.
+            "\u{25a0} You've hit your usage limit. This is only a test fixture\r\n",
         ] {
             assert!(codex_feed(notice).notice, "{notice:?}");
         }
+        // Unmarked prose, or the phrase far from a marked row: no trigger.
         for prose in [
             "You've hit your usage limit. Try again in a bit, I guess.\r\n",
-            "You've hit your usage limit. Upgrade to Pro, they said.\r\n",
-            "You've hit your usage limit. Try again in 5 hours\r\n",
             "You've hit your usage limit, apparently. Try again later.\r\n",
+            "\u{25a0} Something failed\r\na\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh\r\nYou've hit your usage limit\r\n",
         ] {
             assert_eq!(codex_feed(prose), Default::default(), "{prose:?}");
         }
+        // A terminal-wrapped row longer than the buffer keeps its start.
+        let long = format!(
+            "\u{25a0} You've hit your usage limit. {}\r\n",
+            "promo ".repeat(900)
+        );
+        assert!(codex_feed(&long).notice);
         // Tool output and Claude's wording, as Codex's TUI draws them.
         for other in [
             "  \u{2514} Error: 429 Too Many Requests\r\n",
@@ -747,16 +712,10 @@ mod tests {
     }
 
     /// `diagnostic_line` as it was before Codex terminals were scoped
-    /// (main 48195be), for Claude's unchanged behaviour.
+    /// (main 48195be), for Claude's unchanged behaviour, minus Codex's own
+    /// wording, which no longer counts on a Claude terminal at all.
     fn before(line: &str) -> (bool, bool, bool) {
         use super::*;
-        let codex = line.strip_prefix('\u{25a0}').unwrap_or(line).trim_start();
-        let codex = codex
-            .strip_prefix("error running remote compact task:")
-            .map_or(codex, str::trim_start);
-        if codex_limit_notice(codex) {
-            return (true, false, false);
-        }
         let api = line
             .strip_prefix("api error:")
             .or_else(|| line.strip_prefix("error:"));
@@ -980,9 +939,10 @@ mod diagnostic_tests {
                 "■ You've hit your usage limit. Try again at 4:31 PM.\r\n",
                 (true, false, false),
             ),
+            // Codex's wording counts only in Codex's marked cell.
             (
                 "You've hit your usage limit. Try again at Nov 21st, 2026 4:31 PM.\r\n",
-                (true, false, false),
+                (false, false, false),
             ),
             (
                 "■ You've hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 21st, 2026 4:31 PM.\r\n",
@@ -1002,7 +962,11 @@ mod diagnostic_tests {
             ),
         ] {
             let input = format!("\x1b[31m{line}\x1b[0m");
-            let mut detector = Diagnostics::default();
+            // Codex's notices are read on a Codex terminal, Claude's on Claude's.
+            let mut detector = Diagnostics {
+                codex: line.contains("usage limit"),
+                ..Default::default()
+            };
             let mut actual = (false, false, false);
             for byte in input.as_bytes() {
                 let next = detector.feed(&[*byte]);
@@ -1040,7 +1004,10 @@ mod diagnostic_tests {
 
     #[test]
     fn an_unterminated_diagnostic_counts_only_after_output_is_finished() {
-        let mut detector = Diagnostics::default();
+        let mut detector = Diagnostics {
+            codex: true,
+            ..Default::default()
+        };
         let notice = "■ You've hit your usage limit. Try again later.";
         assert!(!detector.feed(notice.as_bytes()).0.any());
         assert!(detector.finish().0.notice);
@@ -1077,5 +1044,64 @@ mod diagnostic_tests {
                 .0
                 .claude_menu
         );
+    }
+}
+
+/// The fixtures of the four independent reviews of option B (server-ops,
+/// ~/deacon/work/agy-optB-review/r4-fixtures on the VM): genuine Codex
+/// notices in every wrap, split and promo form, and the prose, redraw and
+/// bucket cases that once switched a healthy account.
+#[cfg(test)]
+mod review_fixture_tests {
+    use super::*;
+
+    fn feed(bytes: &[u8], codex: bool) -> ScreenLimits {
+        let mut detector = Diagnostics {
+            codex,
+            ..Default::default()
+        };
+        let mut seen = ScreenLimits::default();
+        // One byte at a time, as the reviewers replayed them.
+        for byte in bytes {
+            seen.merge(detector.feed(&[*byte]).0);
+        }
+        seen.merge(detector.finish().0);
+        seen
+    }
+
+    #[test]
+    fn every_genuine_codex_notice_triggers_and_codex_wording_never_counts_for_claude() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-notices");
+        let mut genuine = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_stem().unwrap().to_str().unwrap().to_owned();
+            let bytes = std::fs::read(&path).unwrap();
+            let claude = name.starts_with("claude-");
+            let codex = feed(&bytes, true);
+            let on_claude = feed(&bytes, false);
+            if claude {
+                assert!(on_claude.any(), "{name}: Claude's own notice on Claude");
+                assert!(!codex.notice, "{name}: Claude's wording on Codex");
+                continue;
+            }
+            assert!(
+                !on_claude.any(),
+                "{name}: Codex's wording on a Claude terminal"
+            );
+            let is_genuine = ["matrix-", "long-", "native-wrap-"]
+                .iter()
+                .any(|p| name.starts_with(p))
+                || matches!(name.as_str(), "split-urls" | "bare");
+            if is_genuine {
+                genuine += 1;
+                assert!(codex.notice, "{name}: a genuine notice must trigger");
+            }
+            // Everything else may trigger or not: a trigger is confirmed by
+            // a fresh quota read (limits::Limits::check_codex), which shows
+            // room for prose, a redraw or a model bucket.
+        }
+        assert!(genuine >= 60, "{genuine}");
     }
 }

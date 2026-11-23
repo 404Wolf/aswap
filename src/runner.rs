@@ -986,12 +986,11 @@ fn limit_seen(
 ) -> bool {
     let fresh = moment.exited.is_some();
     if account.provider == Provider::Codex {
-        // An early notice needs the quota to agree (single-flight reads).
+        // A notice counts once a fresh quota read confirms it.
         return limits.check_codex(
             screen.notice,
             moment.exited == Some(true),
             || rotated_since(store, account, moment.launched),
-            || usage::cached(store, account).ok(),
             || {
                 // Off the terminal thread: a forced read can wait for
                 // another fetch, or for the owner on a follower.

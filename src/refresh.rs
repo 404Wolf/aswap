@@ -395,6 +395,16 @@ fn write_pending(store: &Store, account: &Account, replaces: Option<String>, aut
         let _ = store::json_write(&copy, &pending);
     }
 }
+/// An uncertain sidecar is still authoritative until normal recovery checks it.
+pub(crate) fn has_pending(store: &Store, account: &Account) -> bool {
+    pending_paths(store, account).into_iter().any(|path| {
+        !matches!(
+            std::fs::symlink_metadata(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound
+        )
+    })
+}
+
 /// Drop an account's pending logins: its login file is being replaced
 /// (a new rotation, `add`, a live login preserved), so they are stale.
 pub(crate) fn discard_pending(store: &Store, account: &Account) {

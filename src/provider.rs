@@ -341,8 +341,11 @@ fn preserve_live(
         };
         if matched {
             let _refresh = store.refresh_lock(&candidate)?;
-            crate::refresh::discard_pending(store, &candidate);
-            store::atomic(&profile.join(candidate.provider.auth_file()), bytes)?;
+            // The outgoing default may still hold the revoked login. Leave
+            // the profile bytes and pending copy for normal rotation recovery.
+            if !crate::refresh::has_pending(store, &candidate) {
+                store::atomic(&profile.join(candidate.provider.auth_file()), bytes)?;
+            }
             target_is_live |= candidate.label == target.label;
         }
     }
