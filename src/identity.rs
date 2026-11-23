@@ -187,3 +187,28 @@ pub fn siblings(
         .chain(bindings(store, account, accounts))
         .collect()
 }
+/// A login without the membership claim whose aliases (same workspace and
+/// user) name more than one account: which one it is can't be told. Returns
+/// those aliases' labels, or nothing when the login is unambiguous.
+/// Caller holds the store lock.
+pub fn ambiguous_with(
+    store: &crate::store::Store,
+    account: &crate::store::Account,
+    accounts: &[crate::store::Account],
+) -> Vec<String> {
+    let key = |label: &str| {
+        store
+            .profile(account.provider, label)
+            .ok()
+            .and_then(|p| read(account.provider, &p).ok())
+            .and_then(|id| id.account_key())
+    };
+    if key(&account.label).is_some() {
+        return Vec::new();
+    }
+    let aliases = duplicates(store, account, accounts);
+    let mut keys: Vec<String> = aliases.iter().filter_map(|l| key(l)).collect();
+    keys.sort();
+    keys.dedup();
+    if keys.len() > 1 { aliases } else { Vec::new() }
+}

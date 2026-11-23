@@ -611,6 +611,7 @@ fn list_json_schema_is_pinned() {
             [
                 "active",
                 "age_seconds",
+                "ambiguous_with",
                 "duplicates",
                 "fetched_at",
                 "http_status",

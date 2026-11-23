@@ -13,6 +13,10 @@ pub struct Row<'a> {
     pub duplicates: &'a [String],
     /// The same real account in other programs, as `provider:label`.
     pub same_account: &'a [String],
+    /// When this login could be either of these aliases' accounts.
+    pub ambiguous_with: &'a [String],
+    /// Labels (of this program) whose login is ambiguous.
+    pub ambiguous_labels: &'a [String],
     pub cached: &'a Cached,
 }
 /// The provider-wide auto policy shown above its accounts.
@@ -394,11 +398,41 @@ fn render_row(
         (None, Some(p)) => facts.push(clean(p)),
         (None, None) => {}
     }
-    if !row.duplicates.is_empty() {
+    if !row.ambiguous_with.is_empty() {
         facts.push(format!(
-            "same login as {}",
-            clean(&row.duplicates.join(", "))
+            "ambiguous: matches {} (different members); re-sign or remove {}",
+            clean(&row.ambiguous_with.join(" and ")),
+            clean(row.label)
         ));
+    } else {
+        let (unsure, same): (Vec<&String>, Vec<&String>) = row
+            .duplicates
+            .iter()
+            .partition(|l| row.ambiguous_labels.contains(l));
+        if !same.is_empty() {
+            facts.push(format!(
+                "same login as {}",
+                clean(
+                    &same
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            ));
+        }
+        if !unsure.is_empty() {
+            facts.push(format!(
+                "ambiguous login {} may be this account",
+                clean(
+                    &unsure
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            ));
+        }
     }
     if !row.same_account.is_empty() {
         facts.push(format!(
