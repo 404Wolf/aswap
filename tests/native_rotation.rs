@@ -345,3 +345,72 @@ fn a_cli_rotation_of_a_later_alias_is_saved_to_it_and_its_aliases() {
         assert_eq!(case.saved("a"), login(provider, "a", "a-r2"), "{provider}");
     }
 }
+
+#[test]
+fn switching_to_the_live_account_after_a_cli_rotation_keeps_it_live() {
+    // agy.9 review N1: the rotation is saved and stays live, never the
+    // revoked login written back.
+    for provider in ["codex", "claude"] {
+        let case = Case::new(provider);
+        case.run(&["switch", provider, "a", "--activate-live"]);
+        case.live("a", "a-r2");
+        case.run(&["switch", provider, "a", "--activate-live"]);
+        assert_eq!(case.saved("a"), login(provider, "a", "a-r2"), "{provider}");
+        assert_eq!(
+            case.live_login(),
+            login(provider, "a", "a-r2"),
+            "{provider}"
+        );
+    }
+}
+
+#[test]
+fn restore_safety_backups_outlive_switch_pruning_and_messages_say_why() {
+    // agy.9 review lows.
+    let provider = "codex";
+    let case = Case::new(provider);
+    case.live("a", "a-elsewhere");
+    case.run(&["switch", provider, "b", "--activate-live"]);
+    let backup = case.backups().pop().unwrap();
+    let from = backup.to_str().unwrap().to_owned();
+    write(
+        &case.profile("a").join(case.auth_file),
+        &login(provider, "a", "a-newer"),
+    );
+    case.run(&["restore", provider, "a", "--from", &from, "--force"]);
+    let safety: Vec<_> = case
+        .backups()
+        .into_iter()
+        .filter(|b| {
+            b.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("before-restore-")
+        })
+        .collect();
+    assert_eq!(safety.len(), 1);
+    // The backup already equals the profile: nothing to do, no refusal.
+    let out = case
+        .command(&["restore", provider, "a", "--from", &from])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("already holds that login"));
+
+    for n in 0..24 {
+        let label = if n % 2 == 0 { "a" } else { "b" };
+        case.run(&["switch", provider, label, "--activate-live"]);
+    }
+    assert!(safety[0].exists(), "the safety backup is never pruned");
+
+    // A backup without a note (made before agy.9) says why --force is needed.
+    let old = case.root.join("old-backup");
+    fs::create_dir_all(&old).unwrap();
+    write(&old.join(case.auth_file), &login(provider, "a", "a-old"));
+    let refused = case.fails(&["restore", provider, "a", "--from", old.to_str().unwrap()]);
+    assert!(refused.contains("made before agy.9"), "{refused}");
+}

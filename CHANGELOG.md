@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.2-preview.agy.10 (2026-11-23)
+
+agy.9 with its review's changes (t4j5; t2kg). Not a release.
+
+### Fixed
+- **Switching to the account that is already live, after its CLI rotated the login,** keeps the rotation live. Before, the rotation was saved, but the revoked login was written back live.
+- **`aswap restore`'s safety backups (`before-restore-*`)** are never pruned; the 20-backup cap applies to switch backups only.
+- **`aswap restore` messages:** a backup that already equals the account's login is a no-op ("already holds that login"). A backup made before agy.9 says why `--force` is needed.
+
 ## 0.2.2-preview.agy.9 (2026-11-23)
 
 agy.8 with its review's changes (t4j5; t2kg's rulings). Not a release.

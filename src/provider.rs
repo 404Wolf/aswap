@@ -492,7 +492,11 @@ fn prune_backups(dir: &std::path::Path, keep: &std::path::Path) {
     };
     let mut backups: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with("before-"))
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("before-switch-")
+        })
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
     backups.sort();
@@ -508,14 +512,15 @@ fn prune_backups(dir: &std::path::Path, keep: &std::path::Path) {
 /// must be the same account. Without `force` it refuses when a rotation is
 /// pending, or when the profile's login changed since the backup was made
 /// (it may be newer). The replaced login (and any pending copy) is backed
-/// up first.
+/// up first (its directory is returned; None: the account already held
+/// that login, nothing changed).
 pub fn restore(
     store: &Store,
     provider: Provider,
     label: &str,
     from: &std::path::Path,
     force: bool,
-) -> Result<(Account, std::path::PathBuf)> {
+) -> Result<(Account, Option<std::path::PathBuf>)> {
     let _lock = store.lock()?;
     let state = store.load()?;
     let account = store.account(&state, provider, Some(label))?;
@@ -538,12 +543,24 @@ pub fn restore(
         .try_refresh_lock(&account)?
         .ok_or(Error(crate::refresh::BUSY))?;
     let pending = crate::refresh::pending_exists(store, &account);
-    let note: BackupNote = store::json_read(&from.join(BACKUP_NOTE)).unwrap_or_default();
-    let unchanged = note.profile_credential.is_some()
-        && note.profile_credential == credential(provider, &saved);
+    if credential(provider, &backup).is_some()
+        && credential(provider, &backup) == credential(provider, &saved)
+        && !pending
+    {
+        // Already that account's login: nothing to replace.
+        return Ok((account, None));
+    }
+    let note: Option<BackupNote> = store::json_read(&from.join(BACKUP_NOTE)).ok();
+    let noted = note.as_ref().and_then(|n| n.profile_credential.clone());
+    let unchanged = noted.is_some() && noted == credential(provider, &saved);
     if !force && pending {
         return Err(Error(
             "that account has a pending rotated login (newer than the backup); --force replaces it (it is backed up first)",
+        ));
+    }
+    if !force && noted.is_none() {
+        return Err(Error(
+            "this backup doesn't record the account's login when it was made (made before agy.9, or the account had none), so aswap can't tell which is newer; --force replaces it (it is backed up first)",
         ));
     }
     if !force && !unchanged {
@@ -575,7 +592,7 @@ pub fn restore(
         store::atomic(&replaced.join(format!("pending-{n}.json")), &bytes)?;
     }
     crate::refresh::install_login(store, &account, &backup)?;
-    Ok((account, replaced))
+    Ok((account, Some(replaced)))
 }
 pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
     let provider = account.provider;
@@ -630,6 +647,10 @@ pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
     if let Some(old) = &old_auth {
         preserve_live(store, account, old, old_config.as_ref(), &auth_path)?;
     }
+    // Read again: saving the outgoing login may just have installed the
+    // CLI's rotation into this very profile (switching to the live account).
+    let bytes = store::read_private(&profile.join(provider.auth_file()))?;
+    validate_auth(provider, &bytes)?;
     store::atomic(&auth_path, &bytes)?;
     if let Some((path, value)) = config
         && let Err(e) = store::json_write(&path, &value)

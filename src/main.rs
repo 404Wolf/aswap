@@ -493,11 +493,16 @@ fn execute(cli: Cli) -> Result<i32> {
             output(
                 &json!({"restored":account,"replaced_login_backup":replaced}),
                 cli.json,
-                format!(
-                    "Restored {provider}:{label} from {}; the replaced login is in {}",
-                    from.display(),
-                    replaced.display()
-                ),
+                match &replaced {
+                    None => {
+                        format!("{provider}:{label} already holds that login; nothing to restore")
+                    }
+                    Some(replaced) => format!(
+                        "Restored {provider}:{label} from {}; the replaced login is in {}",
+                        from.display(),
+                        replaced.display()
+                    ),
+                },
             )?;
         }
         Action::Rename { provider, old, new } => {
