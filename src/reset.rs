@@ -359,7 +359,10 @@ impl ResetLog {
             .any(|s| s.label == label && s.until > at)
     }
     fn skip(&mut self, label: &str, account: Option<String>, until: u64) {
-        self.skipped.retain(|s| s.label != label);
+        // One skip per (account, label): another account's skip under a
+        // reused label stays. Legacy skips (no account) by label.
+        self.skipped
+            .retain(|s| !(s.label == label && s.account == account));
         self.skipped.push(Skip {
             label: label.to_owned(),
             until,
@@ -1226,7 +1229,9 @@ fn one_per_account(
     at: u64,
 ) -> (Vec<(Account, Cached)>, ResetLog) {
     let pending = log.pending.as_ref().map(|p| p.label.clone());
+    // The view holds only the skips that match an account here.
     let mut view = log.clone();
+    view.skipped.clear();
     let mut kept: Vec<(Account, Cached)> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for (account, _) in &entries {
@@ -1254,8 +1259,12 @@ fn one_per_account(
             .skipped
             .iter()
             .filter(|s| s.until > at)
-            .filter(|s| {
-                group.iter().any(|(a, _)| a.label == s.label) || (key.is_some() && s.account == key)
+            // A skip that names an account matches that account only, never
+            // a different member who reuses its label. A legacy skip (no
+            // account) matches by label.
+            .filter(|s| match &s.account {
+                Some(account) => key.as_ref() == Some(account),
+                None => group.iter().any(|(a, _)| a.label == s.label),
             })
             .map(|s| s.until)
             .max()

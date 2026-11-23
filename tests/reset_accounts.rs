@@ -430,3 +430,318 @@ fn review_live_declines_skip_current_aliases_for_both_outcomes() {
         assert!(log.skipped.iter().any(|s| s.label == b.label));
     }
 }
+
+#[test]
+fn safety_reserved_pending_label_cannot_consume_or_hide_headroom() {
+    for reconcile in [false, true] {
+        let p = Pool::new();
+        let a = p.add("pending", "synthetic-member-a");
+        let b = p.add("unreserved-alias", "synthetic-member-a");
+        let c = p.add("other", "synthetic-member-b");
+        let at = aswap::now();
+        let mut f = Fake::new(&p.store);
+        f.response = json!({"synthetic_error":true});
+        f.readings.insert(a.label.clone(), cache(100.0, at));
+        let mut log = ResetLog::default();
+        reset::step(
+            &mut f,
+            Provider::Codex,
+            &settings(AutoReset::On),
+            vec![(a.clone(), cache(100.0, at))],
+            &mut log,
+            false,
+            at,
+        )
+        .unwrap();
+        let retry = log.pending.as_ref().unwrap().retry_at;
+        log.pending.as_mut().unwrap().reconcile = reconcile;
+        let mut policy = settings(AutoReset::On);
+        policy.reserved.push(a.label.clone());
+        f.response = json!({"outcome":"reset"});
+        f.readings.insert(a.label.clone(), cache(100.0, retry));
+        let result = reset::step(
+            &mut f,
+            Provider::Codex,
+            &policy,
+            vec![
+                (a, cache(100.0, retry)),
+                (b, cache(20.0, retry)),
+                (c, cache(100.0, retry)),
+            ],
+            &mut log,
+            false,
+            retry,
+        )
+        .unwrap();
+        assert_eq!(
+            f.consumed.len(),
+            1,
+            "reserved pending target consumed again: {result:?}"
+        );
+    }
+}
+#[test]
+fn safety_other_pending_request_respects_unreserved_alias_headroom() {
+    for reconcile in [false, true] {
+        let p = Pool::new();
+        let a = p.add("reserved", "synthetic-member-a");
+        let b = p.add("usable", "synthetic-member-a");
+        let c = p.add("pending-other", "synthetic-member-b");
+        let at = aswap::now();
+        let mut f = Fake::new(&p.store);
+        f.response = json!({"synthetic_error":true});
+        f.readings.insert(c.label.clone(), cache(100.0, at));
+        let mut log = ResetLog::default();
+        reset::step(
+            &mut f,
+            Provider::Codex,
+            &settings(AutoReset::On),
+            vec![(c.clone(), cache(100.0, at))],
+            &mut log,
+            false,
+            at,
+        )
+        .unwrap();
+        let retry = log.pending.as_ref().unwrap().retry_at;
+        log.pending.as_mut().unwrap().reconcile = reconcile;
+        let mut policy = settings(AutoReset::On);
+        policy.reserved.push(a.label.clone());
+        f.response = json!({"outcome":"reset"});
+        f.readings.insert(c.label.clone(), cache(100.0, retry));
+        reset::step(
+            &mut f,
+            Provider::Codex,
+            &policy,
+            vec![
+                (a, cache(20.0, retry)),
+                (b, cache(20.0, retry)),
+                (c, cache(100.0, retry)),
+            ],
+            &mut log,
+            false,
+            retry,
+        )
+        .unwrap();
+        assert_eq!(
+            f.consumed.len(),
+            1,
+            "unreserved alias headroom must stop pending attempt"
+        );
+    }
+}
+#[test]
+fn safety_known_skip_must_not_follow_label_to_a_different_member() {
+    let p = Pool::new();
+    let old = p.add("reused", "synthetic-member-a");
+    let at = aswap::now();
+    let mut f = Fake::new(&p.store);
+    f.readings.insert(old.label.clone(), cache(100.0, at));
+    let mut log = ResetLog::default();
+    reset::step(
+        &mut f,
+        Provider::Codex,
+        &settings(AutoReset::On),
+        vec![(old.clone(), cache(100.0, at))],
+        &mut log,
+        false,
+        at,
+    )
+    .unwrap();
+    assert_eq!(f.consumed.len(), 1);
+    let old_key = f.account_key(&old);
+    assert!(log.skipped.iter().any(|s| s.account == old_key));
+    p.remove(&old);
+    let bob = p.add("reused", "synthetic-member-b");
+    let new_key = f.account_key(&bob);
+    assert_ne!(old_key, new_key);
+    f.readings.insert(bob.label.clone(), cache(100.0, at + 1));
+    let result = reset::step(
+        &mut f,
+        Provider::Codex,
+        &settings(AutoReset::On),
+        vec![(bob, cache(100.0, at + 1))],
+        &mut log,
+        false,
+        at + 1,
+    )
+    .unwrap();
+    assert_eq!(
+        f.consumed.len(),
+        2,
+        "Alice's known-key skip incorrectly blocked a different workspace member using her old label: {result:?}"
+    );
+}
+fn intent(label: &str, account: Option<String>, key: &str, at: u64) -> reset::Pending {
+    serde_json::from_value(json!({"label":label,"credit_id":"synthetic-credit","idempotency_key":key,"weekly_resets_at":at+86400,"reason":"synthetic","started_at":at,"attempts":0,"retry_at":at,"account":account})).unwrap()
+}
+#[test]
+fn safety_replay_must_retain_both_accounts_when_one_label_was_reused() {
+    let p = Pool::new();
+    let alice = p.add("alice-alias", "synthetic-member-a");
+    let bob = p.add("reused", "synthetic-member-b");
+    let at = aswap::now();
+    let mut f = Fake::new(&p.store);
+    let alice_key = f.account_key(&alice).unwrap();
+    let bob_key = f.account_key(&bob).unwrap();
+    for (account, key, time) in [
+        (alice_key.clone(), "synthetic-alice-key", at),
+        (bob_key.clone(), "synthetic-bob-key", at + 1),
+    ] {
+        reset::append(
+            &p.store,
+            &reset::Event::Intent {
+                at: time,
+                pending: intent("reused", Some(account), key, time),
+            },
+        )
+        .unwrap();
+        reset::append(
+            &p.store,
+            &reset::Event::Attempt {
+                at: time,
+                key: key.into(),
+                n: 1,
+            },
+        )
+        .unwrap();
+        reset::append(
+            &p.store,
+            &reset::Event::Outcome {
+                at: time,
+                key: key.into(),
+                outcome: "no-credit".into(),
+            },
+        )
+        .unwrap();
+    }
+    let replayed = {
+        let _l = p.store.lock().unwrap();
+        reset::load(&p.store).unwrap()
+    };
+    assert!(
+        replayed
+            .skipped
+            .iter()
+            .any(|s| s.account.as_ref() == Some(&alice_key)),
+        "Bob's later use of same label deleted Alice's account-keyed skip: {:?}",
+        replayed.skipped
+    );
+    assert!(
+        replayed
+            .skipped
+            .iter()
+            .any(|s| s.account.as_ref() == Some(&bob_key))
+    );
+}
+#[test]
+fn safety_legacy_journal_without_account_fields_replays_current_aliases() {
+    let p = Pool::new();
+    let a = p.add("old", "synthetic-member-a");
+    let b = p.add("alias", "synthetic-member-a");
+    let at = aswap::now();
+    let mut pending = serde_json::to_value(intent("old", None, "synthetic-old-key", at)).unwrap();
+    pending.as_object_mut().unwrap().remove("account");
+    for event in [
+        json!({"event":"intent","at":at,"pending":pending}),
+        json!({"event":"outcome","at":at,"key":"synthetic-old-key","outcome":"nothing-to-reset"}),
+    ] {
+        let parsed: reset::Event = serde_json::from_value(event).unwrap();
+        reset::append(&p.store, &parsed).unwrap();
+    }
+    let mut replayed = {
+        let _l = p.store.lock().unwrap();
+        reset::load(&p.store).unwrap()
+    };
+    assert!(replayed.skipped.iter().all(|s| s.account.is_none()));
+    let mut f = Fake::new(&p.store);
+    f.readings.insert(a.label.clone(), cache(100.0, at + 1));
+    f.readings.insert(b.label.clone(), cache(100.0, at + 1));
+    reset::step(
+        &mut f,
+        Provider::Codex,
+        &settings(AutoReset::On),
+        vec![(a, cache(100.0, at + 1)), (b, cache(100.0, at + 1))],
+        &mut replayed,
+        false,
+        at + 1,
+    )
+    .unwrap();
+    assert!(f.consumed.is_empty());
+}
+
+#[test]
+fn safety_legacy_pending_without_account_fields_keeps_its_key() {
+    let p = Pool::new();
+    let a = p.add("old", "synthetic-member-a");
+    let b = p.add("alias", "synthetic-member-a");
+    let at = aswap::now();
+    let mut f = Fake::new(&p.store);
+    f.response = json!({"synthetic_error":true});
+    f.readings.insert(a.label.clone(), cache(100.0, at));
+    let mut log = ResetLog::default();
+    reset::step(
+        &mut f,
+        Provider::Codex,
+        &settings(AutoReset::On),
+        vec![
+            (a.clone(), cache(100.0, at)),
+            (b.clone(), Cached::default()),
+        ],
+        &mut log,
+        false,
+        at,
+    )
+    .unwrap();
+    let pending = log.pending.as_ref().unwrap().clone();
+    let mut snapshot = serde_json::to_value(&log).unwrap();
+    snapshot["pending"]
+        .as_object_mut()
+        .unwrap()
+        .remove("account");
+    store::json_write(&reset::log_path(&p.store), &snapshot).unwrap();
+    let text = std::fs::read_to_string(reset::journal_path(&p.store)).unwrap();
+    let legacy = text
+        .lines()
+        .map(|line| {
+            let mut v: Value = serde_json::from_str(line).unwrap();
+            if let Some(p) = v.get_mut("pending").and_then(Value::as_object_mut) {
+                p.remove("account");
+            }
+            serde_json::to_string(&v).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(reset::journal_path(&p.store), legacy).unwrap();
+    let mut restored = {
+        let _l = p.store.lock().unwrap();
+        reset::load(&p.store).unwrap()
+    };
+    assert!(restored.pending.as_ref().unwrap().account.is_none());
+    assert_eq!(
+        restored.pending.as_ref().unwrap().idempotency_key,
+        pending.idempotency_key
+    );
+    f.response = json!({"outcome":"noCredit"});
+    f.readings
+        .insert(a.label.clone(), cache(100.0, pending.retry_at));
+    reset::step(
+        &mut f,
+        Provider::Codex,
+        &settings(AutoReset::On),
+        vec![(a, cache(100.0, pending.retry_at)), (b, Cached::default())],
+        &mut restored,
+        false,
+        pending.retry_at,
+    )
+    .unwrap();
+    assert_eq!(f.consumed.len(), 2);
+    assert_eq!(f.keys, 1);
+    let text = std::fs::read_to_string(reset::journal_path(&p.store)).unwrap();
+    for line in text.lines() {
+        let event: reset::Event = serde_json::from_str(line).unwrap();
+        if let reset::Event::Attempt { key, .. } = event {
+            assert_eq!(key, pending.idempotency_key);
+        }
+    }
+}
