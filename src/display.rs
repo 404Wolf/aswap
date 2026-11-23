@@ -15,7 +15,7 @@ pub struct Row<'a> {
     pub same_account: &'a [String],
     /// When this login could be either of these aliases' accounts.
     pub ambiguous_with: &'a [String],
-    /// Labels (of this program) whose login is ambiguous.
+    /// Logins whose identity is ambiguous, as `provider:label` (any program).
     pub ambiguous_labels: &'a [String],
     pub cached: &'a Cached,
 }
@@ -405,10 +405,10 @@ fn render_row(
             clean(row.label)
         ));
     } else {
-        let (unsure, same): (Vec<&String>, Vec<&String>) = row
-            .duplicates
-            .iter()
-            .partition(|l| row.ambiguous_labels.contains(l));
+        let (unsure, same): (Vec<&String>, Vec<&String>) = row.duplicates.iter().partition(|l| {
+            row.ambiguous_labels
+                .contains(&format!("{}:{}", row.provider, l))
+        });
         if !same.is_empty() {
             facts.push(format!(
                 "same login as {}",

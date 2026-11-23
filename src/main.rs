@@ -303,12 +303,19 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
                 .unwrap_or_default(),
         );
     }
-    // Labels that are ambiguous: other rows don't call them the same login.
+    // Logins that are ambiguous, as provider:label: other rows of the same
+    // program don't call them the same login.
     let ambiguous_labels: Vec<String> = accounts
         .iter()
         .zip(&ambiguous)
         .filter(|(_, with)| !with.is_empty())
-        .filter_map(|(r, _)| r["label"].as_str().map(str::to_owned))
+        .filter_map(|(r, _)| {
+            Some(format!(
+                "{}:{}",
+                r["provider"].as_str()?,
+                r["label"].as_str()?
+            ))
+        })
         .collect();
     let rows: Vec<_> = accounts
         .iter()

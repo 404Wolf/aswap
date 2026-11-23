@@ -224,3 +224,27 @@ fn ambiguous_json_names_the_candidates_and_drops_same_account() {
         "{text}"
     );
 }
+
+#[test]
+fn review_ambiguous_labels_must_be_scoped_to_their_program() {
+    let p = bridge();
+    p.add(Provider::Pi, "legacy", "synthetic-member-pi");
+    p.add(Provider::Pi, "pi-alias", "synthetic-member-pi");
+    seed(&p);
+    let v: serde_json::Value = serde_json::from_str(&run(&p, &["list", "--json"])).unwrap();
+    let pi = v["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["provider"] == "pi" && r["label"] == "pi-alias")
+        .unwrap();
+    assert_eq!(pi["ambiguous_with"], json!([]));
+    assert_eq!(pi["duplicates"], json!(["legacy"]));
+    for command in ["list", "status"] {
+        let text = run(&p, &[command]);
+        assert!(
+            text.contains("same login as legacy"),
+            "a Codex label made the unrelated, unambiguous pi duplicate look ambiguous: {text}"
+        );
+    }
+}
