@@ -745,3 +745,142 @@ fn safety_legacy_pending_without_account_fields_keeps_its_key() {
         }
     }
 }
+
+#[test]
+fn legacy_memberless_alias_must_share_the_known_accounts_skip() {
+    let p = Pool::new();
+    let known = p.add("known", "synthetic-member-a");
+    let legacy = p.add("legacy", "synthetic-member-a");
+    let at = aswap::now();
+    for (a, member) in [(&known, Some("synthetic-member-a")), (&legacy, None)] {
+        let mut claims = json!({"chatgpt_account_id":"synthetic-workspace","chatgpt_user_id":"synthetic-user-a"});
+        if let Some(m) = member {
+            claims["chatgpt_account_user_id"] = m.into();
+        }
+        let payload = json!({"https://api.openai.com/auth":claims});
+        let jwt = format!(
+            "synthetic.{}.synthetic",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+        );
+        store::json_write(
+            &p.store
+                .profile(a.provider, &a.label)
+                .unwrap()
+                .join("auth.json"),
+            &json!({"tokens":{"account_id":"synthetic-workspace","access_token":jwt}}),
+        )
+        .unwrap();
+    }
+    let mut f = Fake::new(&p.store);
+    assert_eq!(f.aliases(&known), vec!["legacy"]);
+    assert!(f.account_key(&known).is_some());
+    assert!(f.account_key(&legacy).is_none());
+    f.response = json!({"outcome":"noCredit"});
+    f.readings.insert(known.label.clone(), cache(100.0, at));
+    f.readings
+        .insert(legacy.label.clone(), cache(100.0, at + 1));
+    let mut log = ResetLog::default();
+    reset::step(
+        &mut f,
+        Provider::Codex,
+        &settings(AutoReset::On),
+        vec![
+            (known.clone(), cache(100.0, at)),
+            (legacy.clone(), cache(100.0, at)),
+        ],
+        &mut log,
+        false,
+        at,
+    )
+    .unwrap();
+    assert_eq!(f.consumed, vec!["known"]);
+    // Same group and quota, only the legacy label is now first in the view.
+    reset::step(
+        &mut f,
+        Provider::Codex,
+        &settings(AutoReset::On),
+        vec![
+            (legacy, cache(100.0, at + 1)),
+            (known, cache(100.0, at + 1)),
+        ],
+        &mut log,
+        false,
+        at + 1,
+    )
+    .unwrap();
+    assert_eq!(
+        f.consumed.len(),
+        1,
+        "a fallback-matched same-account alias ignored its group member's known-key skip: {:?}",
+        f.consumed
+    );
+}
+
+#[test]
+fn legacy_representative_must_persist_a_known_siblings_account_key() {
+    let p = Pool::new();
+    let known = p.add("known", "synthetic-member-a");
+    let legacy = p.add("legacy", "synthetic-member-a");
+    let at = aswap::now();
+    for (a, member) in [(&known, Some("synthetic-member-a")), (&legacy, None)] {
+        let mut claims = json!({"chatgpt_account_id":"synthetic-workspace","chatgpt_user_id":"synthetic-user-a"});
+        if let Some(m) = member {
+            claims["chatgpt_account_user_id"] = m.into();
+        }
+        let payload = json!({"https://api.openai.com/auth":claims});
+        let jwt = format!(
+            "synthetic.{}.synthetic",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+        );
+        store::json_write(
+            &p.store
+                .profile(a.provider, &a.label)
+                .unwrap()
+                .join("auth.json"),
+            &json!({"tokens":{"account_id":"synthetic-workspace","access_token":jwt}}),
+        )
+        .unwrap();
+    }
+    let mut f = Fake::new(&p.store);
+    assert_eq!(f.aliases(&legacy), vec!["known"]);
+    f.response = json!({"outcome":"noCredit"});
+    f.readings.insert(known.label.clone(), cache(100.0, at + 1));
+    f.readings.insert(legacy.label.clone(), cache(100.0, at));
+    let mut log = ResetLog::default();
+    reset::step(
+        &mut f,
+        Provider::Codex,
+        &settings(AutoReset::On),
+        vec![
+            (legacy.clone(), cache(100.0, at)),
+            (known.clone(), cache(100.0, at)),
+        ],
+        &mut log,
+        false,
+        at,
+    )
+    .unwrap();
+    assert_eq!(f.consumed, vec!["legacy"]);
+    std::fs::remove_file(reset::log_path(&p.store)).unwrap();
+    p.remove(&legacy);
+    let mut replayed = {
+        let _l = p.store.lock().unwrap();
+        reset::load(&p.store).unwrap()
+    };
+    reset::step(
+        &mut f,
+        Provider::Codex,
+        &settings(AutoReset::On),
+        vec![(known, cache(100.0, at + 1))],
+        &mut replayed,
+        false,
+        at + 1,
+    )
+    .unwrap();
+    assert_eq!(
+        f.consumed.len(),
+        1,
+        "the selected legacy alias lost a key available on its group sibling; replay consumed again: {:?}",
+        f.consumed
+    );
+}

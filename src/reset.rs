@@ -1030,7 +1030,7 @@ pub fn step(
         pre: Some(Snapshot::of(&pre)),
         paused: None,
         reconcile: false,
-        account: port.account_key(&account),
+        account: group_key(port, &account),
     });
     // The intent is journaled (fsynced) before anything is sent.
     port.journal(&Event::Intent {
@@ -1254,7 +1254,10 @@ fn one_per_account(
             .or_else(|| group.iter().find(|(a, _)| settings.allows(&a.label, None)))
             .unwrap_or(&group[0]))
         .clone();
-        let key = port.account_key(&chosen.0);
+        // The account's key: its own, else an alias's (a label whose token
+        // predates the membership claim has none of its own).
+        let key = group_key(port, &chosen.0);
+        let keys: Vec<String> = key.iter().cloned().collect();
         if let Some(until) = log
             .skipped
             .iter()
@@ -1263,7 +1266,7 @@ fn one_per_account(
             // a different member who reuses its label. A legacy skip (no
             // account) matches by label.
             .filter(|s| match &s.account {
-                Some(account) => key.as_ref() == Some(account),
+                Some(account) => keys.contains(account),
                 None => group.iter().any(|(a, _)| a.label == s.label),
             })
             .map(|s| s.until)
@@ -1275,6 +1278,21 @@ fn one_per_account(
         kept.push(chosen);
     }
     (kept, view)
+}
+
+/// The real account's key for `account`: its own (`Port::account_key`),
+/// else the first one its same-program aliases name. Aliases are the same
+/// login (`identity::duplicates`), so their key is this account's. One
+/// helper for both matching skips and recording an intent.
+fn group_key(port: &mut impl Port, account: &Account) -> Option<String> {
+    port.account_key(account).or_else(|| {
+        port.aliases(account).iter().find_map(|label| {
+            port.account_key(&Account {
+                provider: account.provider,
+                label: label.clone(),
+            })
+        })
+    })
 }
 
 /// A `reset retry` that may not send now: paused again, key kept, until the
