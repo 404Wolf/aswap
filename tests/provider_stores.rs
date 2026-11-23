@@ -388,6 +388,7 @@ fn v021_supervisor_and_writers_share_the_legacy_state() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
+    assert_eq!(providers(&t.cli(&["list", "claude"])), ["claude"]);
     let writers = std::sync::Barrier::new(3);
     std::thread::scope(|scope| {
         let old_writer = || {

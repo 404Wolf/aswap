@@ -205,7 +205,18 @@ where
     // (see crate::agy).
     // 0.2.1 ignores our pending sidecars. Leave canonical rotation to the
     // existing owner while its ordinary processes share this store.
-    if account.provider == Provider::Agy || store.legacy_compatibility() {
+    if account.provider == Provider::Agy {
+        return Ok(false);
+    }
+    // Hold this guard across the request and every write. If admission is
+    // underway, skip before touching auth, even if our caller has store.lock.
+    let Some(_admission) = store
+        .try_admission_lock(false)
+        .map_err(|_| Failure::new("usage-unavailable"))?
+    else {
+        return Ok(false);
+    };
+    if store.legacy_compatibility() {
         return Ok(false);
     }
     if crate::coordination::follower(store).map_err(|_| Failure::new("usage-unavailable"))?

@@ -388,6 +388,15 @@ impl StoreView {
         };
         let store = Store::open_scoped(self.legacy.clone(), scope)?;
         if store.legacy_compatibility() {
+            // First admission excludes an unfenced refresh until the marker
+            // is durable. Do not wait for this lock while holding store.lock.
+            let _admission = if legacy_marker(&store.root)? {
+                None
+            } else {
+                Some(store.try_admission_lock(true)?.ok_or(Error(
+                    "legacy store admission is busy; retry after credential refresh or concurrent admission finishes",
+                ))?)
+            };
             let _lock = store.lock()?;
             crate::refresh::require_legacy_pending_free(&store)?;
             if !legacy_marker(&store.root)? {
@@ -870,6 +879,38 @@ impl Store {
         })?;
         crate::rename::recover(self)?;
         Ok(guard)
+    }
+    /// Refresh holds a shared lock through OAuth and persistence. First
+    /// admission needs the exclusive lock before taking store.lock.
+    pub(crate) fn try_admission_lock(&self, exclusive: bool) -> Result<Option<Guard>> {
+        let path = self.root.join("legacy-admission.lock");
+        no_links(&path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .safe("cannot open legacy admission lock")?;
+        if !file
+            .metadata()
+            .safe("cannot inspect legacy admission lock")?
+            .is_file()
+        {
+            return Err(Error("legacy admission lock must be a regular file"));
+        }
+        let locked = if exclusive {
+            FileExt::try_lock_exclusive(&file)
+        } else {
+            FileExt::try_lock_shared(&file)
+        };
+        match locked {
+            Ok(()) => Ok(Some(Guard(file, false))),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(_) => Err(Error("cannot lock legacy store admission")),
+        }
     }
     pub fn load(&self) -> Result<State> {
         let p = self.root.join("state.json");

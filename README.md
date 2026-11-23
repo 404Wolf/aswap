@@ -139,8 +139,10 @@ conversation data stay in place. Capture new logins from the private
 Before starting a candidate binary on a shared Claude/Codex root, use that
 binary with the separate Agy configuration and run `aswap list claude --json`.
 It checks for pending rotations and validates the legacy state before
-persisting the `legacy-compatibility` marker in the account root. Keep the
-marker for as long as older supervisors share that root. Every current
+persisting the `legacy-compatibility` marker in the account root. If a
+candidate refresh is in progress, admission refuses until it finishes.
+Stop any preview builds that predate the admission lock before marking the
+root. Keep the marker for as long as older supervisors share that root. Every current
 invocation on that root honors the fence, including invocations with
 missing or different configuration. Agy commands require a separate
 configured store on a fenced root. The new binary disables direct

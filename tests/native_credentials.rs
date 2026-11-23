@@ -428,6 +428,95 @@ fn legacy_compatibility_refresh_child() {
 }
 
 #[test]
+fn admission_waits_for_a_standalone_refresh_to_finish_persisting() {
+    use std::{process::Stdio, time::Instant};
+
+    let f = Fixture::new("claude");
+    let native = env!("CARGO_BIN_EXE_aswap");
+    let original = f.login("one", "old", None);
+    f.add("one", "one", &original);
+    assert!(
+        f.command_for(native)
+            .args(["sync", "--owner"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let marker = f.store().join("legacy-compatibility");
+    let started = f.root.path().join("request-started");
+    let done = f.root.path().join("request-can-finish");
+    let admission = || {
+        f.legacy_compatible(native)
+            .args(["list", "claude"])
+            .output()
+            .unwrap()
+    };
+    let mut refreshing = f
+        .command_for(std::env::current_exe().unwrap())
+        .env("ASWAP_SYNTHETIC_ADMISSION_CHILD", "1")
+        .args(["--exact", "admission_refresh_child"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !started.exists() {
+        assert!(refreshing.try_wait().unwrap().is_none());
+        assert!(Instant::now() < deadline, "synthetic refresh did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let refused = admission();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("legacy store admission is busy"));
+    assert!(!marker.exists());
+    assert_eq!(read_login(&f.profile("one")), original);
+
+    fs::write(done, "").unwrap();
+    let result = refreshing.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    let rotated = read_login(&f.profile("one"));
+    assert_eq!(
+        rotated["claudeAiOauth"]["refreshToken"],
+        "synthetic-admission-rotated"
+    );
+    assert!(admission().status.success());
+    assert!(marker.is_file());
+    assert_eq!(read_login(&f.profile("one")), rotated);
+    assert!(
+        f.command_for(std::env::current_exe().unwrap())
+            .env("ASWAP_SYNTHETIC_LEGACY_CHILD", "1")
+            .args(["--exact", "legacy_compatibility_refresh_child"])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn admission_refresh_child() {
+    use std::time::Instant;
+
+    if std::env::var_os("ASWAP_SYNTHETIC_ADMISSION_CHILD").is_none() {
+        return;
+    }
+    let root = aswap::provider::home().unwrap();
+    let store = store::Store::from_env().unwrap();
+    let account = store.load().unwrap().accounts.remove(0);
+    assert!(aswap::refresh::refresh_with(&store, &account, now(), true, |_, _| {
+        fs::write(root.join("request-started"), "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !root.join("request-can-finish").exists() {
+            assert!(Instant::now() < deadline, "synthetic response release timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(json!({"access_token":"synthetic-admission-fresh","refresh_token":"synthetic-admission-rotated","expires_in":3600}))
+    }).unwrap());
+}
+
+#[test]
 #[ignore = "set ASWAP_V021_BIN to the exact deployed or tagged v0.2.1 executable"]
 fn exact_old_activation_blocks_on_live_refresh_and_ignores_pending() {
     use fs2::FileExt;
@@ -494,8 +583,24 @@ fn exact_old_activation_blocks_on_live_refresh_and_ignores_pending() {
     assert!(old_command().args(args).status().unwrap().success());
     assert_eq!(read_login(&f.live()), original);
     assert!(sidecar.is_file());
-    // Outside mixed mode, the candidate can recover the same sidecar.
+    let refused = f.command("switch", "one", &["--activate-live"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("no pending logins"));
+    assert_eq!(read_login(&f.live()), original);
+    assert_eq!(read_login(&f.profile("one")), original);
+    assert!(sidecar.is_file());
+}
+
+#[test]
+fn standalone_activation_recovers_a_pending_rotation() {
+    let f = Fixture::new("claude");
+    let original = f.login("one", "old", None);
+    let rotated = f.login("one", "rotated", None);
+    f.add("one", "one", &original);
+    f.switch("one");
+    let sidecar = f.pending("one", &rotated, false);
     f.switch("one");
     assert_eq!(read_login(&f.live()), rotated);
+    assert_eq!(read_login(&f.profile("one")), rotated);
     assert!(!sidecar.exists());
 }

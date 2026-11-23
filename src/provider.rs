@@ -574,8 +574,8 @@ pub fn restore(
     from: &std::path::Path,
     force: bool,
 ) -> Result<(Account, Option<std::path::PathBuf>)> {
-    require_native_credential_writes(store)?;
     let _lock = store.lock()?;
+    require_native_credential_writes(store)?;
     let state = store.load()?;
     let account = store.account(&state, provider, Some(label))?;
     store::no_links(from)?;
