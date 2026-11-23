@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.2-preview.agy.8 (2026-11-23)
+
+agy.7 with its review's changes (t4j5; t2kg's rulings). Not a release.
+
+### Fixed
+- **`switch --activate-live` keeps the provider CLI's own rotations.** When the outgoing live login is the same account as a profile (its authoritative account key), aswap put that profile's login live, the profile still holds it, and the live slot now holds another login, the CLI rotated it, so it is saved to that profile. Without that activation record (a store from an older version, a login made elsewhere), with a profile changed since, or with a pending rotation, nothing is saved. A different or unknown account is only backed up, and aswap says where.
+- **An ordinary usage fetch never writes over a newer reading** that a confirming read stored while it ran.
+- **The exit fallback judges the final screen from the rendered screen,** what the user sees: a notice that was erased, scrolled more than 12 rows up, or is on the other screen buffer counts nothing.
+- **The owner's answer to a follower's request** carries its committed bookkeeping (a provider-limit mark, retry-after, backoff) with the provider's own usage.
+
+### Added
+- `aswap restore <provider> <label> --from <backup>` installs a backed-up live login as that account's login (same account only).
+- Live-login backups are pruned to the newest 20 per provider.
+
 ## 0.2.2-preview.agy.7 (2026-11-23)
 
 agy.6 with its review's changes (t4hf; t2kg's rulings). Not a release.

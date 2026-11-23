@@ -426,6 +426,13 @@ fn write_pending(store: &Store, account: &Account, replaces: Option<String>, aut
     }
 }
 
+/// Whether any pending copy of an account's login exists (a rotation not
+/// yet installed, which is newer than anything else).
+pub(crate) fn pending_exists(store: &Store, account: &Account) -> bool {
+    pending_paths(store, account)
+        .into_iter()
+        .any(|p| p.exists())
+}
 /// Drop an account's pending logins: its login file is being replaced
 /// (a new rotation, `add`, a live login preserved), so they are stale.
 pub(crate) fn discard_pending(store: &Store, account: &Account) {

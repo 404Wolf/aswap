@@ -921,6 +921,11 @@ where
         return Ok(updated(snapshot, result, at));
     }
     let latest = read_cache(&path, force)?;
+    // Newest observation wins: a reading stored while this fetch ran (a
+    // confirming read, which takes no usage lock) is newer than this one.
+    if latest.fetched_at > snapshot.fetched_at {
+        return Ok(latest);
+    }
     let entry = merged(&snapshot, latest, result, at);
     store::json_write(&path, &entry)?;
     Ok(entry)
@@ -1647,6 +1652,39 @@ mod fresh_commit_tests {
         assert_eq!(
             kept.usage.windows[0].used_percent, 20.0,
             "the newer reading stays"
+        );
+
+        // And an ordinary fetch that began before a confirming read never
+        // writes its older reading over it (agy.7 review M1).
+        let stale = Cached {
+            fetched_at: at - 600,
+            last_attempt: at - 600,
+            next_poll_at: at - 1,
+            ..Default::default()
+        };
+        store::json_write(&path, &stale).unwrap();
+        let ordinary = cached_mode_with(&store, &account, at, true, |_| {
+            // The confirming read lands during the ordinary fetch.
+            store::json_write(
+                &path,
+                &Cached {
+                    fetched_at: at + 1,
+                    last_attempt: at + 1,
+                    ..newer.clone()
+                },
+            )
+            .unwrap();
+            Ok(Usage {
+                windows: vec![window(100.0)],
+                ..Default::default()
+            })
+        })
+        .unwrap();
+        assert_eq!(ordinary.usage.windows[0].used_percent, 20.0);
+        let kept: Cached = store::json_read(&path).unwrap();
+        assert_eq!(
+            kept.usage.windows[0].used_percent, 20.0,
+            "the confirming read stays"
         );
     }
 }

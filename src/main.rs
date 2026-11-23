@@ -60,6 +60,15 @@ enum Action {
     },
     /// Remove a stored profile (refuses a running account).
     Remove { provider: Provider, label: String },
+    /// Install a backed-up live login (live-backups) as an existing
+    /// account's login; it must be the same account.
+    Restore {
+        provider: Provider,
+        label: String,
+        /// The backup directory aswap printed when it saved the login.
+        #[arg(long)]
+        from: std::path::PathBuf,
+    },
     /// Rename a stored label, its usage cache and retained sessions.
     Rename {
         provider: Provider,
@@ -467,6 +476,18 @@ fn execute(cli: Cli) -> Result<i32> {
                 &json!({"removed":true,"provider":provider,"label":label,"duplicates":duplicates}),
                 cli.json,
                 format!("Removed {provider}:{label}{detail}"),
+            )?;
+        }
+        Action::Restore {
+            provider,
+            label,
+            from,
+        } => {
+            let account = aswap::provider::restore(&store, provider, &label, &from)?;
+            output(
+                &json!({"restored":account}),
+                cli.json,
+                format!("Restored {provider}:{label} from {}", from.display()),
             )?;
         }
         Action::Rename { provider, old, new } => {

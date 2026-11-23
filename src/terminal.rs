@@ -58,6 +58,8 @@ pub struct Terminal {
     /// redrawing a resumed conversation, not reporting a live failure.
     pub quiet_auth: bool,
     pub held_auth: Vec<std::time::Instant>,
+    /// The terminal's size (rows, columns), for the screen model.
+    size: (u16, u16),
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -162,6 +164,7 @@ impl Terminal {
             model_unsupported: false,
             quiet_auth: false,
             held_auth: Vec::new(),
+            size: (24, 80),
         })
     }
     pub fn spawn(&mut self, command: &mut Command) -> Result<Child> {
@@ -185,6 +188,7 @@ impl Terminal {
             });
         }
         self.resize();
+        self.diagnostics.reset_screen(self.size);
         if self.started {
             // Preparation/commit can take time after the last wait pump.
             // Drain outer input at the relaunch boundary, including a TTY,
@@ -235,14 +239,21 @@ impl Terminal {
             self.input_open = false;
         }
     }
-    fn resize(&self) {
+    fn resize(&mut self) {
         let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
         // SAFETY: ioctl initializes size only on success; the subsequent call
         // reads it only in that branch. No signal handler or global state needed.
         unsafe {
             if libc::ioctl(1, libc::TIOCGWINSZ, size.as_mut_ptr()) == 0 {
                 libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, size.as_ptr());
+                let size = size.assume_init();
+                if size.ws_row > 0 && size.ws_col > 0 {
+                    self.size = (size.ws_row, size.ws_col);
+                }
             }
+        }
+        if let Some(parser) = &mut self.diagnostics.screen {
+            parser.set_size(self.size.0, self.size.1);
         }
     }
     /// Forward terminal I/O and inspect a bounded trailing slice for limit errors.
@@ -372,6 +383,7 @@ impl Terminal {
                         .write_all(&buffer[..n])
                         .safe("cannot forward provider output")?;
                     stdout.flush().safe("cannot flush provider output")?;
+                    self.diagnostics.render(&buffer[..n], self.size);
                     let signals = self.diagnostics.feed(&buffer[..n]);
                     limited = self.apply_signals(signals);
                     more_output = n != 0;
@@ -435,8 +447,11 @@ struct Diagnostics {
     /// Codex: the rows of a marked diagnostic so far, whitespace removed,
     /// and how many rows that is (see `codex_notice`).
     codex_rows: Option<(String, u8)>,
-    /// Output rows since the last limit notice (None: none seen).
-    rows_since_notice: Option<u32>,
+    /// The last limit notice's text (whitespace removed), if any.
+    notice_text: Option<String>,
+    /// The rendered screen (what the user sees), to tell whether a notice
+    /// is still in the final screen: not erased, not scrolled far up.
+    screen: Option<vt100::Parser>,
 }
 impl Diagnostics {
     fn feed(&mut self, bytes: &[u8]) -> (ScreenLimits, bool, bool) {
@@ -503,19 +518,49 @@ impl Diagnostics {
     }
 
     fn finish_row(&mut self, signals: &mut (ScreenLimits, bool, bool)) {
+        let text = squash(&normalize(&self.line));
         let mut row = (ScreenLimits::default(), false, false);
         self.finish_row_inner(&mut row);
         if row.0.notice {
-            self.rows_since_notice = Some(0);
+            // Codex's notice spans rows; its sentence is the needle.
+            let needle = if self.codex {
+                CODEX_LIMIT_SQUASHED.to_owned()
+            } else {
+                text.chars().take(NEEDLE).collect()
+            };
+            self.notice_text = Some(needle).filter(|n| !n.is_empty());
         }
         signals.0.merge(row.0);
         signals.1 |= row.1;
         signals.2 |= row.2;
     }
-    /// Whether a limit notice is in the session's final screen: among the
-    /// last `FINAL_ROWS` rows of output, not quoted further up.
+    /// Whether the last limit notice is in the session's final screen: on
+    /// the rendered screen now (not erased), among its last `FINAL_ROWS`
+    /// non-empty rows (not quoted further up).
     fn notice_in_final_screen(&self) -> bool {
-        self.rows_since_notice.is_some_and(|n| n <= FINAL_ROWS)
+        let (Some(needle), Some(parser)) = (&self.notice_text, &self.screen) else {
+            return false;
+        };
+        let screen = parser.screen();
+        let (_, cols) = screen.size();
+        let rows: Vec<String> = screen
+            .rows(0, cols)
+            .map(|row| squash(&normalize(row.as_bytes())))
+            .filter(|row| !row.is_empty())
+            .collect();
+        let start = rows.len().saturating_sub(FINAL_ROWS);
+        rows[start..].concat().contains(needle.as_str())
+    }
+    /// Render output into the screen model.
+    fn render(&mut self, bytes: &[u8], size: (u16, u16)) {
+        self.screen
+            .get_or_insert_with(|| vt100::Parser::new(size.0, size.1, 0))
+            .process(bytes);
+    }
+    /// A new session (or a new size): a new screen.
+    fn reset_screen(&mut self, size: (u16, u16)) {
+        self.screen = Some(vt100::Parser::new(size.0, size.1, 0));
+        self.notice_text = None;
     }
     fn finish_row_inner(&mut self, signals: &mut (ScreenLimits, bool, bool)) {
         if self.truncated {
@@ -529,9 +574,6 @@ impl Diagnostics {
         let decoded = normalize(&self.line);
         self.line.clear();
         let line = decoded.as_str();
-        if !line.is_empty() {
-            self.rows_since_notice = self.rows_since_notice.map(|n| n.saturating_add(1));
-        }
         if self.agy {
             // agy's own notices only; Claude's and Codex's wording would
             // misread its tool output.
@@ -598,7 +640,12 @@ impl Diagnostics {
 }
 /// How many output rows after a notice still count as the final screen (a
 /// provider draws its prompt and footer below it).
-const FINAL_ROWS: u32 = 12;
+const FINAL_ROWS: usize = 12;
+/// How much of a (non-Codex) notice row is looked for on the final screen.
+const NEEDLE: usize = 200;
+fn squash(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
 /// "you've hit your usage limit" with whitespace removed (rows may split it).
 const CODEX_LIMIT_SQUASHED: &str = "you'vehityourusagelimit";
 
@@ -1126,19 +1173,40 @@ mod review_fixture_tests {
     }
 
     #[test]
-    fn only_a_notice_in_the_final_rows_is_in_the_final_screen() {
-        let mut detector = Diagnostics {
-            codex: true,
-            ..Default::default()
+    fn only_a_notice_on_the_rendered_final_screen_counts() {
+        let fresh = || {
+            let mut detector = Diagnostics {
+                codex: true,
+                ..Default::default()
+            };
+            detector.reset_screen((24, 80));
+            detector
         };
-        detector.feed("\u{25a0} You've hit your usage limit. Try again later.\r\n".as_bytes());
-        detector.feed(b"\r\n> \r\n  enter to send\r\n");
+        let feed = |detector: &mut Diagnostics, bytes: &[u8]| {
+            detector.render(bytes, (24, 80));
+            detector.feed(bytes);
+        };
+        let notice = "\u{25a0} You've hit your usage limit. Try again later.\r\n".as_bytes();
+        let mut detector = fresh();
+        feed(&mut detector, notice);
+        feed(&mut detector, b"\r\n> \r\n  enter to send\r\n");
         assert!(detector.notice_in_final_screen());
+        // Further up: more than FINAL_ROWS rows of output after it.
         for _ in 0..FINAL_ROWS {
-            detector.feed(b"more output\r\n");
+            feed(&mut detector, b"more output\r\n");
         }
         assert!(!detector.notice_in_final_screen(), "quoted further up");
-        assert!(!Diagnostics::default().notice_in_final_screen());
+        // Erased (agy.7 review M2): a clear, then an unrelated error.
+        let mut detector = fresh();
+        feed(&mut detector, notice);
+        feed(&mut detector, b"\x1b[2J\x1b[Hunrelated error\r\n");
+        assert!(!detector.notice_in_final_screen(), "erased");
+        // On the other screen buffer it isn't shown either.
+        let mut detector = fresh();
+        feed(&mut detector, notice);
+        feed(&mut detector, b"\x1b[?1049h\x1b[Hfull-screen app\r\n");
+        assert!(!detector.notice_in_final_screen(), "alternate screen");
+        assert!(!fresh().notice_in_final_screen());
     }
 
     #[test]

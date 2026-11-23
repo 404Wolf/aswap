@@ -465,15 +465,19 @@ fn packet_with(
         };
         // The provider's own answer for this request goes out as it came,
         // labelled with the request's id; never a second, cached reading.
+        // The committed entry's bookkeeping (a provider-limit mark, a
+        // retry-after, backoff) goes with it.
         let (answered, cache) = match fresh {
             Some((nonce, usage)) => (
                 Some(nonce),
                 Cached {
                     usage,
-                    fetched_at: now(),
-                    last_attempt: now(),
-                    next_poll_at: now().saturating_add(usage::TTL),
-                    ..Cached::default()
+                    ..usage::cached(store, &account).unwrap_or_else(|_| Cached {
+                        fetched_at: now(),
+                        last_attempt: now(),
+                        next_poll_at: now().saturating_add(usage::TTL),
+                        ..Cached::default()
+                    })
                 },
             ),
             None => (None, usage::cached_force(store, &account, force)?),
@@ -1694,6 +1698,7 @@ mod tests {
             .unwrap()
             .join("usage-cache.json");
         let mut stale: Cached = store::json_read(&path).unwrap_or_default();
+        stale.error = Some("provider-limit".into());
         stale.usage.windows = vec![usage::Window {
             name: "weekly".into(),
             used_percent: 100.0,
@@ -1717,6 +1722,8 @@ mod tests {
             .unwrap();
         assert_eq!(profile.answered.as_deref(), Some("synthetic-request"));
         assert_eq!(profile.cache.usage.windows[0].used_percent, 20.0);
+        // The owner's bookkeeping goes with the answer (agy.7 review L1).
+        assert_eq!(profile.cache.error.as_deref(), Some("provider-limit"));
         // No provider answer (or no commit): no label, whatever the cache.
         let sent = packet_with(&owner, &request, |_| None).unwrap();
         let profile = sent

@@ -151,8 +151,14 @@ access tokens and quota. Session count never determines account eligibility.
 Interactive auto sessions use a Linux PTY, forwarding terminal I/O and window
 size while preserving native provider UIs. Signal cleanup restores terminal
 mode on normal handled termination. Before default-file activation, private
-live-backups preserve the outgoing login; matching stable identity or exact
-authentication associates provider-rotated auth with its stored profile.
+live-backups preserve the outgoing login (the newest 20 per provider). It is
+saved to a profile only when it is the same account (the authoritative account
+key), aswap put that profile's login live (live-activations), the profile
+still holds it, and the live slot now holds another: only the provider's CLI
+rotates the live slot, so that is its newest login. Without that record, with
+a profile changed since, or with a pending rotation, nothing is saved. A different or unknown account is backed up only, and
+aswap prints the backup and the `aswap restore <provider> <label> --from
+<backup>` command (same account only).
 
 ## Profile quota display and identity
 
