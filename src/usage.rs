@@ -203,6 +203,11 @@ impl Usage {
         {
             return None;
         }
+        // Codex's backend denying ordinary usage is out of usage, whatever
+        // the percentages say: never a candidate, never "room".
+        if self.ordinary_usage == OrdinaryUsage::Denied {
+            return Some(100.0);
+        }
         self.windows.iter().map(|w| w.used_percent).reduce(f64::max)
     }
     /// When the account-wide weekly window resets; model-specific weekly
@@ -1015,17 +1020,39 @@ fn fresh_enough(store: &Store, account: &Account, at: u64, force: bool) -> Resul
 /// confirming a limit notice, where an older reading proves nothing.
 pub fn fresh_read(store: &Store, account: &Account) -> Option<Usage> {
     if crate::coordination::follower(store).ok()? {
-        return None;
+        return fresh_read_from_owner(store, account, || {
+            crate::coordination::poll(store, Some(account), false).map(|_| ())
+        });
     }
-    let refresh = |force: bool| {
-        let _lock = store
-            .lock()
-            .map_err(|_| Failure::new("usage-unavailable"))?;
-        crate::refresh::refresh(store, account, now(), force)
-    };
+    // refresh takes the store lock itself, never across the request.
+    let refresh = |force: bool| crate::refresh::refresh(store, account, now(), force);
     fresh_read_with(store, account, now(), |p| {
         fetch_refreshing(account, p, refresh, |p| fetch(account, p))
     })
+}
+/// A follower's fresh read: it asks the refresh owner to read the account
+/// now (`poll`, a forced sync), and accepts only an observation the owner
+/// made after this call began: newer, on the owner's own clock, than the
+/// one the follower held when it asked. So no clock skew between the two
+/// machines matters, and an owner that answered with its old reading, or
+/// can't be reached, gives none (a live session then keeps waiting).
+pub fn fresh_read_from_owner(
+    store: &Store,
+    account: &Account,
+    poll: impl FnOnce() -> Result<()>,
+) -> Option<Usage> {
+    let path = store
+        .profile(account.provider, &account.label)
+        .ok()?
+        .join("usage-cache.json");
+    let before = {
+        let _lock = store.lock().ok()?;
+        read_cache(&path, true).ok().map_or(0, |c| c.fetched_at)
+    };
+    poll().ok()?;
+    let _lock = store.lock().ok()?;
+    let after = read_cache(&path, true).ok()?;
+    (after.error.is_none() && after.fetched_at > before).then_some(after.usage)
 }
 /// `fresh_read` with the fetch given (tests).
 pub fn fresh_read_with<F>(store: &Store, account: &Account, at: u64, fetcher: F) -> Option<Usage>
@@ -1060,14 +1087,9 @@ pub fn cached_force(store: &Store, account: &Account, force: bool) -> Result<Cac
         return Ok(cached);
     }
 
-    // A refresh rewrites shared state (views, aliases), so it runs under
-    // the store lock; it is due rarely, unlike the fetch around it.
-    let refresh = |force: bool| {
-        let _lock = store
-            .lock()
-            .map_err(|_| Failure::new("usage-unavailable"))?;
-        crate::refresh::refresh(store, account, now(), force)
-    };
+    // A refresh rewrites shared state (views, aliases): it takes the store
+    // lock itself for that, never across the token request.
+    let refresh = |force: bool| crate::refresh::refresh(store, account, now(), force);
     cached_mode_with(store, account, now(), force, |p| {
         fetch_refreshing(account, p, refresh, |p| fetch(account, p))
     })

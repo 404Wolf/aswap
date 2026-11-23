@@ -174,8 +174,10 @@ fn request(provider: Provider, body: &Value) -> std::result::Result<Value, Failu
     }
     Ok(value)
 }
-/// Caller holds the store lock. Only the canonical owner can rotate tokens;
-/// access-only live sessions never hold or compete for the refresh lock.
+/// Only the canonical owner can rotate tokens; access-only live sessions
+/// never hold or compete for the refresh lock. The store lock is taken here
+/// only around reads and writes, never across the token request: a caller
+/// that already holds it (tests) keeps it throughout instead.
 pub fn refresh_with<F>(
     store: &Store,
     account: &Account,
@@ -204,6 +206,17 @@ where
     if account.provider == Provider::Agy {
         return Ok(false);
     }
+    // The store lock for the reads and checks below, released before the
+    // network request unless the caller holds it.
+    let mut store_lock = if store::lock_held() {
+        None
+    } else {
+        Some(
+            store
+                .lock()
+                .map_err(|_| Failure::new("usage-unavailable"))?,
+        )
+    };
     if crate::coordination::follower(store).map_err(|_| Failure::new("usage-unavailable"))?
         || (!active
             && !crate::coordination::is_owner(store)
@@ -277,11 +290,24 @@ where
     if !force && at < previous.next {
         return Ok(false);
     }
+    // The request runs without the store lock (the refresh and identity
+    // locks still exclude every other refresher of this login), so no
+    // supervisor's terminal waits on the network.
+    drop(store_lock.take());
     let result = (|| {
         let body = request_body(account.provider, &old)?;
         let response = request(account.provider, &body)?;
         apply_response(account.provider, &old, &response, at)
     })();
+    let _store_lock = if store::lock_held() {
+        None
+    } else {
+        Some(
+            store
+                .lock()
+                .map_err(|_| Failure::new("usage-unavailable"))?,
+        )
+    };
     let auth = match result {
         Ok(auth) => auth,
         Err(error) => {
@@ -373,13 +399,45 @@ struct Pending {
 }
 fn file_hash(path: &std::path::Path) -> Option<String> {
     let bytes = store::read_private(path).ok()?;
-    Some(
-        ring::digest::digest(&ring::digest::SHA256, &bytes)
-            .as_ref()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect(),
-    )
+    Some(bytes_hash(&bytes))
+}
+fn bytes_hash(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+/// `<auth file>.generations` beside a profile's login: the hashes of the
+/// logins it held before (private by name, never linked into a view).
+fn generations_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(".generations");
+    path.with_file_name(name)
+}
+/// How many replaced logins a profile remembers.
+const GENERATIONS: usize = 32;
+/// Before `path` (a profile's login) is replaced: remember what it held, so
+/// that login is known as an OLDER generation of this account from now on.
+/// Caller holds the account's refresh lock.
+pub(crate) fn retire_generation(path: &std::path::Path) {
+    let Some(old) = file_hash(path) else {
+        return;
+    };
+    let history = generations_path(path);
+    let mut known: Vec<String> = store::json_read(&history).unwrap_or_default();
+    if !known.contains(&old) {
+        known.push(old);
+    }
+    let excess = known.len().saturating_sub(GENERATIONS);
+    known.drain(..excess);
+    let _ = store::json_write(&history, &known);
+}
+/// Whether `bytes` is a login this profile held before and replaced: an
+/// older generation, never to be saved over the current one.
+pub(crate) fn older_generation(path: &std::path::Path, bytes: &[u8]) -> bool {
+    let known: Vec<String> = store::json_read(&generations_path(path)).unwrap_or_default();
+    known.contains(&bytes_hash(bytes))
 }
 /// Write both pending copies; either one is enough. `replaces` is the hash
 /// of the login file the rotation started from.
@@ -421,6 +479,7 @@ fn install(
     path: &std::path::Path,
     auth: &Value,
 ) -> crate::Result<()> {
+    retire_generation(path);
     store::json_write(path, auth)?;
     // The old access token is already revoked: hand the new one to every
     // live run now, before anything else, rather than on each run's tick.
@@ -462,8 +521,21 @@ pub(crate) fn recover_pending(
     };
     let current = Some(current);
     for copy in copies {
-        let pending: Option<Pending> = store::json_read(&copy).ok();
-        let usable = pending.filter(|p| {
+        // Not a file (a disk refusing writes left a directory there): no
+        // login in it to recover or lose.
+        if !std::fs::symlink_metadata(&copy).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        // A copy that can't be read may hold the only valid login: keep it
+        // and refuse to go on (no refresh, no activation) until it can be.
+        let Ok(pending) = store::json_read::<Pending>(&copy) else {
+            eprintln!(
+                "aswap: {}:{} has a pending login that can't be read; keeping it and refusing to use the account until it can",
+                account.provider, account.label
+            );
+            return Err(crate::Error("a pending login can't be read; kept"));
+        };
+        let usable = Some(pending).filter(|p| {
             Some(&p.replaces) == current.as_ref()
                 && serde_json::to_vec(&p.auth)
                     .is_ok_and(|bytes| provider::validate_auth(account.provider, &bytes).is_ok())
@@ -480,16 +552,24 @@ pub(crate) fn recover_pending(
 /// An active local run may refresh even when inactive-profile monitoring is off.
 /// Followers still only pull from the designated owner.
 pub fn for_run(store: &Store, account: &Account) -> std::result::Result<bool, Failure> {
-    let at = crate::now();
+    for_run_with(store, account, crate::now(), request)
+}
+/// `for_run` with the token request given (tests).
+pub fn for_run_with<F>(
+    store: &Store,
+    account: &Account,
+    at: u64,
+    request: F,
+) -> std::result::Result<bool, Failure>
+where
+    F: FnOnce(Provider, &Value) -> std::result::Result<Value, Failure>,
+{
     // Every supervisor asks on its terminal thread every 30 s. Answer "not
     // due" without the store lock, so a slow lock holder never stalls
     // typing; refresh_inner decides again under the lock when it may be due.
     if !may_be_due(store, account, at) {
         return Ok(false);
     }
-    let _lock = store
-        .lock()
-        .map_err(|_| Failure::new("usage-unavailable"))?;
     refresh_inner(store, account, at, false, true, request)
 }
 /// False only when an unforced refresh_inner would certainly do nothing:

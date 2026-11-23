@@ -576,3 +576,38 @@ fn a_rename_never_loses_a_pending_login() {
     );
     assert!(!moved.with_file_name(".credentials.json.pending").exists());
 }
+
+#[test]
+fn the_token_request_runs_without_the_store_lock() {
+    // agy.4 review (4): a supervisor's terminal bookkeeping must never wait
+    // on another process's token request.
+    use fs2::FileExt;
+    let (_t, store, a) = seed();
+    coordination::owner(&store).unwrap();
+    let lock_path = store.root.join("store.lock");
+    // As a supervisor asks: without holding the store lock itself.
+    let rotated = refresh::for_run_with(&store, &a, 1000, |_, _| {
+        // Another process can take the store lock during the request.
+        let other = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(other.try_lock_exclusive().is_ok(), "store lock held across the request");
+        fs2::FileExt::unlock(&other).unwrap();
+        Ok(json!({"access_token":"synthetic-new","refresh_token":"synthetic-refresh-rotated","expires_in":3600}))
+    })
+    .unwrap();
+    assert!(rotated);
+    let saved: Value = store::json_read(
+        &store
+            .profile(a.provider, &a.label)
+            .unwrap()
+            .join(a.provider.auth_file()),
+    )
+    .unwrap();
+    assert_eq!(
+        saved["claudeAiOauth"]["refreshToken"],
+        "synthetic-refresh-rotated"
+    );
+}

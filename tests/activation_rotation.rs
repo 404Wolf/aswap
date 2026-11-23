@@ -12,6 +12,22 @@ fn login(provider: &str, account: &str, value: &str) -> Value {
         json!({"claudeAiOauth":{"accessToken":token,"refreshToken":token}})
     }
 }
+/// A login with an expiry: the newer one may expire sooner.
+fn expiring(provider: &str, account: &str, value: &str, expires_ms: u64) -> Value {
+    let mut auth = login(provider, account, value);
+    if provider == "codex" {
+        auth["last_refresh"] = json!("2026-11-23T00:00:00Z");
+        let claims = json!({"exp": expires_ms / 1000});
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        auth["tokens"]["access_token"] = json!(format!(
+            "synthetic.{}.synthetic",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        ));
+    } else {
+        auth["claudeAiOauth"]["expiresAt"] = json!(expires_ms);
+    }
+    auth
+}
 fn write(path: &Path, data: &Value) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let draft = path.with_extension("review-draft");
@@ -108,45 +124,6 @@ impl Case {
 }
 
 #[test]
-fn an_activation_queued_behind_a_completed_rotation_keeps_the_new_login() {
-    for provider in ["codex", "claude"] {
-        let case = Case::new(provider);
-        let saved = case.saved("outgoing");
-        let rotated = login(provider, "outgoing", "outgoing-rotated");
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(case.root.join("data/aswap/store.lock"))
-            .unwrap();
-        use std::os::fd::AsRawFd;
-        // SAFETY: flock on an open file descriptor.
-        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
-        let mut child = case
-            .command(&["switch", provider, "incoming", "--activate-live"])
-            .spawn()
-            .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "activation waits for the store lock"
-        );
-        // A rotation completes meanwhile: the new login is installed.
-        write(&saved, &rotated);
-        drop(lock);
-        assert!(child.wait().unwrap().success());
-        assert_eq!(
-            Case::read(&saved),
-            rotated,
-            "{provider}: the newer login stays"
-        );
-        assert_eq!(
-            Case::read(&case.default()),
-            login(provider, "incoming", "incoming-old")
-        );
-    }
-}
-
-#[test]
 fn activating_an_account_with_a_pending_rotation_installs_the_rotation() {
     for provider in ["codex", "claude"] {
         let case = Case::new(provider);
@@ -162,5 +139,100 @@ fn activating_an_account_with_a_pending_rotation_installs_the_rotation() {
             "{provider}: never the revoked login"
         );
         assert!(!sidecar.exists());
+    }
+}
+
+#[test]
+fn an_unreadable_pending_rotation_is_kept_and_refuses_the_activation() {
+    for provider in ["codex", "claude"] {
+        let case = Case::new(provider);
+        let saved = case.saved("incoming");
+        let sidecar = saved.with_file_name(format!("{}.pending", case.auth_file));
+        fs::write(&sidecar, b"{ not json").unwrap();
+        let default_before = fs::read(case.default()).unwrap();
+        let out = case
+            .command(&["switch", provider, "incoming", "--activate-live"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{provider}: refused");
+        assert!(sidecar.exists(), "{provider}: the pending copy is kept");
+        assert_eq!(
+            fs::read(case.default()).unwrap(),
+            default_before,
+            "{provider}: nothing activated"
+        );
+    }
+}
+
+/// A real rotation (the refresh installer, a mocked token response) while
+/// a `switch --activate-live` waits for the store lock: the activation runs
+/// after it and must keep the new login, whatever its expiry.
+fn queued_activation_after_rotation(provider: &'static str, expires_in: u64) {
+    use aswap::{
+        coordination, refresh,
+        store::{Account, Store},
+    };
+    let case = Case::new(provider);
+    let store = Store::open(case.root.join("data/aswap")).unwrap();
+    coordination::owner(&store).unwrap();
+    let account = Account {
+        provider: if provider == "codex" {
+            aswap::provider::Provider::Codex
+        } else {
+            aswap::provider::Provider::Claude
+        },
+        label: "outgoing".into(),
+    };
+    // The live default and the profile hold the same login, which expires
+    // far later than the rotated one will.
+    let old = expiring(provider, "outgoing", "outgoing-old", 9_000_000_000_000);
+    write(&case.default(), &old);
+    write(&case.saved("outgoing"), &old);
+    let guard = store.lock().unwrap();
+    let mut child = case
+        .command(&["switch", provider, "incoming", "--activate-live"])
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "activation waits for the store lock"
+    );
+    let at = aswap::now();
+    assert!(
+        refresh::refresh_with(&store, &account, at, true, |_, _| Ok(json!({
+            "access_token": "synthetic-rotated-access",
+            "refresh_token": "synthetic-rotated-refresh",
+            "expires_in": expires_in,
+        })))
+        .unwrap()
+    );
+    let installed = fs::read(case.saved("outgoing")).unwrap();
+    drop(guard);
+    assert!(child.wait().unwrap().success());
+    assert_eq!(
+        fs::read(case.saved("outgoing")).unwrap(),
+        installed,
+        "{provider}: the new login stays"
+    );
+    assert_eq!(
+        Case::read(&case.default()),
+        login(provider, "incoming", "incoming-old")
+    );
+}
+
+#[test]
+fn an_activation_queued_behind_a_completed_rotation_keeps_the_new_login() {
+    for provider in ["codex", "claude"] {
+        queued_activation_after_rotation(provider, 3600);
+    }
+}
+
+#[test]
+fn a_rotation_with_a_shorter_expiry_is_still_the_newer_login() {
+    for provider in ["codex", "claude"] {
+        // The default login expires far later than the rotated one.
+        let case_expiry = 60;
+        queued_activation_after_rotation(provider, case_expiry);
     }
 }

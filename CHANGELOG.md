@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.2-preview.agy.5 (2026-11-23)
+
+agy.4 with its review's changes (t4hf; t2kg's rulings). Not a release.
+
+### Fixed
+- **A follower confirms a limit from its refresh owner.** It asks the owner for a forced read and accepts only an observation newer, on the owner's clock, than the one it held. An owner that can't be reached confirms nothing.
+- **Which login is newer is decided by generation, not by expiry or file times.** A profile remembers the logins it replaced. An outgoing default that is one of them is older and never saved over the current one, even when the rotated token expires sooner. Any other default login is newer, such as a provider refresh in place or a new sign-in.
+- **A pending login that can't be read is kept,** and the account isn't refreshed or activated until it can be.
+- **Claude's screen-only notices** (no transcript known) go through the same fresh-read confirmation as Codex's. Claude's transcript decides as before.
+- **The token request never holds the store lock,** so no supervisor's terminal waits on another's network call. The refresh and identity locks still exclude other refreshers.
+- **A Ctrl-C typed during the exit check** ends it at once and counts nothing, like a signal.
+- **A trigger whose latest read failed is kept** past the 5-minute window. Only a latest answer showing room retires it. A read hung for 60 s is replaced.
+- **An account denied ordinary usage** (`ordinaryUsageAllowed: false`) reads as used up everywhere, so it's never a recovery target.
+
 ## 0.2.2-preview.agy.4 (2026-11-23)
 
 agy.3 with the review's changes (t4hf; t2kg's rulings). Not a release.

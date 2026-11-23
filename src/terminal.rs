@@ -78,6 +78,27 @@ impl Terminal {
             .flag
             .load(std::sync::atomic::Ordering::SeqCst)
     }
+    /// After the provider exited: whether the user pressed Ctrl-C since (the
+    /// raw terminal delivers it as a byte, not a signal). Reads, and drops,
+    /// what was typed meanwhile; nobody else reads it now.
+    pub fn user_interrupted(&self) -> bool {
+        if !self.input_open {
+            return false;
+        }
+        let mut poll = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd, no wait.
+        if unsafe { libc::poll(&mut poll, 1, 0) } <= 0 {
+            return false;
+        }
+        let mut buf = [0u8; 256];
+        // SAFETY: reads into a buffer of its length.
+        let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+        n > 0 && buf[..n as usize].contains(&3)
+    }
     pub fn open() -> Result<Self> {
         let interrupt = Interrupt::new()?;
         let mut master = -1;

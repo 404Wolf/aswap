@@ -75,6 +75,8 @@ pub struct Limits {
     noticed: bool,
     /// Codex: a notice came with a login rotated since launch.
     rotated_notice: bool,
+    /// Reads that answered so far.
+    answers: u64,
 }
 
 /// A Codex quota notice seen on screen, not yet confirmed by quota.
@@ -82,8 +84,9 @@ struct Evidence {
     seen: Instant,
     /// Reads started for it so far.
     attempts: usize,
-    /// Whether any read answered (room or not).
-    read: bool,
+    /// How the last read ended: Some(true) answered (room), Some(false)
+    /// failed or timed out, None none yet.
+    last: Option<bool>,
 }
 
 /// A fresh quota observation: one the provider answered for a read started
@@ -93,7 +96,11 @@ pub type Fresh = Option<usage::Usage>;
 
 struct Reading {
     result: std::sync::mpsc::Receiver<Fresh>,
+    started: Instant,
 }
+/// How long one read may run before it counts as failed and is replaced (a
+/// hung worker must never stop the retries).
+const CODEX_READ_WAIT: Duration = Duration::from_secs(60);
 
 struct PendingScreen {
     evidence: ScreenLimits,
@@ -166,6 +173,7 @@ impl Limits {
             last_read: None,
             noticed: false,
             rotated_notice: false,
+            answers: 0,
         }
     }
 
@@ -174,6 +182,11 @@ impl Limits {
     /// (`screen`: shown since the last check) showed one `UNCONFIRMED` or
     /// more after launch. `fresh` checks subagents even if they were just
     /// scanned, for when the provider is gone.
+    /// Whether the conversation's transcript is known (its limits are read
+    /// there, not from the screen).
+    pub fn transcript_known(&self) -> bool {
+        self.main.is_some()
+    }
     pub fn check(&mut self, tracker: Option<&Tracker>, screen: bool, fresh: bool) -> bool {
         if self.seen {
             return true;
@@ -248,19 +261,19 @@ impl Limits {
                 self.evidence = Some(Evidence {
                     seen: Instant::now(),
                     attempts: 0,
-                    read: false,
+                    last: None,
                 });
             }
         }
+        let answers = self.answers;
         self.confirm_codex(&fresh, &now);
         if gone && self.noticed && !self.screen_seen {
             // Re-check after the exit, whatever the earlier reads said.
             self.evidence.get_or_insert(Evidence {
                 seen: Instant::now(),
                 attempts: 0,
-                read: false,
+                last: None,
             });
-            let mut answered = false;
             let end = Instant::now() + self.exit_verify;
             let mut last: Option<Instant> = None;
             while !self.screen_seen && Instant::now() < end {
@@ -274,9 +287,11 @@ impl Limits {
                     last = Some(Instant::now());
                 }
                 std::thread::sleep(Duration::from_millis(50));
-                answered |= self.collect_codex(&now) == Some(true);
+                self.collect_codex(&now);
             }
-            if !self.screen_seen && !answered {
+            // Any answer since this check began (one taken at its start too)
+            // means the account could be checked.
+            if !self.screen_seen && self.answers == answers {
                 self.screen_seen = true;
             }
         }
@@ -294,7 +309,10 @@ impl Limits {
             evidence.attempts += 1;
         }
         self.last_read = Some(Instant::now());
-        self.reading = Some(Reading { result: fresh() });
+        self.reading = Some(Reading {
+            result: fresh(),
+            started: Instant::now(),
+        });
     }
 
     /// Takes a finished read's answer, if any: Some(true) when it answered,
@@ -306,14 +324,20 @@ impl Limits {
         let result = match reading.result.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Disconnected) => None,
+            // Hung: abandon it (its thread ends on its own) so retries go on.
+            Err(TryRecvError::Empty) if reading.started.elapsed() >= CODEX_READ_WAIT => None,
             Err(TryRecvError::Empty) => return None,
         };
         self.reading = None;
         let Some(usage) = result else {
+            if let Some(evidence) = &mut self.evidence {
+                evidence.last = Some(false);
+            }
             return Some(false);
         };
+        self.answers += 1;
         if let Some(evidence) = &mut self.evidence {
-            evidence.read = true;
+            evidence.last = Some(true);
         }
         if exhausted_now(&usage, now()) {
             self.screen_seen = true;
@@ -339,8 +363,10 @@ impl Limits {
         if self.reading.is_some() {
             return;
         }
-        if evidence.read && evidence.seen.elapsed() >= CODEX_CONFIRM {
-            // Answered and never confirmed: prose, a redraw or a model bucket.
+        if evidence.last == Some(true) && evidence.seen.elapsed() >= CODEX_CONFIRM {
+            // The latest read answered with room after the window: prose, a
+            // redraw or a model bucket. A latest read that failed keeps the
+            // trigger (a lagging limit may still show).
             self.evidence = None;
             return;
         }
@@ -883,6 +909,55 @@ mod codex_tests {
                 "failing {failing}"
             );
         }
+        // A lagging 99% answer, then failures, then the window ends: the
+        // trigger is kept (the latest read failed), and a later exhausted
+        // answer still confirms it (review 7).
+        let mut limits = fresh_limits();
+        script(vec![
+            Some(obs(99.0, at)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(obs(100.0, at)),
+        ]);
+        assert!(!limits.check_codex(true, false, no, fresh, no, || at));
+        for after in [10, 30, 60, 120, 240, 600] {
+            later(&mut limits, after);
+            assert!(!limits.check_codex(false, false, no, fresh, no, || at));
+        }
+        assert!(limits.evidence.is_some(), "kept after a failed latest read");
+        later(&mut limits, 900);
+        assert!(limits.check_codex(false, false, no, never, no, || at));
+
+        // A hung read is replaced after CODEX_READ_WAIT, so retries go on
+        // (review 8).
+        let mut limits = fresh_limits();
+        assert!(!limits.check_codex(true, false, no, stuck, no, || at));
+        limits.reading.as_mut().unwrap().started = Instant::now() - CODEX_READ_WAIT;
+        later(&mut limits, 10);
+        script(vec![Some(obs(100.0, at))]);
+        assert!(!limits.check_codex(false, false, no, fresh, no, || at));
+        assert_eq!(started.get(), 1, "a replacement read started");
+        assert!(limits.check_codex(false, false, no, never, no, || at));
+
+        // A room answer taken as the exit check begins counts as answered:
+        // no fallback (review: the entry call's answer).
+        let mut limits = fresh_limits();
+        limits.reading = Some(Reading {
+            result: ready(Some(obs(20.0, at))),
+            started: Instant::now(),
+        });
+        limits.noticed = true;
+        limits.evidence = Some(Evidence {
+            seen: Instant::now(),
+            attempts: 1,
+            last: None,
+        });
+        script(vec![None; 4]);
+        assert!(!limits.check_codex(false, true, no, fresh, no, || at));
+
         // A signal during that re-read stops it, counting nothing.
         let mut limits = fresh_limits();
         limits.exit_verify = Duration::from_secs(30);

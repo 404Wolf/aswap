@@ -257,6 +257,10 @@ thread_local! {
     /// that can afford to wait retry the whole locked step instead.
     static HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
+/// Whether this thread holds the store lock.
+pub(crate) fn lock_held() -> bool {
+    HELD.with(|held| held.get()) > 0
+}
 const LOCKED_PATIENCE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 pub fn label(value: &str) -> Result<()> {

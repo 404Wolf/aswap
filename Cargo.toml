@@ -1,6 +1,6 @@
 [package]
 name = "aswap"
-version = "0.2.2-preview.agy.4"
+version = "0.2.2-preview.agy.5"
 edition = "2024"
 license = "MIT"
 description = "Private account profiles for Claude Code and Codex CLI"
