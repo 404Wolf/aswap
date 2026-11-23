@@ -63,6 +63,10 @@ pub fn run(
     args: &[String],
     auto: bool,
 ) -> Result<i32> {
+    let checked_args = (provider == Provider::Agy)
+        .then(|| crate::agy::check_args(args))
+        .transpose()?;
+    let args = checked_args.as_ref().map_or(args, |checked| &checked.args);
     let pinned = name;
     // Nothing runs yet: wait out a full disk or a busy store rather than exit.
     store::set_patience(PREPARE_PATIENCE);
@@ -165,7 +169,6 @@ pub fn run(
     })?;
     patiently("recording the session's view", || lease.view(&view.path))?;
     if provider == Provider::Agy {
-        crate::agy::check_args(args)?;
         if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty()) {
             // Once per run: agy and the tools it runs see no session bus, so
             // agy keeps this account's login in the view's own file.
@@ -173,11 +176,6 @@ pub fn run(
                 "aswap: agy runs without the D-Bus session bus (per-account login file); Secret Service is unavailable to tools inside it"
             );
         }
-    }
-    if provider == Provider::Agy && crate::agy::spends_credits(&view.path) {
-        return Err(crate::Error(
-            "agy settings have useG1Credits on (paid AI credits after quota runs out); turn it off first",
-        ));
     }
     if auto_args.as_ref().is_some_and(|a| a.ambiguous) {
         let help =

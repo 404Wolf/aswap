@@ -798,6 +798,7 @@ impl Store {
         self.check_provider(provider)?;
         let mut command = provider.command_with_bin(profile, self.agy_program());
         if provider == Provider::Agy {
+            crate::agy::check_view_settings(profile)?;
             self.apply_agy_environment(&mut command)?;
         }
         Ok(command)

@@ -29,7 +29,13 @@ const FAKE_AGY: &str = r##"import json, os, pathlib, sys, time
 args=sys.argv[1:]
 root=pathlib.Path(next(a.split('=',1)[1] for a in args if a.startswith('--gemini_dir=')))
 args=[a for a in args if not a.startswith('--gemini_dir=')]
-assert 'DBUS_SESSION_BUS_ADDRESS' not in os.environ and 'GEMINI_API_KEY' not in os.environ
+assert not os.environ.keys() & {
+    'DBUS_SESSION_BUS_ADDRESS', 'GEMINI_CLI_HOME', 'GEMINI_API_KEY', 'GOOGLE_API_KEY',
+    'GOOGLE_GEMINI_BASE_URL', 'GOOGLE_APPLICATION_CREDENTIALS', 'GOOGLE_GENAI_USE_VERTEXAI',
+    'GOOGLE_CLOUD_PROJECT', 'GOOGLE_CLOUD_QUOTA_PROJECT', 'GOOGLE_CLOUD_LOCATION', 'AGY_ADC_AUTH',
+    'AGY_LLM_GATEWAY_URL', 'AGY_LLM_GATEWAY_API_KEY', 'AGY_LLM_GATEWAY_HEADERS',
+    'AGY_LLM_GATEWAY_MODELS', 'AGY_LLM_GATEWAY_CA_CERT', 'AGY_LLM_GATEWAY_PROXY_URL',
+}
 control=pathlib.Path(__file__).parent.parent
 if args==['--version']:
     print('1.5.13'); sys.exit(0)
@@ -45,6 +51,10 @@ if args==['-p','/usage','--output-format','json']:
     print(json.dumps({'status':'SUCCESS','conversation_id':'','num_turns':0,
                       'command':{'name':'usage','data':{'groups':[{'buckets':buckets}]}}}))
     sys.exit(0)
+if '--settings' in args:
+    override=pathlib.Path(args[args.index('--settings')+1])
+    assert override.name.startswith('aswap-agy-settings-')
+    assert json.loads(override.read_text())=={'useG1Credits':False,'modelProvider':''}
 config=pathlib.Path(os.environ['XDG_CONFIG_HOME'])
 assert config==root/'.config'
 # Tools agy runs see the user's config (gh here), but agy's own secrets
@@ -117,8 +127,28 @@ fn child_with(
         .env("HOME", t.path().join("home"))
         .env("XDG_DATA_HOME", t.path().join("data"))
         .env("XDG_CONFIG_HOME", t.path().join("config"))
-        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/synthetic/bus")
-        .env("GEMINI_API_KEY", "synthetic-billed")
+        .envs(
+            [
+                "DBUS_SESSION_BUS_ADDRESS",
+                "GEMINI_CLI_HOME",
+                "GEMINI_API_KEY",
+                "GOOGLE_API_KEY",
+                "GOOGLE_GEMINI_BASE_URL",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "GOOGLE_GENAI_USE_VERTEXAI",
+                "GOOGLE_CLOUD_PROJECT",
+                "GOOGLE_CLOUD_QUOTA_PROJECT",
+                "GOOGLE_CLOUD_LOCATION",
+                "AGY_ADC_AUTH",
+                "AGY_LLM_GATEWAY_URL",
+                "AGY_LLM_GATEWAY_API_KEY",
+                "AGY_LLM_GATEWAY_HEADERS",
+                "AGY_LLM_GATEWAY_MODELS",
+                "AGY_LLM_GATEWAY_CA_CERT",
+                "AGY_LLM_GATEWAY_PROXY_URL",
+            ]
+            .map(|key| (key, "synthetic-alternate")),
+        )
         .env("ASWAP_AGY_BIN", &agy)
         .env("ASWAP_AGY_CHILD", name)
         .env("ASWAP_TEST_MODE", mode)
@@ -359,7 +389,7 @@ fn run_child() {
 }
 
 #[test]
-fn options_that_leave_the_view_or_spend_credits_are_refused() {
+fn options_that_leave_the_managed_personal_sign_in_are_refused() {
     let t = tempfile::tempdir().unwrap();
     let paid = t.path().join("paid.json");
     fs::write(&paid, r#"{"useG1Credits": true}"#).unwrap();
@@ -369,6 +399,12 @@ fn options_that_leave_the_view_or_spend_credits_are_refused() {
         args(&["-gemini_dir", "/elsewhere"]),
         args(&["--app_data_dir=other"]),
         args(&["--settings", r#"{"useG1Credits":true}"#]),
+        args(&["--settings", r#"{"UseG1Credits":true}"#]),
+        args(&["--settings", r#"{"u\u017feG1Credits":true}"#]),
+        args(&["--settings", r#"{"useG1Credits":true,"useG1Credits":null}"#]),
+        args(&["--settings", r#"{"modelProvider":"gemini"}"#]),
+        args(&["--settings", r#"{"ModelProvider":"gemini"}"#]),
+        args(&["--settings", "[]"]),
         args(&["-settings="]),
         args(&["--settings", paid.to_str().unwrap()]),
     ] {
@@ -376,11 +412,55 @@ fn options_that_leave_the_view_or_spend_credits_are_refused() {
     }
     for allowed in [
         args(&["--settings", r#"{"toolPermission":"always-proceed"}"#]),
+        args(&["--settings", r#"{"useG1Credits":false,"modelProvider":""}"#]),
         args(&["--model", "synthetic"]),
         args(&["--", "--gemini_dir=/literal/prompt/text"]),
     ] {
         assert!(aswap::agy::check_args(&allowed).is_ok(), "{allowed:?}");
     }
+}
+
+#[test]
+fn agy_checks_persisted_settings_and_hands_off_the_validated_override_copy() {
+    let temporary = tempfile::tempdir().unwrap();
+    let app = temporary.path().join(aswap::agy::APP);
+    fs::create_dir(&app).unwrap();
+    let store = Store::open(temporary.path().join("store")).unwrap();
+    let settings = app.join("settings.json");
+    assert!(store.command(Provider::Agy, temporary.path()).is_ok());
+    fs::write(&settings, r#"{"useG1Credits":false,"modelProvider":""}"#).unwrap();
+    assert!(store.command(Provider::Agy, temporary.path()).is_ok());
+
+    let args = vec![format!("--settings={}", settings.display())];
+    let checked = aswap::agy::check_args(&args).unwrap();
+    let copy = Path::new(checked.args[0].strip_prefix("--settings=").unwrap()).to_owned();
+    assert_ne!(copy, settings);
+    fs::write(
+        &settings,
+        r#"{"modelProvider":"gemini","useG1Credits":true}"#,
+    )
+    .unwrap();
+    assert!(store.command(Provider::Agy, temporary.path()).is_err());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&copy).unwrap()).unwrap(),
+        json!({"useG1Credits":false, "modelProvider":""}),
+    );
+    drop(checked);
+    assert!(!copy.exists());
+}
+
+#[test]
+fn agy_launch_reads_the_validated_settings_file() {
+    let source = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        source.path(),
+        r#"{"useG1Credits":false,"modelProvider":""}"#,
+    )
+    .unwrap();
+    let args = json!(["--settings", source.path()]);
+    let (launches, _, _, _) = child_with("run_child", "launch", &args.to_string());
+    assert_eq!(launches.len(), 1);
+    assert_ne!(launches[0]["args"][1], json!(source.path()));
 }
 
 #[test]

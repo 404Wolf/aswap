@@ -165,10 +165,10 @@ configuration keep the standalone behavior.
   plugin secrets). They don't see a D-Bus session bus, so a tool that keeps
   its secrets in the Secret Service (libsecret) can't reach them from inside
   agy. That is the price of agy's login staying a per-account file.
-- **Refused options.** `--gemini_dir`/`--app_data_dir` (they would leave
-  the view), and `--settings` that turns on `useG1Credits`. A `--settings`
-  file that is a symlink (as Home Manager makes) is refused too, because
-  aswap reads it without following links. Pass the JSON inline instead.
+- **Refused options.** `--gemini_dir` and `--app_data_dir` would leave the
+  view. Saved and session settings must leave credits off and use the
+  personal sign-in. Pass `--settings` as inline JSON or a regular JSON
+  file, which aswap checks and copies privately for the run.
   Flags a wrapper on PATH adds are not seen by aswap.
 - **New config entries.** The view's config directory links the provider's
   config entries when the run starts. A new top-level entry that a tool

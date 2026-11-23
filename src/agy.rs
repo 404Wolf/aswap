@@ -33,14 +33,22 @@ pub const AUTH_FILE: &str = "antigravity-cli/antigravity-oauth-token";
 const PERSONAL: &str = "consumer";
 /// Environment a launch drops: billed sign-ins, and the session bus whose
 /// keyring item every account would share.
-pub const SCRUBBED: [&str; 9] = [
+pub const SCRUBBED: [&str; 17] = [
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
+    "GOOGLE_GEMINI_BASE_URL",
     "GOOGLE_APPLICATION_CREDENTIALS",
     "GOOGLE_GENAI_USE_VERTEXAI",
     "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_QUOTA_PROJECT",
     "GOOGLE_CLOUD_LOCATION",
     "AGY_ADC_AUTH",
+    "AGY_LLM_GATEWAY_URL",
+    "AGY_LLM_GATEWAY_API_KEY",
+    "AGY_LLM_GATEWAY_HEADERS",
+    "AGY_LLM_GATEWAY_MODELS",
+    "AGY_LLM_GATEWAY_CA_CERT",
+    "AGY_LLM_GATEWAY_PROXY_URL",
     "DBUS_SESSION_BUS_ADDRESS",
     "GEMINI_CLI_HOME",
 ];
@@ -383,11 +391,18 @@ pub fn sweep_finished_views(runtimes: &Path) {
     }
 }
 
-/// Options aswap refuses on an agy launch: ones that would move agy off its
-/// view (another root or app directory), and session settings that turn on
-/// paid credits (`--settings`, inline JSON or a file). Go flags take one or
-/// two dashes.
-pub fn check_args(args: &[String]) -> Result<()> {
+pub struct CheckedArgs {
+    pub args: Vec<String>,
+    settings_files: Vec<tempfile::NamedTempFile>,
+}
+
+/// Check managed-root flags and personal-only session settings. File-based
+/// overrides are handed to agy through private copies held for the run.
+pub fn check_args(args: &[String]) -> Result<CheckedArgs> {
+    let mut checked = CheckedArgs {
+        args: args.to_vec(),
+        settings_files: Vec::new(),
+    };
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -410,38 +425,72 @@ pub fn check_args(args: &[String]) -> Result<()> {
             }
             "settings" => {
                 let value = inline
-                    .map(str::to_owned)
-                    .or_else(|| args.get(i + 1).cloned());
-                let settings: Option<Value> = value.as_deref().and_then(|v| {
-                    serde_json::from_str(v)
-                        .ok()
-                        .or_else(|| store::json_read(Path::new(v)).ok())
-                });
-                let Some(settings) = settings else {
-                    return Err(Error(
-                        "agy --settings must be inline JSON or a regular JSON file (not a symlink) so aswap can check it",
-                    ));
-                };
-                if settings.get("useG1Credits").and_then(Value::as_bool) == Some(true) {
-                    return Err(Error(
-                        "agy --settings turns on useG1Credits (paid AI credits); refused",
-                    ));
+                    .or_else(|| args.get(i + 1).map(String::as_str))
+                    .ok_or(Error("agy --settings needs a JSON object or regular file"))?;
+                if let Ok(settings) = serde_json::from_str(value) {
+                    check_settings(&settings)?;
+                } else {
+                    let settings = store::json_read(Path::new(value)).map_err(|_| {
+                        Error("agy --settings needs a JSON object or regular JSON file without symlinks")
+                    })?;
+                    check_settings(&settings)?;
+                    let mut file = tempfile::Builder::new()
+                        .prefix("aswap-agy-settings-")
+                        .suffix(".json")
+                        .tempfile()
+                        .safe("cannot create checked agy settings")?;
+                    serde_json::to_writer(file.as_file_mut(), &settings)
+                        .safe("cannot write checked agy settings")?;
+                    let path = file
+                        .path()
+                        .to_str()
+                        .ok_or(Error("invalid checked agy settings path"))?;
+                    if inline.is_some() {
+                        checked.args[i] = format!("--settings={path}");
+                    } else {
+                        checked.args[i + 1] = path.to_owned();
+                    }
+                    checked.settings_files.push(file);
+                }
+                if inline.is_none() {
+                    i += 1;
                 }
             }
             _ => {}
         }
         i += 1;
     }
+    Ok(checked)
+}
+
+fn check_settings(settings: &Value) -> Result<()> {
+    let settings = settings
+        .as_object()
+        .ok_or(Error("agy settings must be a JSON object"))?;
+    for (key, value) in settings {
+        // Match settings regardless of case, as Go's JSON field matching does.
+        match key.to_uppercase().as_str() {
+            "USEG1CREDITS" if value.as_bool() != Some(false) => {
+                return Err(Error("agy settings must leave useG1Credits off"));
+            }
+            "MODELPROVIDER" if value.as_str() != Some("") => {
+                return Err(Error(
+                    "agy settings must leave modelProvider unset or empty",
+                ));
+            }
+            _ => (),
+        }
+    }
     Ok(())
 }
 
-/// A paid fallback agy offers once quota runs out; aswap never launches
-/// with it on.
-pub fn spends_credits(view: &Path) -> bool {
-    store::json_read::<Value>(&view.join(APP).join("settings.json"))
-        .ok()
-        .and_then(|s| s.get("useG1Credits").and_then(Value::as_bool))
-        == Some(true)
+pub(crate) fn check_view_settings(view: &Path) -> Result<()> {
+    let path = view.join(APP).join("settings.json");
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => check_settings(&store::json_read(&path)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(Error("cannot inspect agy settings")),
+    }
 }
 
 /// agy's quota notices, as normalize() leaves them (lowercase, trimmed).
