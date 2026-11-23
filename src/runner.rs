@@ -95,7 +95,7 @@ pub fn run(
     } else {
         crate::models::Gate::default()
     };
-    if auto {
+    if auto && provider != Provider::Agy {
         models.resolve(store, &account)?;
         let (mut entries, settings) = patiently("reading usage", || observations(store, provider))?;
         entries.retain(|(a, _)| settings.allows(&a.label, pinned));
@@ -108,25 +108,31 @@ pub fn run(
         let state = store.load()?;
         if auto {
             let settings = state.auto.get(&provider).cloned().unwrap_or_default();
-            let entries =
-                models.filter_cached(store, &account.label, entries_from_cache(store, provider)?);
-            trace_candidates("launch", &entries, settings.threshold, now(), None);
-            let current = state
-                .active
-                .get(&provider)
-                .filter(|label| pinned.is_none() && !settings.allows(label, None))
-                .map_or(account.label.as_str(), String::as_str);
-            let at = now();
-            let best =
-                usage::choose(current, &entries, &settings, at, false, pinned).or_else(|| {
-                    pinned
-                        .is_none()
-                        .then(|| usage::prefer_at_launch(current, &entries, &settings, at))
-                        .flatten()
-                });
-            if let Some(best) = best {
-                account = best.clone();
-                fallback = quota_fallback(&account, &entries, &settings, at, pinned);
+            // Agy's buckets do not establish quota for the selected model.
+            if provider != Provider::Agy {
+                let entries = models.filter_cached(
+                    store,
+                    &account.label,
+                    entries_from_cache(store, provider)?,
+                );
+                trace_candidates("launch", &entries, settings.threshold, now(), None);
+                let current = state
+                    .active
+                    .get(&provider)
+                    .filter(|label| pinned.is_none() && !settings.allows(label, None))
+                    .map_or(account.label.as_str(), String::as_str);
+                let at = now();
+                let best =
+                    usage::choose(current, &entries, &settings, at, false, pinned).or_else(|| {
+                        pinned
+                            .is_none()
+                            .then(|| usage::prefer_at_launch(current, &entries, &settings, at))
+                            .flatten()
+                    });
+                if let Some(best) = best {
+                    account = best.clone();
+                    fallback = quota_fallback(&account, &entries, &settings, at, pinned);
+                }
             }
             if !settings.allows(&account.label, pinned) {
                 return Err(crate::Error(
@@ -174,7 +180,8 @@ pub fn run(
         ));
     }
     if auto_args.as_ref().is_some_and(|a| a.ambiguous) {
-        let help = crate::session::option_help(provider, &view.path, args);
+        let help =
+            crate::session::option_help(provider, store.command(provider, &view.path)?, args);
         auto_args = Some(crate::session::AutoArgs::parse_with_help(
             provider, args, &help,
         )?);
@@ -222,7 +229,8 @@ pub fn run(
     // A follower learns of a rotation from the owner, a moment after the old
     // token stopped working: give it this long to arrive before deciding
     // that a login error means the account itself has expired.
-    let settle = if crate::coordination::follower(store).unwrap_or(false) {
+    let follower = crate::coordination::follower(store).unwrap_or(false);
+    let settle = if follower {
         AUTH_SETTLE
     } else {
         Duration::ZERO
@@ -241,8 +249,8 @@ pub fn run(
         // until the transcript shows which ones are live.
         let resumed = switches > 0;
         let mut quiet = Quiet::new(tracker.as_ref());
-        let mut limits = crate::limits::Limits::new(tracker.as_ref());
-        let mut cmd = provider.command(&view.path);
+        let mut limits = crate::limits::Limits::new(tracker.as_ref()).with_owner_quota(follower);
+        let mut cmd = store.command(provider, &view.path)?;
         cmd.args(&launch_args);
         let supervisor = std::process::id();
         // SAFETY: only async-signal-safe syscalls run after fork. Close the
@@ -986,44 +994,38 @@ fn limit_seen(
     terminal: Option<&Terminal>,
     moment: Moment,
 ) -> bool {
-    let fresh = moment.exited.is_some();
+    let exited = moment.exited.is_some();
+    let failed = moment.exited == Some(true);
+    let cancelled = || terminal.is_some_and(|t| t.interrupted() || t.user_interrupted());
+    let fresh = || {
+        // Off the terminal thread: a provider read, never a cache.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (store, account) = (store.clone(), account.clone());
+        std::thread::spawn(move || {
+            let reading = usage::fresh_read(&store, &account);
+            let _ = tx.send(reading);
+        });
+        rx
+    };
+    let notice =
+        screen.notice || (failed && terminal.is_some_and(Terminal::notice_in_final_screen));
+    if account.provider == Provider::Agy {
+        limits.observe_agy_quota(notice, failed, fresh, cancelled);
+        return false;
+    }
     // A notice counts once a fresh quota read confirms it.
-    let gate = |limits: &mut crate::limits::Limits, notice: bool, rotated: bool| {
-        limits.final_notice = terminal.is_some_and(Terminal::notice_in_final_screen);
+    let gate = |limits: &mut crate::limits::Limits, rotated: bool| {
         limits.check_codex(
             notice,
-            moment.exited == Some(true),
+            failed,
             || rotated && rotated_since(store, account, moment.launched),
-            || {
-                // Off the terminal thread: a provider read, never a cache.
-                let (tx, rx) = std::sync::mpsc::channel();
-                let (root, account) = (store.root.clone(), account.clone());
-                std::thread::spawn(move || {
-                    let reading = Store::open(root)
-                        .ok()
-                        .and_then(|store| usage::fresh_read(&store, &account));
-                    let _ = tx.send(reading);
-                });
-                rx
-            },
-            || terminal.is_some_and(|t| t.interrupted() || t.user_interrupted()),
+            fresh,
+            cancelled,
             now,
         )
     };
     if account.provider == Provider::Codex {
-        return gate(limits, screen.notice, true);
-    }
-    if account.provider == Provider::Agy {
-        let since = |at: Instant, wall: std::time::SystemTime| {
-            let typed = terminal
-                .and_then(|t| t.input_activity().last_forwarded)
-                .is_some_and(|input| input > at);
-            let worked = tracker
-                .and_then(crate::session::Tracker::transcript)
-                .is_some_and(|path| crate::agy::worked_since(&path, wall));
-            typed || worked
-        };
-        return limits.check_agy(screen.notice, moment.exited == Some(true), since);
+        return gate(limits, true);
     }
     if account.provider != Provider::Claude {
         return screen.notice;
@@ -1031,10 +1033,10 @@ fn limit_seen(
     // Claude's transcript records its limits; the screen alone (no known
     // transcript) is only a trigger, confirmed by a fresh quota read like
     // Codex's, so a quoted notice never switches a healthy account.
-    if tracker.is_some() && limits.check(tracker, false, fresh) {
+    if tracker.is_some() && limits.check(tracker, false, exited) {
         return true;
     }
-    if !limits.transcript_known() && gate(limits, screen.notice, false) {
+    if !limits.transcript_known() && gate(limits, false) {
         return true;
     }
     limits.check_quota(
@@ -1774,7 +1776,7 @@ fn background_poll(store: &Store) -> Option<std::thread::JoinHandle<bool>> {
     if !crate::coordination::follower(store).unwrap_or(false) {
         return None;
     }
-    let store = Store::open(store.root.clone()).ok()?;
+    let store = store.clone();
     Some(std::thread::spawn(move || {
         crate::coordination::poll(&store, None, false).is_ok()
     }))
@@ -1782,7 +1784,7 @@ fn background_poll(store: &Store) -> Option<std::thread::JoinHandle<bool>> {
 /// A follower's poll that skips the 30s schedule: after a login error the
 /// owner may hold a rotated token this follower has not received yet.
 fn immediate_poll(store: &Store) -> Option<std::thread::JoinHandle<bool>> {
-    let store = Store::open(store.root.clone()).ok()?;
+    let store = store.clone();
     Some(std::thread::spawn(move || {
         crate::coordination::poll(&store, None, true).is_ok()
     }))
@@ -1803,27 +1805,18 @@ pub fn observations(
             state.auto.get(&provider).cloned().unwrap_or_default(),
         )
     };
-    let at = now();
     let entries = accounts
         .into_iter()
-        .map(|a| {
-            usage::cached(store, &a).map(|c| {
-                // agy accounts have no quota reading; one not marked limited
-                // counts as available (see crate::agy::assumed).
-                let c = if a.provider == Provider::Agy {
-                    crate::agy::assumed(c, at)
-                } else {
-                    c
-                };
-                (a, c)
-            })
-        })
+        .map(|a| usage::cached(store, &a).map(|cache| (a, cache)))
         .collect::<Result<Vec<_>>>()?;
     Ok((entries, settings))
 }
 /// Auto changes the launcher's active account. Existing isolated runs retain
 /// their profile; explicit --activate-live swaps the default Claude login.
 pub fn tick(store: &Store, provider: Provider, activate_live: bool) -> Result<Option<String>> {
+    if provider == Provider::Agy {
+        return Ok(None);
+    }
     {
         let _lock = store.lock()?;
         if !store.load()?.auto.get(&provider).is_some_and(|s| s.enabled) {
@@ -1867,13 +1860,6 @@ fn entries_from_cache(store: &Store, provider: Provider) -> Result<Vec<(Account,
                 store::json_read(&path)?
             } else {
                 usage::Cached::default()
-            };
-            // As in `observations`: an agy account not marked limited counts
-            // as available.
-            let cache = if provider == Provider::Agy {
-                crate::agy::assumed(cache, now())
-            } else {
-                cache
             };
             Ok((a, cache))
         })

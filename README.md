@@ -146,12 +146,14 @@ like Claude and Codex logins: `aswap add agy <label>` after signing in with
   `aswap add agy` only reads `~/.gemini` and never writes it.
 - **Resuming.** A failover resumes the same conversation with
   `--conversation <id>`. aswap reads the id from the lock agy holds for it.
-- **Limits.** There's no documented quota API, so agy accounts show no
-  usage, and one that hit its quota is left out for an hour.
-  - A quota notice counts at once after the first 15 s of a run.
-  - Before that (it may be a redraw on resume), it counts when agy exits
-    with a failure, or when the 15 s pass with no new conversation activity
-    and no typing.
+- **Usage.** Antigravity CLI 1.1.11 and later versions in the 1.x series
+  report model quota buckets through their headless `/usage` command,
+  without starting a model turn. aswap uses the profile's current access
+  token in a temporary directory with AI credits off. If that token has
+  expired, quota is unavailable and any previously measured windows are
+  last known. Run `aswap run agy --account <label>` to let agy renew the login, or
+  sign in again and re-add the profile if the login can no longer refresh.
+  Then use `aswap usage agy --account <label> --refresh` to check quota again.
 - **Only on the refresh owner's machine, never synced.** `aswap add agy`
   refuses while an aswap process of another build runs, because older
   builds can't read state.json with an agy account in it.

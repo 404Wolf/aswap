@@ -8,6 +8,7 @@ use std::{
     io::{Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    process::Command,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -235,9 +236,175 @@ impl Default for State {
 }
 /// The longest accepted `switch_interval_seconds`.
 pub const MAX_SWITCH_INTERVAL: u64 = 3600;
+#[derive(Clone)]
 pub struct Store {
     pub root: PathBuf,
     pub(crate) sync_policy_path: PathBuf,
+    scope: StoreScope,
+}
+#[derive(Clone)]
+enum StoreScope {
+    Standalone,
+    Legacy,
+    Agy {
+        private_root: PathBuf,
+        program: Option<PathBuf>,
+    },
+}
+
+/// Routes providers to their configured stores before any account data is read.
+/// With no override, the original single-store layout remains available.
+pub struct StoreView {
+    legacy: PathBuf,
+    agy: Option<AgyStore>,
+}
+
+#[derive(Default, Deserialize)]
+struct Config {
+    #[serde(default)]
+    stores: ProviderStores,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderStores {
+    agy: Option<AgyConfig>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgyConfig {
+    root: Option<PathBuf>,
+    private_root: Option<PathBuf>,
+    program: Option<PathBuf>,
+}
+
+struct AgyStore {
+    root: PathBuf,
+    private_root: PathBuf,
+    program: Option<PathBuf>,
+}
+
+fn store_config() -> Result<Config> {
+    // Home Manager may install the declarative config as a symlink.
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(Store::config_dir()?.join("config.toml"))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(_) => return Err(Error("cannot read aswap configuration")),
+    };
+    if !file
+        .metadata()
+        .safe("cannot inspect aswap configuration")?
+        .is_file()
+    {
+        return Err(Error("aswap configuration must be a regular TOML file"));
+    }
+    const MAX_CONFIG: u64 = 1024 * 1024;
+    let mut text = String::new();
+    file.take(MAX_CONFIG + 1)
+        .read_to_string(&mut text)
+        .safe("cannot read aswap configuration")?;
+    if text.len() as u64 > MAX_CONFIG {
+        return Err(Error("aswap configuration exceeds size limit"));
+    }
+    toml::from_str(&text).safe("invalid aswap store configuration")
+}
+
+impl StoreView {
+    pub fn from_env() -> Result<Self> {
+        let legacy = Store::root_from_env()?;
+        let configured = store_config()?.stores.agy.unwrap_or_default();
+        let private = std::env::var_os("ASWAP_AGY_PRIVATE_ROOT")
+            .map(PathBuf::from)
+            .or(configured.private_root);
+        let agy = match std::env::var_os("ASWAP_AGY_HOME")
+            .map(PathBuf::from)
+            .or(configured.root)
+        {
+            Some(root) => {
+                if let Some(program) = &configured.program {
+                    absolute_path(program)?;
+                }
+                let private = match private {
+                    Some(path) => path,
+                    None => crate::provider::home()?.join(".local/state/agy-private"),
+                };
+                // Component comparison also handles trailing slashes and ".".
+                if root.starts_with(&legacy) || legacy.starts_with(&root) {
+                    return Err(Error("agy and legacy account stores must be separate"));
+                }
+                if private.starts_with(&root)
+                    || root.starts_with(&private)
+                    || private.starts_with(&legacy)
+                    || legacy.starts_with(&private)
+                {
+                    return Err(Error(
+                        "agy private state and account stores must be separate",
+                    ));
+                }
+                Some(AgyStore {
+                    root,
+                    private_root: private,
+                    program: configured.program,
+                })
+            }
+            None if private.is_some() || configured.program.is_some() => {
+                return Err(Error(
+                    "agy private_root and program require a separate agy store root",
+                ));
+            }
+            None => None,
+        };
+        Ok(Self { legacy, agy })
+    }
+
+    pub fn legacy(&self) -> Result<Store> {
+        let scope = if self.agy.is_some() {
+            StoreScope::Legacy
+        } else {
+            StoreScope::Standalone
+        };
+        let store = Store::open_scoped(self.legacy.clone(), scope)?;
+        if store.legacy_compatibility() {
+            let _lock = store.lock()?;
+            crate::refresh::require_legacy_pending_free(&store)?;
+        }
+        Ok(store)
+    }
+
+    pub fn for_provider(&self, provider: Provider) -> Result<Store> {
+        if provider == Provider::Agy
+            && let Some(AgyStore {
+                root,
+                private_root,
+                program,
+            }) = &self.agy
+        {
+            return Store::open_scoped(
+                root.clone(),
+                StoreScope::Agy {
+                    private_root: private_root.clone(),
+                    program: program.clone(),
+                },
+            );
+        }
+        self.legacy()
+    }
+
+    pub fn stores(&self, filter: Option<Provider>) -> Result<Vec<Store>> {
+        if let Some(provider) = filter {
+            return Ok(vec![self.for_provider(provider)?]);
+        }
+        let mut stores = vec![self.legacy()?];
+        if self.agy.is_some() {
+            stores.push(self.for_provider(Provider::Agy)?);
+        }
+        Ok(stores)
+    }
 }
 /// A held file lock; `.1` marks the store lock, counted in `HELD`.
 pub struct Guard(File, bool);
@@ -276,8 +443,7 @@ pub fn label(value: &str) -> Result<()> {
     }
     Ok(())
 }
-/// Reject symlinks at every existing path component, including ancestors.
-pub fn no_links(path: &Path) -> Result<()> {
+fn absolute_path(path: &Path) -> Result<()> {
     if !path.is_absolute()
         || path
             .components()
@@ -287,6 +453,11 @@ pub fn no_links(path: &Path) -> Result<()> {
             "an absolute path without parent traversal is required",
         ));
     }
+    Ok(())
+}
+/// Reject symlinks at every existing path component, including ancestors.
+pub fn no_links(path: &Path) -> Result<()> {
+    absolute_path(path)?;
     let mut p = PathBuf::new();
     for part in path.components() {
         p.push(part);
@@ -488,19 +659,141 @@ impl Store {
         Ok(base.join("aswap"))
     }
     pub fn from_env() -> Result<Self> {
-        Self::open(Self::root_from_env()?)
+        StoreView::from_env()?.legacy()
     }
     pub fn open(root: PathBuf) -> Result<Self> {
+        Self::open_scoped(root, StoreScope::Standalone)
+    }
+    fn open_scoped(root: PathBuf, scope: StoreScope) -> Result<Self> {
         no_links(&root)?;
         // Public checkout must never become an account store, even by accident.
         if root.ancestors().any(|p| p.join(".git").exists()) {
             return Err(Error("account stores must live outside a Git checkout"));
         }
+        let sync_policy_path = if let StoreScope::Agy { private_root, .. } = &scope {
+            no_links(private_root)?;
+            if private_root
+                .ancestors()
+                .any(|path| path.join(".git").exists())
+            {
+                return Err(Error("agy private state must live outside a Git checkout"));
+            }
+            private_root.join("config/aswap/sync-policy.json")
+        } else {
+            Self::config_dir()?.join("sync-policy.json")
+        };
         private_dir(&root)?;
         Ok(Self {
             root,
-            sync_policy_path: Self::config_dir()?.join("sync-policy.json"),
+            sync_policy_path,
+            scope,
         })
+    }
+
+    pub fn agy_private_root(&self) -> Option<&Path> {
+        match &self.scope {
+            StoreScope::Agy { private_root, .. } => Some(private_root),
+            _ => None,
+        }
+    }
+
+    pub fn agy_program(&self) -> Option<&Path> {
+        match &self.scope {
+            StoreScope::Agy { program, .. } => program.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// This root is shared with Claude/Codex binaries predating agy support.
+    pub fn legacy_compatibility(&self) -> bool {
+        matches!(self.scope, StoreScope::Legacy)
+    }
+
+    pub fn provider_home(&self, provider: Provider) -> Result<PathBuf> {
+        self.check_provider(provider)?;
+        if let Some(root) = self.agy_private_root() {
+            let home = root.join("home/.gemini");
+            no_links(&home)?;
+            Ok(home)
+        } else {
+            provider.current_home()
+        }
+    }
+
+    /// Set agy's inherited directories while keeping XDG_CONFIG_HOME on
+    /// the per-launch view selected by Provider::command.
+    pub fn apply_agy_environment(&self, command: &mut Command) -> Result<()> {
+        if let Some(root) = self.agy_private_root() {
+            // Reuse the data home installed by the standalone wrapper when
+            // its parent is private. A custom store may have a shared parent.
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid takes no arguments.
+            let uid = unsafe { libc::geteuid() };
+            let data = self.root.parent().filter(|p| {
+                self.root.file_name().is_some_and(|name| name == "aswap")
+                    && fs::metadata(p).is_ok_and(|m| m.uid() == uid && m.mode() & 0o7777 == 0o700)
+            });
+            let data = match data {
+                Some(path) => path.to_owned(),
+                None => {
+                    let path = root.join("data");
+                    private_dir(&path)?;
+                    path
+                }
+            };
+            for (key, path) in [
+                ("HOME", root.join("home")),
+                ("XDG_CACHE_HOME", root.join("cache")),
+                ("XDG_STATE_HOME", root.join("state")),
+                ("XDG_RUNTIME_DIR", root.join("runtime")),
+            ] {
+                private_dir(&path)?;
+                command.env(key, path);
+            }
+            command.env("XDG_DATA_HOME", data);
+        }
+        Ok(())
+    }
+
+    pub fn command(&self, provider: Provider, profile: &Path) -> Result<Command> {
+        self.check_provider(provider)?;
+        let mut command = provider.command_with_bin(profile, self.agy_program());
+        if provider == Provider::Agy {
+            self.apply_agy_environment(&mut command)?;
+        }
+        Ok(command)
+    }
+
+    fn check_provider(&self, provider: Provider) -> Result<()> {
+        match (&self.scope, provider) {
+            (StoreScope::Legacy, Provider::Agy)
+            | (StoreScope::Agy { .. }, Provider::Claude | Provider::Codex) => {
+                Err(Error("account provider is assigned to a different store"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn check_state(&self, state: &State) -> Result<()> {
+        for provider in state
+            .accounts
+            .iter()
+            .map(|a| a.provider)
+            .chain(state.active.keys().copied())
+            .chain(state.auto.keys().copied())
+        {
+            self.check_provider(provider)?;
+        }
+        if matches!(self.scope, StoreScope::Legacy)
+            && (!state.foreign.accounts.is_empty()
+                || !state.foreign.active.is_empty()
+                || !state.foreign.auto.is_empty())
+        {
+            return Err(Error(
+                "legacy account store contains an unsupported provider",
+            ));
+        }
+        Ok(())
     }
     pub fn lock(&self) -> Result<Guard> {
         let path = self.root.join("store.lock");
@@ -541,6 +834,7 @@ impl Store {
         } else {
             State::default()
         };
+        self.check_state(&state)?;
         for a in &state.accounts {
             label(&a.label)?;
         }
@@ -556,9 +850,11 @@ impl Store {
         Ok(state)
     }
     pub fn save(&self, state: &State) -> Result<()> {
+        self.check_state(state)?;
         json_write(&self.root.join("state.json"), state)
     }
     pub fn profile(&self, provider: Provider, name: &str) -> Result<PathBuf> {
+        self.check_provider(provider)?;
         label(name)?;
         Ok(self
             .root
@@ -574,6 +870,7 @@ impl Store {
             .join(format!("{}.json", provider.as_str()))
     }
     pub fn sessions(&self, provider: Provider, name: &str) -> Result<PathBuf> {
+        self.check_provider(provider)?;
         label(name)?;
         Ok(self
             .root

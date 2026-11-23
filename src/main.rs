@@ -2,12 +2,13 @@ use aswap::{
     Error, Result, Safe, now,
     provider::{self, Provider},
     runner,
-    store::{self, Store},
+    store::{self, Store, StoreView},
     usage,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     io::{self, IsTerminal, Write},
     time::Duration,
 };
@@ -16,7 +17,8 @@ use std::{
 #[command(
     name = "aswap",
     version,
-    about = "Private account profiles for Claude Code and Codex CLI"
+    about = "Private account profiles for Claude Code, Codex CLI, and Antigravity CLI",
+    after_long_help = "To reuse a separate Antigravity store, set [stores.agy] in the aswap config.toml. Set root to the absolute account store path, including its final /aswap component when migrating a standalone store. Set private_root to its private state directory (defaults to ~/.local/state/agy-private). ASWAP_AGY_HOME and ASWAP_AGY_PRIVATE_ROOT override those paths. Optional program pins the absolute native agy binary for that store."
 )]
 struct Cli {
     #[arg(
@@ -179,56 +181,148 @@ fn output(value: &Value, structured: bool, pretty: String) -> Result<()> {
     let mut out = io::stdout().lock();
     writeln!(out, "{text}").safe("cannot write output")
 }
-fn snapshot(store: &Store, filter: Option<Provider>, refresh: bool) -> Result<Value> {
-    let (accounts, active, settings, switch_interval) = {
-        let _lock = store.lock()?;
-        let state = store.load()?;
-        (
-            state.accounts,
-            state.active,
-            state.auto,
-            state.switch_interval_seconds,
-        )
-    };
-    let mut rows = Vec::new();
-    for a in accounts
-        .into_iter()
-        .filter(|a| filter.is_none_or(|p| p == a.provider))
-    {
-        let c = if refresh {
-            usage::cached(store, &a)?
-        } else {
-            let _lock = store.lock()?;
-            let path = store
-                .profile(a.provider, &a.label)?
-                .join("usage-cache.json");
-            if path.exists() {
-                store::json_read(&path)?
-            } else {
-                usage::Cached::default()
-            }
-        };
-        let duplicates = duplicate_labels(store, &a)?;
-        let reserved = settings
-            .get(&a.provider)
-            .is_some_and(|s| !s.allows(&a.label, None));
-        // One clock reading, so status, reason and age agree.
-        let at = now();
-        rows.push(json!({"provider":a.provider,"label":a.label,"active":active.get(&a.provider)==Some(&a.label),"reserved":reserved,"remaining_percent":c.used(at).map(|u|100.0-u),"usage":c.usage,"fetched_at":c.fetched_at,"next_poll_at":c.next_poll_at,"duplicates":duplicates,"usage_error":c.diagnostic(),"http_status":c.http_status,"retry_after_seconds":c.retry_after,"last_attempt":c.last_attempt,"usage_status":if c.used(at).is_some(){"ok"}else if c.error.is_some(){"backoff"}else{"unknown"},"usage_reason":c.reason(at),"age_seconds":c.age(at)}));
-    }
-    let coordination = aswap::coordination::settings(store)?;
-    // An unreadable reset log must not hide accounts; the monitor still
-    // refuses to redeem until it is readable again.
-    let usage_resets = {
-        let _lock = store.lock()?;
-        aswap::reset::load(store)
-            .map(|log| log.summary())
-            .unwrap_or_else(|err| json!({"error": err.to_string()}))
-    };
-    Ok(
-        json!({"schema_version":1,"accounts":rows,"auto":settings.iter().map(|(p, a)| (p.as_str().to_owned(), a.public_json())).collect::<serde_json::Map<_, _>>(),"codex_usage_resets":usage_resets,"switch_interval_seconds":switch_interval,"credential_mode":if coordination.owner {"refresh-owner"}else if coordination.host.is_some(){"access-only-follower"}else{"refresh-disabled"},"last_sync":coordination.last_sync,"sync":aswap::coordination::status(store)?}),
-    )
+struct SnapshotRow<'a> {
+    store: &'a Store,
+    account: store::Account,
+    cached: usage::Cached,
+    duplicates: Vec<String>,
+    active: bool,
+    reserved: bool,
 }
+
+impl SnapshotRow<'_> {
+    fn json(&self, at: u64) -> Value {
+        let Self {
+            account,
+            cached: c,
+            duplicates,
+            active,
+            reserved,
+            ..
+        } = self;
+        let used = c.used(at);
+        // Agy observations are per family. Keep their individual windows
+        // without publishing a percentage for the whole account.
+        let remaining_percent = if account.provider == Provider::Agy {
+            None
+        } else {
+            used.map(|u| 100.0 - u)
+        };
+        let usage_status = if used.is_some() {
+            "ok"
+        } else if c.error.is_some() {
+            "backoff"
+        } else {
+            "unknown"
+        };
+        json!({
+            "provider":account.provider,"label":account.label,"active":active,"reserved":reserved,
+            "remaining_percent":remaining_percent,"usage":c.usage,"fetched_at":c.fetched_at,
+            "next_poll_at":c.next_poll_at,"duplicates":duplicates,"usage_error":c.diagnostic(),
+            "http_status":c.http_status,"retry_after_seconds":c.retry_after,"last_attempt":c.last_attempt,
+            "usage_status":usage_status,"usage_reason":c.reason(at),"age_seconds":c.age(at)
+        })
+    }
+}
+
+struct Snapshot<'a> {
+    metadata: &'a Store,
+    rows: Vec<SnapshotRow<'a>>,
+    auto: BTreeMap<Provider, store::Auto>,
+    switch_interval: u64,
+    at: u64,
+}
+
+impl Snapshot<'_> {
+    fn json(&self) -> Result<Value> {
+        let metadata = self.metadata;
+        let coordination = aswap::coordination::settings(metadata)?;
+        // A corrupt reset log should still leave accounts visible.
+        let usage_resets = {
+            let _lock = metadata.lock()?;
+            aswap::reset::load(metadata)
+                .map(|log| log.summary())
+                .unwrap_or_else(|err| json!({"error": err.to_string()}))
+        };
+        let auto: serde_json::Map<_, _> = self
+            .auto
+            .iter()
+            .map(|(p, a)| (p.as_str().to_owned(), a.public_json()))
+            .collect();
+        let accounts: Vec<_> = self.rows.iter().map(|row| row.json(self.at)).collect();
+        Ok(json!({
+            "schema_version":1,"accounts":accounts,"auto":auto,
+            "codex_usage_resets":usage_resets,"switch_interval_seconds":self.switch_interval,
+            "credential_mode":if coordination.owner {"refresh-owner"}else if coordination.host.is_some(){"access-only-follower"}else{"refresh-disabled"},
+            "last_sync":coordination.last_sync,"sync":aswap::coordination::status(metadata)?
+        }))
+    }
+}
+
+fn snapshot(stores: &[Store], filter: Option<Provider>, refresh: bool) -> Result<Snapshot<'_>> {
+    let mut result = Snapshot {
+        metadata: &stores[0],
+        rows: Vec::new(),
+        auto: BTreeMap::new(),
+        switch_interval: 0,
+        at: now(),
+    };
+    for (index, store) in stores.iter().enumerate() {
+        let state = {
+            let _lock = store.lock()?;
+            store.load()?
+        };
+        // StoreView orders the legacy root first when aggregating. Its
+        // settings continue to supply the existing scalar metadata fields.
+        if index == 0 {
+            result.switch_interval = state.switch_interval_seconds;
+        }
+        for account in state
+            .accounts
+            .into_iter()
+            .filter(|a| filter.is_none_or(|p| p == a.provider))
+        {
+            let cached = if refresh {
+                usage::cached(store, &account)?
+            } else {
+                let _lock = store.lock()?;
+                let path = store
+                    .profile(account.provider, &account.label)?
+                    .join("usage-cache.json");
+                if path.exists() {
+                    store::json_read(&path)?
+                } else {
+                    usage::Cached::default()
+                }
+            };
+            result.rows.push(SnapshotRow {
+                store,
+                active: state.active.get(&account.provider) == Some(&account.label),
+                reserved: state
+                    .auto
+                    .get(&account.provider)
+                    .is_some_and(|s| !s.allows(&account.label, None)),
+                duplicates: duplicate_labels(store, &account)?,
+                account,
+                cached,
+            });
+        }
+        result.auto.extend(state.auto);
+    }
+    result.at = now();
+    Ok(result)
+}
+
+fn output_snapshot(snapshot: &Snapshot<'_>, structured: bool, compact: bool) -> Result<()> {
+    let value = snapshot.json()?;
+    let pretty = if structured {
+        String::new()
+    } else {
+        terminal_text(snapshot, compact)?
+    };
+    output(&value, structured, pretty)
+}
+
 fn duplicate_labels(store: &Store, account: &store::Account) -> Result<Vec<String>> {
     let _lock = store.lock()?;
     Ok(aswap::identity::duplicates(
@@ -237,56 +331,33 @@ fn duplicate_labels(store: &Store, account: &store::Account) -> Result<Vec<Strin
         &store.load()?.accounts,
     ))
 }
-fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> {
-    let accounts = value["accounts"].as_array().unwrap();
-    let mut identities = Vec::new();
-    let mut caches = Vec::new();
-    let mut duplicates = Vec::new();
-    for row in accounts {
-        let provider: Provider =
-            serde_json::from_value(row["provider"].clone()).safe("invalid provider")?;
-        let _lock = store.lock()?;
-        identities.push(
-            aswap::identity::read(
-                provider,
-                &store.profile(provider, row["label"].as_str().unwrap())?,
-            )
-            .unwrap_or_default(),
-        );
-        caches.push(usage::Cached {
-            usage: serde_json::from_value(row["usage"].clone()).safe("invalid usage")?,
-            fetched_at: row["fetched_at"].as_u64().unwrap_or(0),
-            error: row["usage_error"]["class"].as_str().map(|class| {
-                match class {
-                    "expired-or-invalid-token" => "http-401",
-                    "forbidden" => "http-403",
-                    "rate-limited" => "http-429",
-                    other => other,
-                }
-                .to_owned()
-            }),
-            http_status: row["http_status"]
-                .as_u64()
-                .and_then(|n| u16::try_from(n).ok()),
-            retry_after: row["retry_after_seconds"].as_u64(),
-            next_poll_at: row["next_poll_at"].as_u64().unwrap_or(0),
-            ..Default::default()
-        });
-        duplicates.push(
-            serde_json::from_value::<Vec<String>>(row["duplicates"].clone()).unwrap_or_default(),
-        );
-    }
-    let rows: Vec<_> = accounts
+fn terminal_text(snapshot: &Snapshot<'_>, compact: bool) -> Result<String> {
+    let identities = snapshot
+        .rows
         .iter()
-        .enumerate()
-        .map(|(i, r)| aswap::display::Row {
-            provider: r["provider"].as_str().unwrap(),
-            label: r["label"].as_str().unwrap(),
-            active: r["active"] == true,
-            reserved: r["reserved"] == true,
-            identity: &identities[i],
-            cached: &caches[i],
-            duplicates: &duplicates[i],
+        .map(|row| {
+            let account = &row.account;
+            let store = row.store;
+            let _lock = store.lock()?;
+            Ok(aswap::identity::read(
+                account.provider,
+                &store.profile(account.provider, &account.label)?,
+            )
+            .unwrap_or_default())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rows: Vec<_> = snapshot
+        .rows
+        .iter()
+        .zip(&identities)
+        .map(|(row, identity)| aswap::display::Row {
+            provider: row.account.provider.as_str(),
+            label: &row.account.label,
+            active: row.active,
+            reserved: row.reserved,
+            identity,
+            cached: &row.cached,
+            duplicates: &row.duplicates,
         })
         .collect();
     let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
@@ -302,17 +373,15 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
         .filter(|w| *w > 0)
         .or_else(|| std::env::var("COLUMNS").ok()?.parse().ok())
         .unwrap_or(80);
-    let auto: std::collections::BTreeMap<Provider, store::Auto> =
-        serde_json::from_value(value["auto"].clone()).unwrap_or_default();
     let default = store::Auto::default();
-    // agy's policy line shows only once an agy account exists.
-    let agy = value["accounts"]
-        .as_array()
-        .is_some_and(|rows| rows.iter().any(|r| r["provider"] == "agy"));
+    let has_agy = snapshot
+        .rows
+        .iter()
+        .any(|r| r.account.provider == Provider::Agy);
     let policies: Vec<_> = [Provider::Claude, Provider::Codex, Provider::Agy]
         .into_iter()
-        .filter(|p| *p != Provider::Agy || agy)
-        .map(|provider| (provider, auto.get(&provider).unwrap_or(&default)))
+        .filter(|p| *p != Provider::Agy || has_agy)
+        .map(|provider| (provider, snapshot.auto.get(&provider).unwrap_or(&default)))
         .map(|(provider, a)| aswap::display::Policy {
             provider: provider.as_str(),
             enabled: a.enabled,
@@ -322,12 +391,14 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
         })
         .collect();
     let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    let mut text = aswap::display::render_with(&rows, &policies, compact, width, color, now());
-    if !rows.is_empty()
-        && let Some(seconds) = value["switch_interval_seconds"].as_u64()
-    {
+    let mut text =
+        aswap::display::render_with(&rows, &policies, compact, width, color, snapshot.at);
+    if !rows.is_empty() {
         text.push_str(if compact { "\n" } else { "\n\n" });
-        text.push_str(&aswap::display::switch_interval_lines(seconds, width, color).join("\n"));
+        text.push_str(
+            &aswap::display::switch_interval_lines(snapshot.switch_interval, width, color)
+                .join("\n"),
+        );
     }
     Ok(text)
 }
@@ -393,14 +464,18 @@ fn execute(cli: Cli) -> Result<i32> {
         output(&value, cli.json, report.text())?;
         return Ok(i32::from(report.incomplete()));
     }
-    let store = Store::from_env()?;
+    let view = StoreView::from_env()?;
     match cli.command {
         Action::Gc { .. } => unreachable!(),
         Action::Sessions { provider } => {
-            let rows: Vec<_> = aswap::live::sessions(&store)?
-                .into_iter()
-                .filter(|r| provider.is_none_or(|p| r["provider"] == p.as_str()))
-                .collect();
+            let mut rows = Vec::new();
+            for store in view.stores(provider)? {
+                rows.extend(
+                    aswap::live::sessions(&store)?
+                        .into_iter()
+                        .filter(|r| provider.is_none_or(|p| r["provider"] == p.as_str())),
+                );
+            }
             let pretty = if rows.is_empty() {
                 "No local running sessions".into()
             } else {
@@ -423,6 +498,7 @@ fn execute(cli: Cli) -> Result<i32> {
             output(&json!({"sessions": rows}), cli.json, pretty)?;
         }
         Action::Add { provider, label } => {
+            let store = view.for_provider(provider)?;
             let a = provider::add(&store, provider, &label)?;
             let duplicates = duplicate_labels(&store, &a)?;
             let warning = if duplicates.is_empty() {
@@ -439,29 +515,18 @@ fn execute(cli: Cli) -> Result<i32> {
                 format!("Added {provider}:{label}{warning}"),
             )?;
         }
-        Action::List { provider } => {
-            let v = snapshot(&store, provider, false)?;
-            let pretty = if cli.json {
-                String::new()
-            } else {
-                terminal_text(&store, &v, true)?
-            };
-            output(&v, cli.json, pretty)?;
-        }
-        Action::Status { provider } => {
-            let v = snapshot(&store, provider, true)?;
-            let pretty = if cli.json {
-                String::new()
-            } else {
-                terminal_text(&store, &v, false)?
-            };
-            output(&v, cli.json, pretty)?;
+        Action::List { provider } | Action::Status { provider } => {
+            let compact = matches!(cli.command, Action::List { .. });
+            let stores = view.stores(provider)?;
+            let snapshot = snapshot(&stores, provider, !compact)?;
+            output_snapshot(&snapshot, cli.json, compact)?;
         }
         Action::Switch {
             provider,
             label,
             activate_live,
         } => {
+            let store = view.for_provider(provider)?;
             let a = provider::switch(&store, provider, &label, activate_live)?;
             output(
                 &json!({"active":a,"live_activated":activate_live}),
@@ -470,6 +535,7 @@ fn execute(cli: Cli) -> Result<i32> {
             )?;
         }
         Action::Remove { provider, label } => {
+            let store = view.for_provider(provider)?;
             let duplicates = provider::remove(&store, provider, &label)?;
             let detail = if duplicates.is_empty() {
                 String::new()
@@ -488,6 +554,7 @@ fn execute(cli: Cli) -> Result<i32> {
             from,
             force,
         } => {
+            let store = view.for_provider(provider)?;
             let (account, replaced) =
                 aswap::provider::restore(&store, provider, &label, &from, force)?;
             output(
@@ -506,6 +573,7 @@ fn execute(cli: Cli) -> Result<i32> {
             )?;
         }
         Action::Rename { provider, old, new } => {
+            let store = view.for_provider(provider)?;
             let account = aswap::rename::rename(&store, provider, &old, &new)?;
             output(
                 &json!({"renamed":account,"old_label":old}),
@@ -518,48 +586,50 @@ fn execute(cli: Cli) -> Result<i32> {
             account,
             refresh,
         } => {
-            let v = if let Some(provider) = provider {
+            if provider.is_none() && account.is_some() {
+                return Err(Error("--account requires a provider"));
+            }
+            let stores = view.stores(provider)?;
+            let selected = if let Some(provider) = provider {
+                let store = &stores[0];
                 let a = {
                     let _lock = store.lock()?;
                     store.account(&store.load()?, provider, account.as_deref())?
                 };
-                usage::cached_force(&store, &a, refresh)?;
-                let mut v = snapshot(&store, Some(provider), false)?;
-                v["accounts"]
-                    .as_array_mut()
-                    .unwrap()
-                    .retain(|r| r["label"] == a.label);
-                v
+                usage::cached_force(store, &a, refresh)?;
+                Some(a.label)
             } else {
-                if account.is_some() {
-                    return Err(Error("--account requires a provider"));
+                for store in &stores {
+                    let accounts = {
+                        let _lock = store.lock()?;
+                        store.load()?.accounts
+                    };
+                    for a in accounts {
+                        usage::cached_force(store, &a, refresh)?;
+                    }
                 }
-                let accounts = {
-                    let _lock = store.lock()?;
-                    store.load()?.accounts
-                };
-                for a in accounts {
-                    usage::cached_force(&store, &a, refresh)?;
-                }
-                snapshot(&store, None, false)?
+                None
             };
-            let pretty = if cli.json {
-                String::new()
-            } else {
-                terminal_text(&store, &v, false)?
-            };
-            output(&v, cli.json, pretty)?;
+            let mut snapshot = snapshot(&stores, provider, false)?;
+            if let Some(label) = selected {
+                snapshot.rows.retain(|row| row.account.label == label);
+            }
+            output_snapshot(&snapshot, cli.json, false)?;
         }
         Action::Run {
             provider,
             account,
             args,
             auto,
-        } => return runner::run(&store, provider, account.as_deref(), &args, auto),
+        } => {
+            let store = view.for_provider(provider)?;
+            return runner::run(&store, provider, account.as_deref(), &args, auto);
+        }
         Action::Auto {
             global: Some(AutoGlobal::SwitchInterval { seconds }),
             ..
         } => {
+            let store = view.legacy()?;
             let _lock = store.lock()?;
             let mut state = store.load()?;
             if let Some(seconds) = seconds {
@@ -583,6 +653,7 @@ fn execute(cli: Cli) -> Result<i32> {
             let (Some(provider), Some(action)) = (provider, action) else {
                 unreachable!("clap requires a provider and an action without a subcommand")
             };
+            let store = view.for_provider(provider)?;
             if matches!(
                 action,
                 AutoAction::Threshold
@@ -733,6 +804,7 @@ fn execute(cli: Cli) -> Result<i32> {
             serve,
             watch,
         } => {
+            let store = view.legacy()?;
             if serve {
                 aswap::coordination::serve(&store, watch)?;
             } else if off {
@@ -768,7 +840,8 @@ fn execute(cli: Cli) -> Result<i32> {
             }
         }
         Action::Waybar { once, interval } => loop {
-            let v = waybar(&snapshot(&store, None, true)?);
+            let stores = view.stores(None)?;
+            let v = waybar(&snapshot(&stores, None, true)?.json()?);
             let mut out = io::stdout().lock();
             if let Err(e) = writeln!(out, "{v}").and_then(|_| out.flush()) {
                 if e.kind() == io::ErrorKind::BrokenPipe {

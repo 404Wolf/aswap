@@ -428,13 +428,19 @@ fn known_profiles<'de, D: serde::Deserializer<'de>>(
     Ok(profiles)
 }
 fn packet(store: &Store, request: &Request) -> Result<Packet> {
-    packet_with(store, request, |account| usage::fresh_read(store, account))
+    packet_with(
+        store,
+        request,
+        |account| usage::fresh_read(store, account),
+        |account, force| usage::cached_force(store, account, force),
+    )
 }
-/// `packet` with the provider read for a nonce request given (tests).
+/// `packet` with the two usage paths supplied (tests).
 fn packet_with(
     store: &Store,
     request: &Request,
     fresh_read: impl Fn(&Account) -> Option<usage::Usage>,
+    ordinary_read: impl Fn(&Account, bool) -> Result<Cached>,
 ) -> Result<Packet> {
     if request.protocol != 1 {
         return Err(Error("sync: version-mismatch"));
@@ -456,34 +462,38 @@ fn packet_with(
         let force = request
             .force
             .as_ref()
-            .is_some_and(|a| a.provider == account.provider && a.label == account.label);
-        // A follower asking with a nonce gets a reading made for its request
-        // or none: a provider read now, never a cache.
-        let fresh = match (&request.nonce, force) {
-            (Some(nonce), true) => fresh_read(&account).map(|u| (nonce.clone(), u)),
-            _ => None,
-        };
-        // The provider's own answer for this request goes out as it came,
-        // labelled with the request's id; never a second, cached reading.
-        // The committed entry's bookkeeping (a provider-limit mark, a
-        // retry-after, backoff) goes with it.
-        let (answered, cache) = match fresh {
-            Some((nonce, usage)) => (
-                Some(nonce),
-                Cached {
-                    usage,
-                    ..usage::cached(store, &account).unwrap_or_else(|_| Cached {
-                        fetched_at: now(),
-                        last_attempt: now(),
-                        next_poll_at: now().saturating_add(usage::TTL),
-                        ..Cached::default()
-                    })
-                },
-            ),
-            None => (None, usage::cached_force(store, &account, force)?),
-        };
+            .is_some_and(|a| same_label(a, &account));
+        let reading = request
+            .nonce
+            .as_ref()
+            .filter(|_| force)
+            .and_then(|nonce| fresh_read(&account).map(|usage| (nonce.clone(), usage)));
+        let ordinary = request
+            .nonce
+            .is_none()
+            .then(|| ordinary_read(&account, force))
+            .transpose()?;
         let _lock = store.lock()?;
         let path = store.profile(account.provider, &account.label)?;
+        // A nonce exchange has one provider read. Carry the persisted caches
+        // in its full sync packet without polling any other account or
+        // retrying the target through the ordinary sync path.
+        let mut cache = match ordinary {
+            Some(cache) => cache,
+            None => {
+                let cache_path = path.join("usage-cache.json");
+                if cache_path.exists() {
+                    store::json_read(&cache_path)?
+                } else {
+                    Cached::default()
+                }
+            }
+        };
+        let answered = reading.map(|(nonce, usage)| {
+            // Keep the stored bookkeeping and echo the raw reading for this request.
+            cache.usage = usage;
+            nonce
+        });
         let auth: Value = store::json_read(&path.join(account.provider.auth_file()))?;
         let config = if account.provider == Provider::Claude && path.join(".claude.json").exists() {
             crate::shared::account_config(&store::json_read(&path.join(".claude.json"))?)
@@ -503,6 +513,9 @@ fn packet_with(
         issued_at: now(),
         profiles,
     })
+}
+fn same_label(left: &Account, right: &Account) -> bool {
+    left.provider == right.provider && left.label == right.label
 }
 #[cfg(test)]
 fn install(store: &Store, packet: Packet, settings: &mut Settings) -> Result<(usize, bool)> {
@@ -681,12 +694,13 @@ fn remote_error(status: std::process::ExitStatus, first: &'static str) -> Error 
         _ => "sync: remote-exit; see classified remote stderr above",
     })
 }
+const EXCHANGE_WAIT: Duration = Duration::from_secs(90);
+/// Give the exchange time to finish, including draining its response and
+/// acquiring the follower's store lock to accept the packet.
+pub(crate) const FRESH_REPLY_WAIT: Duration = EXCHANGE_WAIT.saturating_add(Duration::from_secs(15));
+
 fn exchange(host: &str, request: &Request) -> Result<Packet> {
-    exchange_command(
-        ssh(host, "aswap sync --serve")?,
-        request,
-        Duration::from_secs(90),
-    )
+    exchange_command(ssh(host, "aswap sync --serve")?, request, EXCHANGE_WAIT)
 }
 fn exchange_command(mut command: Command, request: &Request, timeout: Duration) -> Result<Packet> {
     let mut child = command
@@ -840,26 +854,13 @@ fn poll_inner(
             nonce: nonce.map(str::to_owned),
         },
     );
-    // The reading made for this request, before the packet is installed.
-    let result = result.inspect(|packet| {
-        *answered = packet
-            .profiles
-            .iter()
-            .find(|p| {
-                nonce.is_some()
-                    && p.answered.as_deref() == nonce
-                    && force.is_some_and(|f| {
-                        f.provider == p.account.provider && f.label == p.account.label
-                    })
-            })
-            .map(|p| p.cache.usage.clone());
-    });
     let _lock = store.lock()?;
     if settings(store)?.host.as_deref() != Some(host.as_str()) {
         return Err(Error("sync: configuration changed during sync"));
     }
-    match result.and_then(|packet| accept(store, packet)) {
+    match result.and_then(|packet| accept_answer(store, packet, force.zip(nonce))) {
         Ok(done) => {
+            *answered = done.answer;
             log(store, "poll", done.event, None, Some(done.count));
             if immediate && done.duplicates > 0 {
                 eprintln!(
@@ -901,6 +902,7 @@ struct Accepted {
     count: usize,
     duplicates: usize,
     event: &'static str,
+    answer: Option<usage::Usage>,
 }
 /// Two overlapping exchanges are at most this far apart on the owner's clock.
 /// A packet older than the installed one by more than this means the owner's
@@ -909,6 +911,14 @@ const OVERLAP: u64 = 300;
 /// Caller holds the store lock and has checked the host. Installs a packet
 /// unless a newer one already landed.
 fn accept(store: &Store, packet: Packet) -> Result<Accepted> {
+    accept_answer(store, packet, None)
+}
+
+fn accept_answer(
+    store: &Store,
+    packet: Packet,
+    request: Option<(&Account, &str)>,
+) -> Result<Accepted> {
     let policy = SyncPolicy::read(&store.sync_policy_path)?;
     policy.check_local(store)?;
     let mut settings = settings(store)?;
@@ -927,8 +937,18 @@ fn accept(store: &Store, packet: Packet) -> Result<Accepted> {
                 .count(),
             duplicates: 0,
             event: "stale",
+            answer: None,
         });
     }
+    let answer = request.and_then(|(account, nonce)| {
+        packet.profiles.iter().find_map(|p| {
+            (same_label(account, &p.account)
+                && account.provider != Provider::Agy
+                && policy.permits(account)
+                && p.answered.as_deref() == Some(nonce))
+            .then(|| p.cache.usage.clone())
+        })
+    });
     let duplicates = duplicate_count_permitted(&packet, &policy);
     settings.failures = 0;
     settings.last_issued = packet.issued_at;
@@ -937,6 +957,7 @@ fn accept(store: &Store, packet: Packet) -> Result<Accepted> {
         count,
         duplicates,
         event: if changed { "installed" } else { "unchanged" },
+        answer,
     })
 }
 /// Caller holds the store lock.
@@ -1248,12 +1269,7 @@ pub fn spawn_sync(store: &Store) {
     if !follower(store).unwrap_or(false) {
         return;
     }
-    let (Ok(watching), Ok(polling)) = (
-        Store::open(store.root.clone()),
-        Store::open(store.root.clone()),
-    ) else {
-        return;
-    };
+    let (watching, polling) = (store.clone(), store.clone());
     std::thread::spawn(move || {
         while follower(&watching).unwrap_or(false) {
             let _ = watch(&watching);
@@ -1692,6 +1708,27 @@ mod tests {
         // agy.6 review: the nonce labels the provider's own answer.
         let (_t, owner) = seed();
         let account = owner.load().unwrap().accounts[0].clone();
+        let sibling = Account {
+            provider: Provider::Claude,
+            label: "other".into(),
+        };
+        let mut state = owner.load().unwrap();
+        state.accounts.insert(0, sibling.clone());
+        owner.save(&state).unwrap();
+        let sibling_path = owner.profile(sibling.provider, &sibling.label).unwrap();
+        store::json_write(
+            &sibling_path.join(sibling.provider.auth_file()),
+            &json!({"claudeAiOauth":{"accessToken":"synthetic-sibling"}}),
+        )
+        .unwrap();
+        store::json_write(
+            &sibling_path.join("usage-cache.json"),
+            &Cached {
+                last_attempt: 42,
+                ..Cached::default()
+            },
+        )
+        .unwrap();
         // The owner's cache says 100%, the provider answers 20% now.
         let path = owner
             .profile(account.provider, &account.label)
@@ -1714,7 +1751,22 @@ mod tests {
             force: Some(account.clone()),
             nonce: Some("synthetic-request".into()),
         };
-        let sent = packet_with(&owner, &request, |_| Some(answer.clone())).unwrap();
+        let ordinary_read = |_: &Account, _| panic!("nonce exchange must not run ordinary reads");
+        let sent = packet_with(
+            &owner,
+            &request,
+            |target| {
+                assert!(same_label(target, &account));
+                Some(answer.clone())
+            },
+            ordinary_read,
+        )
+        .unwrap();
+        assert_eq!(sent.profiles.len(), 2);
+        let sibling = &sent.profiles[0];
+        assert_eq!(sibling.account.label, "other");
+        assert_eq!(sibling.cache.last_attempt, 42);
+        assert!(sibling.answered.is_none());
         let profile = sent
             .profiles
             .iter()
@@ -1725,7 +1777,16 @@ mod tests {
         // The owner's bookkeeping goes with the answer (agy.7 review L1).
         assert_eq!(profile.cache.error.as_deref(), Some("provider-limit"));
         // No provider answer (or no commit): no label, whatever the cache.
-        let sent = packet_with(&owner, &request, |_| None).unwrap();
+        let sent = packet_with(
+            &owner,
+            &request,
+            |target| {
+                assert!(same_label(target, &account));
+                None
+            },
+            ordinary_read,
+        )
+        .unwrap();
         let profile = sent
             .profiles
             .iter()
@@ -1789,6 +1850,33 @@ mod tests {
             .unwrap();
             assert!(fresh.is_none(), "{answered:?}");
         }
+        let (_t, follower) = follower_store();
+        let fresh = poll_fresh_with(&follower, &account, |_, request| {
+            let mut response = packet(request.nonce.clone(), 100.0);
+            response.profiles[0].account.label = "other".into();
+            Ok(response)
+        })
+        .unwrap();
+        assert!(fresh.is_none());
+
+        let (_t, follower) = follower_store();
+        policy(&follower, json!({"deny":["codex:work"]}));
+        let fresh = poll_fresh_with(&follower, &account, |_, request| {
+            Ok(packet(request.nonce.clone(), 100.0))
+        })
+        .unwrap();
+        assert!(fresh.is_none());
+
+        let (_t, follower) = follower_store();
+        poll_with(&follower, None, true, |_, _| Ok(packet(None, 20.0))).unwrap();
+        let last_issued = settings(&follower).unwrap().last_issued;
+        let fresh = poll_fresh_with(&follower, &account, |_, request| {
+            let mut response = packet(request.nonce.clone(), 100.0);
+            response.issued_at = last_issued - 1;
+            Ok(response)
+        })
+        .unwrap();
+        assert!(fresh.is_none());
         // The owner can't be reached: none.
         let (_t, follower) = follower_store();
         assert!(

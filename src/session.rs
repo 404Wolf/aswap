@@ -693,14 +693,17 @@ impl Tracker {
 }
 
 /// Help is never printed, and runs with a private config home and bounded output/time.
-pub fn option_help(provider: Provider, view: &Path, args: &[String]) -> String {
+pub fn option_help(
+    provider: Provider,
+    mut command: std::process::Command,
+    args: &[String],
+) -> String {
     use std::{
         io::Read,
         os::unix::process::CommandExt,
         process::Stdio,
         time::{Duration, Instant},
     };
-    let mut command = provider.command(view);
     if provider == Provider::Codex
         && args
             .first()

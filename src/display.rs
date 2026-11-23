@@ -78,7 +78,10 @@ fn next_reset(c: &Cached, now: u64) -> Option<&Window> {
         .filter(|w| w.resets_at.is_some_and(|at| at > now))
         .min_by_key(|w| w.resets_at)
 }
-fn window_name(name: &str, duration: Option<u64>) -> String {
+fn window_name(provider: &str, name: &str, duration: Option<u64>) -> String {
+    if provider == "agy" {
+        return clean(name);
+    }
     match (name, duration) {
         ("five_hour", _) | (_, Some(300)) => "session".into(),
         ("seven_day", _) => "weekly".into(),
@@ -126,6 +129,11 @@ fn problem(row: &Row<'_>, now: u64) -> Option<(String, Option<String>)> {
         "refresh-invalid-grant" | "expired-or-invalid-token" => {
             (format!("login expired ({detail})"), Some(readd))
         }
+        "agy-usage-access-expired" => (
+            "Agy access token expired".into(),
+            Some(format!("run this Agy account to renew access, or {readd}")),
+        ),
+        "agy-usage-auth-unavailable" => ("Agy quota access unavailable".into(), Some(readd)),
         "forbidden" => (format!("usage forbidden ({detail}) · {retry}"), None),
         "rate-limited" => (
             format!("usage API rate-limited ({detail}{after}) · {retry}"),
@@ -305,8 +313,12 @@ pub fn render_with(
     // One window-name column across every account, so bars line up.
     let name_width = rows
         .iter()
-        .flat_map(|r| &r.cached.usage.windows)
-        .map(|w| window_name(&w.name, w.duration_minutes).chars().count())
+        .flat_map(|r| r.cached.usage.windows.iter().map(move |w| (r.provider, w)))
+        .map(|(provider, w)| {
+            window_name(provider, &w.name, w.duration_minutes)
+                .chars()
+                .count()
+        })
         .max()
         .unwrap_or(0);
     let mut lines = Vec::new();
@@ -410,7 +422,7 @@ fn render_row(
         }
     }
     let summary = if compact && !collapsed {
-        window_summary(c, now)
+        window_summary(row.provider, c, now)
     } else {
         String::new()
     };
@@ -480,7 +492,7 @@ fn render_row(
             };
             format!(
                 "    Next reset: {} in {}{date}{stale}",
-                window_name(&w.name, w.duration_minutes),
+                window_name(row.provider, &w.name, w.duration_minutes),
                 duration(at - now)
             )
         }
@@ -500,7 +512,7 @@ fn render_row(
         if c.fetched_at != 0 && !c.usage.windows.is_empty() {
             lines.extend(paint.lines(
                 "2",
-                &format!("    last known: {}", window_summary(c, now)),
+                &format!("    last known: {}", window_summary(row.provider, c, now)),
                 width,
             ));
         }
@@ -511,7 +523,10 @@ fn render_row(
         lines.extend(paint.lines("2", "    quota unknown", width));
     }
     for w in windows {
-        let name = format!("{:<name_width$}", window_name(&w.name, w.duration_minutes));
+        let name = format!(
+            "{:<name_width$}",
+            window_name(row.provider, &w.name, w.duration_minutes)
+        );
         let pct = format!("{:>4} used", percent(w.used_percent));
         let when = reset(w, now);
         let limit = if w.used_percent >= 100.0 && w.resets_at.is_none_or(|r| r > now) {
@@ -555,7 +570,7 @@ fn render_row(
     }
 }
 /// One-line window summary for list rows and long-broken logins.
-fn window_summary(c: &Cached, now: u64) -> String {
+fn window_summary(provider: &str, c: &Cached, now: u64) -> String {
     let parts: Vec<String> = c
         .usage
         .windows
@@ -563,7 +578,7 @@ fn window_summary(c: &Cached, now: u64) -> String {
         .map(|w| {
             let mut s = format!(
                 "{} {} used",
-                window_name(&w.name, w.duration_minutes),
+                window_name(provider, &w.name, w.duration_minutes),
                 percent(w.used_percent)
             );
             if w.duration_minutes == Some(10080)

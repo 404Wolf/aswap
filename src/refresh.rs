@@ -203,7 +203,9 @@ where
 {
     // agy refreshes its own login; aswap never calls Google's token endpoint
     // (see crate::agy).
-    if account.provider == Provider::Agy {
+    // 0.2.1 ignores our pending sidecars. Leave canonical rotation to the
+    // existing owner while its ordinary processes share this store.
+    if account.provider == Provider::Agy || store.legacy_compatibility() {
         return Ok(false);
     }
     if crate::coordination::follower(store).map_err(|_| Failure::new("usage-unavailable"))?
@@ -258,7 +260,7 @@ where
         .join(account.provider.auth_file());
     // A rotation whose final write failed left the only valid refresh token
     // in the pending sidecar: install it before anything else.
-    recover_pending(store, account, &path).map_err(|_| Failure::new("usage-unavailable"))?;
+    recover_pending(store, account).map_err(|_| Failure::new("usage-unavailable"))?;
     // Re-read only after acquiring the identity lock; another refresher may have won.
     let old: Value = store::json_read(&path).map_err(|_| Failure::new("usage-unavailable"))?;
     // What a pending copy of a rotation replaces (see write_pending).
@@ -338,8 +340,12 @@ where
     // The provider has already invalidated the old refresh token, so the
     // new login must survive a failed write: it goes to pending copies
     // first, and the next refresh installs one if the main write fails.
-    write_pending(store, account, replaces, &auth);
-    install(store, account, &path, &auth).map_err(|_| Failure::new("usage-unavailable"))?;
+    write_pending(store, account, replaces, &old, &auth);
+    let aliases = aliases(store, account).map_err(|_| Failure::new("usage-unavailable"))?;
+    // A label could have been added while the request was in flight.
+    require_clear_aliases(store, &aliases).map_err(|_| Failure::new("usage-unavailable"))?;
+    install_login(store, account, &aliases, &auth)
+        .map_err(|_| Failure::new("usage-unavailable"))?;
     // A token that lives under twice the margin would be due again soon, or
     // on every check: the next unforced refresh waits half its lifetime, and
     // never less than a minute, even for a token that is already expired.
@@ -368,21 +374,21 @@ fn pending_path(path: &std::path::Path) -> std::path::PathBuf {
 /// A second pending copy in `$XDG_RUNTIME_DIR` (a tmpfs on systemd hosts),
 /// so a full or failing data disk can't lose both. Named per store, so
 /// two stores (a test's and the real one) never share it.
-fn runtime_pending_path(store: &Store, account: &Account) -> Option<std::path::PathBuf> {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+fn runtime_pending_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
-        .filter(|dir| dir.is_absolute() && dir.is_dir())?;
-    let root = ring::digest::digest(
-        &ring::digest::SHA256,
-        store.root.as_os_str().as_encoded_bytes(),
-    );
-    let root: String = root.as_ref()[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    Some(dir.join("aswap").join(format!(
-        "{root}-{}-{}.pending.json",
-        account.provider, account.label
+        .filter(|dir| dir.is_absolute() && dir.is_dir())
+        .map(|dir| dir.join("aswap"))
+}
+fn runtime_pending_prefix(store: &Store) -> String {
+    bytes_hash(store.root.as_os_str().as_encoded_bytes())[..16].to_owned()
+}
+fn runtime_pending_path(store: &Store, account: &Account) -> Option<std::path::PathBuf> {
+    Some(runtime_pending_dir()?.join(format!(
+        "{}-{}-{}.pending.json",
+        runtime_pending_prefix(store),
+        account.provider,
+        account.label
     )))
 }
 pub(crate) fn pending_paths(store: &Store, account: &Account) -> Vec<std::path::PathBuf> {
@@ -398,13 +404,16 @@ pub(crate) fn pending_paths(store: &Store, account: &Account) -> Vec<std::path::
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Pending {
     replaces: String,
+    // Lets recovery finish an interrupted alias install after the origin
+    // already holds the rotation. Older sidecars lack this fingerprint.
+    base_pair: Option<String>,
     auth: Value,
 }
 fn file_hash(path: &std::path::Path) -> Option<String> {
     let bytes = store::read_private(path).ok()?;
     Some(bytes_hash(&bytes))
 }
-fn bytes_hash(bytes: &[u8]) -> String {
+pub(crate) fn bytes_hash(bytes: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, bytes)
         .as_ref()
         .iter()
@@ -413,12 +422,19 @@ fn bytes_hash(bytes: &[u8]) -> String {
 }
 /// Write both pending copies; either one is enough. `replaces` is the hash
 /// of the login file the rotation started from.
-fn write_pending(store: &Store, account: &Account, replaces: Option<String>, auth: &Value) {
+fn write_pending(
+    store: &Store,
+    account: &Account,
+    replaces: Option<String>,
+    old: &Value,
+    auth: &Value,
+) {
     let Some(replaces) = replaces else {
         return;
     };
     let pending = Pending {
         replaces,
+        base_pair: provider::credential_pair(account.provider, old),
         auth: auth.clone(),
     };
     for copy in pending_paths(store, account) {
@@ -426,108 +442,193 @@ fn write_pending(store: &Store, account: &Account, replaces: Option<String>, aut
     }
 }
 
-/// Whether any pending copy of an account's login exists (a rotation not
-/// yet installed, which is newer than anything else).
+/// A directory can block a sidecar write but contains no pending login.
+fn pending_copy(path: &std::path::Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => !metadata.is_dir(),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
 pub(crate) fn pending_exists(store: &Store, account: &Account) -> bool {
     pending_paths(store, account)
-        .into_iter()
-        .any(|p| p.exists())
+        .iter()
+        .any(|path| pending_copy(path))
 }
-/// Drop an account's pending logins: its login file is being replaced
-/// (a new rotation, `add`, a live login preserved), so they are stale.
+/// Check the legacy store before admitting a mixed-version process. Check
+/// names and metadata only, including leftover sidecars whose label is no
+/// longer in state.json. Old releases cannot finish such a rotation.
+pub(crate) fn require_legacy_pending_free(store: &Store) -> crate::Result<()> {
+    use std::io::ErrorKind::NotFound;
+    const PENDING: crate::Error = crate::Error(
+        "legacy compatibility requires a store with no pending logins; resolve them before sharing the store with an older aswap",
+    );
+    const INSPECT: crate::Error = crate::Error("cannot inspect legacy store for pending logins");
+    for provider in [Provider::Claude, Provider::Codex] {
+        let dir = store.root.join("profiles").join(provider.as_str());
+        store::no_links(&dir)?;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == NotFound => continue,
+            Err(_) => return Err(INSPECT),
+        };
+        for entry in entries {
+            let profile = entry.map_err(|_| INSPECT)?.path();
+            if !std::fs::symlink_metadata(&profile)
+                .map_err(|_| INSPECT)?
+                .is_dir()
+            {
+                continue;
+            }
+            match std::fs::symlink_metadata(pending_path(&profile.join(provider.auth_file()))) {
+                Ok(_) => return Err(PENDING),
+                Err(err) if err.kind() == NotFound => {}
+                Err(_) => return Err(INSPECT),
+            }
+        }
+    }
+    if let Some(dir) = runtime_pending_dir() {
+        store::no_links(&dir)?;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == NotFound => return Ok(()),
+            Err(_) => return Err(INSPECT),
+        };
+        let prefix = runtime_pending_prefix(store);
+        let claude = format!("{prefix}-claude-");
+        let codex = format!("{prefix}-codex-");
+        for entry in entries {
+            let name = entry.map_err(|_| INSPECT)?.file_name();
+            if let Some(name) = name.to_str()
+                && name.ends_with(".pending.json")
+                && (name.starts_with(&claude) || name.starts_with(&codex))
+            {
+                return Err(PENDING);
+            }
+        }
+    }
+    Ok(())
+}
 pub(crate) fn discard_pending(store: &Store, account: &Account) {
     for copy in pending_paths(store, account) {
         let _ = std::fs::remove_file(copy);
     }
 }
-/// Write a rotated login, hand it to every live run and alias, then drop
-/// its pending copies (a failure to remove them is harmless: they no
-/// longer match the login file).
-/// Install a login as an account's own, the way a refresh does: its file,
-/// running views, aliases, usage backoff, pending copies.
-pub(crate) fn install_login(store: &Store, account: &Account, auth: &Value) -> crate::Result<()> {
-    let path = store
-        .profile(account.provider, &account.label)?
-        .join(account.provider.auth_file());
-    install(store, account, &path, auth)
+/// All labels that an install will rewrite. The same identity fingerprint
+/// selects these aliases and the refresh lock protecting them.
+pub(crate) fn aliases(store: &Store, account: &Account) -> crate::Result<Vec<Account>> {
+    Ok(
+        crate::identity::duplicates(store, account, &store.load()?.accounts)
+            .into_iter()
+            .map(|label| Account {
+                provider: account.provider,
+                label,
+            })
+            .collect(),
+    )
 }
-fn install(
+pub(crate) fn require_clear_aliases(store: &Store, aliases: &[Account]) -> crate::Result<()> {
+    if aliases.iter().any(|alias| pending_exists(store, alias)) {
+        return Err(crate::Error(
+            "an alias has an unresolved pending login; kept",
+        ));
+    }
+    Ok(())
+}
+fn login_path(store: &Store, account: &Account) -> crate::Result<std::path::PathBuf> {
+    Ok(store
+        .profile(account.provider, &account.label)?
+        .join(account.provider.auth_file()))
+}
+/// Caller holds the store and identity refresh locks and has checked pending
+/// copies for every alias it passes in.
+pub(crate) fn install_login(
     store: &Store,
     account: &Account,
-    path: &std::path::Path,
+    aliases: &[Account],
     auth: &Value,
 ) -> crate::Result<()> {
-    store::json_write(path, auth)?;
-    // The old access token is already revoked: hand the new one to every
-    // live run now, before anything else, rather than on each run's tick.
+    store::json_write(&login_path(store, account)?, auth)?;
+    // The old access token may already be revoked. Update running views now.
     crate::shared::hand_out(store, account, auth);
-    propagate(store, account, auth)?;
+    propagate(store, aliases, auth)?;
     crate::usage::credentials_changed(store, account)?;
     discard_pending(store, account);
     Ok(())
 }
-/// Install or drop an account's pending logins now, under its refresh lock
-/// (the caller holds the store lock): before a rename moves the account.
+/// Install pending auth under the refresh lock before a rename.
 pub(crate) fn settle_pending(store: &Store, account: &Account) -> crate::Result<()> {
+    if store.legacy_compatibility() {
+        return require_legacy_pending_free(store);
+    }
     // Under the store lock: only ever try the refresh lock (lock order).
     let _refresh = store.try_refresh_lock(account)?.ok_or(crate::Error(BUSY))?;
-    let path = store
-        .profile(account.provider, &account.label)?
-        .join(account.provider.auth_file());
-    recover_pending(store, account, &path)
+    recover_pending(store, account)
 }
 /// What a store-lock holder gets when an account's refresh lock is taken
 /// (a token refresh is running): drop the store lock and try again.
 pub const BUSY: &str = "a token refresh is in progress; retry";
 
-/// Install a pending login left by a rotation whose final write failed,
-/// if the login file is still the one it replaces; drop it otherwise.
-pub(crate) fn recover_pending(
-    store: &Store,
-    account: &Account,
-    path: &std::path::Path,
-) -> crate::Result<()> {
-    let copies: Vec<_> = pending_paths(store, account)
-        .into_iter()
-        .filter(|copy| copy.exists())
-        .collect();
-    if copies.is_empty() {
-        return Ok(());
-    }
-    // A login file that can't be read (the disk still failing) proves
-    // nothing: keep every copy, the tmpfs one above all, and retry later.
-    let Some(current) = file_hash(path) else {
-        return Err(crate::Error(
-            "cannot read the login to recover its pending copy",
-        ));
-    };
-    let current = Some(current);
-    for copy in copies {
-        // Not a file (a disk refusing writes left a directory there): no
-        // login in it to recover or lose.
-        if !std::fs::symlink_metadata(&copy).is_ok_and(|m| m.is_file()) {
+/// Inspect all copies before writing any alias. A copy whose base no longer
+/// exists is stale, except when its login is already in the origin profile
+/// and an interrupted install may still need to reach the other aliases.
+pub(crate) fn recover_pending(store: &Store, account: &Account) -> crate::Result<()> {
+    let aliases = aliases(store, account)?;
+    let group = std::iter::once(account).chain(&aliases);
+    let mut selected: Option<(&Account, Pending, Option<String>)> = None;
+    let mut copies = Vec::new();
+    for member in group.clone() {
+        let member_copies: Vec<_> = pending_paths(store, member)
+            .into_iter()
+            .filter(|path| pending_copy(path))
+            .collect();
+        if member_copies.is_empty() {
             continue;
         }
-        // A copy that can't be read may hold the only valid login: keep it
-        // and refuse to go on (no refresh, no activation) until it can be.
-        let Ok(pending) = store::json_read::<Pending>(&copy) else {
-            eprintln!(
-                "aswap: {}:{} has a pending login that can't be read; keeping it and refusing to use the account until it can",
-                account.provider, account.label
-            );
-            return Err(crate::Error("a pending login can't be read; kept"));
-        };
-        let usable = Some(pending).filter(|p| {
-            Some(&p.replaces) == current.as_ref()
-                && serde_json::to_vec(&p.auth)
-                    .is_ok_and(|bytes| provider::validate_auth(account.provider, &bytes).is_ok())
-        });
-        match usable {
-            Some(pending) => return install(store, account, path, &pending.auth),
-            None => {
-                let _ = std::fs::remove_file(&copy);
+        let bytes = store::read_private(&login_path(store, member)?)?;
+        let current: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| crate::Error("cannot read the login to recover its pending copy"))?;
+        let current_hash = bytes_hash(&bytes);
+        for copy in member_copies {
+            let pending: Pending = store::json_read(&copy)
+                .map_err(|_| crate::Error("a pending login can't be read; kept"))?;
+            copies.push(copy);
+            let base = if pending.replaces == current_hash {
+                provider::credential_pair(member.provider, &current)
+            } else if pending.auth == current {
+                pending.base_pair.clone()
+            } else {
+                continue;
+            };
+            provider::validate_auth(
+                member.provider,
+                &serde_json::to_vec(&pending.auth)
+                    .map_err(|_| crate::Error("cannot encode pending login"))?,
+            )?;
+            if let Some((_, chosen, _)) = &selected {
+                if chosen.auth != pending.auth {
+                    return Err(crate::Error("conflicting pending logins; kept"));
+                }
+            } else {
+                selected = Some((member, pending, base));
             }
         }
+    }
+    if let Some((origin, pending, base)) = selected {
+        let rotated = provider::credential_pair(origin.provider, &pending.auth);
+        let others: Vec<_> = group.filter(|m| m.label != origin.label).cloned().collect();
+        for other in &others {
+            let saved = store::json_read(&login_path(store, other)?)?;
+            let pair = provider::credential_pair(other.provider, &saved);
+            if pair != base && pair != rotated {
+                return Err(crate::Error(
+                    "an alias login differs from the pending rotation's base; kept",
+                ));
+            }
+        }
+        install_login(store, origin, &others, &pending.auth)?;
+    }
+    for copy in copies {
+        let _ = std::fs::remove_file(copy);
     }
     Ok(())
 }
@@ -646,18 +747,11 @@ pub fn launch_auth(provider: Provider, auth: &Value) -> Value {
 
 /// Caller holds store + account identity lease. Keep duplicate labels on the
 /// same rotation while preserving unrelated per-profile credential extensions.
-pub(crate) fn propagate(store: &Store, account: &Account, auth: &Value) -> crate::Result<()> {
-    let aliases = crate::identity::duplicates(store, account, &store.load()?.accounts);
-    for label in aliases {
-        let other = Account {
-            provider: account.provider,
-            label,
-        };
-        let path = store
-            .profile(other.provider, &other.label)?
-            .join(other.provider.auth_file());
+fn propagate(store: &Store, aliases: &[Account], auth: &Value) -> crate::Result<()> {
+    for other in aliases {
+        let path = login_path(store, other)?;
         let mut saved: Value = store::json_read(&path)?;
-        let field = if account.provider == Provider::Claude {
+        let field = if other.provider == Provider::Claude {
             "claudeAiOauth"
         } else {
             "tokens"
@@ -665,14 +759,14 @@ pub(crate) fn propagate(store: &Store, account: &Account, auth: &Value) -> crate
         if let Some(value) = auth.get(field) {
             saved[field] = value.clone();
         }
-        if account.provider == Provider::Codex
+        if other.provider == Provider::Codex
             && let Some(value) = auth.get("last_refresh")
         {
             saved["last_refresh"] = value.clone();
         }
         store::json_write(&path, &saved)?;
-        crate::shared::hand_out(store, &other, &saved);
-        crate::usage::credentials_changed(store, &other)?;
+        crate::shared::hand_out(store, other, &saved);
+        crate::usage::credentials_changed(store, other)?;
     }
     Ok(())
 }
@@ -699,16 +793,17 @@ mod pending_tests {
             &copy,
             &Pending {
                 replaces: "synthetic-hash".into(),
+                base_pair: None,
                 auth: serde_json::json!({"claudeAiOauth":{"accessToken":"synthetic"}}),
             },
         )
         .unwrap();
-        assert!(recover_pending(&store, &account, &path).is_err());
+        assert!(recover_pending(&store, &account).is_err());
         assert!(copy.exists(), "the pending copy was dropped");
         // Once the file reads and differs, the copy is stale and dropped.
         std::fs::remove_dir(&path).unwrap();
         std::fs::write(&path, b"{}").unwrap();
-        recover_pending(&store, &account, &path).unwrap();
+        recover_pending(&store, &account).unwrap();
         assert!(!copy.exists());
     }
 }

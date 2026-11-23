@@ -1,0 +1,28 @@
+{
+  "accounts": [
+    { "provider": "claude", "label": "work" },
+    { "provider": "codex", "label": "work" }
+  ],
+  "active": { "claude": "work", "codex": "work" },
+  "auto": {
+    "claude": {
+      "resume_prompt": null,
+      "enabled": false,
+      "threshold": 90.0,
+      "last_switch": 0,
+      "prefer": "weekly-reset",
+      "reserved": [],
+      "auto_reset": "off"
+    },
+    "codex": {
+      "resume_prompt": null,
+      "enabled": false,
+      "threshold": 90.0,
+      "last_switch": 0,
+      "prefer": "weekly-reset",
+      "reserved": [],
+      "auto_reset": "off"
+    }
+  },
+  "switch_interval_seconds": 11
+}

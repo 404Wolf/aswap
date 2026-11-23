@@ -17,7 +17,12 @@
 //! `~/.gemini` itself is only ever read, at `add` time.
 use crate::{Error, Result, Safe, store};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::{
+    io::{Read, Seek},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
 
 /// agy's own directory inside a root.
 pub const APP: &str = "antigravity-cli";
@@ -55,27 +60,6 @@ pub const SHARED_APP: [&str; 5] = [
 /// a snapshot (the /resume picker's index).
 const SUMMARIES: &str = "conversation_summaries.db";
 
-/// How long a limited agy account is left out before a launch may try it
-/// again: agy reports when a limit lifts only on its screen.
-pub const LIMIT_HOLD: u64 = 3600;
-
-/// For account selection only: an agy reading has no windows, so an
-/// account that isn't marked limited is taken as available, with an
-/// "assumed" window at 0%. A limited one stays out (its error stands).
-pub fn assumed(mut cache: crate::usage::Cached, at: u64) -> crate::usage::Cached {
-    if cache.error.is_none() && cache.usage.windows.is_empty() {
-        cache.usage.windows.push(crate::usage::Window {
-            name: "assumed".into(),
-            used_percent: 0.0,
-            resets_at: None,
-            duration_minutes: None,
-            codex_slot: None,
-        });
-        cache.fetched_at = at;
-    }
-    cache
-}
-
 pub fn current_home() -> Result<PathBuf> {
     Ok(crate::provider::home()?.join(".gemini"))
 }
@@ -111,6 +95,162 @@ pub fn newer_view_login(view: &Value, profile: &Value) -> Option<Value> {
         && email(view) == email(profile)
         && expires_at(view)? > expires_at(profile).unwrap_or(0))
     .then(|| view.clone())
+}
+
+/// Google's CLI 1.1.11 introduced the zero-turn print-mode quota command.
+/// Check the installed binary before passing a slash command as a prompt.
+fn supports_headless_quota(version: &[u8]) -> bool {
+    let Ok(version) = std::str::from_utf8(version) else {
+        return false;
+    };
+    let mut parts = version.trim().split('.');
+    let numbers = [parts.next(), parts.next(), parts.next()]
+        .map(|part| part.and_then(|p| p.parse::<u32>().ok()));
+    matches!(numbers, [Some(1), Some(minor), Some(patch)] if (minor, patch) >= (1, 11))
+        && parts.next().is_none()
+}
+
+/// The quota CLI can read using a current access token alone. Keep the
+/// refresh token in the profile and all CLI side effects in a disposable root.
+pub(crate) fn quota_response(
+    profile: &Path,
+    at: u64,
+    program: Option<&Path>,
+) -> std::result::Result<Value, crate::usage::Failure> {
+    quota_response_with(profile, at, |root| {
+        crate::provider::Provider::Agy.command_with_bin(root, program)
+    })
+}
+
+fn quota_response_with(
+    profile: &Path,
+    at: u64,
+    make_command: impl Fn(&Path) -> Command,
+) -> std::result::Result<Value, crate::usage::Failure> {
+    use crate::usage::Failure;
+
+    let login: Value = store::json_read(&profile.join(AUTH_FILE))
+        .map_err(|_| Failure::new("agy-usage-auth-unavailable"))?;
+    if login.get("auth_method").and_then(Value::as_str) != Some(PERSONAL) {
+        return Err(Failure::new("agy-usage-auth-unavailable"));
+    }
+    let expiry = expires_at(&login).ok_or_else(|| Failure::new("agy-usage-auth-unavailable"))?;
+    if expiry <= at {
+        return Err(Failure::new("agy-usage-access-expired"));
+    }
+    let access = login
+        .pointer("/token/access_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| Failure::new("agy-usage-auth-unavailable"))?;
+    let mut auth = serde_json::json!({
+        "auth_method": PERSONAL,
+        "token": {"access_token": access, "expiry": login["token"]["expiry"]},
+    });
+    if let Some(token_type) = login.pointer("/token/token_type").and_then(Value::as_str) {
+        auth["token"]["token_type"] = Value::from(token_type);
+    }
+    if let Some(email) = email(&login) {
+        auth["id_token_email"] = Value::from(email);
+    }
+
+    let temporary = tempfile::tempdir().map_err(|_| Failure::new("agy-usage-setup-failed"))?;
+    let root = temporary.path();
+    let gemini = root.join(".gemini");
+    let setup_failed = |_| Failure::new("agy-usage-setup-failed");
+    store::json_write(
+        &gemini.join(APP).join("settings.json"),
+        &serde_json::json!({"useG1Credits": false}),
+    )
+    .map_err(setup_failed)?;
+
+    let directories = [
+        ("XDG_CONFIG_HOME", ".config"),
+        ("XDG_DATA_HOME", ".local/share"),
+        ("XDG_CACHE_HOME", ".cache"),
+        ("XDG_STATE_HOME", ".local/state"),
+        ("XDG_RUNTIME_DIR", "run"),
+        ("TMPDIR", "tmp"),
+    ];
+    for (_, name) in directories {
+        store::private_dir(&root.join(name)).map_err(setup_failed)?;
+    }
+    let command = || {
+        let mut command = make_command(&gemini);
+        let program = command.get_program().to_owned();
+        command.env_clear().current_dir(root).env("HOME", root);
+        command.env("ASWAP_AGY_BIN", program);
+        command.env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+        command.env("AGY_SYSTEMD_SCOPE", "1");
+        for key in ["PATH", "SSL_CERT_FILE", "SSL_CERT_DIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        for (key, name) in directories {
+            command.env(key, root.join(name));
+        }
+        command
+    };
+    let version = quota_output(command().arg("--version"), root)?;
+    if !supports_headless_quota(&version) {
+        return Err(Failure::new("agy-usage-unsupported-version"));
+    }
+    store::json_write(&gemini.join(AUTH_FILE), &auth).map_err(setup_failed)?;
+    let stdout = quota_output(
+        command().args(["-p", "/usage", "--output-format", "json"]),
+        root,
+    )?;
+    serde_json::from_slice(&stdout).map_err(|_| Failure::new("agy-usage-invalid-response"))
+}
+
+fn quota_output(
+    command: &mut Command,
+    root: &Path,
+) -> std::result::Result<Vec<u8>, crate::usage::Failure> {
+    use crate::usage::Failure;
+    const MAX_BYTES: u64 = 256 * 1024;
+    let output_failed = |_| Failure::new("agy-usage-output-failed");
+    let mut output = tempfile::tempfile_in(root).map_err(output_failed)?;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(output.try_clone().map_err(output_failed)?)
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| Failure::new("agy-usage-start-failed"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() >= deadline => {
+                break Err(Failure::new("agy-usage-timeout"));
+            }
+            Ok(None) => {}
+            Err(_) => break Err(Failure::new("agy-usage-process-failed")),
+        }
+        match output.metadata() {
+            Ok(meta) if meta.len() <= MAX_BYTES => {}
+            _ => break Err(Failure::new("agy-usage-output-failed")),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    if status.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    if !status?.success() {
+        return Err(Failure::new("agy-usage-command-failed"));
+    }
+    output.rewind().map_err(output_failed)?;
+    let mut bytes = Vec::new();
+    output
+        .take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(output_failed)?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err(Failure::new("agy-usage-output-failed"));
+    }
+    Ok(bytes)
 }
 
 /// Read a login agy may be writing (it rewrites its token file in place,
@@ -295,30 +435,6 @@ pub fn check_args(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Whether agy moved on since an early quota notice made at `since`: a
-/// model step or user input in the transcript after it. System messages
-/// and failed steps don't count, so an error agy logs there isn't progress.
-pub fn worked_since(transcript: &Path, since: std::time::SystemTime) -> bool {
-    let Ok(text) = std::fs::read_to_string(transcript) else {
-        return false;
-    };
-    let since: chrono::DateTime<chrono::Utc> = since.into();
-    text.lines().rev().any(|line| {
-        let Ok(entry) = serde_json::from_str::<Value>(line) else {
-            return false;
-        };
-        let kind = entry.get("type").and_then(Value::as_str);
-        let status = entry.get("status").and_then(Value::as_str);
-        let at = entry
-            .get("created_at")
-            .and_then(Value::as_str)
-            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
-        matches!(kind, Some("PLANNER_RESPONSE" | "GENERIC" | "USER_INPUT"))
-            && !matches!(status, Some("ERROR" | "FAILED" | "CANCELED"))
-            && at.is_some_and(|at| at > since)
-    })
-}
-
 /// A paid fallback agy offers once quota runs out; aswap never launches
 /// with it on.
 pub fn spends_credits(view: &Path) -> bool {
@@ -462,6 +578,69 @@ mod tests {
     }
 
     #[test]
+    fn headless_quota_requires_a_supported_stable_version() {
+        for version in ["1.1.11\n", "1.5.13\n", "1.5.14\n"] {
+            assert!(supports_headless_quota(version.as_bytes()), "{version}");
+        }
+        for version in ["1.1.10", "1.5.14-dev", "1.5.14.1", "2.0.0", "agy 1.5.14"] {
+            assert!(!supports_headless_quota(version.as_bytes()), "{version}");
+        }
+    }
+
+    #[test]
+    fn quota_command_uses_an_isolated_access_only_login() {
+        let profile = tempfile::tempdir().unwrap();
+        let login_path = profile.path().join(AUTH_FILE);
+        let login = login("one@example.com", "2099-01-01T00:00:00Z");
+        store::json_write(&login_path, &login).unwrap();
+        store::json_write(
+            &profile.path().join(APP).join("settings.json"),
+            &json!({"useG1Credits": true}),
+        )
+        .unwrap();
+        let response = quota_response_with(profile.path(), 1, |root| {
+            let mut command = Command::new("sh");
+            command.args([
+                "-eu",
+                "-c",
+                r#"
+                test "$PWD/.gemini" = "$1"
+                test "$HOME/.gemini" = "$1"
+                test "$XDG_CONFIG_HOME" = "$HOME/.config"
+                test -z "${DBUS_SESSION_BUS_ADDRESS-}"
+                test -z "${GEMINI_API_KEY-}"
+                auth="$1/antigravity-cli/antigravity-oauth-token"
+                case "$2" in
+                --version)
+                    test ! -e "$auth"
+                    printf '1.5.13\n'
+                    ;;
+                -p)
+                    test "$3 $4 $5" = "/usage --output-format json"
+                    grep -q '"access_token": "synthetic-a"' "$auth"
+                    if grep -q 'refresh_token' "$auth"; then exit 1; fi
+                    grep -q '"useG1Credits": false' "$1/antigravity-cli/settings.json"
+                    printf '{"synthetic":true}\n'
+                    ;;
+                *) exit 1 ;;
+                esac
+                "#,
+                "agy-test",
+            ]);
+            command.arg(root);
+            command
+        })
+        .unwrap();
+        assert_eq!(response, json!({"synthetic": true}));
+        assert_eq!(store::json_read::<Value>(&login_path).unwrap(), login);
+        let error = quota_response_with(profile.path(), expires_at(&login).unwrap(), |_| {
+            panic!("expired access must not start the CLI")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind, "agy-usage-access-expired");
+    }
+
+    #[test]
     fn a_newer_view_login_of_the_same_account_is_adopted() {
         let profile = login("one@example.com", "2026-11-22T02:00:00Z");
         let refreshed = login("one@example.com", "2026-11-22T03:00:00Z");
@@ -492,38 +671,6 @@ mod tests {
         ] {
             assert!(!limit_notice(prose), "{prose}");
         }
-    }
-
-    #[test]
-    fn only_model_work_after_a_notice_is_progress() {
-        let t = tempfile::tempdir().unwrap();
-        let transcript = t.path().join("transcript.jsonl");
-        let notice =
-            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
-        let entry = |kind: &str, status: &str, at: &str| {
-            json!({"type":kind,"status":status,"created_at":at,"source":"MODEL"}).to_string()
-        };
-        let before = "2027-01-15T08:00:00Z"; // before the notice
-        let after = "2027-01-15T08:00:30Z";
-        let write = |lines: &[String]| std::fs::write(&transcript, lines.join("\n")).unwrap();
-        write(&[entry("PLANNER_RESPONSE", "DONE", before)]);
-        assert!(!worked_since(&transcript, notice));
-        write(&[
-            entry("SYSTEM_MESSAGE", "DONE", after),
-            entry("GENERIC", "ERROR", after),
-        ]);
-        assert!(
-            !worked_since(&transcript, notice),
-            "errors and system messages are not work"
-        );
-        write(&[
-            entry("SYSTEM_MESSAGE", "DONE", after),
-            entry("GENERIC", "DONE", after),
-        ]);
-        assert!(worked_since(&transcript, notice));
-        write(&[entry("USER_INPUT", "DONE", after)]);
-        assert!(worked_since(&transcript, notice));
-        assert!(!worked_since(&t.path().join("missing"), notice));
     }
 
     #[test]

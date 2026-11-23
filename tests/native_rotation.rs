@@ -2,17 +2,25 @@
 //! login (agy.7 review, t2kg's ruling). Synthetic logins only.
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
-use std::{fs, path::Path, path::PathBuf, process::Command};
+use std::{fs, path::Path, path::PathBuf, process::Command, sync::LazyLock};
+
+static FIXTURE_TIME: LazyLock<u64> = LazyLock::new(aswap::now);
 
 /// A login naming its account with authority (#46): Codex's workspace
 /// membership in the access token, Claude's account in its config.
 fn login(provider: &str, account: &str, value: &str) -> Value {
     let token = format!("synthetic-{value}");
     if provider == "codex" {
+        let generation = value
+            .rsplit_once("-r")
+            .and_then(|(_, n)| n.parse::<u64>().ok())
+            .unwrap_or(1)
+            .min(9);
         let claims = json!({"https://api.openai.com/auth": {
             "chatgpt_account_id": format!("workspace-{account}"),
             "chatgpt_account_user_id": format!("member-{account}"),
-        }, "synthetic": value});
+        }, "synthetic": value, "iat": *FIXTURE_TIME - 100 + generation * 10,
+           "exp": *FIXTURE_TIME + 3600});
         let access = format!(
             "synthetic.{}.synthetic",
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
@@ -87,6 +95,39 @@ impl Case {
             );
         }
     }
+    fn simulate_native_rotation(&self) {
+        if self.provider == "codex" {
+            // Model a rotation issued between activation and observation
+            // without relying on wall-clock sleeps in this fixture.
+            let dir = self.root.join("data/aswap/live-activations");
+            let path = fs::read_dir(dir).unwrap().next().unwrap().unwrap().path();
+            let mut record = read(&path);
+            record["activated_at"] = json!(*FIXTURE_TIME - 85);
+            write(&path, &record);
+        }
+        self.live("a", "a-r2");
+    }
+
+    fn restore_if_opaque(&self, label: &str) {
+        if self.provider != "claude" {
+            return;
+        }
+        assert_eq!(self.saved(label), login(self.provider, "a", "a-r1"));
+        let rotated = login(self.provider, "a", "a-r2");
+        let backup = self
+            .backups()
+            .into_iter()
+            .find(|dir| read(&dir.join(self.auth_file)) == rotated)
+            .expect("opaque native rotation must be preserved in a backup");
+        self.run(&[
+            "restore",
+            self.provider,
+            label,
+            "--from",
+            backup.to_str().unwrap(),
+        ]);
+    }
+
     fn live_login(&self) -> Value {
         read(&self.slot_dir().join(self.auth_file))
     }
@@ -149,11 +190,11 @@ fn the_clis_own_rotation_of_the_live_login_is_kept() {
     for provider in ["codex", "claude"] {
         let case = Case::new(provider);
         case.run(&["switch", provider, "a", "--activate-live"]);
-        // The CLI rotates a's live login.
-        case.live("a", "a-r2");
+        case.simulate_native_rotation();
         let said = case.run(&["switch", provider, "b", "--activate-live"]);
+        assert_eq!(said.contains("restore"), provider == "claude", "{said}");
+        case.restore_if_opaque("a");
         assert_eq!(case.saved("a"), login(provider, "a", "a-r2"), "{provider}");
-        assert!(!said.contains("restore"), "{provider}: {said}");
         // Switching back puts the rotation live, never the revoked r1.
         case.run(&["switch", provider, "a", "--activate-live"]);
         assert_eq!(
@@ -339,22 +380,27 @@ fn a_cli_rotation_of_a_later_alias_is_saved_to_it_and_its_aliases() {
         case.live("a", "a-r1");
         case.run(&["add", provider, "a2"]);
         case.run(&["switch", provider, "a2", "--activate-live"]);
-        case.live("a", "a-r2");
+        case.simulate_native_rotation();
         case.run(&["switch", provider, "b", "--activate-live"]);
+        case.restore_if_opaque("a2");
         assert_eq!(case.saved("a2"), login(provider, "a", "a-r2"), "{provider}");
         assert_eq!(case.saved("a"), login(provider, "a", "a-r2"), "{provider}");
     }
 }
 
 #[test]
-fn switching_to_the_live_account_after_a_cli_rotation_keeps_it_live() {
-    // agy.9 review N1: the rotation is saved and stays live, never the
-    // revoked login written back.
+fn switching_to_the_live_account_keeps_an_adopted_rotation_live() {
+    // The provable rotation takes effect in the same switch. An opaque
+    // rotation takes effect after explicit restore and activation.
     for provider in ["codex", "claude"] {
         let case = Case::new(provider);
         case.run(&["switch", provider, "a", "--activate-live"]);
-        case.live("a", "a-r2");
+        case.simulate_native_rotation();
         case.run(&["switch", provider, "a", "--activate-live"]);
+        if provider == "claude" {
+            case.restore_if_opaque("a");
+            case.run(&["switch", provider, "a", "--activate-live"]);
+        }
         assert_eq!(case.saved("a"), login(provider, "a", "a-r2"), "{provider}");
         assert_eq!(
             case.live_login(),

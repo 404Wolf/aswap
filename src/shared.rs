@@ -677,7 +677,7 @@ impl View {
         let home = shared_home(
             &store.root,
             account.provider,
-            account.provider.current_home()?,
+            store.provider_home(account.provider)?,
         )?;
         if home.ancestors().any(|p| p.join(".git").exists()) {
             return Err(Error("provider state must live outside a Git checkout"));
@@ -806,10 +806,16 @@ impl View {
         if !agy {
             names.insert("history.jsonl".into());
         } else {
-            let config_home = std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .map_or_else(|| provider::home().map(|h| h.join(".config")), Ok)?;
+            let config_home = if let Some(root) = store.agy_private_root() {
+                let path = root.join("config");
+                crate::store::no_links(&path)?;
+                path
+            } else {
+                std::env::var_os("XDG_CONFIG_HOME")
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_absolute())
+                    .map_or_else(|| provider::home().map(|h| h.join(".config")), Ok)?
+            };
             crate::agy::prepare_view(&path, &home, &config_home)?;
             crate::agy::sweep_finished_views(&store.root.join("runtimes").join("agy"));
         }

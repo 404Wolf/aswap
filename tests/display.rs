@@ -5,6 +5,50 @@ use aswap::{
     usage::{Cached, parse_claude, parse_codex},
 };
 use serde_json::json;
+
+#[test]
+fn agy_display_keeps_bucket_ids_and_explains_expired_access() {
+    let c = Cached {
+        error: Some("agy-usage-access-expired".into()),
+        fetched_at: 1000,
+        usage: aswap::usage::Usage {
+            windows: [("gemini-5h", 300), ("3p-weekly", 10080)]
+                .map(|(name, duration)| aswap::usage::Window {
+                    name: name.to_owned(),
+                    used_percent: 50.0,
+                    duration_minutes: Some(duration),
+                    resets_at: Some(2000),
+                    codex_slot: None,
+                })
+                .into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(c.diagnostic().unwrap()["class"], "agy-usage-access-expired");
+    for compact in [false, true] {
+        let rendered = display::render(
+            &[Row {
+                provider: "agy",
+                label: "synthetic",
+                active: true,
+                reserved: false,
+                identity: &identity::Identity::default(),
+                duplicates: &[],
+                cached: &c,
+            }],
+            compact,
+            100,
+            false,
+            1000,
+        );
+        assert!(rendered.contains("gemini-5h"));
+        assert!(rendered.contains("3p-weekly"));
+        assert!(rendered.contains("run this Agy account to renew access"));
+        assert!(rendered.contains("last known quota"));
+    }
+}
+
 fn fixture(compact: bool, width: usize, color: bool, stale: bool) -> String {
     let claude = identity::from_values(
         Provider::Claude,

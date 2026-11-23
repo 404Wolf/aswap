@@ -288,6 +288,11 @@ impl Cached {
             "refresh-invalid-response" => "refresh-invalid-response",
             "sync-unavailable" => "sync-unavailable",
             "owner-profile-missing" => "owner-profile-missing",
+            "agy-usage-access-expired" => "agy-usage-access-expired",
+            "agy-usage-auth-unavailable" => "agy-usage-auth-unavailable",
+            "agy-usage-unsupported-version" => "agy-usage-unsupported-version",
+            "agy-usage-no-windows" => "agy-usage-no-windows",
+            "agy-usage-invalid-response" => "agy-usage-invalid-response",
             "http-error" | "usage-http-error" | "refresh-http-error" => "http-error",
             _ => "usage-unavailable",
         };
@@ -461,6 +466,76 @@ pub fn parse_claude(v: &Value) -> Result<Usage> {
     }
     if windows.is_empty() {
         return Err(Error("no supported Claude usage windows"));
+    }
+    Ok(Usage {
+        windows,
+        ..Default::default()
+    })
+}
+fn parse_agy(v: &Value) -> std::result::Result<Usage, Failure> {
+    let invalid = || Failure::new("agy-usage-invalid-response");
+    if v["status"].as_str() != Some("SUCCESS")
+        || v["conversation_id"].as_str() != Some("")
+        || v["num_turns"].as_u64() != Some(0)
+        || v["command"]["name"].as_str() != Some("usage")
+    {
+        return Err(invalid());
+    }
+    let groups = v["command"]["data"]["groups"]
+        .as_array()
+        .ok_or_else(invalid)?;
+    let mut windows = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for group in groups {
+        for bucket in group["buckets"].as_array().ok_or_else(invalid)? {
+            let id = bucket["id"].as_str().ok_or_else(invalid)?;
+            if id.is_empty()
+                || id.len() > 128
+                || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                || !seen.insert(id)
+            {
+                return Err(invalid());
+            }
+            match bucket.get("disabled").and_then(Value::as_bool) {
+                Some(true) => continue,
+                Some(false) => (),
+                None if bucket.get("disabled").is_some() => return Err(invalid()),
+                None => (),
+            }
+            let remaining = bucket["remaining_fraction"]
+                .as_f64()
+                .filter(|fraction| (0.0..=1.0).contains(fraction))
+                .ok_or_else(invalid)?;
+            let resets_at = match bucket.get("reset_time") {
+                None | Some(Value::Null) => None,
+                Some(time) => match time.as_str() {
+                    Some("") => None,
+                    Some(time) => Some(
+                        chrono::DateTime::parse_from_rfc3339(time)
+                            .ok()
+                            .and_then(|d| u64::try_from(d.timestamp()).ok())
+                            .ok_or_else(invalid)?,
+                    ),
+                    None => return Err(invalid()),
+                },
+            };
+            let duration_minutes = match bucket["window"].as_str() {
+                Some("5h") => Some(300),
+                Some("weekly") => Some(10080),
+                Some(_) => None,
+                None => return Err(invalid()),
+            };
+            windows.push(Window {
+                name: id.to_owned(),
+                used_percent: (1.0 - remaining) * 100.0,
+                resets_at,
+                duration_minutes,
+                codex_slot: None,
+            });
+        }
+    }
+    if windows.is_empty() {
+        return Err(Failure::new("agy-usage-no-windows"));
     }
     Ok(Usage {
         windows,
@@ -725,10 +800,15 @@ pub(crate) fn codex_request_within(
     result
 }
 pub fn fetch(account: &Account, profile: &Path) -> std::result::Result<Usage, Failure> {
+    fetch_with_agy_program(account, profile, None)
+}
+fn fetch_with_agy_program(
+    account: &Account,
+    profile: &Path,
+    agy_program: Option<&Path>,
+) -> std::result::Result<Usage, Failure> {
     if account.provider == Provider::Agy {
-        // No documented quota API (see crate::agy): an empty reading, which
-        // clears a limit mark once it lapses.
-        return Ok(Usage::default());
+        return parse_agy(&crate::agy::quota_response(profile, now(), agy_program)?);
     }
     if account.provider == Provider::Codex {
         let diagnostic = std::cell::Cell::new(Failure::new("codex-rpc-unavailable"));
@@ -981,6 +1061,11 @@ fn fresh_enough(store: &Store, account: &Account, at: u64, force: bool) -> Resul
     let profile = store.profile(account.provider, &account.label)?;
     let path = profile.join("usage-cache.json");
     let mut old = read_cache(&path, force)?;
+    if account.provider == Provider::Agy && old.error.as_deref() == Some("provider-limit") {
+        // Older builds could mark Agy from screen text alone. Read native
+        // quota now instead of waiting for that mark's backoff to lapse.
+        old.next_poll_at = 0;
+    }
     if old.error.is_some() && old.retry_after.is_none() {
         old.next_poll_at = old
             .next_poll_at
@@ -1020,11 +1105,10 @@ fn fresh_enough(store: &Store, account: &Account, at: u64, force: bool) -> Resul
     Ok(Decision::Fetch { old, path, profile })
 }
 /// A quota observation fetched by this call, now: the provider's own answer,
-/// never a cached one (a forced read that couldn't fetch, because another
-/// process holds the fetch or this is a follower, returns None). For
-/// confirming a limit notice, where an older reading proves nothing.
+/// never a cached one. A follower asks the owner for synced providers.
+/// Agy stays local to the account store.
 pub fn fresh_read(store: &Store, account: &Account) -> Option<Usage> {
-    if crate::coordination::follower(store).ok()? {
+    if account.provider != Provider::Agy && crate::coordination::follower(store).ok()? {
         return crate::coordination::poll_fresh(store, account)
             .ok()
             .flatten();
@@ -1032,7 +1116,9 @@ pub fn fresh_read(store: &Store, account: &Account) -> Option<Usage> {
     // refresh takes the store lock itself, never across the request.
     let refresh = |force: bool| crate::refresh::refresh(store, account, now(), force);
     fresh_read_with(store, account, now(), |p| {
-        fetch_refreshing(account, p, refresh, |p| fetch(account, p))
+        fetch_refreshing(account, p, refresh, |p| {
+            fetch_with_agy_program(account, p, store.agy_program())
+        })
     })
 }
 /// `fresh_read` with the fetch given (tests).
@@ -1091,7 +1177,9 @@ pub fn cached_force(store: &Store, account: &Account, force: bool) -> Result<Cac
     // lock itself for that, never across the token request.
     let refresh = |force: bool| crate::refresh::refresh(store, account, now(), force);
     cached_mode_with(store, account, now(), force, |p| {
-        fetch_refreshing(account, p, refresh, |p| fetch(account, p))
+        fetch_refreshing(account, p, refresh, |p| {
+            fetch_with_agy_program(account, p, store.agy_program())
+        })
     })
 }
 /// One usage fetch, refreshing the login first when it is due and forcing
@@ -1256,14 +1344,7 @@ pub fn mark_limited(store: &Store, account: &Account) -> Result<()> {
         entry.http_status = None;
         entry.retry_after = None;
     }
-    // agy has no quota reading to show when the limit lifts: hold the mark
-    // for an hour, then let a launch try the account again.
-    let hold = if account.provider == Provider::Agy {
-        crate::agy::LIMIT_HOLD
-    } else {
-        TTL
-    };
-    entry.next_poll_at = entry.next_poll_at.max(now().saturating_add(hold));
+    entry.next_poll_at = entry.next_poll_at.max(now().saturating_add(TTL));
     store::json_write(&path, &entry)
 }
 
@@ -1331,6 +1412,106 @@ mod isolation_tests {
                 10.0 + index as f64 * 30.0
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod agy_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn response() -> Value {
+        let bucket = |id, window, remaining, time| json!({"id": id, "window": window, "remaining_fraction": remaining, "reset_time": time});
+        json!({
+            "status": "SUCCESS",
+            "conversation_id": "",
+            "num_turns": 0,
+            "command": {"name": "usage", "data": {"groups": [
+                {"name":"Gemini Models", "buckets": [
+                    bucket("gemini-weekly", "weekly", 0.75, "2099-01-02T00:00:00Z"),
+                    bucket("gemini-5h", "5h", 0.0, "2099-01-01T01:00:00Z"),
+                ]},
+                {"name":"Claude and GPT models", "buckets": [
+                    bucket("3p-weekly", "weekly", 1.0, "2099-01-03T00:00:00Z"),
+                    bucket("3p-5h", "5h", 0.33333, "2099-01-01T02:00:00Z"),
+                ]},
+            ]}}
+        })
+    }
+
+    #[test]
+    fn native_quota_preserves_bucket_ids_percentages_and_reset_times() {
+        let usage = parse_agy(&response()).unwrap();
+        let json = serde_json::to_value(usage).unwrap();
+        let windows = json["windows"].as_array().unwrap();
+        let expected = [
+            ("gemini-weekly", 25.0, 10080, 4_070_995_200_u64),
+            ("gemini-5h", 100.0, 300, 4_070_912_400),
+            ("3p-weekly", 0.0, 10080, 4_071_081_600),
+            ("3p-5h", 66.667, 300, 4_070_916_000),
+        ];
+        assert_eq!(windows.len(), expected.len());
+        for (window, (name, percent, minutes, reset)) in windows.iter().zip(expected) {
+            assert_eq!(window["name"], name);
+            assert!((window["used_percent"].as_f64().unwrap() - percent).abs() < 0.000001);
+            assert_eq!(window["duration_minutes"], minutes);
+            assert_eq!(window["resets_at"], reset);
+            assert!(window.get("codex_slot").is_none());
+        }
+    }
+
+    #[test]
+    fn agy_rejects_partial_or_non_native_quota_results() {
+        for (path, value) in [
+            ("/num_turns", json!(1)),
+            ("/conversation_id", json!("not-empty")),
+            ("/command/name", json!("model")),
+            ("/command/data/groups/0/buckets/0/id", json!("3p-weekly")),
+            (
+                "/command/data/groups/0/buckets/0/remaining_fraction",
+                json!(-0.1),
+            ),
+            (
+                "/command/data/groups/0/buckets/0/remaining_fraction",
+                Value::Null,
+            ),
+            (
+                "/command/data/groups/0/buckets/0/reset_time",
+                json!("next week"),
+            ),
+        ] {
+            let mut result = response();
+            *result.pointer_mut(path).unwrap() = value;
+            assert_eq!(
+                parse_agy(&result).unwrap_err().kind,
+                "agy-usage-invalid-response"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_and_empty_results_do_not_invent_percentages() {
+        let mut result = response();
+        result["command"]["data"]["groups"] = json!([
+            {"buckets": [{"id":"gemini-5h", "disabled":true}]},
+        ]);
+        assert_eq!(parse_agy(&result).unwrap_err().kind, "agy-usage-no-windows");
+    }
+
+    #[test]
+    fn expired_access_keeps_quota_as_last_known() {
+        let old = updated(Cached::default(), parse_agy(&response()), 10_000);
+        let stale = updated(
+            old.clone(),
+            Err(Failure::new("agy-usage-access-expired")),
+            10_020,
+        );
+        assert_eq!(stale.fetched_at, old.fetched_at);
+        assert_eq!(stale.reason(10_020), Reason::Error);
+        assert_eq!(
+            serde_json::to_value(stale.usage).unwrap(),
+            serde_json::to_value(old.usage).unwrap()
+        );
     }
 }
 

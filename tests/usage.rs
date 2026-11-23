@@ -3,6 +3,97 @@ use aswap::{
     store::{Account, Auto, Prefer, Store},
     usage::{self, Cached, Usage, Window},
 };
+
+#[test]
+fn agy_usage_refresh_uses_the_configured_native_program() {
+    use serde_json::{Value, json};
+    use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let account = Account {
+        provider: Provider::Agy,
+        label: "synthetic".into(),
+    };
+    let store = Store::open(root.join("agy-store")).unwrap();
+    let mut state = store.load().unwrap();
+    state.accounts.push(account.clone());
+    store.save(&state).unwrap();
+    let profile = store.profile(Provider::Agy, &account.label).unwrap();
+    aswap::store::json_write(
+        &profile.join(Provider::Agy.auth_file()),
+        &json!({
+            "auth_method":"consumer",
+            "id_token_email":"fake@example.com",
+            "token":{"access_token":"synthetic-access",
+                "refresh_token":"synthetic-refresh","expiry":"2099-01-01T00:00:00Z"}
+        }),
+    )
+    .unwrap();
+
+    let program = root.join("synthetic-agy");
+    let path = std::env::var_os("PATH").unwrap();
+    let shell = std::env::split_paths(&path)
+        .map(|dir| dir.join("sh"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let response = json!({
+        "status":"SUCCESS", "conversation_id":"", "num_turns":0,
+        "command":{"name":"usage","data":{"groups":[{"buckets":[
+            {"id":"gemini-weekly","window":"weekly","remaining_fraction":0.75,
+                "reset_time":"2099-01-01T00:00:00Z"}
+        ]}]}}
+    });
+    fs::write(
+        &program,
+        format!(
+            "#!{}\nset -eu\nshift\ncase \"$*\" in\n--version) echo 1.5.13;;\n'-p /usage --output-format json') printf '%s\\n' '{response}';;\n*) exit 1;;\nesac\n",
+            shell.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let config = root.join("config");
+    fs::create_dir_all(config.join("aswap")).unwrap();
+    fs::write(
+        config.join("aswap/config.toml"),
+        format!(
+            "[stores.agy]\nroot = {:?}\nprivate_root = {:?}\nprogram = {program:?}\n",
+            store.root,
+            root.join("agy-private"),
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_aswap"))
+        .args([
+            "usage",
+            "agy",
+            "--account",
+            "synthetic",
+            "--refresh",
+            "--json",
+        ])
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", config)
+        .env("XDG_DATA_HOME", root.join("legacy-data"))
+        .env("ASWAP_AGY_BIN", root.join("missing-agy"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let bucket = &status["accounts"][0]["usage"]["windows"][0];
+    assert_eq!(bucket["name"], "gemini-weekly", "{status}");
+    assert_eq!(bucket["used_percent"], 25.0);
+    assert_eq!(bucket["duration_minutes"], 10080);
+}
+
 fn account(name: &str) -> Account {
     Account {
         provider: Provider::Claude,

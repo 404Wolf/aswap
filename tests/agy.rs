@@ -1,5 +1,5 @@
 //! agy (Antigravity CLI) accounts: capture, an isolated launch, failover on
-//! a quota notice with resume by conversation, and login write-back.
+//! native quota observations, and login write-back.
 //! Synthetic logins and a fake agy only; no network.
 use aswap::{
     provider::{self, Provider},
@@ -22,7 +22,7 @@ fn token_path(home: &Path) -> std::path::PathBuf {
 
 /// A fake agy: checks its isolation, holds presence/<id>.lock as agy does,
 /// and logs each launch. `ASWAP_TEST_MODE`:
-/// - stuck: account one prints a quota notice and does nothing else;
+/// - partial/all/offline: account one prints a quota notice and exits;
 /// - redraw: account one prints the notice, then keeps working;
 /// - refresh: account one writes a refreshed login (later expiry), exits.
 const FAKE_AGY: &str = r##"import json, os, pathlib, sys, time
@@ -30,6 +30,21 @@ args=sys.argv[1:]
 root=pathlib.Path(next(a.split('=',1)[1] for a in args if a.startswith('--gemini_dir=')))
 args=[a for a in args if not a.startswith('--gemini_dir=')]
 assert 'DBUS_SESSION_BUS_ADDRESS' not in os.environ and 'GEMINI_API_KEY' not in os.environ
+control=pathlib.Path(__file__).parent.parent
+if args==['--version']:
+    print('1.5.13'); sys.exit(0)
+if args==['-p','/usage','--output-format','json']:
+    mode=(control/'mode').read_text()
+    with (control/'usage-reads').open('a') as f: f.write('quota\n')
+    if mode=='offline': sys.exit(7)
+    buckets=[{'id':'gemini-weekly','window':'weekly','remaining_fraction':0,
+              'reset_time':'2099-01-01T00:00:00Z'}]
+    if mode=='all':
+        buckets.append({'id':'3p-5h','window':'5h','remaining_fraction':0,
+                        'reset_time':'2099-01-01T00:00:00Z'})
+    print(json.dumps({'status':'SUCCESS','conversation_id':'','num_turns':0,
+                      'command':{'name':'usage','data':{'groups':[{'buckets':buckets}]}}}))
+    sys.exit(0)
 config=pathlib.Path(os.environ['XDG_CONFIG_HOME'])
 assert config==root/'.config'
 # Tools agy runs see the user's config (gh here), but agy's own secrets
@@ -56,15 +71,15 @@ transcript.parent.mkdir(parents=True,exist_ok=True)
 transcript.write_text('{"type":"user"}\n')
 if who!='one': sys.exit(0)
 if mode=='refresh':
-    login['token']['expiry']='2030-01-01T00:00:00Z'
+    login['token']['expiry']='2099-01-01T00:00:00Z'
     login['token']['access_token']='synthetic-a-refreshed'
     with token.open('w') as f: f.write(json.dumps(login))
     time.sleep(2.5)
     sys.exit(0)
+if mode=='launch': sys.exit(0)
 print('Quota exhausted', flush=True)
-if mode=='stuck':
-    time.sleep(40); sys.exit(9)
-for _ in range(20):
+if mode in ('partial', 'all', 'offline'): sys.exit(9)
+for _ in range(3):
     time.sleep(1)
     step={'type':'PLANNER_RESPONSE','status':'DONE','source':'MODEL',
           'created_at':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()}
@@ -81,6 +96,7 @@ fn child_with(
     args: &str,
 ) -> (Vec<Value>, std::path::PathBuf, tempfile::TempDir, String) {
     let t = tempfile::tempdir().unwrap();
+    fs::write(t.path().join("mode"), mode).unwrap();
     let bin = t.path().join("bin");
     fs::create_dir(&bin).unwrap();
     let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
@@ -153,7 +169,7 @@ fn two_accounts() -> Store {
     for name in ["one", "two"] {
         store::json_write(
             &token_path(&home),
-            &login(&format!("{name}@example.com"), "2026-11-22T08:00:00Z"),
+            &login(&format!("{name}@example.com"), "2098-01-01T00:00:00Z"),
         )
         .unwrap();
         provider::add(&store, Provider::Agy, name).unwrap();
@@ -223,38 +239,44 @@ fn capture_child() {
 }
 
 #[test]
-fn a_stuck_agy_at_its_quota_fails_over_and_resumes_the_conversation() {
-    // The user's first prompt (-i) is said once, never replayed.
-    let (launches, _, _t, stderr) =
-        child_with("run_child", "stuck", r#"["-i","synthetic first prompt"]"#);
-    let first: Vec<String> = serde_json::from_value(launches[0]["args"].clone()).unwrap();
-    assert!(
-        first.contains(&"synthetic first prompt".to_owned()),
-        "{first:?}"
-    );
-    assert_eq!(launches.len(), 2, "{launches:?}");
-    assert_eq!(launches[0]["account"], "one");
-    assert_eq!(launches[1]["account"], "two");
-    let resumed: Vec<String> = serde_json::from_value(launches[1]["args"].clone()).unwrap();
-    assert_eq!(resumed[..2], ["--conversation".to_owned(), ID.to_owned()]);
-    assert!(
-        resumed[2].starts_with("--prompt-interactive="),
-        "{resumed:?}"
-    );
-    assert_eq!(resumed.len(), 3, "{resumed:?}");
-    assert!(!resumed.iter().any(|a| a.contains("synthetic first prompt")));
-    // The hidden session bus is said once.
-    assert_eq!(
-        stderr.matches("runs without the D-Bus session bus").count(),
-        1,
-        "{stderr}"
-    );
+fn an_agy_notice_records_only_observed_buckets_and_never_rejects_the_account() {
+    for (mode, count) in [("partial", 1), ("all", 2), ("offline", 0)] {
+        let (launches, home, temp, stderr) =
+            child_with("run_child", mode, r#"["-i","synthetic first prompt"]"#);
+        assert_eq!(launches.len(), 1, "{mode}: {launches:?}");
+        assert_eq!(launches[0]["account"], "one");
+        let first: Vec<String> = serde_json::from_value(launches[0]["args"].clone()).unwrap();
+        assert!(first.contains(&"synthetic first prompt".to_owned()));
+        assert_eq!(
+            stderr.matches("runs without the D-Bus session bus").count(),
+            1
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("usage-reads")).unwrap(),
+            "quota\n"
+        );
+        let data = home.parent().unwrap().join("data/aswap/profiles/agy");
+        let cache: aswap::usage::Cached =
+            store::json_read(&data.join("one/usage-cache.json")).unwrap();
+        assert_ne!(cache.error.as_deref(), Some("provider-limit"));
+        assert_eq!(cache.usage.windows.len(), count, "{mode}");
+        assert!(cache.usage.windows.iter().all(|w| w.used_percent == 100.0));
+        assert!(!data.join("two/usage-cache.json").exists());
+    }
 }
 
 #[test]
 fn a_redrawn_agy_notice_followed_by_work_never_switches() {
     let (launches, _, _t, _) = child("run_child", "redraw");
     assert_eq!(launches.len(), 1, "{launches:?}");
+}
+
+#[test]
+fn cached_agy_buckets_do_not_select_a_different_default_or_launch_account() {
+    let (launches, _, temp, _) = child("run_child", "launch");
+    assert_eq!(launches.len(), 1);
+    assert_eq!(launches[0]["account"], "one");
+    assert!(!temp.path().join("usage-reads").exists());
 }
 
 #[test]
@@ -268,7 +290,7 @@ fn a_login_agy_refreshed_in_its_view_is_written_back() {
             .join(Provider::Agy.auth_file()),
     )
     .unwrap();
-    assert_eq!(profile["token"]["expiry"], "2030-01-01T00:00:00Z");
+    assert_eq!(profile["token"]["expiry"], "2099-01-01T00:00:00Z");
     // The original in ~/.gemini was never touched.
     let original: Value = store::json_read(&token_path(&home)).unwrap();
     assert_eq!(original["id_token_email"], "two@example.com");
@@ -293,8 +315,47 @@ fn run_child() {
     let store = two_accounts();
     let args: Vec<String> =
         serde_json::from_str(&std::env::var("ASWAP_TEST_ARGS").unwrap_or("[]".into())).unwrap();
-    let code = aswap::runner::run(&store, Provider::Agy, Some("one"), &args, true).unwrap();
-    assert!(matches!(code, 0 | 9), "exit {code}");
+    let mode = std::env::var("ASWAP_TEST_MODE").unwrap();
+    if mode == "launch" {
+        let mut state = store.load().unwrap();
+        state.active.insert(Provider::Agy, "one".into());
+        state.auto.entry(Provider::Agy).or_default().enabled = true;
+        store.save(&state).unwrap();
+        for (label, percent) in [("one", 100.0), ("two", 5.0)] {
+            let cache = aswap::usage::Cached {
+                usage: aswap::usage::Usage {
+                    windows: vec![aswap::usage::Window {
+                        name: "gemini-5h".into(),
+                        used_percent: percent,
+                        duration_minutes: Some(300),
+                        resets_at: Some(aswap::now() + 3600),
+                        codex_slot: None,
+                    }],
+                    ..Default::default()
+                },
+                fetched_at: aswap::now(),
+                next_poll_at: aswap::now() + aswap::usage::TTL,
+                ..Default::default()
+            };
+            let profile = store.profile(Provider::Agy, label).unwrap();
+            store::json_write(&profile.join("usage-cache.json"), &cache).unwrap();
+        }
+        assert!(
+            aswap::runner::tick(&store, Provider::Agy, false)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let pinned = (mode != "launch").then_some("one");
+    let code = aswap::runner::run(&store, Provider::Agy, pinned, &args, true).unwrap();
+    assert_eq!(
+        code,
+        if matches!(mode.as_str(), "partial" | "all" | "offline") {
+            9
+        } else {
+            0
+        }
+    );
 }
 
 #[test]
