@@ -1020,9 +1020,9 @@ fn fresh_enough(store: &Store, account: &Account, at: u64, force: bool) -> Resul
 /// confirming a limit notice, where an older reading proves nothing.
 pub fn fresh_read(store: &Store, account: &Account) -> Option<Usage> {
     if crate::coordination::follower(store).ok()? {
-        return fresh_read_from_owner(store, account, || {
-            crate::coordination::poll(store, Some(account), false).map(|_| ())
-        });
+        return crate::coordination::poll_fresh(store, account)
+            .ok()
+            .flatten();
     }
     // refresh takes the store lock itself, never across the request.
     let refresh = |force: bool| crate::refresh::refresh(store, account, now(), force);
@@ -1030,42 +1030,45 @@ pub fn fresh_read(store: &Store, account: &Account) -> Option<Usage> {
         fetch_refreshing(account, p, refresh, |p| fetch(account, p))
     })
 }
-/// A follower's fresh read: it asks the refresh owner to read the account
-/// now (`poll`, a forced sync), and accepts only an observation the owner
-/// made after this call began: newer, on the owner's own clock, than the
-/// one the follower held when it asked. So no clock skew between the two
-/// machines matters, and an owner that answered with its old reading, or
-/// can't be reached, gives none (a live session then keeps waiting).
-pub fn fresh_read_from_owner(
-    store: &Store,
-    account: &Account,
-    poll: impl FnOnce() -> Result<()>,
-) -> Option<Usage> {
-    let path = store
-        .profile(account.provider, &account.label)
-        .ok()?
-        .join("usage-cache.json");
-    let before = {
-        let _lock = store.lock().ok()?;
-        read_cache(&path, true).ok().map_or(0, |c| c.fetched_at)
-    };
-    poll().ok()?;
-    let _lock = store.lock().ok()?;
-    let after = read_cache(&path, true).ok()?;
-    (after.error.is_none() && after.fetched_at > before).then_some(after.usage)
-}
 /// `fresh_read` with the fetch given (tests).
 pub fn fresh_read_with<F>(store: &Store, account: &Account, at: u64, fetcher: F) -> Option<Usage>
 where
     F: FnOnce(&Path) -> std::result::Result<Usage, Failure>,
 {
-    let mut fresh = None;
-    let _ = cached_mode_with(store, account, at, true, |p| {
-        let result = fetcher(p);
-        fresh = result.as_ref().ok().cloned();
-        result
-    });
+    // No per-login usage lock: an abandoned read (its RPC hung) must never
+    // block the next one. The answer is merged into the cache afterwards,
+    // under the store lock, as any fetch is.
+    let profile = store.profile(account.provider, &account.label).ok()?;
+    let path = profile.join("usage-cache.json");
+    let snapshot = {
+        let _lock = store.lock().ok()?;
+        read_cache(&path, true).ok()?
+    };
+    let result = fetcher(&profile);
+    let fresh = result.as_ref().ok().cloned();
+    if let Ok(_lock) = store.lock()
+        && let Ok(state) = store.load()
+        && store
+            .account(&state, account.provider, Some(&account.label))
+            .is_ok()
+        && let Ok(latest) = read_cache(&path, true)
+    {
+        let _ = store::json_write(&path, &merged(&snapshot, latest, result, at));
+    }
     fresh
+}
+/// Whether this account's own login was rejected on its last use (its
+/// usage reading failed on authorization). Caller holds the store lock.
+pub fn login_rejected(store: &Store, account: &Account) -> bool {
+    let Ok(profile) = store.profile(account.provider, &account.label) else {
+        return false;
+    };
+    read_cache(&profile.join("usage-cache.json"), true).is_ok_and(|cache| {
+        matches!(
+            cache.error.as_deref(),
+            Some("http-401" | "refresh-invalid-grant" | "refresh-http-401")
+        )
+    })
 }
 pub fn cached(store: &Store, account: &Account) -> Result<Cached> {
     cached_force(store, account, false)
@@ -1556,5 +1559,47 @@ mod rotation_tests {
         assert_eq!(forced(live, Failure::new("codex-rpc-timeout")), 0);
         assert_eq!(forced(now() - 1, Failure::new("codex-rpc-unavailable")), 1);
         assert_eq!(forced(live, Failure::http(401, 0)), 1);
+    }
+}
+
+#[cfg(test)]
+mod fresh_read_tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_read_never_waits_on_a_held_usage_lock() {
+        // agy.5 review (b): an abandoned read still holding the per-login
+        // fetch lock must not block the next confirming read.
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let account = Account {
+            provider: crate::provider::Provider::Codex,
+            label: "one".into(),
+        };
+        let mut state = store.load().unwrap();
+        state.accounts.push(account.clone());
+        store.save(&state).unwrap();
+        let profile = store.profile(account.provider, &account.label).unwrap();
+        store::private_dir(&profile).unwrap();
+        let _held = store
+            .usage_lock(&account, std::time::Duration::ZERO)
+            .unwrap()
+            .expect("the abandoned read's lock");
+        let at = now();
+        let started = std::time::Instant::now();
+        let fresh = fresh_read_with(&store, &account, at, |_| {
+            Ok(Usage {
+                windows: vec![Window {
+                    name: "weekly".into(),
+                    used_percent: 100.0,
+                    resets_at: Some(at + 3600),
+                    duration_minutes: Some(10080),
+                    codex_slot: None,
+                }],
+                ..Default::default()
+            })
+        });
+        assert_eq!(fresh.unwrap().windows[0].used_percent, 100.0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

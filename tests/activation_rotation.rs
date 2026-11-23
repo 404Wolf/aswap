@@ -236,3 +236,162 @@ fn a_rotation_with_a_shorter_expiry_is_still_the_newer_login() {
         queued_activation_after_rotation(provider, case_expiry);
     }
 }
+
+#[test]
+fn the_outgoing_login_is_saved_only_when_provably_newer() {
+    use aswap::{
+        coordination, refresh,
+        store::{Account, Store},
+    };
+    for provider in ["codex", "claude"] {
+        let account = Account {
+            provider: if provider == "codex" {
+                aswap::provider::Provider::Codex
+            } else {
+                aswap::provider::Provider::Claude
+            },
+            label: "outgoing".into(),
+        };
+        // (a) The revoked login with different formatting (trailing
+        // whitespace) is still the revoked login: never saved.
+        let case = Case::new(provider);
+        let store = Store::open(case.root.join("data/aswap")).unwrap();
+        coordination::owner(&store).unwrap();
+        let old = fs::read(case.default()).unwrap();
+        {
+            let _lock = store.lock().unwrap();
+            assert!(
+                refresh::refresh_with(&store, &account, aswap::now(), true, |_, _| Ok(json!({
+                    "access_token": "synthetic-rotated-access",
+                    "refresh_token": "synthetic-rotated-refresh",
+                    "expires_in": 3600,
+                })))
+                .unwrap()
+            );
+        }
+        let installed = fs::read(case.saved("outgoing")).unwrap();
+        let mut spaced = old.clone();
+        spaced.extend_from_slice(b"\n\n  ");
+        fs::write(case.default(), &spaced).unwrap();
+        case.ok(&["switch", provider, "incoming", "--activate-live"]);
+        assert_eq!(
+            fs::read(case.saved("outgoing")).unwrap(),
+            installed,
+            "{provider}: (a)"
+        );
+
+        // (b) A history that can't be written: the install fails closed
+        // (the new login stays pending), never a stale restoration.
+        let case = Case::new(provider);
+        let store = Store::open(case.root.join("data/aswap")).unwrap();
+        coordination::owner(&store).unwrap();
+        let saved = case.saved("outgoing");
+        let before = fs::read(&saved).unwrap();
+        fs::create_dir(saved.with_file_name(format!("{}.generations", case.auth_file))).unwrap();
+        {
+            let _lock = store.lock().unwrap();
+            assert!(
+                refresh::refresh_with(&store, &account, aswap::now(), true, |_, _| Ok(json!({
+                    "access_token": "synthetic-rotated-access",
+                    "refresh_token": "synthetic-rotated-refresh",
+                    "expires_in": 3600,
+                })))
+                .is_err()
+            );
+        }
+        assert_eq!(
+            fs::read(&saved).unwrap(),
+            before,
+            "{provider}: (b) not installed"
+        );
+        assert!(
+            saved
+                .with_file_name(format!("{}.pending", case.auth_file))
+                .exists(),
+            "{provider}: (b) kept pending"
+        );
+
+        // (c) No history (an older version's store) and a working profile:
+        // a different live login is not provably newer, so not saved.
+        let case = Case::new(provider);
+        let saved = case.saved("outgoing");
+        let before = fs::read(&saved).unwrap();
+        write(
+            &case.default(),
+            &login(provider, "outgoing", "outgoing-elsewhere"),
+        );
+        case.ok(&["switch", provider, "incoming", "--activate-live"]);
+        assert_eq!(fs::read(&saved).unwrap(), before, "{provider}: (c)");
+    }
+}
+
+#[test]
+fn an_activation_during_a_blocked_token_request_does_not_deadlock() {
+    // agy.5 review: the refresh holds the account's refresh lock across its
+    // request and then needs the store lock; an activation holding the
+    // store lock must not wait on that refresh lock.
+    use aswap::{
+        coordination, refresh,
+        store::{Account, Store},
+    };
+    for provider in ["codex", "claude"] {
+        let case = Case::new(provider);
+        let store = Store::open(case.root.join("data/aswap")).unwrap();
+        coordination::owner(&store).unwrap();
+        let account = Account {
+            provider: if provider == "codex" {
+                aswap::provider::Provider::Codex
+            } else {
+                aswap::provider::Provider::Claude
+            },
+            label: "outgoing".into(),
+        };
+        let (in_request, entered) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let root = case.root.join("data/aswap");
+        let refresher = std::thread::spawn(move || {
+            let store = Store::open(root).unwrap();
+            refresh::refresh_with(&store, &account, aswap::now(), true, |_, _| {
+                in_request.send(()).unwrap();
+                released.recv().unwrap();
+                Ok(json!({
+                    "access_token": "synthetic-rotated-access",
+                    "refresh_token": "synthetic-rotated-refresh",
+                    "expires_in": 3600,
+                }))
+            })
+            .map_err(|f| f.kind)
+        });
+        entered.recv().unwrap();
+        let mut child = case
+            .command(&["switch", provider, "incoming", "--activate-live"])
+            .spawn()
+            .unwrap();
+        // The activation waits (it may not use the refresh lock) without
+        // holding the store lock, so the token reply can be installed.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        release.send(()).unwrap();
+        assert_eq!(
+            refresher.join().unwrap(),
+            Ok(true),
+            "{provider}: the refresh finished"
+        );
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > end {
+                let _ = child.kill();
+                panic!("{provider}: activation deadlocked");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert!(status.success());
+        let saved = Case::read(&case.saved("outgoing"));
+        assert!(
+            saved.to_string().contains("synthetic-rotated-refresh"),
+            "{provider}: rotation kept"
+        );
+    }
+}

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.2-preview.agy.6 (2026-11-23)
+
+agy.5 with its review's changes (t4hf; t2kg's rulings). Not a release.
+
+### Fixed
+- **No lock-order deadlock between a token refresh and an activation.** Everywhere, an account's refresh lock comes before the store lock. Holders of the store lock only try the refresh lock (`switch` and `rename` let go and retry). The refresh takes its locks first.
+- **A follower takes only its owner's answer to its own request.** The follower sends a request id with its forced sync. The owner echoes it on that account only when it read the provider for that request, and the follower accepts nothing else. An older owner never echoes, so it confirms nothing.
+- **Credentials are told apart by their token identity, never their bytes.** If the generation history can't be written, a rotation's install fails closed: the new login stays in its pending copies. Alias propagation records generations too. The outgoing live login is saved into its profile only when provably newer: a different credential, not one the profile replaced, while the profile's own login was rejected. Otherwise it is kept only in live-backups.
+- **An answer with no usage in it** counts as no answer, never as room.
+- **A confirming read takes no per-login fetch lock,** so an abandoned read can't block the next one.
+- **The exit fallback** (a notice, then no read answering at all, at a failed exit) applies only when the notice is in the session's final screen, its last 12 rows of output. A quote further up, or an unrelated exit, counts nothing.
+
 ## 0.2.2-preview.agy.5 (2026-11-23)
 
 agy.4 with its review's changes (t4hf; t2kg's rulings). Not a release.

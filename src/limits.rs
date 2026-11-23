@@ -77,6 +77,9 @@ pub struct Limits {
     rotated_notice: bool,
     /// Reads that answered so far.
     answers: u64,
+    /// Whether the last notice is in the session's final screen (set by the
+    /// supervisor from its terminal before an exit check).
+    pub(crate) final_notice: bool,
 }
 
 /// A Codex quota notice seen on screen, not yet confirmed by quota.
@@ -174,6 +177,7 @@ impl Limits {
             noticed: false,
             rotated_notice: false,
             answers: 0,
+            final_notice: false,
         }
     }
 
@@ -290,8 +294,10 @@ impl Limits {
                 self.collect_codex(&now);
             }
             // Any answer since this check began (one taken at its start too)
-            // means the account could be checked.
-            if !self.screen_seen && self.answers == answers {
+            // means the account could be checked. And the fallback holds
+            // only for a notice in the session's final screen: a quote
+            // further up and an unrelated exit count nothing.
+            if !self.screen_seen && self.answers == answers && self.final_notice {
                 self.screen_seen = true;
             }
         }
@@ -329,6 +335,11 @@ impl Limits {
             Err(TryRecvError::Empty) => return None,
         };
         self.reading = None;
+        // An answer without any usage in it (no windows, no denial) says
+        // nothing about quota: it counts as no answer, never as room.
+        let result = result.filter(|usage| {
+            !usage.windows.is_empty() || usage.ordinary_usage == usage::OrdinaryUsage::Denied
+        });
         let Some(usage) = result else {
             if let Some(evidence) = &mut self.evidence {
                 evidence.last = Some(false);
@@ -793,6 +804,7 @@ mod codex_tests {
         let fresh_limits = || {
             let mut limits = Limits::new(None);
             limits.exit_verify = Duration::from_millis(400);
+            limits.final_notice = true;
             limits
         };
         let later = |limits: &mut Limits, after: u64| {
@@ -957,6 +969,26 @@ mod codex_tests {
         });
         script(vec![None; 4]);
         assert!(!limits.check_codex(false, true, no, fresh, no, || at));
+
+        // Never answered, but the notice isn't in the final screen (a quote
+        // further up, an unrelated exit): the exit counts nothing (t2kg's
+        // refined ruling).
+        let mut limits = fresh_limits();
+        limits.final_notice = false;
+        assert!(!limits.check_codex(true, false, no, stuck, no, || at));
+        assert!(!limits.check_codex(false, true, no, stuck, no, || at));
+
+        // An answer with no usage in it is no answer: never room, so it
+        // retires nothing and still lets the exit fallback count (review a).
+        let mut limits = fresh_limits();
+        script(vec![Some(usage::Usage::default()); 8]);
+        assert!(!limits.check_codex(true, false, no, fresh, no, || at));
+        for after in [10, 30, 60, 120, 240, 600] {
+            later(&mut limits, after);
+            assert!(!limits.check_codex(false, false, no, fresh, no, || at));
+        }
+        assert!(limits.evidence.is_some(), "an empty answer retires nothing");
+        assert!(limits.check_codex(false, true, no, fresh, no, || at));
 
         // A signal during that re-read stops it, counting nothing.
         let mut limits = fresh_limits();

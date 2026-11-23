@@ -206,17 +206,6 @@ where
     if account.provider == Provider::Agy {
         return Ok(false);
     }
-    // The store lock for the reads and checks below, released before the
-    // network request unless the caller holds it.
-    let mut store_lock = if store::lock_held() {
-        None
-    } else {
-        Some(
-            store
-                .lock()
-                .map_err(|_| Failure::new("usage-unavailable"))?,
-        )
-    };
     if crate::coordination::follower(store).map_err(|_| Failure::new("usage-unavailable"))?
         || (!active
             && !crate::coordination::is_owner(store)
@@ -246,9 +235,23 @@ where
     } else {
         None
     };
+    // Lock order, everywhere: an account's refresh lock BEFORE the store
+    // lock, never the reverse (holders of the store lock only ever try the
+    // refresh lock; see Store::try_refresh_lock).
     let _refresh = store
         .refresh_lock(account)
         .map_err(|_| Failure::new("usage-unavailable"))?;
+    // The store lock for the reads and checks below, released before the
+    // network request unless the caller holds it.
+    let mut store_lock = if store::lock_held() {
+        None
+    } else {
+        Some(
+            store
+                .lock()
+                .map_err(|_| Failure::new("usage-unavailable"))?,
+        )
+    };
     let path = store
         .profile(account.provider, &account.label)
         .map_err(|_| Failure::new("usage-unavailable"))?
@@ -417,27 +420,50 @@ fn generations_path(path: &std::path::Path) -> std::path::PathBuf {
 }
 /// How many replaced logins a profile remembers.
 const GENERATIONS: usize = 32;
-/// Before `path` (a profile's login) is replaced: remember what it held, so
-/// that login is known as an OLDER generation of this account from now on.
-/// Caller holds the account's refresh lock.
-pub(crate) fn retire_generation(path: &std::path::Path) {
-    let Some(old) = file_hash(path) else {
-        return;
+/// A login's credential identity: a hash of its refresh token (else its
+/// access token), parsed, so formatting never makes an old login look new.
+pub(crate) fn credential_id(provider: Provider, auth: &Value) -> Option<String> {
+    let pointers: &[&str] = match provider {
+        Provider::Claude => &["/claudeAiOauth/refreshToken", "/claudeAiOauth/accessToken"],
+        Provider::Codex => &["/tokens/refresh_token", "/tokens/access_token"],
+        Provider::Agy => &["/token/refresh_token", "/token/access_token"],
+    };
+    let token = pointers.iter().find_map(|p| {
+        auth.pointer(p)
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+    })?;
+    Some(bytes_hash(format!("{provider}\0{token}").as_bytes()))
+}
+/// Before `path` (a profile's login) is replaced: remember the credential it
+/// held, so that login is known as an OLDER generation of this account from
+/// now on. An error (the history can't be written) means the replacement
+/// must not happen: it fails closed. Caller holds the refresh lock.
+pub(crate) fn retire_generation(provider: Provider, path: &std::path::Path) -> crate::Result<()> {
+    let Ok(old) = store::json_read::<Value>(path) else {
+        return Ok(());
+    };
+    let Some(old) = credential_id(provider, &old) else {
+        return Ok(());
     };
     let history = generations_path(path);
-    let mut known: Vec<String> = store::json_read(&history).unwrap_or_default();
+    let mut known: Vec<String> = if history.exists() {
+        store::json_read(&history)?
+    } else {
+        Vec::new()
+    };
     if !known.contains(&old) {
         known.push(old);
     }
     let excess = known.len().saturating_sub(GENERATIONS);
     known.drain(..excess);
-    let _ = store::json_write(&history, &known);
+    store::json_write(&history, &known)
 }
-/// Whether `bytes` is a login this profile held before and replaced: an
+/// Whether `auth` is a login this profile held before and replaced: an
 /// older generation, never to be saved over the current one.
-pub(crate) fn older_generation(path: &std::path::Path, bytes: &[u8]) -> bool {
+pub(crate) fn older_generation(provider: Provider, path: &std::path::Path, auth: &Value) -> bool {
     let known: Vec<String> = store::json_read(&generations_path(path)).unwrap_or_default();
-    known.contains(&bytes_hash(bytes))
+    credential_id(provider, auth).is_some_and(|id| known.contains(&id))
 }
 /// Write both pending copies; either one is enough. `replaces` is the hash
 /// of the login file the rotation started from.
@@ -479,7 +505,9 @@ fn install(
     path: &std::path::Path,
     auth: &Value,
 ) -> crate::Result<()> {
-    retire_generation(path);
+    // Fails closed: without the record of what it replaces, the new login
+    // stays in its pending copies (recovered on the next refresh).
+    retire_generation(account.provider, path)?;
     store::json_write(path, auth)?;
     // The old access token is already revoked: hand the new one to every
     // live run now, before anything else, rather than on each run's tick.
@@ -492,12 +520,17 @@ fn install(
 /// Install or drop an account's pending logins now, under its refresh lock
 /// (the caller holds the store lock): before a rename moves the account.
 pub(crate) fn settle_pending(store: &Store, account: &Account) -> crate::Result<()> {
-    let _refresh = store.refresh_lock(account)?;
+    // Under the store lock: only ever try the refresh lock (lock order).
+    let _refresh = store.try_refresh_lock(account)?.ok_or(crate::Error(BUSY))?;
     let path = store
         .profile(account.provider, &account.label)?
         .join(account.provider.auth_file());
     recover_pending(store, account, &path)
 }
+/// What a store-lock holder gets when an account's refresh lock is taken
+/// (a token refresh is running): drop the store lock and try again.
+pub const BUSY: &str = "a token refresh is in progress; retry";
+
 /// Install a pending login left by a rotation whose final write failed,
 /// if the login file is still the one it replaces; drop it otherwise.
 pub(crate) fn recover_pending(
@@ -688,6 +721,9 @@ pub(crate) fn propagate(store: &Store, account: &Account, auth: &Value) -> crate
         {
             saved["last_refresh"] = value.clone();
         }
+        // The alias held the same, now replaced, login: an older generation
+        // for it too.
+        retire_generation(other.provider, &path)?;
         store::json_write(&path, &saved)?;
         crate::shared::hand_out(store, &other, &saved);
         crate::usage::credentials_changed(store, &other)?;

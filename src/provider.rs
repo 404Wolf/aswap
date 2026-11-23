@@ -270,6 +270,19 @@ pub fn add(store: &Store, provider: Provider, name: &str) -> Result<Account> {
 }
 /// Activate a stored login. Never follow Home Manager symlinks or replace unreadable config.
 pub fn switch(store: &Store, provider: Provider, name: &str, activate: bool) -> Result<Account> {
+    // A token refresh holds the account's refresh lock and then needs the
+    // store lock: while one runs, let go of the store lock and try again.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match switch_once(store, provider, name, activate) {
+            Err(Error(crate::refresh::BUSY)) if std::time::Instant::now() < end => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            result => return result,
+        }
+    }
+}
+fn switch_once(store: &Store, provider: Provider, name: &str, activate: bool) -> Result<Account> {
     let _lock = store.lock()?;
     let mut state = store.load()?;
     let account = store.account(&state, provider, Some(name))?;
@@ -340,21 +353,31 @@ fn preserve_live(
             identity.is_some() && identity == saved_config.get("oauthAccount")
         };
         if matched {
-            let _refresh = store.refresh_lock(&candidate)?;
+            // Under the store lock: only try (lock order; switch retries).
+            let _refresh = store
+                .try_refresh_lock(&candidate)?
+                .ok_or(Error(crate::refresh::BUSY))?;
             // The outgoing default may still hold the revoked login. Leave
             // the profile bytes and pending copy for normal rotation recovery.
             let path = profile.join(candidate.provider.auth_file());
-            // Is the default login newer than the profile's? Not by expiry
-            // (a rotation can shorten it) or file times (any write touches
-            // them): by generation. A login this profile held before and
-            // replaced (a rotation installed over it) is older; the same
-            // bytes are nothing to save; anything else is a login made
-            // outside aswap since (the provider refreshed its default home,
-            // or a new sign-in), which is newer.
-            let saved_bytes = store::read_private(&path)?;
-            let newer = saved_bytes != bytes && !crate::refresh::older_generation(&path, bytes);
-            if !crate::refresh::has_pending(store, &candidate) && newer {
-                crate::refresh::retire_generation(&path);
+            // Is the outgoing default newer than the profile's login? Only
+            // when that is provable: it is a different credential (by token
+            // identity, never bytes), not one the profile held before
+            // (generations), and the profile's own login was rejected. In
+            // every other case (no history, an older generation, a profile
+            // that still works) it fails closed: the default stays only in
+            // live-backups.
+            let saved_now: Value = store::json_read(&path)?;
+            let provider = candidate.provider;
+            let differs = crate::refresh::credential_id(provider, &current)
+                != crate::refresh::credential_id(provider, &saved_now);
+            let older = crate::refresh::older_generation(provider, &path, &current);
+            let rejected = crate::usage::login_rejected(store, &candidate);
+            let newer = differs && !older && rejected;
+            if !crate::refresh::has_pending(store, &candidate)
+                && newer
+                && crate::refresh::retire_generation(provider, &path).is_ok()
+            {
                 store::atomic(&path, bytes)?;
                 target_is_live |= candidate.label == target.label;
             }
@@ -368,7 +391,9 @@ pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
     // A rotation of the incoming account saved only in its pending copy is
     // installed first, so activation never puts the revoked login live.
     {
-        let _refresh = store.refresh_lock(account)?;
+        let _refresh = store
+            .try_refresh_lock(account)?
+            .ok_or(Error(crate::refresh::BUSY))?;
         crate::refresh::recover_pending(store, account, &profile.join(provider.auth_file()))?;
     }
     let mut bytes = store::read_private(&profile.join(provider.auth_file()))?;

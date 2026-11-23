@@ -1256,55 +1256,6 @@ fn a_fresh_read_is_the_providers_answer_never_a_cached_reading() {
 }
 
 #[test]
-fn a_follower_takes_only_an_observation_the_owner_made_after_it_asked() {
-    // agy.4 review: a follower's confirming read comes from the refresh
-    // owner, and only an observation newer than the follower's own counts.
-    let temp = tempfile::tempdir().unwrap();
-    let store = aswap::store::Store::open(temp.path().join("data/aswap")).unwrap();
-    let account = aswap::store::Account {
-        provider: aswap::provider::Provider::Codex,
-        label: "one".into(),
-    };
-    let profile = store.profile(account.provider, &account.label).unwrap();
-    aswap::store::private_dir(&profile).unwrap();
-    let cache_path = profile.join("usage-cache.json");
-    let at = aswap::now();
-    let cache = |used: f64, fetched_at: u64| aswap::usage::Cached {
-        usage: aswap::usage::Usage {
-            windows: vec![aswap::usage::Window {
-                name: "weekly".into(),
-                used_percent: used,
-                resets_at: Some(at + 3600),
-                duration_minutes: Some(10080),
-                codex_slot: None,
-            }],
-            ..Default::default()
-        },
-        fetched_at,
-        next_poll_at: fetched_at + 180,
-        last_attempt: fetched_at,
-        ..Default::default()
-    };
-    // A real limit: the owner's new reading has the account exhausted.
-    aswap::store::json_write(&cache_path, &cache(20.0, at - 60)).unwrap();
-    let fresh = aswap::usage::fresh_read_from_owner(&store, &account, || {
-        aswap::store::json_write(&cache_path, &cache(100.0, at)).unwrap();
-        Ok(())
-    });
-    assert_eq!(fresh.unwrap().windows[0].used_percent, 100.0);
-    // The owner answered with the reading the follower already had (an old
-    // 100%), or couldn't be reached: no fresh observation.
-    aswap::store::json_write(&cache_path, &cache(100.0, at)).unwrap();
-    assert!(aswap::usage::fresh_read_from_owner(&store, &account, || Ok(())).is_none());
-    assert!(
-        aswap::usage::fresh_read_from_owner(&store, &account, || {
-            Err(aswap::Error("synthetic owner unreachable"))
-        })
-        .is_none()
-    );
-}
-
-#[test]
 fn an_account_denied_ordinary_usage_is_never_a_recovery_candidate() {
     // agy.4 review (9): a fresh cache at 10% that denies ordinary usage is
     // out of usage, so recovery never picks it.

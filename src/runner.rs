@@ -989,6 +989,7 @@ fn limit_seen(
     let fresh = moment.exited.is_some();
     // A notice counts once a fresh quota read confirms it.
     let gate = |limits: &mut crate::limits::Limits, notice: bool, rotated: bool| {
+        limits.final_notice = terminal.is_some_and(Terminal::notice_in_final_screen);
         limits.check_codex(
             notice,
             moment.exited == Some(true),

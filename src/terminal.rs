@@ -78,6 +78,11 @@ impl Terminal {
             .flag
             .load(std::sync::atomic::Ordering::SeqCst)
     }
+    /// Whether the last limit notice is in the session's final screen (its
+    /// last rows of output), not text further up.
+    pub fn notice_in_final_screen(&self) -> bool {
+        self.diagnostics.notice_in_final_screen()
+    }
     /// After the provider exited: whether the user pressed Ctrl-C since (the
     /// raw terminal delivers it as a byte, not a signal). Reads, and drops,
     /// what was typed meanwhile; nobody else reads it now.
@@ -430,6 +435,8 @@ struct Diagnostics {
     /// Codex: the rows of a marked diagnostic so far, whitespace removed,
     /// and how many rows that is (see `codex_notice`).
     codex_rows: Option<(String, u8)>,
+    /// Output rows since the last limit notice (None: none seen).
+    rows_since_notice: Option<u32>,
 }
 impl Diagnostics {
     fn feed(&mut self, bytes: &[u8]) -> (ScreenLimits, bool, bool) {
@@ -496,6 +503,21 @@ impl Diagnostics {
     }
 
     fn finish_row(&mut self, signals: &mut (ScreenLimits, bool, bool)) {
+        let mut row = (ScreenLimits::default(), false, false);
+        self.finish_row_inner(&mut row);
+        if row.0.notice {
+            self.rows_since_notice = Some(0);
+        }
+        signals.0.merge(row.0);
+        signals.1 |= row.1;
+        signals.2 |= row.2;
+    }
+    /// Whether a limit notice is in the session's final screen: among the
+    /// last `FINAL_ROWS` rows of output, not quoted further up.
+    fn notice_in_final_screen(&self) -> bool {
+        self.rows_since_notice.is_some_and(|n| n <= FINAL_ROWS)
+    }
+    fn finish_row_inner(&mut self, signals: &mut (ScreenLimits, bool, bool)) {
         if self.truncated {
             self.menu_header = false;
             self.truncated = false;
@@ -507,6 +529,9 @@ impl Diagnostics {
         let decoded = normalize(&self.line);
         self.line.clear();
         let line = decoded.as_str();
+        if !line.is_empty() {
+            self.rows_since_notice = self.rows_since_notice.map(|n| n.saturating_add(1));
+        }
         if self.agy {
             // agy's own notices only; Claude's and Codex's wording would
             // misread its tool output.
@@ -571,6 +596,9 @@ impl Diagnostics {
         hit
     }
 }
+/// How many output rows after a notice still count as the final screen (a
+/// provider draws its prompt and footer below it).
+const FINAL_ROWS: u32 = 12;
 /// "you've hit your usage limit" with whitespace removed (rows may split it).
 const CODEX_LIMIT_SQUASHED: &str = "you'vehityourusagelimit";
 
@@ -1095,6 +1123,22 @@ mod review_fixture_tests {
         }
         seen.merge(detector.finish().0);
         seen
+    }
+
+    #[test]
+    fn only_a_notice_in_the_final_rows_is_in_the_final_screen() {
+        let mut detector = Diagnostics {
+            codex: true,
+            ..Default::default()
+        };
+        detector.feed("\u{25a0} You've hit your usage limit. Try again later.\r\n".as_bytes());
+        detector.feed(b"\r\n> \r\n  enter to send\r\n");
+        assert!(detector.notice_in_final_screen());
+        for _ in 0..FINAL_ROWS {
+            detector.feed(b"more output\r\n");
+        }
+        assert!(!detector.notice_in_final_screen(), "quoted further up");
+        assert!(!Diagnostics::default().notice_in_final_screen());
     }
 
     #[test]
