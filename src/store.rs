@@ -252,6 +252,24 @@ enum StoreScope {
     },
 }
 
+const LEGACY_MARKER: &str = "legacy-compatibility";
+const LEGACY_MARKER_V1: &[u8] = b"aswap legacy compatibility v1\n";
+
+fn legacy_marker(root: &Path) -> Result<bool> {
+    let path = root.join(LEGACY_MARKER);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(metadata) if metadata.is_file() && metadata.len() == LEGACY_MARKER_V1.len() as u64 => {
+            if read_private(&path)? == LEGACY_MARKER_V1 {
+                Ok(true)
+            } else {
+                Err(Error("invalid legacy compatibility marker"))
+            }
+        }
+        _ => Err(Error("invalid legacy compatibility marker")),
+    }
+}
+
 /// Routes providers to their configured stores before any account data is read.
 /// With no override, the original single-store layout remains available.
 pub struct StoreView {
@@ -372,27 +390,28 @@ impl StoreView {
         if store.legacy_compatibility() {
             let _lock = store.lock()?;
             crate::refresh::require_legacy_pending_free(&store)?;
+            if !legacy_marker(&store.root)? {
+                // Validate the state before making the opt-in durable.
+                store.load()?;
+                atomic(&store.root.join(LEGACY_MARKER), LEGACY_MARKER_V1)?;
+            }
         }
         Ok(store)
     }
 
     pub fn for_provider(&self, provider: Provider) -> Result<Store> {
         if provider == Provider::Agy
-            && let Some(AgyStore {
-                root,
-                private_root,
-                program,
-            }) = &self.agy
+            && let Some(agy) = &self.agy
         {
-            return Store::open_scoped(
-                root.clone(),
-                StoreScope::Agy {
-                    private_root: private_root.clone(),
-                    program: program.clone(),
-                },
-            );
+            let store = Self::open_agy(agy)?;
+            // Even an Agy-only invocation enables the fence for later
+            // invocations that share the legacy root with another binary.
+            self.legacy()?;
+            return Ok(store);
         }
-        self.legacy()
+        let store = self.legacy()?;
+        store.check_provider(provider)?;
+        Ok(store)
     }
 
     pub fn stores(&self, filter: Option<Provider>) -> Result<Vec<Store>> {
@@ -400,10 +419,20 @@ impl StoreView {
             return Ok(vec![self.for_provider(provider)?]);
         }
         let mut stores = vec![self.legacy()?];
-        if self.agy.is_some() {
-            stores.push(self.for_provider(Provider::Agy)?);
+        if let Some(agy) = &self.agy {
+            stores.push(Self::open_agy(agy)?);
         }
         Ok(stores)
+    }
+
+    fn open_agy(agy: &AgyStore) -> Result<Store> {
+        Store::open_scoped(
+            agy.root.clone(),
+            StoreScope::Agy {
+                private_root: agy.private_root.clone(),
+                program: agy.program.clone(),
+            },
+        )
     }
 }
 /// A held file lock; `.1` marks the store lock, counted in `HELD`.
@@ -670,6 +699,14 @@ impl Store {
         if root.ancestors().any(|p| p.join(".git").exists()) {
             return Err(Error("account stores must live outside a Git checkout"));
         }
+        let scope = if legacy_marker(&root)? {
+            if matches!(scope, StoreScope::Agy { .. }) {
+                return Err(Error("a fenced legacy store cannot be used for agy"));
+            }
+            StoreScope::Legacy
+        } else {
+            scope
+        };
         let sync_policy_path = if let StoreScope::Agy { private_root, .. } = &scope {
             no_links(private_root)?;
             if private_root
@@ -707,6 +744,8 @@ impl Store {
     /// This root is shared with Claude/Codex binaries predating agy support.
     pub fn legacy_compatibility(&self) -> bool {
         matches!(self.scope, StoreScope::Legacy)
+            // A standalone handle can outlive admission of this root.
+            || !matches!(legacy_marker(&self.root), Ok(false))
     }
 
     pub fn provider_home(&self, provider: Provider) -> Result<PathBuf> {
@@ -765,9 +804,13 @@ impl Store {
     }
 
     fn check_provider(&self, provider: Provider) -> Result<()> {
+        if provider == Provider::Agy && self.legacy_compatibility() {
+            return Err(Error(
+                "agy requires a separate configured store on this fenced legacy root",
+            ));
+        }
         match (&self.scope, provider) {
-            (StoreScope::Legacy, Provider::Agy)
-            | (StoreScope::Agy { .. }, Provider::Claude | Provider::Codex) => {
+            (StoreScope::Agy { .. }, Provider::Claude | Provider::Codex) => {
                 Err(Error("account provider is assigned to a different store"))
             }
             _ => Ok(()),
@@ -784,7 +827,7 @@ impl Store {
         {
             self.check_provider(provider)?;
         }
-        if matches!(self.scope, StoreScope::Legacy)
+        if self.legacy_compatibility()
             && (!state.foreign.accounts.is_empty()
                 || !state.foreign.active.is_empty()
                 || !state.foreign.auto.is_empty())

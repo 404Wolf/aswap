@@ -181,6 +181,82 @@ fn scoped_roots_refuse_aliases_and_wrong_provider_state() {
 }
 
 #[test]
+fn the_legacy_fence_survives_missing_and_alternate_config() {
+    let t = Sandbox::new();
+    let native = Path::new(env!("CARGO_BIN_EXE_aswap"));
+    let root = t.path("data/aswap");
+    let marker = root.join("legacy-compatibility");
+    let preexisting = aswap::store::Store::open(root.clone()).unwrap();
+    assert!(!preexisting.legacy_compatibility());
+
+    let pending = "data/aswap/profiles/codex/work/auth.json.pending";
+    t.write(pending, "synthetic pending sidecar");
+    let refused = t.native(&["list", "agy"]).output().unwrap();
+    assert!(!refused.status.success());
+    assert!(!marker.exists(), "a failed admission persisted a marker");
+    fs::remove_file(t.path(pending)).unwrap();
+    assert_eq!(providers(&t.cli(&["list", "agy"])), ["agy"]);
+    assert!(marker.is_file());
+    assert!(preexisting.legacy_compatibility());
+    assert!(
+        !t.native(&["list", "agy"])
+            .env("XDG_DATA_HOME", t.path("unrelated-data"))
+            .env("ASWAP_AGY_HOME", &root)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let live = "codex/auth.json";
+    t.write(live, "synthetic live sentinel");
+    for config in [None, Some(t.path("alternate-config"))] {
+        for (args, reason) in [
+            (&["auto", "agy", "on"][..], "separate configured store"),
+            (
+                &["switch", "codex", "work", "--activate-live"][..],
+                "disables live activation",
+            ),
+        ] {
+            let mut cmd = t.command(native, args);
+            match &config {
+                Some(path) => {
+                    cmd.env("XDG_CONFIG_HOME", path);
+                }
+                None => {
+                    cmd.env_remove("XDG_CONFIG_HOME");
+                }
+            }
+            let out = cmd.output().unwrap();
+            assert!(!out.status.success());
+            assert!(String::from_utf8_lossy(&out.stderr).contains(reason));
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(root.join("state.json")).unwrap(),
+        LEGACY_STATE
+    );
+    assert_eq!(
+        fs::read_to_string(t.path(live)).unwrap(),
+        "synthetic live sentinel"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("profiles/codex/work/auth.json")).unwrap(),
+        CODEX
+    );
+
+    fs::write(marker, "unknown marker format").unwrap();
+    let refused = t
+        .command(native, &["auto", "claude", "on"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("invalid legacy compatibility marker")
+    );
+}
+
+#[test]
 fn persistent_config_reuses_the_existing_private_view_and_child_environment() {
     let t = Sandbox::new();
     let agy_store = t.path("agy-data/aswap");

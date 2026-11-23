@@ -111,9 +111,43 @@ headroom instead, to keep the session running as long as possible.
 
 ## Antigravity CLI (agy) accounts
 
-aswap pools personal Google sign-ins of Google's Antigravity CLI (`agy`)
-like Claude and Codex logins: `aswap add agy <label>` after signing in with
-`agy`, then `aswap run agy --auto`.
+aswap pools personal Google sign-ins of Google's Antigravity CLI (`agy`).
+After signing in, use `aswap add agy <label>` and
+`aswap run agy --account <label>`.
+
+### Reuse an isolated store alongside older Claude and Codex supervisors
+
+Set the absolute paths in `$XDG_CONFIG_HOME/aswap/config.toml` (normally
+`~/.config/aswap/config.toml`). Point `root` at the existing Agy account
+store itself and `private_root` at the existing private state directory.
+Pin the native Agy executable with `program` when PATH contains a wrapper.
+
+```toml
+[stores.agy]
+root = "/home/alice/.local/share/aswap-agy/aswap"
+private_root = "/home/alice/.local/state/agy-private"
+program = "/opt/antigravity/bin/agy"
+```
+
+`private_root` defaults to `~/.local/state/agy-private`.
+`ASWAP_AGY_HOME` and `ASWAP_AGY_PRIVATE_ROOT` override the two paths.
+Use the same configuration for interactive launches, Herdr revival, and
+noninteractive services that need Agy. Existing Agy credentials and
+conversation data stay in place. Capture new logins from the private
+`home/.gemini` under `private_root`.
+
+Before starting a candidate binary on a shared Claude/Codex root, use that
+binary with the separate Agy configuration and run `aswap list claude --json`.
+It checks for pending rotations and validates the legacy state before
+persisting the `legacy-compatibility` marker in the account root. Keep the
+marker for as long as older supervisors share that root. Every current
+invocation on that root honors the fence, including invocations with
+missing or different configuration. Agy commands require a separate
+configured store on a fenced root. The new binary disables direct
+Claude/Codex credential refresh, live activation, and credential restore
+there. Existing legacy supervisors can continue using their original
+Claude/Codex state. Stores without the marker or a separate Agy
+configuration keep the standalone behavior.
 
 - **Only personal sign-ins.** An API key, application-default credentials
   or a Cloud project login is refused: those are billed. A launch also
@@ -123,10 +157,10 @@ like Claude and Codex logins: `aswap add agy <label>` after signing in with
   `XDG_CONFIG_HOME` and no D-Bus session bus, so the login is that
   directory's file, never the shared keyring.
 - **What's shared.** Conversations (`brain/`, `conversations/`,
-  `presence/`, `cache/`, `history.jsonl`) and `~/.gemini/config`
-  (plugins, hooks, MCP servers, skills) are linked in. The Gemini CLI's own
-  files in `~/.gemini` are not.
-- **Tools agy runs** see your `~/.config` (git, gh, herdr, ...) through the
+  `presence/`, `cache/`, `history.jsonl`) and `config/` (plugins, hooks,
+  MCP servers, skills) are linked from the configured provider home.
+- **Tools agy runs** see the provider's config (the private `config/` with
+  a separate Agy store, or your XDG config in standalone mode) through the
   view's own config directory, except `antigravity/` (agy's per-account
   plugin secrets). They don't see a D-Bus session bus, so a tool that keeps
   its secrets in the Secret Service (libsecret) can't reach them from inside
@@ -136,16 +170,20 @@ like Claude and Codex logins: `aswap add agy <label>` after signing in with
   file that is a symlink (as Home Manager makes) is refused too, because
   aswap reads it without following links. Pass the JSON inline instead.
   Flags a wrapper on PATH adds are not seen by aswap.
-- **New config entries.** The view's config directory links your
-  `~/.config` entries when the run starts. A new top-level entry that a tool
+- **New config entries.** The view's config directory links the provider's
+  config entries when the run starts. A new top-level entry that a tool
   inside agy creates, or one it replaces by rename, lands in the view and is
   gone after the run.
 - **Refreshing.** agy refreshes its own login; aswap never contacts
   Google's token endpoint. A view's newer login is written back to its
   profile, and the view's copy is removed when the run ends.
-  `aswap add agy` only reads `~/.gemini` and never writes it.
-- **Resuming.** A failover resumes the same conversation with
-  `--conversation <id>`. aswap reads the id from the lock agy holds for it.
+  `aswap add agy` reads the login from the configured provider home.
+- **Quota and resuming.** Agy reports quota by model family. Those readings
+  inform status but cannot establish that another account can serve the
+  current model. Automatic cross-account quota failover is disabled for
+  Agy. To choose a different account, select it explicitly and ask Agy to
+  resume with `--conversation <id>`. Agy determines whether the selected
+  account can open that conversation.
 - **Usage.** Antigravity CLI 1.1.11 and later versions in the 1.x series
   report model quota buckets through their headless `/usage` command,
   without starting a model turn. aswap uses the profile's current access
@@ -154,11 +192,8 @@ like Claude and Codex logins: `aswap add agy <label>` after signing in with
   last known. Run `aswap run agy --account <label>` to let agy renew the login, or
   sign in again and re-add the profile if the login can no longer refresh.
   Then use `aswap usage agy --account <label> --refresh` to check quota again.
-- **Only on the refresh owner's machine, never synced.** `aswap add agy`
-  refuses while an aswap process of another build runs, because older
-  builds can't read state.json with an agy account in it.
-- **Not yet.** Whether a conversation resumes on a *different* Google
-  account depends on agy's backend and is untested.
+- **Local profiles.** Agy credentials stay local. `aswap add agy` refuses
+  when it detects another aswap build using the same store.
 
 ## Codex usage-limit resets (opt-in)
 
