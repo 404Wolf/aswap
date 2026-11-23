@@ -863,7 +863,7 @@ mod pending_tests {
                 b"this synthetic sidecar is unreadable and invalid",
             )
             .unwrap();
-            std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o0)).unwrap();
             assert_eq!(
                 require_runtime_pending_free(&runtime, &prefix, Some(uid))
                     .unwrap_err()
