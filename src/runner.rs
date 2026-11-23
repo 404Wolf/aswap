@@ -168,14 +168,14 @@ pub fn run(
         crate::shared::View::prepare(store, &account)
     })?;
     patiently("recording the session's view", || lease.view(&view.path))?;
-    if provider == Provider::Agy {
-        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty()) {
-            // Once per run: agy and the tools it runs see no session bus, so
-            // agy keeps this account's login in the view's own file.
-            eprintln!(
-                "aswap: agy runs without the D-Bus session bus (per-account login file); Secret Service is unavailable to tools inside it"
-            );
-        }
+    if provider == Provider::Agy
+        && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty())
+    {
+        // Once per run: agy and the tools it runs see no session bus, so
+        // agy keeps this account's login in the view's own file.
+        eprintln!(
+            "aswap: agy runs without the D-Bus session bus (per-account login file); Secret Service is unavailable to tools inside it"
+        );
     }
     if auto_args.as_ref().is_some_and(|a| a.ambiguous) {
         let help =
