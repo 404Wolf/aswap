@@ -515,7 +515,7 @@ pub fn restore(
     }
     if !force && noted.is_none() {
         return Err(Error(
-            "this backup doesn't record the account's login when it was made (made before agy.9, or the account had none), so aswap can't tell which is newer; --force replaces it (it is backed up first)",
+            "this backup doesn't record the account's login when it was made (made by an older aswap, or the account had none), so aswap can't tell which is newer; --force replaces it (it is backed up first)",
         ));
     }
     if !force && !unchanged {

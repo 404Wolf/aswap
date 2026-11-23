@@ -407,10 +407,10 @@ fn restore_safety_backups_outlive_switch_pruning_and_messages_say_why() {
     }
     assert!(safety[0].exists(), "the safety backup is never pruned");
 
-    // A backup without a note (made before agy.9) says why --force is needed.
+    // A backup without a note (made by an older aswap) says why --force is needed.
     let old = case.root.join("old-backup");
     fs::create_dir_all(&old).unwrap();
     write(&old.join(case.auth_file), &login(provider, "a", "a-old"));
     let refused = case.fails(&["restore", provider, "a", "--from", old.to_str().unwrap()]);
-    assert!(refused.contains("made before agy.9"), "{refused}");
+    assert!(refused.contains("made by an older aswap"), "{refused}");
 }
