@@ -88,6 +88,13 @@ pub enum Hold {
     AvailabilityUnknown {
         label: String,
     },
+    /// A login whose token predates the membership claim is the same login
+    /// (workspace and user) as two logins that name DIFFERENT accounts:
+    /// which account it is can't be told, so nothing is redeemed until it is
+    /// signed in again or removed.
+    Ambiguous {
+        label: String,
+    },
 }
 
 /// One reset-log entry. Idempotency keys and credit ids are never recorded here.
@@ -950,9 +957,13 @@ pub fn step(
         port.save(log)?;
     }
     // One account, one place (see `one_per_account`), for a retry too.
-    let (mut entries, view) = one_per_account(port, settings, log, entries, at);
+    let (mut entries, view, ambiguous) = one_per_account(port, settings, log, entries, at);
     if let Some(pending) = log.pending.clone() {
         return resume(port, settings, &entries, log, pending, at);
+    }
+    // Uncertain is "no": two members could merge into one account.
+    if let Some(label) = ambiguous {
+        return held(Hold::Ambiguous { label });
     }
     // A usable account without a fresh reading (one a run just marked
     // limited, say) is read now, so it's known rather than deferring.
@@ -1030,7 +1041,7 @@ pub fn step(
         pre: Some(Snapshot::of(&pre)),
         paused: None,
         reconcile: false,
-        account: group_key(port, &account),
+        account: group_key(port, &account).known(),
     });
     // The intent is journaled (fsynced) before anything is sent.
     port.journal(&Event::Intent {
@@ -1227,8 +1238,9 @@ fn one_per_account(
     log: &ResetLog,
     entries: Vec<(Account, Cached)>,
     at: u64,
-) -> (Vec<(Account, Cached)>, ResetLog) {
+) -> (Vec<(Account, Cached)>, ResetLog, Option<String>) {
     let pending = log.pending.as_ref().map(|p| p.label.clone());
+    let mut ambiguous: Option<String> = None;
     // The view holds only the skips that match an account here.
     let mut view = log.clone();
     view.skipped.clear();
@@ -1256,7 +1268,17 @@ fn one_per_account(
         .clone();
         // The account's key: its own, else an alias's (a label whose token
         // predates the membership claim has none of its own).
-        let key = group_key(port, &chosen.0);
+        let key = match group
+            .iter()
+            .map(|(a, _)| group_key(port, a))
+            .find(|k| *k == GroupKey::Ambiguous)
+        {
+            Some(_) => {
+                ambiguous.get_or_insert(account.label.clone());
+                None
+            }
+            None => group_key(port, &chosen.0).known(),
+        };
         let keys: Vec<String> = key.iter().cloned().collect();
         if let Some(until) = log
             .skipped
@@ -1277,22 +1299,51 @@ fn one_per_account(
         seen.extend(group.iter().map(|(a, _)| a.label.clone()));
         kept.push(chosen);
     }
-    (kept, view)
+    (kept, view, ambiguous)
 }
 
 /// The real account's key for `account`: its own (`Port::account_key`),
 /// else the first one its same-program aliases name. Aliases are the same
 /// login (`identity::duplicates`), so their key is this account's. One
 /// helper for both matching skips and recording an intent.
-fn group_key(port: &mut impl Port, account: &Account) -> Option<String> {
-    port.account_key(account).or_else(|| {
-        port.aliases(account).iter().find_map(|label| {
+fn group_key(port: &mut impl Port, account: &Account) -> GroupKey {
+    if let Some(own) = port.account_key(account) {
+        return GroupKey::Known(own);
+    }
+    let mut keys: Vec<String> = port
+        .aliases(account)
+        .iter()
+        .filter_map(|label| {
             port.account_key(&Account {
                 provider: account.provider,
                 label: label.clone(),
             })
         })
-    })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    match keys.len() {
+        0 => GroupKey::Unknown,
+        1 => GroupKey::Known(keys.remove(0)),
+        _ => GroupKey::Ambiguous,
+    }
+}
+/// What `group_key` found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GroupKey {
+    Known(String),
+    /// No label of the group names an account (legacy tokens only).
+    Unknown,
+    /// Aliases name different accounts: see `Hold::Ambiguous`.
+    Ambiguous,
+}
+impl GroupKey {
+    fn known(self) -> Option<String> {
+        match self {
+            Self::Known(key) => Some(key),
+            _ => None,
+        }
+    }
 }
 
 /// A `reset retry` that may not send now: paused again, key kept, until the

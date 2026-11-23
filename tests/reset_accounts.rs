@@ -884,3 +884,62 @@ fn legacy_representative_must_persist_a_known_siblings_account_key() {
         f.consumed
     );
 }
+
+#[test]
+fn review_legacy_bridge_must_not_merge_two_known_members() {
+    let p = Pool::new();
+    let legacy = p.add("legacy", "unused");
+    let alice = p.add("alice", "synthetic-member-a");
+    let bob = p.add("bob", "synthetic-member-b");
+    let at = aswap::now();
+    for (a, member) in [
+        (&legacy, None),
+        (&alice, Some("synthetic-member-a")),
+        (&bob, Some("synthetic-member-b")),
+    ] {
+        let mut claims = json!({"chatgpt_account_id":"synthetic-workspace","chatgpt_user_id":"synthetic-user-a"});
+        if let Some(m) = member {
+            claims["chatgpt_account_user_id"] = m.into();
+        }
+        let payload = json!({"https://api.openai.com/auth":claims});
+        let jwt = format!(
+            "synthetic.{}.synthetic",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+        );
+        store::json_write(
+            &p.store
+                .profile(a.provider, &a.label)
+                .unwrap()
+                .join("auth.json"),
+            &json!({"tokens":{"account_id":"synthetic-workspace","access_token":jwt}}),
+        )
+        .unwrap();
+    }
+    let mut f = Fake::new(&p.store);
+    assert!(f.aliases(&alice).iter().all(|x| x != "bob"));
+    assert_eq!(f.aliases(&legacy), vec!["alice", "bob"]);
+    f.response = json!({"outcome":"noCredit"});
+    for a in [&legacy, &alice, &bob] {
+        f.readings.insert(a.label.clone(), cache(100.0, at));
+    }
+    let mut log = ResetLog::default();
+    reset::step(
+        &mut f,
+        Provider::Codex,
+        &settings(AutoReset::On),
+        vec![
+            (legacy, cache(100.0, at)),
+            (alice, cache(100.0, at)),
+            (bob, cache(100.0, at)),
+        ],
+        &mut log,
+        false,
+        at,
+    )
+    .unwrap();
+    assert!(
+        f.consumed.is_empty(),
+        "ambiguous legacy group carries two distinct authoritative keys but consume was attempted: {:?}",
+        f.consumed
+    );
+}
