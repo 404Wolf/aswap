@@ -35,6 +35,38 @@ pub struct Usage {
     /// Codex usage-limit reset credits as the app-server lists them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reset_credits: Vec<ResetCredit>,
+    /// Codex's `ordinaryUsageAllowed`, the backend's permission for ordinary
+    /// usage (see [`OrdinaryUsage`]).
+    #[serde(default, skip_serializing_if = "OrdinaryUsage::not_reported")]
+    pub ordinary_usage: OrdinaryUsage,
+}
+/// Codex's `ordinaryUsageAllowed` (app-server protocol v2): the backend's
+/// permission for ordinary included usage. Upstream: "Null means
+/// unavailable; clients must not infer recovery from percentages or reset
+/// times." Older Codex versions don't report it at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OrdinaryUsage {
+    /// The read has no such field: an older Codex. Percentages decide.
+    #[default]
+    NotReported,
+    /// Reported as null: permission unknown.
+    Unknown,
+    Allowed,
+    Denied,
+}
+impl OrdinaryUsage {
+    fn not_reported(&self) -> bool {
+        *self == Self::NotReported
+    }
+    pub fn from_read(v: &Value) -> Self {
+        match v.get("ordinaryUsageAllowed") {
+            None => Self::NotReported,
+            Some(Value::Bool(true)) => Self::Allowed,
+            Some(Value::Bool(false)) => Self::Denied,
+            Some(_) => Self::Unknown,
+        }
+    }
 }
 /// One Codex usage-limit reset credit. Redeeming it resets the account's
 /// eligible windows (5-hour and weekly together); it is an earned, expiring
@@ -477,6 +509,7 @@ pub fn parse_codex(v: &Value) -> Result<Usage> {
         credits,
         available_usage_resets,
         reset_credits: parse_reset_credits(v),
+        ordinary_usage: OrdinaryUsage::from_read(v),
     })
 }
 #[derive(Clone, Copy, Debug)]
@@ -975,6 +1008,37 @@ fn fresh_enough(store: &Store, account: &Account, at: u64, force: bool) -> Resul
         }
     }
     Ok(Decision::Fetch { old, path, profile })
+}
+/// A quota observation fetched by this call, now: the provider's own answer,
+/// never a cached one (a forced read that couldn't fetch, because another
+/// process holds the fetch or this is a follower, returns None). For
+/// confirming a limit notice, where an older reading proves nothing.
+pub fn fresh_read(store: &Store, account: &Account) -> Option<Usage> {
+    if crate::coordination::follower(store).ok()? {
+        return None;
+    }
+    let refresh = |force: bool| {
+        let _lock = store
+            .lock()
+            .map_err(|_| Failure::new("usage-unavailable"))?;
+        crate::refresh::refresh(store, account, now(), force)
+    };
+    fresh_read_with(store, account, now(), |p| {
+        fetch_refreshing(account, p, refresh, |p| fetch(account, p))
+    })
+}
+/// `fresh_read` with the fetch given (tests).
+pub fn fresh_read_with<F>(store: &Store, account: &Account, at: u64, fetcher: F) -> Option<Usage>
+where
+    F: FnOnce(&Path) -> std::result::Result<Usage, Failure>,
+{
+    let mut fresh = None;
+    let _ = cached_mode_with(store, account, at, true, |p| {
+        let result = fetcher(p);
+        fresh = result.as_ref().ok().cloned();
+        result
+    });
+    fresh
 }
 pub fn cached(store: &Store, account: &Account) -> Result<Cached> {
     cached_force(store, account, false)

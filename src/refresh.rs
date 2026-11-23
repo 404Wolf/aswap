@@ -441,7 +441,11 @@ pub(crate) fn settle_pending(store: &Store, account: &Account) -> crate::Result<
 }
 /// Install a pending login left by a rotation whose final write failed,
 /// if the login file is still the one it replaces; drop it otherwise.
-fn recover_pending(store: &Store, account: &Account, path: &std::path::Path) -> crate::Result<()> {
+pub(crate) fn recover_pending(
+    store: &Store,
+    account: &Account,
+    path: &std::path::Path,
+) -> crate::Result<()> {
     let copies: Vec<_> = pending_paths(store, account)
         .into_iter()
         .filter(|copy| copy.exists())

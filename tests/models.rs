@@ -130,6 +130,9 @@ if 'app-server' in args:
                 result={'data':[{'id':'other','model':'other'}],'nextCursor':'page2'}
             else:
                 result={'data':[{'id':'synthetic-sol' if allowed else 'other','model':'synthetic-sol' if allowed else 'other'}]}
+        elif method=='account/rateLimits/read':
+            # 'one' hits its limit below: its quota reads exhausted.
+            result={'rateLimits':{'primary':{'usedPercent':100 if label=='one' else 20,'windowDurationMins':300,'resetsAt':int(time.time())+3600}}}
         else: continue
         print(json.dumps({'id':req['id'],'result':result}),flush=True)
     sys.exit(0)

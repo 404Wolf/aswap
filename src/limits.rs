@@ -42,8 +42,6 @@ pub const CODEX_CONFIRM: Duration = Duration::from_secs(300);
 /// the earlier ones failed or showed room (a quota reading can lag the
 /// limit). Bounded by `CODEX_CONFIRM`.
 const CODEX_RETRY: [u64; 6] = [0, 10, 30, 60, 120, 240];
-/// How long one confirming read may take before it counts as failed.
-const CODEX_READ_WAIT: Duration = Duration::from_secs(20);
 /// After a failed exit with a notice unconfirmed: how long to keep reading.
 pub const CODEX_EXIT_VERIFY: Duration = Duration::from_secs(30);
 
@@ -71,25 +69,30 @@ pub struct Limits {
     evidence: Option<Evidence>,
     /// `CODEX_EXIT_VERIFY`, shorter in tests.
     exit_verify: Duration,
+    /// When the last confirming read started.
+    last_read: Option<Instant>,
+    /// Codex: a quota notice was seen this run (re-checked at a failed exit).
+    noticed: bool,
+    /// Codex: a notice came with a login rotated since launch.
+    rotated_notice: bool,
 }
 
 /// A Codex quota notice seen on screen, not yet confirmed by quota.
 struct Evidence {
-    /// When it was seen (wall clock, seconds): a confirming read must be
-    /// fetched at or after this.
-    since: u64,
     seen: Instant,
     /// Reads started for it so far.
     attempts: usize,
-    /// Whether any read came back with a reading (room or not).
+    /// Whether any read answered (room or not).
     read: bool,
-    /// Whether the last read failed (no answer, or a failed fetch).
-    failed: bool,
 }
 
+/// A fresh quota observation: one the provider answered for a read started
+/// after the notice (`usage::fresh_read`), never a cached reading. None: the
+/// read couldn't fetch or failed.
+pub type Fresh = Option<usage::Usage>;
+
 struct Reading {
-    result: std::sync::mpsc::Receiver<Option<usage::Cached>>,
-    started: Instant,
+    result: std::sync::mpsc::Receiver<Fresh>,
 }
 
 struct PendingScreen {
@@ -160,6 +163,9 @@ impl Limits {
             reading: None,
             evidence: None,
             exit_verify: CODEX_EXIT_VERIFY,
+            last_read: None,
+            noticed: false,
+            rotated_notice: false,
         }
     }
 
@@ -197,59 +203,69 @@ impl Limits {
     }
 
     /// Whether a Codex usage limit is live. A quota notice on screen
-    /// (`notice`) is only a trigger: it counts once a fresh quota read taken
-    /// after it shows the account exhausted. Prose that looks like a notice,
-    /// a redraw of an old one, or a model-specific bucket therefore never
-    /// switches a healthy account. The read runs in the background (`fresh`,
-    /// never on the terminal's thread) and is retried at `CODEX_RETRY` for up
-    /// to `CODEX_CONFIRM`, since a reading can lag the limit; the evidence is
-    /// kept across checks until then. A login rotated since launch
-    /// (`rotated`) counts at once: Codex may be refusing with its old token,
-    /// and the supervisor's credential recovery reloads the same account.
+    /// (`notice`) is only a trigger. It counts once a FRESH quota read
+    /// (`fresh`: started after the notice, answered by the provider; see
+    /// [`Fresh`]) shows the account exhausted: a window used up and not yet
+    /// reset, or `ordinaryUsageAllowed` false. Prose that looks like a
+    /// notice, a redraw or a model bucket never switches a healthy account.
     ///
-    /// After a failed exit (`gone`) with a notice unconfirmed, reads continue
-    /// for up to `CODEX_EXIT_VERIFY` (the provider is gone; nothing waits)
-    /// while they show room (a lagging reading); a read that fails then
-    /// counts. While running, when no read at all came back (a follower
-    /// without its owner, the quota service down) by the time the evidence
-    /// runs out, the notice counts too: an agent is never left on an account
-    /// it can't check.
+    /// While the session runs, a notice NEVER counts without such a read.
+    /// Reads run in the background, never on the terminal's thread, one at
+    /// a time and each kept until it answers (a slow one is not abandoned
+    /// for a second that would contend with it). They are retried at
+    /// `CODEX_RETRY`, then every `CODEX_RETRY`'s last interval for as long as
+    /// none answers (the session is still working, so nothing is stuck). The
+    /// trigger is kept until an answer resolves it: confirmed, or showing
+    /// room once `CODEX_CONFIRM` has passed.
+    ///
+    /// A login rotated since launch (`rotated`) never counts on its own; it
+    /// lets the supervisor reload the same account (`rotated_notice`), never
+    /// switch to another.
+    ///
+    /// After a failed exit (`gone`) following any notice this run, the
+    /// account is re-read every 5 s for the whole `CODEX_EXIT_VERIFY`
+    /// (stopped early by `cancelled`, a signal to the supervisor, which then
+    /// counts nothing). Confirmed: it counts. Only if none of those reads
+    /// ever answered does the notice count, after the whole window, so an
+    /// exited session isn't ended on an account that can't be checked.
+    #[allow(clippy::too_many_arguments)]
     pub fn check_codex(
         &mut self,
         notice: bool,
         gone: bool,
         rotated: impl FnOnce() -> bool,
-        fresh: impl Fn() -> std::sync::mpsc::Receiver<Option<usage::Cached>>,
+        fresh: impl Fn() -> std::sync::mpsc::Receiver<Fresh>,
+        cancelled: impl Fn() -> bool,
         now: impl Fn() -> u64,
     ) -> bool {
         if self.screen_seen {
             return true;
         }
-        if notice && self.evidence.is_none() {
-            if rotated() {
-                self.screen_seen = true;
-                return true;
+        if notice {
+            self.noticed = true;
+            if self.evidence.is_none() {
+                self.rotated_notice |= rotated();
+                self.evidence = Some(Evidence {
+                    seen: Instant::now(),
+                    attempts: 0,
+                    read: false,
+                });
             }
-            self.evidence = Some(Evidence {
-                since: now(),
+        }
+        self.confirm_codex(&fresh, &now);
+        if gone && self.noticed && !self.screen_seen {
+            // Re-check after the exit, whatever the earlier reads said.
+            self.evidence.get_or_insert(Evidence {
                 seen: Instant::now(),
                 attempts: 0,
                 read: false,
-                failed: false,
             });
-        }
-        self.confirm_codex(&fresh, &now);
-        if gone && self.evidence.is_some() {
-            // Re-read every few seconds, not on the retry schedule: nothing
-            // else waits now, and the session's fate depends on it.
+            let mut answered = false;
             let end = Instant::now() + self.exit_verify;
             let mut last: Option<Instant> = None;
-            while !self.screen_seen && self.evidence.is_some() && Instant::now() < end {
-                // The account can't be checked now: recover rather than leave
-                // the session on it.
-                if self.evidence.as_ref().is_some_and(|e| e.failed) {
-                    self.screen_seen = true;
-                    break;
+            while !self.screen_seen && Instant::now() < end {
+                if cancelled() {
+                    return false;
                 }
                 if self.reading.is_none()
                     && last.is_none_or(|at| at.elapsed() >= Duration::from_secs(5))
@@ -258,84 +274,84 @@ impl Limits {
                     last = Some(Instant::now());
                 }
                 std::thread::sleep(Duration::from_millis(50));
-                self.confirm_codex(&fresh, &now);
+                answered |= self.collect_codex(&now) == Some(true);
             }
-            if self.evidence.as_ref().is_some_and(|e| !e.read) {
+            if !self.screen_seen && !answered {
                 self.screen_seen = true;
             }
         }
         self.screen_seen
     }
 
-    fn start_read(
-        &mut self,
-        fresh: &impl Fn() -> std::sync::mpsc::Receiver<Option<usage::Cached>>,
-    ) {
+    /// A notice whose login rotated since launch: the supervisor may reload
+    /// the same account with its new login (never switch to another).
+    pub fn rotated_notice(&self) -> bool {
+        self.rotated_notice && !self.screen_seen
+    }
+
+    fn start_read(&mut self, fresh: &impl Fn() -> std::sync::mpsc::Receiver<Fresh>) {
         if let Some(evidence) = &mut self.evidence {
             evidence.attempts += 1;
         }
-        self.reading = Some(Reading {
-            result: fresh(),
-            started: Instant::now(),
-        });
+        self.last_read = Some(Instant::now());
+        self.reading = Some(Reading { result: fresh() });
+    }
+
+    /// Takes a finished read's answer, if any: Some(true) when it answered,
+    /// Some(false) when it couldn't, None while it runs. Confirms on
+    /// exhaustion.
+    fn collect_codex(&mut self, now: &impl Fn() -> u64) -> Option<bool> {
+        use std::sync::mpsc::TryRecvError;
+        let reading = self.reading.as_ref()?;
+        let result = match reading.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Disconnected) => None,
+            Err(TryRecvError::Empty) => return None,
+        };
+        self.reading = None;
+        let Some(usage) = result else {
+            return Some(false);
+        };
+        if let Some(evidence) = &mut self.evidence {
+            evidence.read = true;
+        }
+        if exhausted_now(&usage, now()) {
+            self.screen_seen = true;
+            self.evidence = None;
+        }
+        Some(true)
     }
 
     /// Collects a finished confirming read, starts the next one when due,
-    /// and retires evidence that ran out.
+    /// and retires a trigger an answer resolved.
     fn confirm_codex(
         &mut self,
-        fresh: &impl Fn() -> std::sync::mpsc::Receiver<Option<usage::Cached>>,
+        fresh: &impl Fn() -> std::sync::mpsc::Receiver<Fresh>,
         now: &impl Fn() -> u64,
     ) {
-        use std::sync::mpsc::TryRecvError;
-        let Some(since) = self.evidence.as_ref().map(|e| e.since) else {
+        if self.evidence.is_none() {
             return;
-        };
-        if let Some(reading) = &self.reading {
-            let result = match reading.result.try_recv() {
-                Ok(result) => Some(result),
-                Err(TryRecvError::Disconnected) => Some(None),
-                Err(TryRecvError::Empty) if reading.started.elapsed() >= CODEX_READ_WAIT => {
-                    Some(None)
-                }
-                Err(TryRecvError::Empty) => None,
-            };
-            if let Some(result) = result {
-                self.reading = None;
-                // A failed fetch comes back as a reading with its error.
-                let good = result.filter(|cache| {
-                    matches!(cache.error.as_deref(), None | Some("provider-limit"))
-                });
-                if let Some(evidence) = &mut self.evidence {
-                    evidence.read |= good.is_some();
-                    evidence.failed = good.is_none();
-                }
-                if let Some(cache) = good
-                    && cache.fetched_at >= since
-                    && exhausted(&cache, now())
-                {
-                    self.screen_seen = true;
-                    self.evidence = None;
-                    return;
-                }
-            }
         }
+        self.collect_codex(now);
         let Some(evidence) = &self.evidence else {
             return;
         };
-        if evidence.seen.elapsed() >= CODEX_CONFIRM {
-            if self.reading.is_none() {
-                // Never checked at all: count it. Checked and not confirmed:
-                // it was prose, a redraw or a model bucket.
-                self.screen_seen = !evidence.read;
-                self.evidence = None;
-            }
+        if self.reading.is_some() {
             return;
         }
-        let due = CODEX_RETRY
-            .get(evidence.attempts)
-            .is_some_and(|after| evidence.seen.elapsed() >= Duration::from_secs(*after));
-        if self.reading.is_none() && due {
+        if evidence.read && evidence.seen.elapsed() >= CODEX_CONFIRM {
+            // Answered and never confirmed: prose, a redraw or a model bucket.
+            self.evidence = None;
+            return;
+        }
+        let last = *CODEX_RETRY.last().expect("retry schedule");
+        let due = match CODEX_RETRY.get(evidence.attempts) {
+            Some(after) => evidence.seen.elapsed() >= Duration::from_secs(*after),
+            None => self
+                .last_read
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(last)),
+        };
+        if due {
             self.start_read(fresh);
         }
     }
@@ -450,11 +466,11 @@ impl Limits {
 }
 
 /// A fresh reading with some window used up and not yet reset.
-fn exhausted(cache: &usage::Cached, at: u64) -> bool {
-    matches!(cache.error.as_deref(), None | Some("provider-limit"))
-        && cache.fetched_at != 0
-        && at.saturating_sub(cache.fetched_at) < usage::TTL
-        && cache.usage.windows.iter().any(|window| {
+/// A fresh observation showing the account out of usage now: a window used
+/// up and not yet reset, or Codex's backend denying ordinary usage.
+fn exhausted_now(usage: &usage::Usage, at: u64) -> bool {
+    usage.ordinary_usage == usage::OrdinaryUsage::Denied
+        || usage.windows.iter().any(|window| {
             window.used_percent >= 100.0 && window.resets_at.is_none_or(|reset| reset > at)
         })
 }
@@ -709,29 +725,25 @@ mod agy_tests {
 mod codex_tests {
     use super::*;
 
-    fn reading(used: f64, at: u64) -> usage::Cached {
-        usage::Cached {
-            usage: usage::Usage {
-                windows: vec![usage::Window {
-                    name: "primary".into(),
-                    used_percent: used,
-                    resets_at: Some(at + 3600),
-                    duration_minutes: Some(300),
-                    codex_slot: None,
-                }],
-                ..Default::default()
-            },
-            fetched_at: at,
+    fn obs(used: f64, at: u64) -> usage::Usage {
+        usage::Usage {
+            windows: vec![usage::Window {
+                name: "primary".into(),
+                used_percent: used,
+                resets_at: Some(at + 3600),
+                duration_minutes: Some(300),
+                codex_slot: None,
+            }],
             ..Default::default()
         }
     }
-    fn ready(value: Option<usage::Cached>) -> std::sync::mpsc::Receiver<Option<usage::Cached>> {
+    fn ready(value: Fresh) -> std::sync::mpsc::Receiver<Fresh> {
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(value).unwrap();
         rx
     }
     /// A read that never answers (its sender is kept alive).
-    fn stuck() -> std::sync::mpsc::Receiver<Option<usage::Cached>> {
+    fn stuck() -> std::sync::mpsc::Receiver<Fresh> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::mem::forget(tx);
         rx
@@ -740,102 +752,150 @@ mod codex_tests {
     #[test]
     fn a_codex_notice_counts_only_when_a_fresh_read_confirms_it() {
         let at = crate::now();
-        let never = || -> std::sync::mpsc::Receiver<Option<usage::Cached>> { panic!("read") };
+        let never = || -> std::sync::mpsc::Receiver<Fresh> { panic!("read") };
         let no = || false;
-        let reads = std::cell::RefCell::new(Vec::<Option<usage::Cached>>::new());
-        let script = |values: Vec<Option<usage::Cached>>| {
+        let reads = std::cell::RefCell::new(Vec::<Fresh>::new());
+        let started = std::cell::Cell::new(0usize);
+        let script = |values: Vec<Fresh>| {
             *reads.borrow_mut() = values;
+            started.set(0);
         };
         let fresh = || {
-            let next = reads.borrow_mut().remove(0);
-            ready(next)
+            started.set(started.get() + 1);
+            ready(reads.borrow_mut().remove(0))
         };
         let fresh_limits = || {
             let mut limits = Limits::new(None);
-            limits.exit_verify = Duration::from_millis(300);
+            limits.exit_verify = Duration::from_millis(400);
             limits
         };
-        // Back-date the evidence so the next retry is due now.
         let later = |limits: &mut Limits, after: u64| {
             limits.evidence.as_mut().unwrap().seen = Instant::now() - Duration::from_secs(after);
+            limits.last_read = Some(Instant::now() - Duration::from_secs(after));
         };
 
-        // A real limit: the read taken after the notice has it exhausted.
+        // A real limit: the fresh read has the account exhausted.
         let mut limits = fresh_limits();
-        script(vec![Some(reading(100.0, at))]);
-        assert!(!limits.check_codex(true, false, no, fresh, || at));
-        assert!(limits.check_codex(false, false, no, never, || at));
+        script(vec![Some(obs(100.0, at))]);
+        assert!(!limits.check_codex(true, false, no, fresh, no, || at));
+        assert!(limits.check_codex(false, false, no, never, no, || at));
+        assert_eq!(started.get(), 1);
 
-        // The login rotated since launch: counts at once, no read.
-        assert!(fresh_limits().check_codex(true, false, || true, never, || at));
-
-        // Prose, a redraw or a model bucket: the reads show room, so it
-        // never counts, also after the evidence ran out; a later notice
-        // starts over.
+        // Codex's backend denying ordinary usage is exhaustion too, however
+        // the percentages read (review (c)).
         let mut limits = fresh_limits();
-        script(vec![Some(reading(20.0, at)); 6]);
-        assert!(!limits.check_codex(true, false, no, fresh, || at));
+        let mut denied = obs(20.0, at);
+        denied.ordinary_usage = usage::OrdinaryUsage::Denied;
+        script(vec![Some(denied)]);
+        assert!(!limits.check_codex(true, false, no, fresh, no, || at));
+        assert!(limits.check_codex(false, false, no, never, no, || at));
+
+        // A rotated login never counts by itself (review (a)): it only lets
+        // the supervisor reload the same account.
+        let mut limits = fresh_limits();
+        script(vec![Some(obs(20.0, at))]);
+        assert!(!limits.check_codex(true, false, || true, fresh, no, || at));
+        assert!(limits.rotated_notice());
+        assert!(!limits.check_codex(false, false, no, never, no, || at));
+
+        // Prose, a redraw or a model bucket: fresh reads show room. Never
+        // counts; retired once answered and past the window; no more reads.
+        let mut limits = fresh_limits();
+        script(vec![Some(obs(20.0, at)); 6]);
+        assert!(!limits.check_codex(true, false, no, fresh, no, || at));
         for after in [10, 30, 60, 120, 240] {
-            assert!(!limits.check_codex(false, false, no, fresh, || at));
+            assert!(!limits.check_codex(false, false, no, fresh, no, || at));
             later(&mut limits, after);
         }
-        assert!(!limits.check_codex(false, false, no, fresh, || at));
+        assert!(!limits.check_codex(false, false, no, fresh, no, || at));
         later(&mut limits, CODEX_CONFIRM.as_secs());
-        assert!(!limits.check_codex(false, false, no, fresh, || at));
+        assert!(!limits.check_codex(false, false, no, fresh, no, || at));
         assert!(limits.evidence.is_none());
-        assert!(!limits.check_codex(false, false, no, never, || at));
+        assert!(!limits.check_codex(false, false, no, never, no, || at));
 
-        // The evidence is kept: a failed read, then a lagging one showing
-        // room, then exhaustion, with no second notice (round 4, 1).
+        // Kept across failures and lag, without a second notice.
         let mut limits = fresh_limits();
-        script(vec![
-            None,
-            Some(reading(99.0, at)),
-            Some(reading(100.0, at + 30)),
-        ]);
-        assert!(!limits.check_codex(true, false, no, fresh, || at));
-        assert!(!limits.check_codex(false, false, no, fresh, || at));
+        script(vec![None, Some(obs(99.0, at)), Some(obs(100.0, at))]);
+        assert!(!limits.check_codex(true, false, no, fresh, no, || at));
+        assert!(!limits.check_codex(false, false, no, fresh, no, || at));
         later(&mut limits, 10);
-        assert!(!limits.check_codex(false, false, no, fresh, || at));
+        assert!(!limits.check_codex(false, false, no, fresh, no, || at));
         later(&mut limits, 30);
-        assert!(!limits.check_codex(false, false, no, fresh, || at));
-        assert!(limits.check_codex(false, false, no, never, || at + 30));
+        assert!(!limits.check_codex(false, false, no, fresh, no, || at));
+        assert!(limits.check_codex(false, false, no, never, no, || at));
 
-        // A reading fetched before the notice never confirms it, however
-        // exhausted (round 4, 2: quota may have come back since).
+        // While the session runs, failed or unanswered reads never make a
+        // notice count, also long past the window; the trigger is kept and
+        // retried (review (d) and the ruling).
         let mut limits = fresh_limits();
-        script(vec![Some(reading(100.0, at - 60))]);
-        assert!(!limits.check_codex(true, false, no, fresh, || at));
-        assert!(!limits.check_codex(false, false, no, fresh, || at));
+        script(vec![None; 10]);
+        assert!(!limits.check_codex(true, false, no, fresh, no, || at));
+        for after in [10, 30, 60, 120, 240, 600, 900] {
+            later(&mut limits, after);
+            assert!(!limits.check_codex(false, false, no, fresh, no, || at));
+        }
+        assert!(limits.evidence.is_some());
+        let mut limits = fresh_limits();
+        assert!(!limits.check_codex(true, false, no, stuck, no, || at));
+        later(&mut limits, CODEX_CONFIRM.as_secs() * 2);
+        assert!(!limits.check_codex(false, false, no, never, no, || at));
+        assert!(
+            limits.evidence.is_some() && limits.reading.is_some(),
+            "one read, kept"
+        );
 
-        // No read ever comes back: the evidence counts when it runs out.
+        // A failed exit re-reads: confirmed counts, room doesn't.
         let mut limits = fresh_limits();
-        assert!(!limits.check_codex(true, false, no, stuck, || at));
-        limits.reading.as_mut().unwrap().started = Instant::now() - CODEX_READ_WAIT;
-        later(&mut limits, CODEX_CONFIRM.as_secs());
-        assert!(limits.check_codex(false, false, no, stuck, || at));
-
-        // A failed exit with the notice unconfirmed reads again: confirmed,
-        // it counts; showing room, it doesn't; never answered, it counts.
-        let mut limits = fresh_limits();
-        script(vec![None, Some(reading(100.0, at))]);
-        assert!(!limits.check_codex(true, false, no, fresh, || at));
+        script(vec![None, Some(obs(100.0, at))]);
+        assert!(!limits.check_codex(true, false, no, fresh, no, || at));
         limits.exit_verify = Duration::from_secs(10);
-        assert!(limits.check_codex(false, true, no, fresh, || at));
+        assert!(limits.check_codex(false, true, no, fresh, no, || at));
         let mut limits = fresh_limits();
-        script(vec![Some(reading(20.0, at)), Some(reading(20.0, at))]);
-        assert!(!limits.check_codex(true, false, no, fresh, || at));
-        assert!(!limits.check_codex(false, true, no, fresh, || at));
+        script(vec![Some(obs(20.0, at)); 4]);
+        assert!(!limits.check_codex(true, false, no, fresh, no, || at));
+        assert!(!limits.check_codex(false, true, no, fresh, no, || at));
+        // Retired earlier (room), then exhausted at the failed exit: counts.
         let mut limits = fresh_limits();
-        assert!(!limits.check_codex(true, false, no, stuck, || at));
-        assert!(limits.check_codex(false, true, no, stuck, || at));
+        script(vec![Some(obs(20.0, at)), Some(obs(100.0, at))]);
+        assert!(!limits.check_codex(true, false, no, fresh, no, || at));
+        later(&mut limits, CODEX_CONFIRM.as_secs());
+        assert!(!limits.check_codex(false, false, no, never, no, || at));
+        assert!(limits.evidence.is_none());
+        assert!(limits.check_codex(false, true, no, fresh, no, || at));
+
+        // Never answered (failing or stuck): counts at exit, but only after
+        // the whole bounded re-read ran, never at once (the ruling).
+        for failing in [true, false] {
+            let mut limits = fresh_limits();
+            limits.exit_verify = Duration::from_millis(600);
+            let begun = Instant::now();
+            let counted = if failing {
+                script(vec![None; 4]);
+                assert!(!limits.check_codex(true, false, no, fresh, no, || at));
+                limits.check_codex(false, true, no, fresh, no, || at)
+            } else {
+                assert!(!limits.check_codex(true, false, no, stuck, no, || at));
+                limits.check_codex(false, true, no, stuck, no, || at)
+            };
+            assert!(counted);
+            assert!(
+                begun.elapsed() >= Duration::from_millis(600),
+                "failing {failing}"
+            );
+        }
+        // A signal during that re-read stops it, counting nothing.
+        let mut limits = fresh_limits();
+        limits.exit_verify = Duration::from_secs(30);
+        assert!(!limits.check_codex(true, false, no, stuck, no, || at));
+        let begun = Instant::now();
+        assert!(!limits.check_codex(false, true, no, stuck, || true, || at));
+        assert!(begun.elapsed() < Duration::from_secs(1));
 
         // No notice: nothing happens, even at a failed exit.
-        assert!(!fresh_limits().check_codex(false, true, no, never, || at));
-        assert!(!fresh_limits().check_codex(false, false, no, never, || at));
+        assert!(!fresh_limits().check_codex(false, true, no, never, no, || at));
+        assert!(!fresh_limits().check_codex(false, false, no, never, no, || at));
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

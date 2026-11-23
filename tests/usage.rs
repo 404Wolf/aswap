@@ -1200,3 +1200,57 @@ fn a_fetch_never_recreates_an_account_removed_meanwhile() {
     assert_eq!(c.used(1000), Some(10.0));
     assert!(!profile.exists(), "the removed profile came back");
 }
+
+#[test]
+fn a_fresh_read_is_the_providers_answer_never_a_cached_reading() {
+    // A notice is confirmed only by a read answered after it (agy.3 review
+    // (b)): an exhausted cache from the same second proves nothing.
+    let temp = tempfile::tempdir().unwrap();
+    let store = aswap::store::Store::open(temp.path().join("data/aswap")).unwrap();
+    let account = aswap::store::Account {
+        provider: aswap::provider::Provider::Codex,
+        label: "one".into(),
+    };
+    let profile = store.profile(account.provider, &account.label).unwrap();
+    aswap::store::private_dir(&profile).unwrap();
+    aswap::store::json_write(
+        &profile.join("auth.json"),
+        &serde_json::json!({"tokens":{"access_token":"synthetic","account_id":"synthetic"}}),
+    )
+    .unwrap();
+    let mut state = store.load().unwrap();
+    state.accounts.push(account.clone());
+    store.save(&state).unwrap();
+    let at = aswap::now();
+    let exhausted = aswap::usage::Usage {
+        windows: vec![aswap::usage::Window {
+            name: "weekly".into(),
+            used_percent: 100.0,
+            resets_at: Some(at + 3600),
+            duration_minutes: Some(10080),
+            codex_slot: None,
+        }],
+        ..Default::default()
+    };
+    aswap::store::json_write(
+        &profile.join("usage-cache.json"),
+        &aswap::usage::Cached {
+            usage: exhausted.clone(),
+            fetched_at: at,
+            next_poll_at: at + 180,
+            last_attempt: at,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // The provider can't be read: no answer, not the cached 100%.
+    let failed = aswap::usage::fresh_read_with(&store, &account, at, |_| {
+        Err(aswap::usage::Failure::new("network"))
+    });
+    assert!(failed.is_none());
+    // The provider answers: that answer.
+    let mut room = exhausted.clone();
+    room.windows[0].used_percent = 20.0;
+    let answered = aswap::usage::fresh_read_with(&store, &account, at, |_| Ok(room.clone()));
+    assert_eq!(answered.unwrap().windows[0].used_percent, 20.0);
+}

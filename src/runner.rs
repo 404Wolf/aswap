@@ -411,7 +411,9 @@ pub fn run(
                     syncing = immediate_poll(store);
                 }
             }
-            let quota_rotation = limited
+            // A confirmed limit, or a notice that came with a rotated login
+            // (that only reloads the same account; never a switch).
+            let quota_rotation = (limited || limits.rotated_notice())
                 && !auth_failed
                 && !expired
                 && provider == Provider::Codex
@@ -589,7 +591,7 @@ pub fn run(
             let deadline = auth_seen.unwrap_or_else(Instant::now) + settle;
             rotated = rotation_by(store, &account, launched.as_deref(), deadline);
         }
-        if limited
+        if (limited || limits.rotated_notice())
             && provider == Provider::Codex
             && !rotated
             && !expired
@@ -992,18 +994,18 @@ fn limit_seen(
             moment.exited == Some(true),
             || rotated_since(store, account, moment.launched),
             || {
-                // Off the terminal thread: a forced read can wait for
-                // another fetch, or for the owner on a follower.
+                // Off the terminal thread: a provider read, never a cache.
                 let (tx, rx) = std::sync::mpsc::channel();
                 let (root, account) = (store.root.clone(), account.clone());
                 std::thread::spawn(move || {
                     let reading = Store::open(root)
-                        .and_then(|store| usage::cached_force(&store, &account, true))
-                        .ok();
+                        .ok()
+                        .and_then(|store| usage::fresh_read(&store, &account));
                     let _ = tx.send(reading);
                 });
                 rx
             },
+            || terminal.is_some_and(Terminal::interrupted),
             now,
         );
     }

@@ -71,6 +71,13 @@ pub(crate) struct InputActivity {
 const TIOCSCTTY: libc::c_ulong = libc::TIOCSCTTY as libc::c_ulong;
 
 impl Terminal {
+    /// Whether the supervisor was asked to stop (SIGTERM, SIGHUP, SIGINT,
+    /// SIGQUIT) while this terminal is up.
+    pub fn interrupted(&self) -> bool {
+        self.interrupt
+            .flag
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
     pub fn open() -> Result<Self> {
         let interrupt = Interrupt::new()?;
         let mut master = -1;

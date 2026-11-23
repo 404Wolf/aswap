@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.2-preview.agy.4 (2026-11-23)
+
+agy.3 with the review's changes (t4hf; t2kg's rulings). Not a release.
+
+### Fixed
+- **A Codex notice counts only with a fresh confirming read, while running.**
+  - Reads that fail or don't answer are retried and never make a live session switch.
+  - A failed exit re-reads for the whole 30 s, every 5 s. Only if none of those reads answered does the notice count, after the full window. A signal during that wait stops it, and nothing counts.
+  - A confirming read is the provider's own answer to a read started after the notice (`usage::fresh_read`), never a cached reading, even one from the same second.
+  - `ordinaryUsageAllowed: false` counts as exhaustion.
+  - A trigger is kept until an answer resolves it. One read runs at a time, kept until it answers.
+  - A rotated login no longer counts as a limit. It only lets the supervisor reload the same account.
+- **Activation never writes an older login over a newer one.** Under the refresh lock, the outgoing default is saved into its profile only when it is newer. Newer means a later expiry, or, without one, the file written last. A rotation that completed while the activation waited is kept. An incoming account's pending rotation is installed before it goes live.
+
 ## 0.2.2-preview.agy.3 (2026-11-23)
 
 0.2.2-preview.agy.2 (#44 plus the wake fixture fix) with fixes for two bugs it inherited from main. Server-ops found both in their review of agy.2. Not a release.

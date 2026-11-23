@@ -282,11 +282,15 @@ pub fn switch(store: &Store, provider: Provider, name: &str, activate: bool) -> 
 }
 /// Preserve the outgoing default login, including provider token rotations.
 /// Identity matching never guesses from the currently selected label.
+fn modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
 fn preserve_live(
     store: &Store,
     target: &Account,
     bytes: &[u8],
     config: Option<&Value>,
+    live_path: &std::path::Path,
 ) -> Result<bool> {
     validate_auth(target.provider, bytes)?;
     let current: Value =
@@ -343,10 +347,27 @@ fn preserve_live(
             let _refresh = store.refresh_lock(&candidate)?;
             // The outgoing default may still hold the revoked login. Leave
             // the profile bytes and pending copy for normal rotation recovery.
-            if !crate::refresh::has_pending(store, &candidate) {
-                store::atomic(&profile.join(candidate.provider.auth_file()), bytes)?;
+            // Re-read the profile now, under the refresh lock: a rotation may
+            // have completed since. The default login is saved only when it
+            // is strictly newer than what the profile holds; never over a
+            // newer (or equal, or unknown-age) rotation.
+            let path = profile.join(candidate.provider.auth_file());
+            let saved_now: Value = store::json_read(&path)?;
+            let newer = match (
+                crate::refresh::expires_at(candidate.provider, &current),
+                crate::refresh::expires_at(candidate.provider, &saved_now),
+            ) {
+                (Some(live), Some(saved)) if live != saved => live > saved,
+                // No (or the same) expiry to tell them apart: the file
+                // written last holds the newer login (a rotation installs
+                // into the profile; a provider refreshes its default home).
+                _ => modified(live_path)
+                    .is_some_and(|live| modified(&path).is_none_or(|saved| live > saved)),
+            };
+            if !crate::refresh::has_pending(store, &candidate) && newer {
+                store::atomic(&path, bytes)?;
+                target_is_live |= candidate.label == target.label;
             }
-            target_is_live |= candidate.label == target.label;
         }
     }
     Ok(target_is_live)
@@ -354,6 +375,12 @@ fn preserve_live(
 pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
     let provider = account.provider;
     let profile = store.profile(provider, &account.label)?;
+    // A rotation of the incoming account saved only in its pending copy is
+    // installed first, so activation never puts the revoked login live.
+    {
+        let _refresh = store.refresh_lock(account)?;
+        crate::refresh::recover_pending(store, account, &profile.join(provider.auth_file()))?;
+    }
     let mut bytes = store::read_private(&profile.join(provider.auth_file()))?;
     validate_auth(provider, &bytes)?;
     let dest = provider.current_home()?;
@@ -394,7 +421,7 @@ pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
         None
     };
     if let Some(old) = &old_auth
-        && preserve_live(store, account, old, old_config.as_ref())?
+        && preserve_live(store, account, old, old_config.as_ref(), &auth_path)?
     {
         bytes = old.clone();
     }
