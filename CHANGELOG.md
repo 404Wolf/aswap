@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2-preview.agy.9 (2026-11-23)
+
+agy.8 with its review's changes (t4j5; t2kg's rulings). Not a release.
+
+### Fixed
+- **The activation record belongs to one live slot** (the live auth file under `CODEX_HOME`, `CLAUDE_CONFIG_DIR` or the home default), not to the provider. Another slot's record never makes a revoked login look like a CLI rotation. The record is written last, once the activation stands, so a rolled-back activation leaves the old record.
+- **A CLI rotation is saved to the account that was put live,** even when it is a later alias. It is installed the way a refresh would install it: its aliases, running views and usage backoff too.
+- **`aswap restore` refuses, unless `--force`,** when the account's login changed since the backup (it may be newer) or a rotation is pending. Before replacing anything, it backs up the current login and any pending copy, and prints where.
+- **A same-account live login that isn't saved is reported,** with the backup path and the restore command.
+- `vt100` updated to 0.18.1.
+
 ## 0.2.2-preview.agy.8 (2026-11-23)
 
 agy.7 with its review's changes (t4j5; t2kg's rulings). Not a release.

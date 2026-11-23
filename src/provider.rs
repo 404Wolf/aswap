@@ -316,105 +316,172 @@ fn credential(provider: Provider, auth: &Value) -> Option<String> {
             .collect(),
     )
 }
-/// What `--activate-live` put live last, per provider: the label and the
-/// credential. The live slot then changes only by the provider's own CLI
-/// rotating it, so a different credential there is that rotation.
+/// What `--activate-live` last put in one live slot (its auth file): the
+/// label and the credential. That slot then changes only by the provider's
+/// own CLI rotating it, so a different credential there is that rotation.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Activation {
+    /// The live auth file, canonical (the slot this record describes).
+    slot: std::path::PathBuf,
     label: String,
     credential: String,
 }
-fn activation_path(store: &Store, provider: Provider) -> std::path::PathBuf {
+/// A live slot's identity: its auth file with the directory canonical.
+fn slot(auth_path: &std::path::Path) -> std::path::PathBuf {
+    let dir = auth_path.parent().unwrap_or(std::path::Path::new("."));
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_owned());
+    dir.join(auth_path.file_name().unwrap_or_default())
+}
+fn activation_path(
+    store: &Store,
+    provider: Provider,
+    slot: &std::path::Path,
+) -> std::path::PathBuf {
+    let hash: String =
+        ring::digest::digest(&ring::digest::SHA256, slot.as_os_str().as_encoded_bytes())
+            .as_ref()
+            .iter()
+            .take(16)
+            .map(|b| format!("{b:02x}"))
+            .collect();
     store
         .root
         .join("live-activations")
-        .join(format!("{}.json", provider.as_str()))
+        .join(format!("{}-{hash}.json", provider.as_str()))
 }
-/// The outgoing live login, before an activation replaces it.
-///
-/// It is always backed up (live-backups, pruned to `LIVE_BACKUPS`). It is
-/// saved to a profile only when it is the SAME account as that profile (by
-/// the authoritative account key), aswap put that profile's login live, the
-/// profile still holds it, and the live slot now holds another: the
-/// provider's CLI rotated it, so it is the newest login for that account.
-/// In every other case (no activation record, a profile changed since, a
-/// pending rotation) it is backed up only. A different or unknown account
-/// is backed up only, and the user is told where and how to restore it.
-fn preserve_live(
+fn read_activation(
     store: &Store,
-    target: &Account,
+    provider: Provider,
+    slot: &std::path::Path,
+) -> Option<Activation> {
+    let record: Activation = store::json_read(&activation_path(store, provider, slot)).ok()?;
+    (record.slot == slot).then_some(record)
+}
+/// Beside a backup: which account's stored login it was compared with, and
+/// that login's credential then (for `restore` to tell whether the profile
+/// changed since).
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct BackupNote {
+    label: Option<String>,
+    profile_credential: Option<String>,
+}
+const BACKUP_NOTE: &str = "aswap-backup.json";
+/// Write `bytes` (and Claude's config) into a new private backup directory.
+fn back_up(
+    store: &Store,
+    provider: Provider,
+    prefix: &str,
     bytes: &[u8],
     config: Option<&Value>,
-) -> Result<()> {
-    validate_auth(target.provider, bytes)?;
-    let provider = target.provider;
-    let current: Value =
-        serde_json::from_slice(bytes).safe("invalid live credential JSON; contents redacted")?;
+    note: &BackupNote,
+) -> Result<std::path::PathBuf> {
     let backups = store.root.join("live-backups").join(provider.as_str());
     store::private_dir(&backups)?;
     let backup = tempfile::Builder::new()
-        .prefix("before-switch-")
+        .prefix(prefix)
         .tempdir_in(&backups)
         .safe("cannot preserve outgoing login")?;
     store::atomic(&backup.path().join(provider.auth_file()), bytes)?;
     if let Some(config) = config {
         store::json_write(&backup.path().join(".claude.json"), config)?;
     }
+    store::json_write(&backup.path().join(BACKUP_NOTE), note)?;
     let backup = backup.keep();
     prune_backups(&backups, &backup);
+    Ok(backup)
+}
+/// A profile's login and config, and its authoritative account key.
+fn stored(store: &Store, account: &Account) -> Result<(Value, Option<String>)> {
+    let profile = store.profile(account.provider, &account.label)?;
+    let saved: Value = store::json_read(&profile.join(account.provider.auth_file()))?;
+    let config: Value =
+        store::json_read(&profile.join(".claude.json")).unwrap_or_else(|_| serde_json::json!({}));
+    let key = crate::identity::account_key(account.provider, &saved, &config);
+    Ok((saved, key))
+}
+/// The outgoing login of one live slot (`auth_path`), before an activation
+/// replaces it.
+///
+/// It is always backed up (live-backups, pruned to `LIVE_BACKUPS`). It is
+/// saved, as a refresh would install it, only to the account aswap put live
+/// in THIS slot (its activation record), when that account is the same
+/// account (authoritative key), its profile still holds exactly what aswap
+/// put live, the slot now holds another login, and no rotation is pending:
+/// the provider's CLI rotated it, so it is that account's newest login.
+/// Otherwise it is backed up only, and the user is told where.
+fn preserve_live(
+    store: &Store,
+    target: &Account,
+    bytes: &[u8],
+    config: Option<&Value>,
+    auth_path: &std::path::Path,
+) -> Result<()> {
+    validate_auth(target.provider, bytes)?;
+    let provider = target.provider;
+    let current: Value =
+        serde_json::from_slice(bytes).safe("invalid live credential JSON; contents redacted")?;
     let empty = serde_json::json!({});
     let live_key = crate::identity::account_key(provider, &current, config.unwrap_or(&empty));
     let live_credential = credential(provider, &current);
-    let activated: Option<Activation> = store::json_read(&activation_path(store, provider)).ok();
-    let mut saved_to = None;
-    if let Some(live_key) = &live_key {
-        for candidate in store
-            .load()?
-            .accounts
-            .into_iter()
-            .filter(|a| a.provider == provider)
-        {
-            let profile = store.profile(candidate.provider, &candidate.label)?;
-            let path = profile.join(provider.auth_file());
-            let saved: Value = store::json_read(&path)?;
-            let saved_config: Value =
-                store::json_read(&profile.join(".claude.json")).unwrap_or(empty.clone());
-            if crate::identity::account_key(provider, &saved, &saved_config).as_ref()
-                != Some(live_key)
-            {
-                continue;
+    let accounts: Vec<Account> = store
+        .load()?
+        .accounts
+        .into_iter()
+        .filter(|a| a.provider == provider)
+        .collect();
+    // The same account's profiles (aliases included), by authoritative key.
+    let mut same = Vec::new();
+    if live_key.is_some() {
+        for account in &accounts {
+            let (saved, key) = stored(store, account)?;
+            if key == live_key {
+                same.push((account.clone(), saved));
             }
-            saved_to = Some(candidate.label.clone());
-            if live_credential.is_none() || live_credential == credential(provider, &saved) {
-                break;
-            }
-            // Provably the CLI's own rotation: aswap put this profile's login
-            // live (the activation record), the profile still holds exactly
-            // that login, and the live slot now holds another. Without the
-            // record (a store from before it, a login made elsewhere) or
-            // with a profile changed since, nothing proves it newer.
-            let rotated_by_cli = activated.as_ref().is_some_and(|a| {
-                a.label == candidate.label
-                    && credential(provider, &saved).as_ref() == Some(&a.credential)
-                    && live_credential.as_ref() != Some(&a.credential)
-            });
-            // Under the store lock: only try (lock order; switch retries).
-            let _refresh = store
-                .try_refresh_lock(&candidate)?
-                .ok_or(Error(crate::refresh::BUSY))?;
-            if rotated_by_cli && !crate::refresh::pending_exists(store, &candidate) {
-                store::atomic(&path, bytes)?;
-                crate::refresh::discard_pending(store, &candidate);
-            }
-            break;
         }
     }
-    if saved_to.is_none() {
-        eprintln!(
-            "aswap: the live {provider} login isn't a known account here; saved it to {}. Restore it with: aswap restore {provider} <label> --from {}",
-            backup.display(),
+    let record = read_activation(store, provider, &slot(auth_path));
+    let rotated = record.as_ref().and_then(|record| {
+        let (account, saved) = same.iter().find(|(a, _)| a.label == record.label)?;
+        (credential(provider, saved).as_ref() == Some(&record.credential)
+            && live_credential.is_some()
+            && live_credential.as_ref() != Some(&record.credential))
+        .then_some(account.clone())
+    });
+    let compared = rotated
+        .clone()
+        .or_else(|| same.first().map(|(a, _)| a.clone()));
+    let note = BackupNote {
+        label: compared.as_ref().map(|a| a.label.clone()),
+        profile_credential: compared.as_ref().and_then(|a| {
+            same.iter()
+                .find(|(b, _)| b.label == a.label)
+                .and_then(|(_, saved)| credential(provider, saved))
+        }),
+    };
+    let backup = back_up(store, provider, "before-switch-", bytes, config, &note)?;
+    if let Some(account) = rotated {
+        // Under the store lock: only try (lock order; switch retries).
+        let _refresh = store
+            .try_refresh_lock(&account)?
+            .ok_or(Error(crate::refresh::BUSY))?;
+        if !crate::refresh::pending_exists(store, &account) {
+            return crate::refresh::install_login(store, &account, &current);
+        }
+    }
+    let restore = format!(
+        "aswap restore {provider} <label> --from {}",
+        backup.display()
+    );
+    match &compared {
+        Some(account) => eprintln!(
+            "aswap: the live {provider} login of {} isn't provably newer than its stored login, so it was not saved; it is in {}. Restore it with: {restore}",
+            account.label,
             backup.display()
-        );
+        ),
+        None => eprintln!(
+            "aswap: the live {provider} login isn't a known account here; saved it to {}. Restore it with: {restore}",
+            backup.display()
+        ),
     }
     Ok(())
 }
@@ -425,11 +492,7 @@ fn prune_backups(dir: &std::path::Path, keep: &std::path::Path) {
     };
     let mut backups: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
         .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("before-switch-")
-        })
+        .filter(|e| e.file_name().to_string_lossy().starts_with("before-"))
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
     backups.sort();
@@ -440,15 +503,19 @@ fn prune_backups(dir: &std::path::Path, keep: &std::path::Path) {
         }
     }
 }
-/// `aswap restore <provider> <label> --from <backup>`: install a backed-up
-/// live login as that account's login (the account must exist and be the
-/// same account as the backup, by its authoritative key).
+/// `aswap restore <provider> <label> --from <backup> [--force]`: install a
+/// backed-up live login as that account's login, as a refresh would. It
+/// must be the same account. Without `force` it refuses when a rotation is
+/// pending, or when the profile's login changed since the backup was made
+/// (it may be newer). The replaced login (and any pending copy) is backed
+/// up first.
 pub fn restore(
     store: &Store,
     provider: Provider,
     label: &str,
     from: &std::path::Path,
-) -> Result<Account> {
+    force: bool,
+) -> Result<(Account, std::path::PathBuf)> {
     let _lock = store.lock()?;
     let state = store.load()?;
     let account = store.account(&state, provider, Some(label))?;
@@ -460,13 +527,9 @@ pub fn restore(
     let empty = serde_json::json!({});
     let backup_config: Value =
         store::json_read(&from.join(".claude.json")).unwrap_or(empty.clone());
-    let profile = store.profile(provider, label)?;
-    let saved: Value = store::json_read(&profile.join(provider.auth_file()))?;
-    let saved_config: Value = store::json_read(&profile.join(".claude.json")).unwrap_or(empty);
+    let (saved, saved_key) = stored(store, &account)?;
     let backup_key = crate::identity::account_key(provider, &backup, &backup_config);
-    if backup_key.is_none()
-        || backup_key != crate::identity::account_key(provider, &saved, &saved_config)
-    {
+    if backup_key.is_none() || backup_key != saved_key {
         return Err(Error(
             "the backup isn't a login of that account; use aswap add for a different account",
         ));
@@ -474,9 +537,45 @@ pub fn restore(
     let _refresh = store
         .try_refresh_lock(&account)?
         .ok_or(Error(crate::refresh::BUSY))?;
-    store::atomic(&profile.join(provider.auth_file()), &bytes)?;
-    crate::refresh::discard_pending(store, &account);
-    Ok(account)
+    let pending = crate::refresh::pending_exists(store, &account);
+    let note: BackupNote = store::json_read(&from.join(BACKUP_NOTE)).unwrap_or_default();
+    let unchanged = note.profile_credential.is_some()
+        && note.profile_credential == credential(provider, &saved);
+    if !force && pending {
+        return Err(Error(
+            "that account has a pending rotated login (newer than the backup); --force replaces it (it is backed up first)",
+        ));
+    }
+    if !force && !unchanged {
+        return Err(Error(
+            "that account's login changed since the backup and may be newer; --force replaces it (it is backed up first)",
+        ));
+    }
+    // Back up what is replaced: the profile's login and any pending copy.
+    let profile = store.profile(provider, label)?;
+    let current = store::read_private(&profile.join(provider.auth_file()))?;
+    let config: Option<Value> = store::json_read(&profile.join(".claude.json")).ok();
+    let replaced = back_up(
+        store,
+        provider,
+        "before-restore-",
+        &current,
+        config.as_ref(),
+        &BackupNote {
+            label: Some(label.to_owned()),
+            profile_credential: credential(provider, &saved),
+        },
+    )?;
+    for (n, copy) in crate::refresh::pending_paths(store, &account)
+        .into_iter()
+        .filter(|p| p.exists())
+        .enumerate()
+    {
+        let bytes = store::read_private(&copy)?;
+        store::atomic(&replaced.join(format!("pending-{n}.json")), &bytes)?;
+    }
+    crate::refresh::install_login(store, &account, &backup)?;
+    Ok((account, replaced))
 }
 pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
     let provider = account.provider;
@@ -529,26 +628,9 @@ pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
         None
     };
     if let Some(old) = &old_auth {
-        preserve_live(store, account, old, old_config.as_ref())?;
+        preserve_live(store, account, old, old_config.as_ref(), &auth_path)?;
     }
     store::atomic(&auth_path, &bytes)?;
-    // What is live now, so the next switch can tell the CLI's own rotation.
-    if let Some(credential) = serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .and_then(|auth| credential(provider, &auth))
-    {
-        let path = activation_path(store, provider);
-        if let Some(parent) = path.parent() {
-            store::private_dir(parent)?;
-        }
-        store::json_write(
-            &path,
-            &Activation {
-                label: account.label.clone(),
-                credential,
-            },
-        )?;
-    }
     if let Some((path, value)) = config
         && let Err(e) = store::json_write(&path, &value)
     {
@@ -558,6 +640,30 @@ pub fn activate_profile(store: &Store, account: &Account) -> Result<()> {
             std::fs::remove_file(&auth_path).safe("cannot roll back credential activation")?;
         }
         return Err(e);
+    }
+    // Last, once the activation stands: what this slot holds now, so the
+    // next switch can tell the CLI's own rotation.
+    let record = activation_path(store, provider, &slot(&auth_path));
+    match serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|auth| credential(provider, &auth))
+    {
+        Some(credential) => {
+            if let Some(parent) = record.parent() {
+                store::private_dir(parent)?;
+            }
+            store::json_write(
+                &record,
+                &Activation {
+                    slot: slot(&auth_path),
+                    label: account.label.clone(),
+                    credential,
+                },
+            )?;
+        }
+        None => {
+            let _ = std::fs::remove_file(&record);
+        }
     }
     Ok(())
 }

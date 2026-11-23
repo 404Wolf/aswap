@@ -68,6 +68,10 @@ enum Action {
         /// The backup directory aswap printed when it saved the login.
         #[arg(long)]
         from: std::path::PathBuf,
+        /// Replace the account's login even if it changed since the backup
+        /// or has a pending rotation (both are backed up first).
+        #[arg(long)]
+        force: bool,
     },
     /// Rename a stored label, its usage cache and retained sessions.
     Rename {
@@ -482,12 +486,18 @@ fn execute(cli: Cli) -> Result<i32> {
             provider,
             label,
             from,
+            force,
         } => {
-            let account = aswap::provider::restore(&store, provider, &label, &from)?;
+            let (account, replaced) =
+                aswap::provider::restore(&store, provider, &label, &from, force)?;
             output(
-                &json!({"restored":account}),
+                &json!({"restored":account,"replaced_login_backup":replaced}),
                 cli.json,
-                format!("Restored {provider}:{label} from {}", from.display()),
+                format!(
+                    "Restored {provider}:{label} from {}; the replaced login is in {}",
+                    from.display(),
+                    replaced.display()
+                ),
             )?;
         }
         Action::Rename { provider, old, new } => {

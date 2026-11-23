@@ -385,7 +385,7 @@ fn runtime_pending_path(store: &Store, account: &Account) -> Option<std::path::P
         account.provider, account.label
     )))
 }
-fn pending_paths(store: &Store, account: &Account) -> Vec<std::path::PathBuf> {
+pub(crate) fn pending_paths(store: &Store, account: &Account) -> Vec<std::path::PathBuf> {
     let profile = store.profile(account.provider, &account.label).ok();
     profile
         .map(|p| pending_path(&p.join(account.provider.auth_file())))
@@ -443,6 +443,14 @@ pub(crate) fn discard_pending(store: &Store, account: &Account) {
 /// Write a rotated login, hand it to every live run and alias, then drop
 /// its pending copies (a failure to remove them is harmless: they no
 /// longer match the login file).
+/// Install a login as an account's own, the way a refresh does: its file,
+/// running views, aliases, usage backoff, pending copies.
+pub(crate) fn install_login(store: &Store, account: &Account, auth: &Value) -> crate::Result<()> {
+    let path = store
+        .profile(account.provider, &account.label)?
+        .join(account.provider.auth_file());
+    install(store, account, &path, auth)
+}
 fn install(
     store: &Store,
     account: &Account,

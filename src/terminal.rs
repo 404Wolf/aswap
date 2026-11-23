@@ -253,7 +253,7 @@ impl Terminal {
             }
         }
         if let Some(parser) = &mut self.diagnostics.screen {
-            parser.set_size(self.size.0, self.size.1);
+            parser.set_size(nonzero(self.size.0), nonzero(self.size.1));
         }
     }
     /// Forward terminal I/O and inspect a bounded trailing slice for limit errors.
@@ -544,7 +544,7 @@ impl Diagnostics {
         let screen = parser.screen();
         let (_, cols) = screen.size();
         let rows: Vec<String> = screen
-            .rows(0, cols)
+            .rows(0, cols.get())
             .map(|row| squash(&normalize(row.as_bytes())))
             .filter(|row| !row.is_empty())
             .collect();
@@ -554,12 +554,12 @@ impl Diagnostics {
     /// Render output into the screen model.
     fn render(&mut self, bytes: &[u8], size: (u16, u16)) {
         self.screen
-            .get_or_insert_with(|| vt100::Parser::new(size.0, size.1, 0))
+            .get_or_insert_with(|| vt100::Parser::new(nonzero(size.0), nonzero(size.1), 0))
             .process(bytes);
     }
     /// A new session (or a new size): a new screen.
     fn reset_screen(&mut self, size: (u16, u16)) {
-        self.screen = Some(vt100::Parser::new(size.0, size.1, 0));
+        self.screen = Some(vt100::Parser::new(nonzero(size.0), nonzero(size.1), 0));
         self.notice_text = None;
     }
     fn finish_row_inner(&mut self, signals: &mut (ScreenLimits, bool, bool)) {
@@ -641,6 +641,9 @@ impl Diagnostics {
 /// How many output rows after a notice still count as the final screen (a
 /// provider draws its prompt and footer below it).
 const FINAL_ROWS: usize = 12;
+fn nonzero(n: u16) -> std::num::NonZeroU16 {
+    std::num::NonZeroU16::new(n).unwrap_or(std::num::NonZeroU16::MIN)
+}
 /// How much of a (non-Codex) notice row is looked for on the final screen.
 const NEEDLE: usize = 200;
 fn squash(text: &str) -> String {

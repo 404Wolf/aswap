@@ -39,6 +39,8 @@ struct Case {
     root: PathBuf,
     provider: &'static str,
     auth_file: &'static str,
+    /// A second live slot (CODEX_HOME / CLAUDE_CONFIG_DIR), when set.
+    slot: Option<PathBuf>,
 }
 impl Case {
     fn new(provider: &'static str) -> Self {
@@ -55,6 +57,7 @@ impl Case {
             root,
             provider,
             auth_file,
+            slot: None,
         };
         for label in ["a", "b"] {
             case.live(label, &format!("{label}-r1"));
@@ -62,30 +65,30 @@ impl Case {
         }
         case
     }
+    fn slot_dir(&self) -> PathBuf {
+        self.slot
+            .clone()
+            .unwrap_or_else(|| self.root.join("home").join(format!(".{}", self.provider)))
+    }
     /// Put `account`'s login `value` live, as its CLI would.
     fn live(&self, account: &str, value: &str) {
-        let home = self.root.join("home");
         write(
-            &home
-                .join(format!(".{}", self.provider))
-                .join(self.auth_file),
+            &self.slot_dir().join(self.auth_file),
             &login(self.provider, account, value),
         );
         if self.provider == "claude" {
+            let config = match &self.slot {
+                Some(dir) => dir.join(".claude.json"),
+                None => self.root.join("home/.claude.json"),
+            };
             write(
-                &home.join(".claude.json"),
+                &config,
                 &json!({"oauthAccount":{"accountUuid":format!("uuid-{account}")}}),
             );
         }
     }
     fn live_login(&self) -> Value {
-        read(
-            &self
-                .root
-                .join("home")
-                .join(format!(".{}", self.provider))
-                .join(self.auth_file),
-        )
+        read(&self.slot_dir().join(self.auth_file))
     }
     fn saved(&self, label: &str) -> Value {
         read(&self.profile(label).join(self.auth_file))
@@ -117,6 +120,14 @@ impl Case {
             .env("XDG_DATA_HOME", self.root.join("data"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("XDG_RUNTIME_DIR", self.root.join("runtime"));
+        if let Some(dir) = &self.slot {
+            let var = if self.provider == "codex" {
+                "CODEX_HOME"
+            } else {
+                "CLAUDE_CONFIG_DIR"
+            };
+            command.env(var, dir);
+        }
         command
     }
     /// Run aswap; its stderr.
@@ -219,4 +230,118 @@ fn live_backups_are_pruned() {
         case.run(&["switch", "codex", label, "--activate-live"]);
     }
     assert!(case.backups().len() <= 20, "{}", case.backups().len());
+}
+
+#[test]
+fn a_record_of_another_live_slot_never_saves_a_revoked_login() {
+    // agy.8 review H1: the record belongs to one live slot.
+    for provider in ["codex", "claude"] {
+        let mut case = Case::new(provider);
+        let other = case.root.join("slot-2");
+        fs::create_dir_all(&other).unwrap();
+        // Slot 2 puts a's r1 live.
+        case.slot = Some(other.clone());
+        case.run(&["switch", provider, "a", "--activate-live"]);
+        // aswap's own refresh rotates a to r2 (r1 is revoked).
+        write(
+            &case.profile("a").join(case.auth_file),
+            &login(provider, "a", "a-r2"),
+        );
+        // The default slot puts r2 live.
+        case.slot = None;
+        case.run(&["switch", provider, "a", "--activate-live"]);
+        // Slot 2, still holding the revoked r1, switches away.
+        case.slot = Some(other);
+        case.run(&["switch", provider, "b", "--activate-live"]);
+        assert_eq!(case.saved("a"), login(provider, "a", "a-r2"), "{provider}");
+    }
+}
+
+#[test]
+fn a_same_account_login_not_saved_is_reported() {
+    // agy.8 review L1.
+    for provider in ["codex", "claude"] {
+        let case = Case::new(provider);
+        // No activation record: a login made outside aswap.
+        case.live("a", "a-elsewhere");
+        let said = case.run(&["switch", provider, "b", "--activate-live"]);
+        let backup = case.backups().pop().unwrap();
+        assert!(said.contains("isn't provably newer"), "{provider}: {said}");
+        assert!(
+            said.contains(&backup.display().to_string()),
+            "{provider}: {said}"
+        );
+    }
+}
+
+#[test]
+fn restore_refuses_a_changed_or_pending_login_unless_forced_and_backs_it_up() {
+    // agy.8 review M2.
+    for provider in ["codex", "claude"] {
+        let case = Case::new(provider);
+        case.live("a", "a-elsewhere");
+        case.run(&["switch", provider, "b", "--activate-live"]);
+        let backup = case.backups().pop().unwrap();
+        let from = backup.to_str().unwrap();
+        // The profile changed since the backup: it may be newer.
+        write(
+            &case.profile("a").join(case.auth_file),
+            &login(provider, "a", "a-newer"),
+        );
+        let refused = case.fails(&["restore", provider, "a", "--from", from]);
+        assert!(refused.contains("changed since the backup"), "{refused}");
+        assert_eq!(case.saved("a"), login(provider, "a", "a-newer"));
+        // A pending rotation: refused too.
+        let pending = case
+            .profile("a")
+            .join(format!("{}.pending", case.auth_file));
+        write(
+            &pending,
+            &json!({"replaces": "synthetic", "auth": login(provider, "a", "a-pending")}),
+        );
+        let refused = case.fails(&["restore", provider, "a", "--from", from]);
+        assert!(refused.contains("pending"), "{refused}");
+        // Forced: both are backed up first, then the backup is installed.
+        let before = case.backups();
+        case.run(&["restore", provider, "a", "--from", from, "--force"]);
+        assert_eq!(case.saved("a"), login(provider, "a", "a-elsewhere"));
+        let made: Vec<_> = case
+            .backups()
+            .into_iter()
+            .filter(|b| !before.contains(b))
+            .collect();
+        assert_eq!(made.len(), 1, "{provider}");
+        assert_eq!(
+            read(&made[0].join(case.auth_file)),
+            login(provider, "a", "a-newer")
+        );
+        assert!(made[0].join("pending-0.json").exists(), "{provider}");
+    }
+}
+
+#[test]
+fn restore_of_an_unchanged_profile_needs_no_force() {
+    for provider in ["codex", "claude"] {
+        let case = Case::new(provider);
+        case.live("a", "a-elsewhere");
+        case.run(&["switch", provider, "b", "--activate-live"]);
+        let backup = case.backups().pop().unwrap();
+        case.run(&["restore", provider, "a", "--from", backup.to_str().unwrap()]);
+        assert_eq!(case.saved("a"), login(provider, "a", "a-elsewhere"));
+    }
+}
+
+#[test]
+fn a_cli_rotation_of_a_later_alias_is_saved_to_it_and_its_aliases() {
+    // agy.8 review M1: the alias that was put live, then propagated.
+    for provider in ["codex", "claude"] {
+        let case = Case::new(provider);
+        case.live("a", "a-r1");
+        case.run(&["add", provider, "a2"]);
+        case.run(&["switch", provider, "a2", "--activate-live"]);
+        case.live("a", "a-r2");
+        case.run(&["switch", provider, "b", "--activate-live"]);
+        assert_eq!(case.saved("a2"), login(provider, "a", "a-r2"), "{provider}");
+        assert_eq!(case.saved("a"), login(provider, "a", "a-r2"), "{provider}");
+    }
 }

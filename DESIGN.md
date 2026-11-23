@@ -153,12 +153,17 @@ size while preserving native provider UIs. Signal cleanup restores terminal
 mode on normal handled termination. Before default-file activation, private
 live-backups preserve the outgoing login (the newest 20 per provider). It is
 saved to a profile only when it is the same account (the authoritative account
-key), aswap put that profile's login live (live-activations), the profile
-still holds it, and the live slot now holds another: only the provider's CLI
-rotates the live slot, so that is its newest login. Without that record, with
-a profile changed since, or with a pending rotation, nothing is saved. A different or unknown account is backed up only, and
+key), aswap put that profile's login live in this same slot (live-activations
+holds one record per live auth file, written last, once an activation
+stands), the profile still holds it, and the slot now holds another: only the
+provider's CLI rotates the slot, so that is its newest login. It is installed
+as a refresh would (aliases, running views, backoff). Without that record,
+with a profile changed since, or with a pending rotation, nothing is saved,
+and aswap says so. A different or unknown account is backed up only, and
 aswap prints the backup and the `aswap restore <provider> <label> --from
-<backup>` command (same account only).
+<backup>` command (same account only). `restore` refuses, without `--force`,
+when the profile's login changed since the backup or a rotation is pending;
+the replaced login and any pending copy are backed up first.
 
 ## Profile quota display and identity
 
