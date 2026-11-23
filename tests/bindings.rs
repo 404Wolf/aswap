@@ -992,3 +992,45 @@ fn review_clock_small_backward_jump_keeps_numbers_monotonic() {
         .unwrap();
     assert!(fresh.observation > prior);
 }
+
+#[test]
+fn list_shows_the_same_account_across_programs_without_renaming_fields() {
+    let pool = Pool::new();
+    pool.add(Provider::Codex, "work", "synthetic-member-a");
+    pool.add(Provider::Pi, "work-pi", "synthetic-member-a");
+    pool.add(Provider::Pi, "bob", "synthetic-member-b");
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_aswap"))
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", pool._temp.path())
+            .env("XDG_DATA_HOME", pool._temp.path().join("data"))
+            .env("XDG_CONFIG_HOME", pool._temp.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let v: serde_json::Value = serde_json::from_str(&run(&["list", "--json"])).unwrap();
+    let row = |label: &str| {
+        v["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["label"] == label)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row("work")["same_account"], json!(["pi:work-pi"]));
+    assert_eq!(row("work-pi")["same_account"], json!(["codex:work"]));
+    assert_eq!(row("bob")["same_account"], json!([]));
+    // Existing fields are unchanged; programs keep separate logins.
+    assert_eq!(row("work")["duplicates"], json!([]));
+    let text = run(&["list"]);
+    assert!(text.contains("same account as pi:work-pi"), "{text}");
+}

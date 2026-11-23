@@ -11,6 +11,8 @@ pub struct Row<'a> {
     pub reserved: bool,
     pub identity: &'a Identity,
     pub duplicates: &'a [String],
+    /// The same real account in other programs, as `provider:label`.
+    pub same_account: &'a [String],
     pub cached: &'a Cached,
 }
 /// The provider-wide auto policy shown above its accounts.
@@ -396,6 +398,12 @@ fn render_row(
         facts.push(format!(
             "same login as {}",
             clean(&row.duplicates.join(", "))
+        ));
+    }
+    if !row.same_account.is_empty() {
+        facts.push(format!(
+            "same account as {}",
+            clean(&row.same_account.join(", "))
         ));
     }
     if compact && let Some(credits) = credits_line(c) {

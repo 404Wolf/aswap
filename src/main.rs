@@ -212,12 +212,21 @@ fn snapshot(store: &Store, filter: Option<Provider>, refresh: bool) -> Result<Va
             }
         };
         let duplicates = duplicate_labels(store, &a)?;
+        // The same real account in other programs (Codex and pi's ChatGPT
+        // login): one quota, shown under each.
+        let same_account: Vec<String> = {
+            let _lock = store.lock()?;
+            aswap::identity::bindings(store, &a, &store.load()?.accounts)
+                .iter()
+                .map(|b| format!("{}:{}", b.provider, b.label))
+                .collect()
+        };
         let reserved = settings
             .get(&a.provider)
             .is_some_and(|s| !s.allows(&a.label, None));
         // One clock reading, so status, reason and age agree.
         let at = now();
-        rows.push(json!({"provider":a.provider,"label":a.label,"active":active.get(&a.provider)==Some(&a.label),"reserved":reserved,"remaining_percent":c.used(at).map(|u|100.0-u),"usage":c.usage,"fetched_at":c.fetched_at,"next_poll_at":c.next_poll_at,"duplicates":duplicates,"usage_error":c.diagnostic(),"http_status":c.http_status,"retry_after_seconds":c.retry_after,"last_attempt":c.last_attempt,"usage_status":if c.used(at).is_some(){"ok"}else if c.error.is_some(){"backoff"}else{"unknown"},"usage_reason":c.reason(at),"age_seconds":c.age(at)}));
+        rows.push(json!({"provider":a.provider,"label":a.label,"active":active.get(&a.provider)==Some(&a.label),"reserved":reserved,"remaining_percent":c.used(at).map(|u|100.0-u),"usage":c.usage,"fetched_at":c.fetched_at,"next_poll_at":c.next_poll_at,"duplicates":duplicates,"same_account":same_account,"usage_error":c.diagnostic(),"http_status":c.http_status,"retry_after_seconds":c.retry_after,"last_attempt":c.last_attempt,"usage_status":if c.used(at).is_some(){"ok"}else if c.error.is_some(){"backoff"}else{"unknown"},"usage_reason":c.reason(at),"age_seconds":c.age(at)}));
     }
     let coordination = aswap::coordination::settings(store)?;
     // An unreadable reset log must not hide accounts; the monitor still
@@ -245,6 +254,7 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
     let mut identities = Vec::new();
     let mut caches = Vec::new();
     let mut duplicates = Vec::new();
+    let mut same_accounts = Vec::new();
     for row in accounts {
         let provider: Provider =
             serde_json::from_value(row["provider"].clone()).safe("invalid provider")?;
@@ -278,6 +288,9 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
         duplicates.push(
             serde_json::from_value::<Vec<String>>(row["duplicates"].clone()).unwrap_or_default(),
         );
+        same_accounts.push(
+            serde_json::from_value::<Vec<String>>(row["same_account"].clone()).unwrap_or_default(),
+        );
     }
     let rows: Vec<_> = accounts
         .iter()
@@ -290,6 +303,7 @@ fn terminal_text(store: &Store, value: &Value, compact: bool) -> Result<String> 
             identity: &identities[i],
             cached: &caches[i],
             duplicates: &duplicates[i],
+            same_account: &same_accounts[i],
         })
         .collect();
     let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();

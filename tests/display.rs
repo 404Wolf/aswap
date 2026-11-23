@@ -30,6 +30,7 @@ fn fixture(compact: bool, width: usize, color: bool, stale: bool) -> String {
                 reserved: false,
                 identity: &claude,
                 duplicates: &duplicates,
+                same_account: &[],
                 cached: &claude_cache,
             },
             Row {
@@ -39,6 +40,7 @@ fn fixture(compact: bool, width: usize, color: bool, stale: bool) -> String {
                 reserved: false,
                 identity: &codex,
                 duplicates: &[],
+                same_account: &[],
                 cached: &codex_cache,
             },
             Row {
@@ -48,6 +50,7 @@ fn fixture(compact: bool, width: usize, color: bool, stale: bool) -> String {
                 reserved: false,
                 identity: &unknown,
                 duplicates: &[],
+                same_account: &[],
                 cached: &empty,
             },
         ],
@@ -107,6 +110,7 @@ fn very_narrow_terminals_and_control_characters() {
             reserved: false,
             identity: &id,
             duplicates: &[],
+            same_account: &[],
             cached: &c,
         }],
         true,
@@ -138,6 +142,7 @@ fn unavailable_quota_explains_reason_and_retains_dimmed_last_known_bar() {
             reserved: false,
             identity: &id,
             duplicates: &[],
+            same_account: &[],
             cached: &cache,
         }],
         false,
@@ -174,6 +179,7 @@ fn expired_window_is_last_known_even_when_recently_checked() {
             reserved: false,
             identity: &id,
             duplicates: &[],
+            same_account: &[],
             cached: &cache,
         }],
         true,
@@ -224,6 +230,7 @@ fn accounts_sort_by_next_future_window_with_unknown_last() {
                 reserved: false,
                 identity: &id,
                 duplicates: &[],
+                same_account: &[],
                 cached: &expired,
             },
             Row {
@@ -233,6 +240,7 @@ fn accounts_sort_by_next_future_window_with_unknown_last() {
                 reserved: false,
                 identity: &id,
                 duplicates: &[],
+                same_account: &[],
                 cached: &later,
             },
             Row {
@@ -242,6 +250,7 @@ fn accounts_sort_by_next_future_window_with_unknown_last() {
                 reserved: false,
                 identity: &id,
                 duplicates: &[],
+                same_account: &[],
                 cached: &soon,
             },
         ];

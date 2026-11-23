@@ -621,6 +621,7 @@ fn list_json_schema_is_pinned() {
                 "remaining_percent",
                 "reserved",
                 "retry_after_seconds",
+                "same_account",
                 "usage",
                 "usage_error",
                 "usage_reason",
