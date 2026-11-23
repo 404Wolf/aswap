@@ -713,6 +713,12 @@ pub trait Port {
     fn journal(&mut self, event: &Event) -> Result<()>;
     /// The reset mode as stored now, rechecked right before a request is sent.
     fn mode(&mut self) -> Result<AutoReset>;
+    /// Other labels of this program that are the same login, hence the
+    /// same account (`identity::duplicates`): one redemption, skip or
+    /// ranking place for all of them.
+    fn aliases(&mut self, _account: &Account) -> Vec<String> {
+        Vec::new()
+    }
     /// Waits before re-reading an account after a redemption.
     fn pause(&mut self, secs: u64) {
         std::thread::sleep(std::time::Duration::from_secs(secs));
@@ -935,7 +941,42 @@ pub fn step(
             *cache = fresh;
         }
     }
-    let decision = match decide(provider, settings, &entries, log, at) {
+    // One account, one place: aliases (labels of the same login) count once
+    // in the guard and the ranking, and a skip of any of them skips all.
+    // The account is represented by its label with a usable reading, if any.
+    let mut view = log.clone();
+    let mut kept: Vec<(Account, Cached)> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    let all = entries;
+    for (account, cache) in &all {
+        if seen.contains(&account.label) {
+            continue;
+        }
+        let aliases = port.aliases(account);
+        let group: Vec<&(Account, Cached)> = all
+            .iter()
+            .filter(|(a, _)| a.label == account.label || aliases.contains(&a.label))
+            .collect();
+        let chosen = group
+            .iter()
+            .find(|(_, c)| c.used(at).is_some())
+            .copied()
+            .unwrap_or(&(account.clone(), cache.clone()))
+            .clone();
+        if let Some(until) = log
+            .skipped
+            .iter()
+            .filter(|s| s.until > at && group.iter().any(|(a, _)| a.label == s.label))
+            .map(|s| s.until)
+            .max()
+        {
+            view.skip(&chosen.0.label, until);
+        }
+        seen.extend(group.iter().map(|(a, _)| a.label.clone()));
+        kept.push(chosen);
+    }
+    let mut entries = kept;
+    let decision = match decide(provider, settings, &entries, &view, at) {
         Ok(decision) => decision,
         Err(Refusal::Hold(hold)) => return held(hold),
         Err(Refusal::Money { label }) => return refuse(port, settings, log, label, None, at),
@@ -977,7 +1018,7 @@ pub fn step(
         });
     };
     entries[index].1 = pre.clone();
-    let decision = match decide(provider, settings, &entries, log, at) {
+    let decision = match decide(provider, settings, &entries, &view, at) {
         Ok(fresh) if fresh.label == decision.label => fresh,
         Ok(_) => {
             return held(Hold::Changed {
@@ -1335,6 +1376,9 @@ fn attempt(
             record.outcome = outcome.into();
             log.push(record);
             log.skip(&pending.label, pending.weekly_resets_at);
+            for alias in port.aliases(account) {
+                log.skip(&alias, pending.weekly_resets_at);
+            }
             port.save(log)?;
             Ok(Step::Declined {
                 label: pending.label,
@@ -1515,6 +1559,16 @@ pub fn load(store: &Store) -> Result<ResetLog> {
         for (at, intent, outcome) in endings {
             if matches!(outcome.as_str(), "nothing-to-reset" | "no-credit") {
                 log.skip(&intent.label, intent.weekly_resets_at);
+                // Its aliases are the same account.
+                if let Ok(state) = store.load() {
+                    let account = Account {
+                        provider: Provider::Codex,
+                        label: intent.label.clone(),
+                    };
+                    for alias in crate::identity::duplicates(store, &account, &state.accounts) {
+                        log.skip(&alias, intent.weekly_resets_at);
+                    }
+                }
             }
             log.push(Record {
                 at,
@@ -1754,6 +1808,15 @@ struct StorePort<'a> {
 impl Port for StorePort<'_> {
     fn refresh(&mut self, account: &Account) -> Result<Cached> {
         usage::cached_force(self.store, account, true)
+    }
+    fn aliases(&mut self, account: &Account) -> Vec<String> {
+        let Ok(_lock) = self.store.lock() else {
+            return Vec::new();
+        };
+        self.store
+            .load()
+            .map(|state| crate::identity::duplicates(self.store, account, &state.accounts))
+            .unwrap_or_default()
     }
     fn redeem(
         &mut self,
@@ -2396,6 +2459,8 @@ mod tests {
         /// Reads after a redeem call that fail first.
         failing_reads: u32,
         pauses: Vec<u64>,
+        /// Labels that are one login (the same account).
+        alias_groups: Vec<Vec<&'static str>>,
     }
     impl Port for Fake {
         /// `before` until a redeem call, then `after` if given.
@@ -2441,6 +2506,18 @@ mod tests {
         }
         fn pause(&mut self, secs: u64) {
             self.pauses.push(secs);
+        }
+        fn aliases(&mut self, account: &Account) -> Vec<String> {
+            self.alias_groups
+                .iter()
+                .find(|g| g.contains(&account.label.as_str()))
+                .map(|g| {
+                    g.iter()
+                        .filter(|l| **l != account.label)
+                        .map(|l| (*l).to_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
         }
     }
     /// One step over `exhausted()`, read just now.
@@ -2846,6 +2923,139 @@ mod tests {
             c.fetched_at = at;
         }
         entries
+    }
+
+    fn with_alias(mut entries: Vec<(Account, Cached)>, alias: Cached) -> Vec<(Account, Cached)> {
+        entries.insert(0, (codex("six-b"), alias));
+        entries
+    }
+
+    #[test]
+    fn a_skip_of_one_alias_skips_the_account_and_no_consume_call_is_wasted() {
+        // "six-b" is the same login as "six"; Codex said nothing-to-reset to
+        // it, so "six" (the same account) is skipped too.
+        let mut log = ResetLog::default();
+        log.skip("six-b", AT + 6 * DAY);
+        let entries = with_alias(
+            exhausted_at(AT),
+            cache(100.0, Some(6), vec![credit("c6", None)]),
+        );
+        let mut fake = Fake {
+            before: Some(cache(100.0, Some(3), vec![credit("c3", None)])),
+            responses: vec![Ok(serde_json::json!({"outcome": "reset"}))],
+            clock: Some(AT),
+            alias_groups: vec![vec!["six", "six-b"]],
+            ..Default::default()
+        };
+        step(
+            &mut fake,
+            Provider::Codex,
+            &settings(AutoReset::On),
+            entries,
+            &mut log,
+            false,
+            AT,
+        )
+        .unwrap();
+        let labels: Vec<_> = fake.redeemed.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(labels, ["three"], "never six, the skipped alias's account");
+    }
+
+    #[test]
+    fn a_declined_answer_rebuilt_from_the_journal_skips_its_aliases_too() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("store")).unwrap();
+        let claims = serde_json::json!({"https://api.openai.com/auth":{
+            "chatgpt_account_id":"synthetic-workspace","chatgpt_account_user_id":"synthetic-member"}});
+        let jwt = format!(
+            "synthetic.{}.synthetic",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        );
+        let mut state = store.load().unwrap();
+        for label in ["six", "six-b"] {
+            let profile = store.profile(Provider::Codex, label).unwrap();
+            std::fs::create_dir_all(&profile).unwrap();
+            store::json_write(
+                &profile.join("auth.json"),
+                &serde_json::json!({"tokens":{"account_id":"synthetic-workspace","access_token":jwt}}),
+            )
+            .unwrap();
+            state.accounts.push(codex(label));
+        }
+        store.save(&state).unwrap();
+        let key = "synthetic-key-1".to_owned();
+        for event in [
+            Event::Intent {
+                at: AT,
+                pending: pending(0, AT),
+            },
+            Event::Attempt {
+                at: AT,
+                key: key.clone(),
+                n: 1,
+            },
+            Event::Outcome {
+                at: AT,
+                key,
+                outcome: "nothing-to-reset".into(),
+            },
+        ] {
+            append(&store, &event).unwrap();
+        }
+        let log = load(&store).unwrap();
+        assert!(log.skipped("six", AT + DAY) && log.skipped("six-b", AT + DAY));
+    }
+
+    #[test]
+    fn a_declined_answer_skips_every_alias_of_the_account() {
+        let mut log = ResetLog::default();
+        let mut fake = Fake {
+            before: Some(cache(100.0, Some(6), vec![credit("c6", None)])),
+            responses: vec![Ok(serde_json::json!({"outcome": "nothingToReset"}))],
+            clock: Some(AT),
+            alias_groups: vec![vec!["six", "six-b"]],
+            ..Default::default()
+        };
+        step(
+            &mut fake,
+            Provider::Codex,
+            &settings(AutoReset::On),
+            exhausted_at(AT),
+            &mut log,
+            false,
+            AT,
+        )
+        .unwrap();
+        assert_eq!(fake.redeemed[0].0, "six");
+        assert!(log.skipped("six", AT + DAY) && log.skipped("six-b", AT + DAY));
+    }
+
+    #[test]
+    fn aliases_count_once_so_an_unread_alias_does_not_hold_the_pool() {
+        // "six-b" is unread (and can't be read), but it is the same account
+        // as "six", which is: the pool is known, and "six" ranks first.
+        let mut stale = cache(100.0, Some(6), vec![credit("c6", None)]);
+        stale.fetched_at = 0;
+        let mut fake = Fake {
+            alias_groups: vec![vec!["six", "six-b"]],
+            ..Default::default()
+        };
+        let mut log = ResetLog::default();
+        let step = step(
+            &mut fake,
+            Provider::Codex,
+            &settings(AutoReset::DryRun),
+            with_alias(exhausted_at(AT), stale),
+            &mut log,
+            false,
+            AT,
+        )
+        .unwrap();
+        assert!(
+            matches!(&step, Step::WouldReset { decision, .. } if decision.label == "six"),
+            "{step:?}"
+        );
     }
 
     #[test]

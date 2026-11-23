@@ -332,9 +332,12 @@ impl Rejected {
             .iter()
             .filter_map(|(a, _)| {
                 if a.provider == Provider::Codex {
-                    return redeemed_codex
-                        .get(&a.label)
-                        .map(|at| (a.label.clone(), *at));
+                    // Its own redemption, or an alias's (the same account).
+                    return std::iter::once(a.label.clone())
+                        .chain(crate::identity::duplicates(store, a, &accounts))
+                        .filter_map(|label| redeemed_codex.get(&label).copied())
+                        .max()
+                        .map(|at| (a.label.clone(), at));
                 }
                 crate::identity::bindings(store, a, &accounts)
                     .iter()
@@ -405,6 +408,73 @@ impl Restarts {
 #[cfg(test)]
 mod rejection_tests {
     use super::*;
+
+    #[test]
+    fn a_codex_redemption_releases_an_alias_label_of_the_same_login() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let jwt = |member: &str| {
+            let claims = serde_json::json!({"https://api.openai.com/auth":{
+                "chatgpt_account_id":"synthetic-workspace","chatgpt_account_user_id":member}});
+            format!(
+                "synthetic.{}.synthetic",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+            )
+        };
+        let add = |provider: Provider, label: &str, member: &str| {
+            let account = Account {
+                provider,
+                label: label.into(),
+            };
+            let profile = store.profile(provider, label).unwrap();
+            std::fs::create_dir_all(&profile).unwrap();
+            let auth = if provider == Provider::Pi {
+                serde_json::json!({"openai-codex":{"type":"oauth","access":jwt(member),
+                    "refresh":"synthetic","expires":4_000_000_000_000u64,"accountId":"synthetic-workspace"}})
+            } else {
+                serde_json::json!({"tokens":{"account_id":"synthetic-workspace","access_token":jwt(member)}})
+            };
+            store::json_write(&profile.join(provider.auth_file()), &auth).unwrap();
+            let mut state = store.load().unwrap();
+            state.accounts.push(account.clone());
+            store.save(&state).unwrap();
+            account
+        };
+        add(Provider::Codex, "work", "synthetic-member-a");
+        let alias = add(Provider::Codex, "work-b", "synthetic-member-a");
+        let teammate = add(Provider::Codex, "bob", "synthetic-member-b");
+        let at = now();
+        store::json_write(
+            &crate::reset::log_path(&store),
+            &serde_json::json!({"history":[{"at":at,"label":"work","outcome":"reset","reason":"synthetic"}]}),
+        )
+        .unwrap();
+        let mut rejected = Rejected::default();
+        for account in [&alias, &teammate] {
+            rejected.labels.insert(
+                account.label.clone(),
+                Some(Lapse {
+                    at,
+                    count: 1,
+                    reset: None,
+                    resumed: false,
+                }),
+            );
+        }
+        let kept: Vec<_> = rejected
+            .filter_at(
+                &store,
+                "other",
+                90.0,
+                vec![(alias, cache(95.0, at)), (teammate, cache(95.0, at))],
+                at + 1,
+            )
+            .into_iter()
+            .map(|(a, _)| a.label)
+            .collect();
+        assert_eq!(kept, ["work-b"]);
+    }
 
     #[test]
     fn a_codex_redemption_releases_the_same_accounts_pi_binding() {
