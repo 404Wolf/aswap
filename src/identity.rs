@@ -36,6 +36,41 @@ fn claims(auth: &Value, key: &str) -> Value {
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(Value::Null)
 }
+/// The real account a login belongs to, only when the login names it with
+/// authority (as #46 defines it): Codex's workspace membership
+/// (`chatgpt_account_user_id` in the access token, for the selected
+/// workspace), Claude's account in its organization. Never a guess from a
+/// workspace alone, `sub` or email. None: unknown.
+pub(crate) fn account_key(provider: Provider, auth: &Value, config: &Value) -> Option<String> {
+    let key = match provider {
+        Provider::Codex => {
+            let selected = text(auth, &["/tokens/account_id"])?;
+            let access = claims(auth, "/tokens/access_token");
+            let claim = access.pointer("/https:~1~1api.openai.com~1auth")?;
+            if claim.get("chatgpt_account_id").and_then(Value::as_str) != Some(selected.as_str()) {
+                return None;
+            }
+            let member = claim
+                .get("chatgpt_account_user_id")
+                .and_then(Value::as_str)
+                .filter(|m| !m.is_empty() && m.trim() == *m)?;
+            format!("openai\0{member}")
+        }
+        Provider::Claude => {
+            let account = text(config, &["/oauthAccount/accountUuid"])?;
+            let organization =
+                text(config, &["/oauthAccount/organizationUuid"]).unwrap_or_default();
+            format!("anthropic\0{account}\0{organization}")
+        }
+    };
+    Some(
+        ring::digest::digest(&ring::digest::SHA256, key.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
+}
 pub fn from_values(provider: Provider, auth: &Value, config: &Value) -> Identity {
     let (email, plan, account, organization) = match provider {
         Provider::Claude => (

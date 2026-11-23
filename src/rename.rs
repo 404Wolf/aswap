@@ -100,6 +100,19 @@ fn finish(store: &Store, tx: Transaction) -> Result<()> {
     sync(&store.root)
 }
 pub fn rename(store: &Store, provider: Provider, old: &str, new: &str) -> Result<Account> {
+    // A running token refresh holds the account's refresh lock and then
+    // needs the store lock: let go and try again meanwhile (lock order).
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match rename_once(store, provider, old, new) {
+            Err(Error(crate::refresh::BUSY)) if std::time::Instant::now() < end => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            result => return result,
+        }
+    }
+}
+fn rename_once(store: &Store, provider: Provider, old: &str, new: &str) -> Result<Account> {
     store::label(old)?;
     store::label(new)?;
     let _lock = store.lock()?;

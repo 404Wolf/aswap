@@ -122,30 +122,31 @@ fn isolated_lifecycle_child() {
     )
     .unwrap();
     aswap::provider::add(&store, Provider::Claude, "two").unwrap();
-    // Rotate the outgoing live token after capture; activation must preserve it.
+    // A different live login for the outgoing account appeared outside
+    // aswap. Nothing proves it newer than the profile's (which still
+    // works), so activation fails closed: the profile keeps its login and
+    // the live one is kept in live-backups.
     store::atomic(
         &claude.join(".credentials.json"),
         br#"{"claudeAiOauth":{"accessToken":"synthetic-second-rotated"}}"#,
     )
     .unwrap();
     aswap::provider::switch(&store, Provider::Claude, "one", true).unwrap();
-    let outgoing = store::read_private(
-        &store
-            .profile(Provider::Claude, "two")
-            .unwrap()
-            .join(".credentials.json"),
-    )
-    .unwrap();
+    let outgoing_path = store
+        .profile(Provider::Claude, "two")
+        .unwrap()
+        .join(".credentials.json");
+    let outgoing = String::from_utf8(store::read_private(&outgoing_path).unwrap()).unwrap();
+    assert!(outgoing.contains("synthetic-second") && !outgoing.contains("rotated"));
+    let backups: Vec<_> = std::fs::read_dir(store.root.join("live-backups/claude"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(backups.len(), 1);
     assert!(
-        String::from_utf8(outgoing)
+        String::from_utf8(store::read_private(&backups[0].join(".credentials.json")).unwrap())
             .unwrap()
             .contains("synthetic-second-rotated")
-    );
-    assert_eq!(
-        std::fs::read_dir(store.root.join("live-backups/claude"))
-            .unwrap()
-            .count(),
-        1
     );
 
     let config: serde_json::Value = store::json_read(&claude.join(".claude.json")).unwrap();

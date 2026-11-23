@@ -257,6 +257,10 @@ thread_local! {
     /// that can afford to wait retry the whole locked step instead.
     static HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
+/// Whether this thread holds the store lock.
+pub(crate) fn lock_held() -> bool {
+    HELD.with(|held| held.get()) > 0
+}
 const LOCKED_PATIENCE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 pub fn label(value: &str) -> Result<()> {
@@ -604,6 +608,35 @@ impl Store {
         crate::live::count(self, account)
     }
     /// Short identity critical section; caller also holds the store lock.
+    /// `refresh_lock` without waiting: None while another holds it. Every
+    /// holder of the store lock takes the refresh lock only this way (the
+    /// lock order is refresh lock, then store lock), and on None drops the
+    /// store lock and tries again.
+    pub(crate) fn try_refresh_lock(&self, account: &Account) -> Result<Option<Guard>> {
+        let (f, _) = self.refresh_lock_file(account)?;
+        Ok(f.try_lock_exclusive().is_ok().then_some(Guard(f, false)))
+    }
+    fn refresh_lock_file(&self, account: &Account) -> Result<(File, ())> {
+        let identity = crate::identity::read(
+            account.provider,
+            &self.profile(account.provider, &account.label)?,
+        )
+        .unwrap_or_default();
+        let key = identity.lock_key().unwrap_or_else(|| account.label.clone());
+        let path = self
+            .root
+            .join(format!("{}-{key}.refresh.lock", account.provider));
+        no_links(&path)?;
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .safe("cannot open refresh lock")?;
+        Ok((f, ()))
+    }
     pub(crate) fn refresh_lock(&self, account: &Account) -> Result<Guard> {
         let identity = crate::identity::read(
             account.provider,

@@ -68,6 +68,16 @@ aswap auto claude threshold 90          # when --auto switches
 
 Arguments after `--` go to the provider unchanged.
 
+`aswap switch <provider> <label> --activate-live` also puts that login in the
+provider's own default files. The outgoing live login is backed up first, in
+`live-backups/<provider>/` under aswap's data directory (the newest 20 are
+kept). When it is the same account as a profile and the provider's CLI has
+rotated it, it is saved to that profile. Otherwise aswap prints where the
+backup is. `aswap restore <provider> <label> --from <backup>` installs it as
+that account's login (same account only; use `aswap add` for another). It
+refuses when the account's login changed since the backup or a rotation is
+pending, unless `--force`; what it replaces is backed up first.
+
 When a shared limit or reset hits many `--auto` sessions at once, they switch
 one at a time: across all providers and sessions using the same aswap data
 directory, at most one switch starts every `switch_interval_seconds` (default

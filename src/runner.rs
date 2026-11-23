@@ -395,7 +395,9 @@ pub fn run(
                     syncing = immediate_poll(store);
                 }
             }
-            let quota_rotation = limited
+            // A confirmed limit, or a notice that came with a rotated login
+            // (that only reloads the same account; never a switch).
+            let quota_rotation = (limited || limits.rotated_notice())
                 && !auth_failed
                 && !expired
                 && provider == Provider::Codex
@@ -573,7 +575,7 @@ pub fn run(
             let deadline = auth_seen.unwrap_or_else(Instant::now) + settle;
             rotated = rotation_by(store, &account, launched.as_deref(), deadline);
         }
-        if limited
+        if (limited || limits.rotated_notice())
             && provider == Provider::Codex
             && !rotated
             && !expired
@@ -969,33 +971,42 @@ fn limit_seen(
     moment: Moment,
 ) -> bool {
     let fresh = moment.exited.is_some();
-    if account.provider == Provider::Codex {
-        // An early notice needs the quota to agree (single-flight reads).
-        return limits.check_codex(
-            screen.notice,
+    // A notice counts once a fresh quota read confirms it.
+    let gate = |limits: &mut crate::limits::Limits, notice: bool, rotated: bool| {
+        limits.final_notice = terminal.is_some_and(Terminal::notice_in_final_screen);
+        limits.check_codex(
+            notice,
             moment.exited == Some(true),
-            || rotated_since(store, account, moment.launched),
-            || usage::cached(store, account).ok(),
+            || rotated && rotated_since(store, account, moment.launched),
             || {
-                // Off the terminal thread: a forced read can wait for
-                // another fetch, or for the owner on a follower.
+                // Off the terminal thread: a provider read, never a cache.
                 let (tx, rx) = std::sync::mpsc::channel();
                 let (root, account) = (store.root.clone(), account.clone());
                 std::thread::spawn(move || {
                     let reading = Store::open(root)
-                        .and_then(|store| usage::cached_force(&store, &account, true))
-                        .ok();
+                        .ok()
+                        .and_then(|store| usage::fresh_read(&store, &account));
                     let _ = tx.send(reading);
                 });
                 rx
             },
+            || terminal.is_some_and(|t| t.interrupted() || t.user_interrupted()),
             now,
-        );
+        )
+    };
+    if account.provider == Provider::Codex {
+        return gate(limits, screen.notice, true);
     }
-    if account.provider != Provider::Claude || tracker.is_none() {
+    if account.provider != Provider::Claude {
         return screen.notice;
     }
-    if limits.check(tracker, screen.notice, fresh) {
+    // Claude's transcript records its limits; the screen alone (no known
+    // transcript) is only a trigger, confirmed by a fresh quota read like
+    // Codex's, so a quoted notice never switches a healthy account.
+    if tracker.is_some() && limits.check(tracker, false, fresh) {
+        return true;
+    }
+    if !limits.transcript_known() && gate(limits, screen.notice, false) {
         return true;
     }
     limits.check_quota(
@@ -2374,3 +2385,41 @@ mod wake_tests {
 #[cfg(test)]
 #[path = "runner/wake_process_tests.rs"]
 mod wake_process_tests;
+
+#[cfg(test)]
+mod screen_gate_tests {
+    use super::*;
+
+    #[test]
+    fn a_claude_screen_notice_without_a_transcript_needs_a_fresh_read() {
+        // agy.4 review (Claude): "API Error: You've hit your usage limit."
+        // on screen, no transcript known, 20% quota: never a switch while
+        // the session runs, however long after launch.
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let account = Account {
+            provider: Provider::Claude,
+            label: "one".into(),
+        };
+        let mut limits = crate::limits::Limits::new(None);
+        let screen = crate::terminal::ScreenLimits {
+            notice: true,
+            ..Default::default()
+        };
+        std::thread::sleep(crate::limits::UNCONFIRMED);
+        for _ in 0..3 {
+            assert!(!limit_seen(
+                &store,
+                &account,
+                &mut limits,
+                None,
+                screen,
+                None,
+                Moment {
+                    exited: None,
+                    launched: None,
+                },
+            ));
+        }
+    }
+}

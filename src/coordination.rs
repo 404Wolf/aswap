@@ -298,6 +298,11 @@ pub fn configure(store: &Store, host: &str) -> Result<usize> {
 struct Request {
     protocol: u8,
     force: Option<Account>,
+    /// With `force`: a follower's id for this request. The owner echoes it
+    /// on that profile (`Profile::answered`) only when it read the account
+    /// from the provider for THIS request (older owners never do).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nonce: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Profile {
@@ -306,6 +311,9 @@ struct Profile {
     config: Value,
     #[serde(with = "packet_cache")]
     cache: Cached,
+    /// The request nonce this profile's reading answers (see Request).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    answered: Option<String>,
 }
 
 mod packet_cache {
@@ -420,6 +428,14 @@ fn known_profiles<'de, D: serde::Deserializer<'de>>(
     Ok(profiles)
 }
 fn packet(store: &Store, request: &Request) -> Result<Packet> {
+    packet_with(store, request, |account| usage::fresh_read(store, account))
+}
+/// `packet` with the provider read for a nonce request given (tests).
+fn packet_with(
+    store: &Store,
+    request: &Request,
+    fresh_read: impl Fn(&Account) -> Option<usage::Usage>,
+) -> Result<Packet> {
     if request.protocol != 1 {
         return Err(Error("sync: version-mismatch"));
     }
@@ -438,7 +454,31 @@ fn packet(store: &Store, request: &Request) -> Result<Packet> {
             .force
             .as_ref()
             .is_some_and(|a| a.provider == account.provider && a.label == account.label);
-        let cache = usage::cached_force(store, &account, force)?;
+        // A follower asking with a nonce gets a reading made for its request
+        // or none: a provider read now, never a cache.
+        let fresh = match (&request.nonce, force) {
+            (Some(nonce), true) => fresh_read(&account).map(|u| (nonce.clone(), u)),
+            _ => None,
+        };
+        // The provider's own answer for this request goes out as it came,
+        // labelled with the request's id; never a second, cached reading.
+        // The committed entry's bookkeeping (a provider-limit mark, a
+        // retry-after, backoff) goes with it.
+        let (answered, cache) = match fresh {
+            Some((nonce, usage)) => (
+                Some(nonce),
+                Cached {
+                    usage,
+                    ..usage::cached(store, &account).unwrap_or_else(|_| Cached {
+                        fetched_at: now(),
+                        last_attempt: now(),
+                        next_poll_at: now().saturating_add(usage::TTL),
+                        ..Cached::default()
+                    })
+                },
+            ),
+            None => (None, usage::cached_force(store, &account, force)?),
+        };
         let _lock = store.lock()?;
         let path = store.profile(account.provider, &account.label)?;
         let auth: Value = store::json_read(&path.join(account.provider.auth_file()))?;
@@ -452,6 +492,7 @@ fn packet(store: &Store, request: &Request) -> Result<Packet> {
             account,
             config,
             cache,
+            answered,
         });
     }
     Ok(Packet {
@@ -736,10 +777,48 @@ fn duplicate_count_permitted(packet: &Packet, policy: &SyncPolicy) -> usize {
 pub fn poll(store: &Store, force: Option<&Account>, immediate: bool) -> Result<usize> {
     poll_with(store, force, immediate, exchange)
 }
+/// A follower's fresh read of `account`: the owner reads it from the
+/// provider for this request (a nonce it must echo) and the follower takes
+/// that reading only. None: the owner couldn't, or is an older version.
+pub fn poll_fresh(store: &Store, account: &Account) -> Result<Option<usage::Usage>> {
+    poll_fresh_with(store, account, exchange)
+}
+fn poll_fresh_with(
+    store: &Store,
+    account: &Account,
+    exchange: impl FnOnce(&str, &Request) -> Result<Packet>,
+) -> Result<Option<usage::Usage>> {
+    let nonce = {
+        let mut bytes = [0u8; 16];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes)
+            .map_err(|_| Error("cannot make a sync request id"))?;
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    let mut answered = None;
+    poll_inner(
+        store,
+        Some(account),
+        true,
+        Some(&nonce),
+        &mut answered,
+        exchange,
+    )?;
+    Ok(answered)
+}
 fn poll_with(
     store: &Store,
     force: Option<&Account>,
     immediate: bool,
+    exchange: impl FnOnce(&str, &Request) -> Result<Packet>,
+) -> Result<usize> {
+    poll_inner(store, force, immediate, None, &mut None, exchange)
+}
+fn poll_inner(
+    store: &Store,
+    force: Option<&Account>,
+    immediate: bool,
+    nonce: Option<&str>,
+    answered: &mut Option<usage::Usage>,
     exchange: impl FnOnce(&str, &Request) -> Result<Packet>,
 ) -> Result<usize> {
     let bypass = immediate || force.is_some();
@@ -752,8 +831,23 @@ fn poll_with(
         &Request {
             protocol: 1,
             force: force.cloned(),
+            nonce: nonce.map(str::to_owned),
         },
     );
+    // The reading made for this request, before the packet is installed.
+    let result = result.inspect(|packet| {
+        *answered = packet
+            .profiles
+            .iter()
+            .find(|p| {
+                nonce.is_some()
+                    && p.answered.as_deref() == nonce
+                    && force.is_some_and(|f| {
+                        f.provider == p.account.provider && f.label == p.account.label
+                    })
+            })
+            .map(|p| p.cache.usage.clone());
+    });
     let _lock = store.lock()?;
     if settings(store)?.host.as_deref() != Some(host.as_str()) {
         return Err(Error("sync: configuration changed during sync"));
@@ -1065,6 +1159,7 @@ fn watch_session(
             &Request {
                 protocol: WATCH_PROTOCOL,
                 force: None,
+                nonce: None,
             },
             first,
             idle,
@@ -1246,6 +1341,7 @@ fn serve_watch(store: &Store) -> Result<()> {
     let single = Request {
         protocol: 1,
         force: None,
+        nonce: None,
     };
     let mut sent: Option<(Vec<Option<crate::shared::Stamp>>, Instant)> = None;
     while !closed.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1314,6 +1410,7 @@ mod tests {
         let request = Request {
             protocol: 1,
             force: None,
+            nonce: None,
         };
         let one = packet(&store, &request).unwrap();
         let two = packet(&store, &request).unwrap();
@@ -1372,6 +1469,7 @@ mod tests {
         let request = Request {
             protocol: 1,
             force: None,
+            nonce: None,
         };
         let mut packet = packet(&store, &request).unwrap();
         let profile = &mut packet.profiles[0];
@@ -1460,6 +1558,7 @@ mod tests {
         let request = Request {
             protocol: 1,
             force: None,
+            nonce: None,
         };
         let p = packet(&store, &request).unwrap();
         assert_eq!(duplicate_count(&p), 1);
@@ -1501,6 +1600,7 @@ mod tests {
             &Request {
                 protocol: 2,
                 force: None,
+                nonce: None,
             },
         )
         .err()
@@ -1519,6 +1619,7 @@ mod tests {
             &Request {
                 protocol: 1,
                 force: None,
+                nonce: None,
             },
         )
         .err()
@@ -1551,6 +1652,7 @@ mod tests {
         let request = Request {
             protocol: 1,
             force: None,
+            nonce: None,
         };
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 10"]);
@@ -1579,6 +1681,114 @@ mod tests {
             .unwrap();
         assert_eq!(error.0, "sync: version-mismatch");
     }
+    #[test]
+    fn the_owner_sends_the_providers_answer_for_the_request_never_its_cache() {
+        // agy.6 review: the nonce labels the provider's own answer.
+        let (_t, owner) = seed();
+        let account = owner.load().unwrap().accounts[0].clone();
+        // The owner's cache says 100%, the provider answers 20% now.
+        let path = owner
+            .profile(account.provider, &account.label)
+            .unwrap()
+            .join("usage-cache.json");
+        let mut stale: Cached = store::json_read(&path).unwrap_or_default();
+        stale.error = Some("provider-limit".into());
+        stale.usage.windows = vec![usage::Window {
+            name: "weekly".into(),
+            used_percent: 100.0,
+            resets_at: Some(now() + 3600),
+            duration_minutes: Some(10080),
+            codex_slot: None,
+        }];
+        store::json_write(&path, &stale).unwrap();
+        let mut answer = stale.usage.clone();
+        answer.windows[0].used_percent = 20.0;
+        let request = Request {
+            protocol: 1,
+            force: Some(account.clone()),
+            nonce: Some("synthetic-request".into()),
+        };
+        let sent = packet_with(&owner, &request, |_| Some(answer.clone())).unwrap();
+        let profile = sent
+            .profiles
+            .iter()
+            .find(|p| p.account.label == account.label && p.account.provider == account.provider)
+            .unwrap();
+        assert_eq!(profile.answered.as_deref(), Some("synthetic-request"));
+        assert_eq!(profile.cache.usage.windows[0].used_percent, 20.0);
+        // The owner's bookkeeping goes with the answer (agy.7 review L1).
+        assert_eq!(profile.cache.error.as_deref(), Some("provider-limit"));
+        // No provider answer (or no commit): no label, whatever the cache.
+        let sent = packet_with(&owner, &request, |_| None).unwrap();
+        let profile = sent
+            .profiles
+            .iter()
+            .find(|p| p.account.label == account.label && p.account.provider == account.provider)
+            .unwrap();
+        assert!(profile.answered.is_none());
+    }
+    #[test]
+    fn a_follower_takes_only_the_owners_reading_for_its_own_request() {
+        // agy.5 review: provenance by request id, not timestamps.
+        let account = Account {
+            provider: Provider::Codex,
+            label: "work".into(),
+        };
+        let at = now();
+        let reading = |used: f64| Cached {
+            usage: usage::Usage {
+                windows: vec![usage::Window {
+                    name: "weekly".into(),
+                    used_percent: used,
+                    resets_at: Some(at + 3600),
+                    duration_minutes: Some(10080),
+                    codex_slot: None,
+                }],
+                ..Default::default()
+            },
+            fetched_at: at,
+            next_poll_at: at + 180,
+            last_attempt: at,
+            ..Default::default()
+        };
+        let packet = |answered: Option<String>, used: f64| Packet {
+            protocol: 1,
+            issued_at: now(),
+            profiles: vec![Profile {
+                account: account.clone(),
+                auth: json!({"tokens":{"access_token":"synthetic-access","account_id":"synthetic"}}),
+                config: json!({}),
+                cache: reading(used),
+                answered,
+            }],
+        };
+        // The owner read it for this request: taken.
+        let (_t, follower) = follower_store();
+        let fresh = poll_fresh_with(&follower, &account, |_, request| {
+            assert_eq!(
+                request.force.as_ref().map(|a| a.label.as_str()),
+                Some("work")
+            );
+            Ok(packet(request.nonce.clone(), 100.0))
+        })
+        .unwrap();
+        assert_eq!(fresh.unwrap().windows[0].used_percent, 100.0);
+        // An older owner (no echo), or another request's answer: not taken,
+        // however new its timestamps look.
+        for answered in [None, Some("another-request".to_owned())] {
+            let (_t, follower) = follower_store();
+            let fresh = poll_fresh_with(&follower, &account, |_, _| {
+                Ok(packet(answered.clone(), 100.0))
+            })
+            .unwrap();
+            assert!(fresh.is_none(), "{answered:?}");
+        }
+        // The owner can't be reached: none.
+        let (_t, follower) = follower_store();
+        assert!(
+            poll_fresh_with(&follower, &account, |_, _| Err(Error("sync: unreachable"))).is_err()
+        );
+    }
     fn follower_store() -> (tempfile::TempDir, Store) {
         let t = tempfile::tempdir().unwrap();
         let mut store = Store::open(t.path().join("follower")).unwrap();
@@ -1599,6 +1809,7 @@ mod tests {
             &Request {
                 protocol: 1,
                 force: None,
+                nonce: None,
             },
         )
         .unwrap()
@@ -2311,6 +2522,7 @@ mod packet_compat_tests {
             auth: json!({"tokens":{"access_token":"synthetic"}}),
             config: json!({}),
             cache: Cached::default(),
+            answered: None,
         };
         let mut value = serde_json::to_value(Packet {
             protocol: 1,

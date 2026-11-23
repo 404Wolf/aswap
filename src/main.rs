@@ -60,6 +60,19 @@ enum Action {
     },
     /// Remove a stored profile (refuses a running account).
     Remove { provider: Provider, label: String },
+    /// Install a backed-up live login (live-backups) as an existing
+    /// account's login; it must be the same account.
+    Restore {
+        provider: Provider,
+        label: String,
+        /// The backup directory aswap printed when it saved the login.
+        #[arg(long)]
+        from: std::path::PathBuf,
+        /// Replace the account's login even if it changed since the backup
+        /// or has a pending rotation (both are backed up first).
+        #[arg(long)]
+        force: bool,
+    },
     /// Rename a stored label, its usage cache and retained sessions.
     Rename {
         provider: Provider,
@@ -462,6 +475,29 @@ fn execute(cli: Cli) -> Result<i32> {
                 &json!({"removed":true,"provider":provider,"label":label,"duplicates":duplicates}),
                 cli.json,
                 format!("Removed {provider}:{label}{detail}"),
+            )?;
+        }
+        Action::Restore {
+            provider,
+            label,
+            from,
+            force,
+        } => {
+            let (account, replaced) =
+                aswap::provider::restore(&store, provider, &label, &from, force)?;
+            output(
+                &json!({"restored":account,"replaced_login_backup":replaced}),
+                cli.json,
+                match &replaced {
+                    None => {
+                        format!("{provider}:{label} already holds that login; nothing to restore")
+                    }
+                    Some(replaced) => format!(
+                        "Restored {provider}:{label} from {}; the replaced login is in {}",
+                        from.display(),
+                        replaced.display()
+                    ),
+                },
             )?;
         }
         Action::Rename { provider, old, new } => {

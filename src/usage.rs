@@ -35,6 +35,38 @@ pub struct Usage {
     /// Codex usage-limit reset credits as the app-server lists them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reset_credits: Vec<ResetCredit>,
+    /// Codex's `ordinaryUsageAllowed`, the backend's permission for ordinary
+    /// usage (see [`OrdinaryUsage`]).
+    #[serde(default, skip_serializing_if = "OrdinaryUsage::not_reported")]
+    pub ordinary_usage: OrdinaryUsage,
+}
+/// Codex's `ordinaryUsageAllowed` (app-server protocol v2): the backend's
+/// permission for ordinary included usage. Upstream: "Null means
+/// unavailable; clients must not infer recovery from percentages or reset
+/// times." Older Codex versions don't report it at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OrdinaryUsage {
+    /// The read has no such field: an older Codex. Percentages decide.
+    #[default]
+    NotReported,
+    /// Reported as null: permission unknown.
+    Unknown,
+    Allowed,
+    Denied,
+}
+impl OrdinaryUsage {
+    fn not_reported(&self) -> bool {
+        *self == Self::NotReported
+    }
+    pub fn from_read(v: &Value) -> Self {
+        match v.get("ordinaryUsageAllowed") {
+            None => Self::NotReported,
+            Some(Value::Bool(true)) => Self::Allowed,
+            Some(Value::Bool(false)) => Self::Denied,
+            Some(_) => Self::Unknown,
+        }
+    }
 }
 /// One Codex usage-limit reset credit. Redeeming it resets the account's
 /// eligible windows (5-hour and weekly together); it is an earned, expiring
@@ -170,6 +202,11 @@ impl Usage {
             .any(|w| w.resets_at.is_some_and(|r| r <= at))
         {
             return None;
+        }
+        // Codex's backend denying ordinary usage is out of usage, whatever
+        // the percentages say: never a candidate, never "room".
+        if self.ordinary_usage == OrdinaryUsage::Denied {
+            return Some(100.0);
         }
         self.windows.iter().map(|w| w.used_percent).reduce(f64::max)
     }
@@ -477,6 +514,7 @@ pub fn parse_codex(v: &Value) -> Result<Usage> {
         credits,
         available_usage_resets,
         reset_credits: parse_reset_credits(v),
+        ordinary_usage: OrdinaryUsage::from_read(v),
     })
 }
 #[derive(Clone, Copy, Debug)]
@@ -878,6 +916,11 @@ where
         return Ok(updated(snapshot, result, at));
     }
     let latest = read_cache(&path, force)?;
+    // Newest observation wins: a reading stored while this fetch ran (a
+    // confirming read, which takes no usage lock) is newer than this one.
+    if latest.fetched_at > snapshot.fetched_at {
+        return Ok(latest);
+    }
     let entry = merged(&snapshot, latest, result, at);
     store::json_write(&path, &entry)?;
     Ok(entry)
@@ -971,6 +1014,54 @@ fn fresh_enough(store: &Store, account: &Account, at: u64, force: bool) -> Resul
     }
     Ok(Decision::Fetch { old, path, profile })
 }
+/// A quota observation fetched by this call, now: the provider's own answer,
+/// never a cached one (a forced read that couldn't fetch, because another
+/// process holds the fetch or this is a follower, returns None). For
+/// confirming a limit notice, where an older reading proves nothing.
+pub fn fresh_read(store: &Store, account: &Account) -> Option<Usage> {
+    if crate::coordination::follower(store).ok()? {
+        return crate::coordination::poll_fresh(store, account)
+            .ok()
+            .flatten();
+    }
+    // refresh takes the store lock itself, never across the request.
+    let refresh = |force: bool| crate::refresh::refresh(store, account, now(), force);
+    fresh_read_with(store, account, now(), |p| {
+        fetch_refreshing(account, p, refresh, |p| fetch(account, p))
+    })
+}
+/// `fresh_read` with the fetch given (tests).
+pub fn fresh_read_with<F>(store: &Store, account: &Account, at: u64, fetcher: F) -> Option<Usage>
+where
+    F: FnOnce(&Path) -> std::result::Result<Usage, Failure>,
+{
+    // No per-login usage lock: an abandoned read (its RPC hung) must never
+    // block the next one. The answer is merged into the cache afterwards,
+    // under the store lock, as any fetch is.
+    let profile = store.profile(account.provider, &account.label).ok()?;
+    let path = profile.join("usage-cache.json");
+    let snapshot = {
+        let _lock = store.lock().ok()?;
+        read_cache(&path, true).ok()?
+    };
+    let result = fetcher(&profile);
+    let fresh = result.as_ref().ok().cloned();
+    // The answer is the provider's, returned as it came; storing it is
+    // required too (a failed commit means no confirming answer).
+    let _lock = store.lock().ok()?;
+    let state = store.load().ok()?;
+    store
+        .account(&state, account.provider, Some(&account.label))
+        .ok()?;
+    let latest = read_cache(&path, true).ok()?;
+    // Newest observation wins: another reading stored while this one ran
+    // is newer, and this one must not replace it, nor confirm anything.
+    if latest.fetched_at > snapshot.fetched_at || latest.last_attempt > snapshot.last_attempt {
+        return None;
+    }
+    store::json_write(&path, &merged(&snapshot, latest, result, at)).ok()?;
+    fresh
+}
 pub fn cached(store: &Store, account: &Account) -> Result<Cached> {
     cached_force(store, account, false)
 }
@@ -989,14 +1080,9 @@ pub fn cached_force(store: &Store, account: &Account, force: bool) -> Result<Cac
         return Ok(cached);
     }
 
-    // A refresh rewrites shared state (views, aliases), so it runs under
-    // the store lock; it is due rarely, unlike the fetch around it.
-    let refresh = |force: bool| {
-        let _lock = store
-            .lock()
-            .map_err(|_| Failure::new("usage-unavailable"))?;
-        crate::refresh::refresh(store, account, now(), force)
-    };
+    // A refresh rewrites shared state (views, aliases): it takes the store
+    // lock itself for that, never across the token request.
+    let refresh = |force: bool| crate::refresh::refresh(store, account, now(), force);
     cached_mode_with(store, account, now(), force, |p| {
         fetch_refreshing(account, p, refresh, |p| fetch(account, p))
     })
@@ -1456,5 +1542,135 @@ mod rotation_tests {
         assert_eq!(forced(live, Failure::new("codex-rpc-timeout")), 0);
         assert_eq!(forced(now() - 1, Failure::new("codex-rpc-unavailable")), 1);
         assert_eq!(forced(live, Failure::http(401, 0)), 1);
+    }
+}
+
+#[cfg(test)]
+mod fresh_read_tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_read_never_waits_on_a_held_usage_lock() {
+        // agy.5 review (b): an abandoned read still holding the per-login
+        // fetch lock must not block the next confirming read.
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let account = Account {
+            provider: crate::provider::Provider::Codex,
+            label: "one".into(),
+        };
+        let mut state = store.load().unwrap();
+        state.accounts.push(account.clone());
+        store.save(&state).unwrap();
+        let profile = store.profile(account.provider, &account.label).unwrap();
+        store::private_dir(&profile).unwrap();
+        let _held = store
+            .usage_lock(&account, std::time::Duration::ZERO)
+            .unwrap()
+            .expect("the abandoned read's lock");
+        let at = now();
+        let started = std::time::Instant::now();
+        let fresh = fresh_read_with(&store, &account, at, |_| {
+            Ok(Usage {
+                windows: vec![Window {
+                    name: "weekly".into(),
+                    used_percent: 100.0,
+                    resets_at: Some(at + 3600),
+                    duration_minutes: Some(10080),
+                    codex_slot: None,
+                }],
+                ..Default::default()
+            })
+        });
+        assert_eq!(fresh.unwrap().windows[0].used_percent, 100.0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod fresh_commit_tests {
+    use super::*;
+
+    #[test]
+    fn a_confirming_read_never_replaces_a_newer_reading() {
+        // agy.6 review: an older confirming read finishing after a newer
+        // 20% reading was stored neither replaces it nor confirms.
+        let t = tempfile::tempdir().unwrap();
+        let store = Store::open(t.path().join("store")).unwrap();
+        let account = Account {
+            provider: crate::provider::Provider::Codex,
+            label: "one".into(),
+        };
+        let mut state = store.load().unwrap();
+        state.accounts.push(account.clone());
+        store.save(&state).unwrap();
+        let profile = store.profile(account.provider, &account.label).unwrap();
+        store::private_dir(&profile).unwrap();
+        let path = profile.join("usage-cache.json");
+        let at = now();
+        let window = |used: f64| Window {
+            name: "weekly".into(),
+            used_percent: used,
+            resets_at: Some(at + 3600),
+            duration_minutes: Some(10080),
+            codex_slot: None,
+        };
+        let newer = Cached {
+            usage: Usage {
+                windows: vec![window(20.0)],
+                ..Default::default()
+            },
+            fetched_at: at + 5,
+            last_attempt: at + 5,
+            next_poll_at: at + 185,
+            ..Default::default()
+        };
+        let fresh = fresh_read_with(&store, &account, at, |_| {
+            // A newer reading lands while this read runs.
+            store::json_write(&path, &newer).unwrap();
+            Ok(Usage {
+                windows: vec![window(100.0)],
+                ..Default::default()
+            })
+        });
+        assert!(fresh.is_none(), "no confirmation from the older read");
+        let kept: Cached = store::json_read(&path).unwrap();
+        assert_eq!(
+            kept.usage.windows[0].used_percent, 20.0,
+            "the newer reading stays"
+        );
+
+        // And an ordinary fetch that began before a confirming read never
+        // writes its older reading over it (agy.7 review M1).
+        let stale = Cached {
+            fetched_at: at - 600,
+            last_attempt: at - 600,
+            next_poll_at: at - 1,
+            ..Default::default()
+        };
+        store::json_write(&path, &stale).unwrap();
+        let ordinary = cached_mode_with(&store, &account, at, true, |_| {
+            // The confirming read lands during the ordinary fetch.
+            store::json_write(
+                &path,
+                &Cached {
+                    fetched_at: at + 1,
+                    last_attempt: at + 1,
+                    ..newer.clone()
+                },
+            )
+            .unwrap();
+            Ok(Usage {
+                windows: vec![window(100.0)],
+                ..Default::default()
+            })
+        })
+        .unwrap();
+        assert_eq!(ordinary.usage.windows[0].used_percent, 20.0);
+        let kept: Cached = store::json_read(&path).unwrap();
+        assert_eq!(
+            kept.usage.windows[0].used_percent, 20.0,
+            "the confirming read stays"
+        );
     }
 }

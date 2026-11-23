@@ -72,7 +72,20 @@ if args[:1]==['app-server']:
         req=json.loads(line)
         if req.get('method')=='initialize': result={}
         elif req.get('method')=='model/list': result={'data':[{'model':'synthetic-model','id':'synthetic-model','isDefault':True}]}
-        elif req.get('method')=='account/rateLimits/read': result={'rateLimits':{'primary':{'usedPercent':20,'windowDurationMins':300,'resetsAt':int(time.time())+3600}}}
+        elif req.get('method')=='account/rateLimits/read':
+            # The account's quota as the fake left it in the profile cache
+            # (100% after a real limit); otherwise 20%.
+            limits={'primary':{'usedPercent':20,'windowDurationMins':300,'resetsAt':int(time.time())+3600}}
+            auth_text=(p/'auth.json').read_text()
+            label='one' if 'synthetic-first' in auth_text or 'synthetic-rotated' in auth_text else 'two'
+            cache=pathlib.Path(os.environ['XDG_DATA_HOME'])/'aswap'/'profiles'/'codex'/label/'usage-cache.json'
+            try:
+                limits={}
+                for w in json.loads(cache.read_text())['usage']['windows']:
+                    minutes=w.get('duration_minutes') or 300
+                    limits['secondary' if minutes==10080 else 'primary']={'usedPercent':w['used_percent'],'windowDurationMins':minutes,'resetsAt':w.get('resets_at') or int(time.time())+3600}
+            except (OSError,ValueError,KeyError): pass
+            result={'rateLimits':limits}
         else: continue
         print(json.dumps({'id':req['id'],'result':result}),flush=True)
     sys.exit(0)
