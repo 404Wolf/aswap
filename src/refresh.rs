@@ -382,18 +382,22 @@ fn pending_path(path: &std::path::Path) -> std::path::PathBuf {
     name.push(".pending");
     path.with_file_name(name)
 }
-/// A second pending copy in `$XDG_RUNTIME_DIR` (a tmpfs on systemd hosts),
-/// so a full or failing data disk can't lose both. Named per store, so
-/// two stores (a test's and the real one) never share it.
-fn runtime_pending_dir() -> Option<std::path::PathBuf> {
+fn configured_runtime_root() -> Option<std::path::PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
-        .filter(|dir| dir.is_absolute() && dir.is_dir())
+        .filter(|dir| dir.is_absolute())
+}
+fn runtime_pending_dir() -> Option<std::path::PathBuf> {
+    configured_runtime_root()
+        .filter(|dir| dir.is_dir())
         .map(|dir| dir.join("aswap"))
 }
 fn runtime_pending_prefix(store: &Store) -> String {
     bytes_hash(store.root.as_os_str().as_encoded_bytes())[..16].to_owned()
 }
+/// A second pending copy in `$XDG_RUNTIME_DIR` (a tmpfs on systemd hosts),
+/// so a full or failing data disk can't lose both. Named per store, so
+/// two stores (a test's and the real one) never share it.
 fn runtime_pending_path(store: &Store, account: &Account) -> Option<std::path::PathBuf> {
     Some(runtime_pending_dir()?.join(format!(
         "{}-{}-{}.pending.json",
@@ -470,51 +474,84 @@ pub(crate) fn pending_exists(store: &Store, account: &Account) -> bool {
 /// longer in state.json. Old releases cannot finish such a rotation.
 pub(crate) fn require_legacy_pending_free(store: &Store) -> crate::Result<()> {
     use std::io::ErrorKind::NotFound;
-    const PENDING: crate::Error = crate::Error(
-        "legacy compatibility requires a store with no pending logins; resolve them before sharing the store with an older aswap",
-    );
-    const INSPECT: crate::Error = crate::Error("cannot inspect legacy store for pending logins");
     for provider in [Provider::Claude, Provider::Codex] {
         let dir = store.root.join("profiles").join(provider.as_str());
         store::no_links(&dir)?;
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == NotFound => continue,
-            Err(_) => return Err(INSPECT),
+            Err(_) => return Err(LEGACY_PENDING_INSPECT),
         };
         for entry in entries {
-            let profile = entry.map_err(|_| INSPECT)?.path();
+            let profile = entry.map_err(|_| LEGACY_PENDING_INSPECT)?.path();
             if !std::fs::symlink_metadata(&profile)
-                .map_err(|_| INSPECT)?
+                .map_err(|_| LEGACY_PENDING_INSPECT)?
                 .is_dir()
             {
                 continue;
             }
             match std::fs::symlink_metadata(pending_path(&profile.join(provider.auth_file()))) {
-                Ok(_) => return Err(PENDING),
+                Ok(_) => return Err(LEGACY_PENDING),
                 Err(err) if err.kind() == NotFound => {}
-                Err(_) => return Err(INSPECT),
+                Err(_) => return Err(LEGACY_PENDING_INSPECT),
             }
         }
     }
-    if let Some(dir) = runtime_pending_dir() {
-        store::no_links(&dir)?;
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == NotFound => return Ok(()),
-            Err(_) => return Err(INSPECT),
-        };
-        let prefix = runtime_pending_prefix(store);
-        let claude = format!("{prefix}-claude-");
-        let codex = format!("{prefix}-codex-");
-        for entry in entries {
-            let name = entry.map_err(|_| INSPECT)?.file_name();
-            if let Some(name) = name.to_str()
-                && name.ends_with(".pending.json")
-                && (name.starts_with(&claude) || name.starts_with(&codex))
-            {
-                return Err(PENDING);
+    let prefix = runtime_pending_prefix(store);
+    let configured = configured_runtime_root();
+    #[cfg(target_os = "linux")]
+    let configured = {
+        // An SSH shell may omit XDG_RUNTIME_DIR while a service under the
+        // same UID has written its sole copy into the standard runtime.
+        // SAFETY: geteuid takes no arguments.
+        let uid = unsafe { libc::geteuid() };
+        let standard = std::path::Path::new("/run/user").join(uid.to_string());
+        require_runtime_pending_free(&standard, &prefix, Some(uid))?;
+        configured.filter(|dir| dir != &standard)
+    };
+    if let Some(dir) = configured {
+        require_runtime_pending_free(&dir, &prefix, None)?;
+    }
+    Ok(())
+}
+const LEGACY_PENDING: crate::Error = crate::Error(
+    "legacy compatibility requires a store with no pending logins; resolve them before sharing the store with an older aswap",
+);
+const LEGACY_PENDING_INSPECT: crate::Error =
+    crate::Error("cannot inspect legacy store for pending logins");
+
+fn require_runtime_pending_free(
+    runtime: &std::path::Path,
+    prefix: &str,
+    required_owner: Option<u32>,
+) -> crate::Result<()> {
+    use std::{io::ErrorKind::NotFound, os::unix::fs::MetadataExt};
+
+    let dir = runtime.join("aswap");
+    store::no_links(&dir)?;
+    if let Some(uid) = required_owner {
+        for path in [runtime, &dir] {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_dir() && metadata.uid() == uid => {}
+                Err(err) if err.kind() == NotFound => return Ok(()),
+                _ => return Err(LEGACY_PENDING_INSPECT),
             }
+        }
+    }
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == NotFound => return Ok(()),
+        Err(_) => return Err(LEGACY_PENDING_INSPECT),
+    };
+    let claude = format!("{prefix}-claude-");
+    let codex = format!("{prefix}-codex-");
+    for entry in entries {
+        let name = entry.map_err(|_| LEGACY_PENDING_INSPECT)?.file_name();
+        if let Some(name) = name.to_str()
+            && name.ends_with(".pending.json")
+            && (name.starts_with(&claude) || name.starts_with(&codex))
+        {
+            return Err(LEGACY_PENDING);
         }
     }
     Ok(())
@@ -784,6 +821,59 @@ fn propagate(store: &Store, aliases: &[Account], auth: &Value) -> crate::Result<
 #[cfg(test)]
 mod pending_tests {
     use super::*;
+
+    #[test]
+    fn owned_runtime_preflight_finds_a_sole_sidecar_by_name() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("store")).unwrap();
+        let runtime = temp.path().join("run/user/synthetic");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let uid = std::fs::metadata(&runtime).unwrap().uid();
+        let prefix = runtime_pending_prefix(&store);
+        let dir = runtime.join("aswap");
+
+        require_runtime_pending_free(&runtime, &prefix, Some(uid)).unwrap();
+        assert!(!dir.exists());
+
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("different-store-codex-orphan.pending.json"),
+            b"synthetic",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("{prefix}-agy-orphan.pending.json")),
+            b"synthetic",
+        )
+        .unwrap();
+        require_runtime_pending_free(&runtime, &prefix, Some(uid)).unwrap();
+        assert_eq!(
+            require_runtime_pending_free(&runtime, &prefix, Some(uid.wrapping_add(1)))
+                .unwrap_err()
+                .0,
+            LEGACY_PENDING_INSPECT.0
+        );
+
+        for provider in [Provider::Claude, Provider::Codex] {
+            let pending = dir.join(format!("{prefix}-{provider}-orphan.pending.json"));
+            std::fs::write(
+                &pending,
+                b"this synthetic sidecar is unreadable and invalid",
+            )
+            .unwrap();
+            std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0)).unwrap();
+            assert_eq!(
+                require_runtime_pending_free(&runtime, &prefix, Some(uid))
+                    .unwrap_err()
+                    .0,
+                LEGACY_PENDING.0
+            );
+            assert!(pending.is_file());
+            std::fs::remove_file(pending).unwrap();
+        }
+    }
 
     #[test]
     fn an_unreadable_login_keeps_its_pending_copy() {
